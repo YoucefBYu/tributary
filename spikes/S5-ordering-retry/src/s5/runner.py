@@ -91,10 +91,16 @@ class Worker:
 class WorkerPool:
     """Starts, watches and reaps loader processes for one scenario."""
 
-    def __init__(self, run_dir: Path, layout: Layout, group: str) -> None:
+    def __init__(
+        self, run_dir: Path, layout: Layout, group: str, poison_file: Path | None = None
+    ) -> None:
         self.run_dir = run_dir
         self.layout = layout
         self.group = group
+        #: Passed to every worker it starts. Wiring this per scenario was the
+        #: original arrangement and it silently produced a run where nothing
+        #: failed, nothing reached the DLQ and the verdict was still "ok".
+        self.poison_file = poison_file
         self.workers: list[Worker] = []
 
     def start(self, name: str, *, static: bool = True, extra: Sequence[str] = ()) -> Worker:
@@ -112,6 +118,7 @@ class WorkerPool:
             "--log", str(log_path),
             "--stats", str(stats_path),
             *(("--instance-id", name) if static else ()),
+            *(("--poison-file", str(self.poison_file)) if self.poison_file else ()),
             *extra,
         ]
         proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=stderr)  # noqa: S603
@@ -184,6 +191,9 @@ class RunResult:
             and self.report.no_loss
             and not self.commit_violations
             and not self.phi_findings
+            # Exactly the poison messages, no more and no fewer. Without this an
+            # injection harness that forgot to inject anything reports success.
+            and self.dlq_ids == self.expected_dlq_ids
         )
 
     def summary(self) -> dict[str, Any]:
@@ -201,7 +211,11 @@ class RunResult:
                 "missing": len(self.expected_dlq_ids - self.dlq_ids),
             },
             "commit_after_delivery_violations": self.commit_violations[:5],
-            "undrained_partitions": self.undrained,
+            # str keys: orjson refuses int dict keys, and a halted run is
+            # exactly the case that puts entries in here.
+            "undrained_partitions": {
+                str(p): {"committed": c, "high_watermark": h} for p, (c, h) in self.undrained.items()
+            },
             "workers": self.worker_stats,
             "event_stages": self.event_stages,
             "phi_findings": self.phi_findings,
@@ -367,6 +381,18 @@ def _setup(scenario: str, opts: Options) -> tuple[Layout, str, Path, Plan]:
     return layout, group, run_dir, plan
 
 
+def _pool(run_dir: Path, layout: Layout, group: str, plan: Plan) -> WorkerPool:
+    """Build a pool with the failure injection already wired in.
+
+    Every scenario goes through here so that none of them can be written
+    without passing the poison set to its workers.
+    """
+    poison_file = run_dir / "poison.json"
+    return WorkerPool(
+        run_dir, layout, group, poison_file=poison_file if plan.poison else None
+    )
+
+
 def _poison_every(scenario: str) -> int | None:
     if scenario in ("poison_dlq", "halt"):
         return 250 if scenario == "poison_dlq" else 400
@@ -384,7 +410,7 @@ def _common(opts: Options, *, idle_exit_s: float = 12.0) -> list[str]:
 def scenario_baseline(opts: Options) -> RunResult:
     """No faults at all. Establishes throughput and that the harness is honest."""
     layout, group, run_dir, plan = _setup("baseline", opts)
-    pool = WorkerPool(run_dir, layout, group)
+    pool = _pool(run_dir, layout, group, plan)
     t0 = time.monotonic()
     pool.start("worker-a", extra=_common(opts))
     pool.start("worker-b", extra=_common(opts))
@@ -401,7 +427,7 @@ def scenario_baseline_batched(opts: Options) -> RunResult:
     replay window after a kill.
     """
     layout, group, run_dir, plan = _setup("baseline_batched", opts)
-    pool = WorkerPool(run_dir, layout, group)
+    pool = _pool(run_dir, layout, group, plan)
     t0 = time.monotonic()
     extra = [*_common(opts), "--commit-every", "50", "--commit-interval-s", "0.5"]
     pool.start("worker-a", extra=extra)
@@ -425,7 +451,7 @@ def scenario_blocking_retry(opts: Options) -> RunResult:
     would be non-empty.
     """
     layout, group, run_dir, plan = _setup("blocking_retry", opts)
-    pool = WorkerPool(run_dir, layout, group)
+    pool = _pool(run_dir, layout, group, plan)
     t0 = time.monotonic()
     extra = [
         *_common(opts, idle_exit_s=15.0),
@@ -457,7 +483,7 @@ def scenario_blocking_retry(opts: Options) -> RunResult:
 def scenario_poison_dlq(opts: Options) -> RunResult:
     """Permanently-failing messages must leave the partition, via the DLQ."""
     layout, group, run_dir, plan = _setup("poison_dlq", opts)
-    pool = WorkerPool(run_dir, layout, group)
+    pool = _pool(run_dir, layout, group, plan)
     t0 = time.monotonic()
     extra = [*_common(opts), "--max-attempts", "3", "--backoff-base", "0.02", "--backoff-cap", "0.1"]
     pool.start("worker-a", extra=extra)
@@ -469,7 +495,7 @@ def scenario_poison_dlq(opts: Options) -> RunResult:
 def scenario_halt(opts: Options) -> RunResult:
     """`halt-partition`: the order-preserving alternative to dead-lettering."""
     layout, group, run_dir, plan = _setup("halt", opts)
-    pool = WorkerPool(run_dir, layout, group)
+    pool = _pool(run_dir, layout, group, plan)
     t0 = time.monotonic()
     extra = [
         *_common(opts, idle_exit_s=8.0),
@@ -493,7 +519,7 @@ def scenario_halt(opts: Options) -> RunResult:
 def scenario_kill(opts: Options) -> RunResult:
     """``kill -9`` a worker mid-run; a fresh member takes the partitions over."""
     layout, group, run_dir, plan = _setup("kill", opts)
-    pool = WorkerPool(run_dir, layout, group)
+    pool = _pool(run_dir, layout, group, plan)
     t0 = time.monotonic()
     a = pool.start("worker-a", extra=_common(opts, idle_exit_s=20.0))
     pool.start("worker-b", extra=_common(opts, idle_exit_s=20.0))
@@ -516,7 +542,7 @@ def scenario_static_hold(opts: Options) -> RunResult:
     open eyes: it is the recovery-time floor for an ordered channel.
     """
     layout, group, run_dir, plan = _setup("static_hold", opts)
-    pool = WorkerPool(run_dir, layout, group)
+    pool = _pool(run_dir, layout, group, plan)
     t0 = time.monotonic()
     a = pool.start("worker-a", extra=_common(opts, idle_exit_s=25.0))
     pool.start("worker-b", extra=_common(opts, idle_exit_s=25.0))
@@ -537,7 +563,7 @@ def scenario_static_restart(opts: Options) -> RunResult:
     group does not rebalance at all, so the only cost is the downtime itself.
     """
     layout, group, run_dir, plan = _setup("static_restart", opts)
-    pool = WorkerPool(run_dir, layout, group)
+    pool = _pool(run_dir, layout, group, plan)
     t0 = time.monotonic()
     a = pool.start("worker-a", extra=_common(opts, idle_exit_s=20.0))
     b = pool.start("worker-b", extra=_common(opts, idle_exit_s=20.0))
@@ -563,7 +589,7 @@ def scenario_static_restart(opts: Options) -> RunResult:
 def scenario_rebalance(opts: Options) -> RunResult:
     """A third member joins mid-run: cooperative-sticky, incremental assignment."""
     layout, group, run_dir, plan = _setup("rebalance", opts)
-    pool = WorkerPool(run_dir, layout, group)
+    pool = _pool(run_dir, layout, group, plan)
     t0 = time.monotonic()
     pool.start("worker-a", extra=_common(opts, idle_exit_s=15.0))
     pool.start("worker-b", extra=_common(opts, idle_exit_s=15.0))
@@ -583,7 +609,7 @@ def scenario_rebalance(opts: Options) -> RunResult:
 def scenario_broker_kill(opts: Options) -> RunResult:
     """SIGKILL the leader of partition 0 while the loader is mid-flight."""
     layout, group, run_dir, plan = _setup("broker_kill", opts)
-    pool = WorkerPool(run_dir, layout, group)
+    pool = _pool(run_dir, layout, group, plan)
     t0 = time.monotonic()
     extra = [*_common(opts, idle_exit_s=30.0), "--transient-rate", "0.05", "--max-attempts", "30"]
     pool.start("worker-a", extra=extra)
@@ -591,17 +617,26 @@ def scenario_broker_kill(opts: Options) -> RunResult:
     pool.wait_for_deliveries(max(50, opts.count // 4))
     service = faults.leader_service_for(layout.raw, 0)
     log.info("killing broker %s (leader of %s[0])", service, layout.raw)
-    down_at = time.time()
+    down_at = time.monotonic()
     faults.kill_broker(service)
     time.sleep(6.0)
     faults.start_broker(service)
     faults.wait_healthy()
+    # Measured here, not after wait_all(): taking it at the end would silently
+    # report the whole remaining run as broker downtime.
+    recovered_s = round(time.monotonic() - down_at, 1)
     pool.wait_all()
     result = analyse(
         "broker_kill", layout, group, run_dir, plan, pool, wall_s=time.monotonic() - t0
     )
     result.notes["broker_killed"] = service
-    result.notes["broker_down_s"] = round(time.time() - down_at, 1)
+    result.notes["broker_down_to_healthy_s"] = recovered_s
+    # `lost` counts *partitions* handed to the on_lost callback, not messages:
+    # killing the broker that hosts the group coordinator drops members out of
+    # the group, and on_lost must not commit those partitions.
+    result.notes["partitions_lost_from_group"] = {
+        name: (s or {}).get("stats", {}).get("lost") for name, s in result.worker_stats.items()
+    }
     return result
 
 

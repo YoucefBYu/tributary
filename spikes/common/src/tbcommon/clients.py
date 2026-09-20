@@ -63,6 +63,16 @@ def transactional_producer_config(transactional_id: str, **overrides: Any) -> di
     cfg["transactional.id"] = transactional_id
     # Must be <= broker transaction.max.timeout.ms (compose sets 900000).
     cfg.setdefault("transaction.timeout.ms", 60_000)
+    # librdkafka refuses to construct a transactional producer when
+    # `message.timeout.ms` > `transaction.timeout.ms` (_INVALID_ARG at
+    # construction, not at first use). The plain producer default is 120 s,
+    # which is deliberately generous, so it has to come down here rather than
+    # the transaction timeout going up: a long transaction timeout is what a
+    # `read_committed` consumer stalls behind when a producer dies with a
+    # transaction open, so it is the number to keep small.
+    cfg["message.timeout.ms"] = min(
+        int(cfg["message.timeout.ms"]), int(cfg["transaction.timeout.ms"])
+    )
     return cfg
 
 
