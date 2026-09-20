@@ -1,6 +1,7 @@
 """Conformance: every contract's `valid` examples must validate and every `invalid` example must fail.
 
-The two PHI regression guards in the events contract are asserted by name and never skipped.
+The PHI regression guards are asserted by name and never skipped. An invalid example must fail for the documented reason: the
+expected (json_path, validator keyword) pair is asserted, not just "some error". Reports carry paths and keywords only, never the instance.
 """
 
 from __future__ import annotations
@@ -14,6 +15,11 @@ from jsonschema import Draft202012Validator, FormatChecker
 from jsonschema.validators import validator_for
 
 CONTRACTS = Path(__file__).resolve().parents[2] / "contracts"
+# Interim source of expected failures. The manifests (architect-owned) may carry `expected_json_path` and `expected_validator`
+# on invalid entries; when they do, those win. Until then this sidecar is the source.
+EXPECTED = json.loads(
+    (Path(__file__).parent / "expected_failures.json").read_text(encoding="utf-8")
+)
 EVENT_PHI_GUARDS = {
     "invalid/payload-in-event.json",
     "invalid/attrs-clear-text-mrn.json",
@@ -35,6 +41,28 @@ def _safe(errors: list[Any]) -> list[str]:
     return [f"{e.json_path} [{e.validator}]" for e in errors][:5]
 
 
+Failure = tuple[str, str]
+
+
+def _failures(validator: Draft202012Validator, instance: Any) -> set[Failure]:
+    """(json_path, keyword) pairs only: a ValidationError message embeds the failing value, so it is never used."""
+    return {(e.json_path, str(e.validator)) for e in validator.iter_errors(instance)}
+
+
+def _mismatch(actual: set[Failure], expected: Failure) -> str | None:
+    """None when the documented failure is among the actual ones, else a PHI-safe description."""
+    if expected in actual:
+        return None
+    return f"expected {expected[1]} at {expected[0]}; got {sorted(actual)[:5]}"
+
+
+def _expected(contract: str, key: str, entry: dict[str, Any]) -> Failure:
+    if "expected_json_path" in entry and "expected_validator" in entry:
+        return entry["expected_json_path"], entry["expected_validator"]
+    side = EXPECTED[contract][key]
+    return side["expected_json_path"], side["expected_validator"]
+
+
 def _load(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -53,32 +81,95 @@ def _file_cases() -> list[Any]:
         m = _load(manifest_path)
         base = manifest_path.parent
         schema = (base / m["schema"]).resolve()
-        cases += [pytest.param(schema, base / e["file"], True, id=f"{name}:valid:{e['file']}") for e in m["valid"]]
-        cases += [pytest.param(schema, base / e["file"], False, id=f"{name}:invalid:{e['file']}") for e in m["invalid"]]
+        cases += [
+            pytest.param(
+                schema, base / e["file"], True, None, id=f"{name}:valid:{e['file']}"
+            )
+            for e in m["valid"]
+        ]
+        cases += [
+            pytest.param(
+                schema,
+                base / e["file"],
+                False,
+                _expected(name, e["file"], e),
+                id=f"{name}:invalid:{e['file']}",
+            )
+            for e in m["invalid"]
+        ]
     return cases
 
 
-@pytest.mark.parametrize(("schema", "example", "should_pass"), _file_cases())
-def test_example(schema: Path, example: Path, should_pass: bool) -> None:
-    errors = list(_validator(schema).iter_errors(_load(example)))
+@pytest.mark.parametrize(
+    ("schema", "example", "should_pass", "expected"), _file_cases()
+)
+def test_example(
+    schema: Path, example: Path, should_pass: bool, expected: Failure | None
+) -> None:
+    validator = _validator(schema)
     if should_pass:
+        errors = list(validator.iter_errors(_load(example)))
         assert not errors, _safe(errors)
-    else:
-        assert errors, f"{example.name} validated but the manifest says it must fail"
+        return
+    assert expected is not None
+    actual = _failures(validator, _load(example))
+    assert actual, f"{example.name} validated but the manifest says it must fail"
+    problem = _mismatch(actual, expected)
+    assert problem is None, f"{example.name}: {problem}"
 
 
 def _topic_cases() -> list[Any]:
     m = _load(CONTRACTS / "topics/v0/examples/topic-names.json")
     schema = (CONTRACTS / "topics/v0/examples" / m["schema"]).resolve()
-    return [pytest.param(schema, n, True, id=f"topic:valid:{n}") for n in m["valid"]] + [
-        pytest.param(schema, e["name"], False, id=f"topic:invalid:{e['name']}") for e in m["invalid"]
+    return [
+        pytest.param(schema, n, True, None, id=f"topic:valid:{n}") for n in m["valid"]
+    ] + [
+        pytest.param(
+            schema,
+            e["name"],
+            False,
+            _expected("topics", e["name"], e),
+            id=f"topic:invalid:{e['name']}",
+        )
+        for e in m["invalid"]
     ]
 
 
-@pytest.mark.parametrize(("schema", "name", "should_pass"), _topic_cases())
-def test_topic_name(schema: Path, name: str, should_pass: bool) -> None:
-    ok = _validator(schema).is_valid(name)
-    assert ok is should_pass
+@pytest.mark.parametrize(("schema", "name", "should_pass", "expected"), _topic_cases())
+def test_topic_name(
+    schema: Path, name: str, should_pass: bool, expected: Failure | None
+) -> None:
+    validator = _validator(schema)
+    if should_pass:
+        assert validator.is_valid(name)
+        return
+    assert expected is not None
+    problem = _mismatch(_failures(validator, name), expected)
+    assert problem is None, f"{name}: {problem}"
+
+
+def test_every_invalid_entry_has_an_expectation() -> None:
+    """A new invalid example without an expected failure must fail the suite, not slide in as 'any error'."""
+    for name in ("envelope", "events"):
+        m = _load(CONTRACTS / name / "v0/examples/manifest.json")
+        for e in m["invalid"]:
+            _expected(name, e["file"], e)
+    t = _load(CONTRACTS / "topics/v0/examples/topic-names.json")
+    for e in t["invalid"]:
+        _expected("topics", e["name"], e)
+
+
+def test_negative_control_wrong_reason_fails() -> None:
+    """An example that fails for a different reason than documented must make test_example fail."""
+    env = CONTRACTS / "envelope/v0/examples"
+    schema = (env / _load(env / "manifest.json")["schema"]).resolve()
+    example = env / "invalid/missing-msg-id.json"
+    wrong = _expected("envelope", "invalid/msg-id-not-uuid7.json", {})
+    with pytest.raises(AssertionError):
+        test_example(schema, example, False, wrong)
+    test_example(
+        schema, example, False, _expected("envelope", "invalid/missing-msg-id.json", {})
+    )
 
 
 @pytest.mark.parametrize(
@@ -96,7 +187,7 @@ def test_guards_are_listed_and_enforced(contract: str, guards: set[str]) -> None
 
 
 def test_safe_reporting_omits_instance() -> None:
-    v = _validator((CONTRACTS / "events/v0/event.schema.json"))
+    v = _validator(CONTRACTS / "events/v0/event.schema.json")
     errs = list(v.iter_errors({"v": 0, "secret-value-123": "x"}))
     assert errs
     assert "secret-value-123" not in " ".join(_safe(errs))

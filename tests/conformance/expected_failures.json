@@ -1,0 +1,193 @@
+{
+  "_note": "Interim sidecar: the failing json_path and validator keyword each invalid example must produce. Proposed to move into the contracts manifests as expected_json_path / expected_validator (architect owns them); the test prefers a manifest value when present. Cross-checked by hand against each entry's `violates` text.",
+  "envelope": {
+    "invalid/channel-name-not-topic-safe.json": {
+      "expected_json_path": "$.headers['tb-channel']",
+      "expected_validator": "pattern"
+    },
+    "invalid/claim-check-presigned-url.json": {
+      "expected_json_path": "$.headers['tb-claim-check']",
+      "expected_validator": "pattern"
+    },
+    "invalid/claim-check-with-inline-payload.json": {
+      "expected_json_path": "$.payload_present",
+      "expected_validator": "const"
+    },
+    "invalid/claim-check-with-userinfo.json": {
+      "expected_json_path": "$.headers['tb-claim-check']",
+      "expected_validator": "pattern"
+    },
+    "invalid/correlation-id-sender-token.json": {
+      "expected_json_path": "$.headers['tb-correlation-id']",
+      "expected_validator": "pattern"
+    },
+    "invalid/dlq-missing-stage.json": {
+      "expected_json_path": "$.headers",
+      "expected_validator": "required"
+    },
+    "invalid/missing-msg-id.json": {
+      "expected_json_path": "$.headers",
+      "expected_validator": "required"
+    },
+    "invalid/msg-id-not-uuid7.json": {
+      "expected_json_path": "$.headers['tb-msg-id']",
+      "expected_validator": "pattern"
+    },
+    "invalid/payload-over-inline-limit.json": {
+      "expected_json_path": "$.payload_size",
+      "expected_validator": "maximum"
+    },
+    "invalid/raw-with-failure-headers.json": {
+      "expected_json_path": "$.headers",
+      "expected_validator": "not"
+    },
+    "invalid/received-at-no-millis.json": {
+      "expected_json_path": "$.headers['tb-received-at']",
+      "expected_validator": "pattern"
+    },
+    "invalid/received-at-non-utc.json": {
+      "expected_json_path": "$.headers['tb-received-at']",
+      "expected_validator": "pattern"
+    },
+    "invalid/reply-missing-correlation-id.json": {
+      "expected_json_path": "$.headers",
+      "expected_validator": "required"
+    },
+    "invalid/retry-attempt-zero.json": {
+      "expected_json_path": "$.headers['tb-attempt']",
+      "expected_validator": "pattern"
+    },
+    "invalid/retry-missing-not-before.json": {
+      "expected_json_path": "$.headers",
+      "expected_validator": "required"
+    },
+    "invalid/traceparent-all-zero-trace-id.json": {
+      "expected_json_path": "$.headers.traceparent",
+      "expected_validator": "pattern"
+    },
+    "invalid/unregistered-tb-header.json": {
+      "expected_json_path": "$.headers",
+      "expected_validator": "additionalProperties"
+    },
+    "invalid/usr-header-over-length.json": {
+      "expected_json_path": "$.headers['tb-usr-oversized-note']",
+      "expected_validator": "maxLength"
+    }
+  },
+  "events": {
+    "invalid/attrs-clear-text-key.json": {
+      "expected_json_path": "$.attrs",
+      "expected_validator": "pattern"
+    },
+    "invalid/attrs-clear-text-mrn.json": {
+      "expected_json_path": "$.attrs",
+      "expected_validator": "not"
+    },
+    "invalid/attrs-free-text-value.json": {
+      "expected_json_path": "$.attrs.reason",
+      "expected_validator": "pattern"
+    },
+    "invalid/attrs-hl7-delimiters.json": {
+      "expected_json_path": "$.attrs.segment_echo",
+      "expected_validator": "pattern"
+    },
+    "invalid/attrs-hmac-not-fixed-length-hex.json": {
+      "expected_json_path": "$.attrs.mrn_hmac",
+      "expected_validator": "pattern"
+    },
+    "invalid/attrs-too-many-entries.json": {
+      "expected_json_path": "$.attrs",
+      "expected_validator": "maxProperties"
+    },
+    "invalid/claim-check-presigned-url.json": {
+      "expected_json_path": "$.claim_check",
+      "expected_validator": "pattern"
+    },
+    "invalid/claim-check-with-size.json": {
+      "expected_json_path": "$.size_bytes",
+      "expected_validator": "const"
+    },
+    "invalid/error-without-code.json": {
+      "expected_json_path": "$",
+      "expected_validator": "required"
+    },
+    "invalid/message-with-partition-stage.json": {
+      "expected_json_path": "$.stage",
+      "expected_validator": "enum"
+    },
+    "invalid/message-without-message-id.json": {
+      "expected_json_path": "$",
+      "expected_validator": "required"
+    },
+    "invalid/missing-version.json": {
+      "expected_json_path": "$",
+      "expected_validator": "required"
+    },
+    "invalid/partition-without-topic.json": {
+      "expected_json_path": "$",
+      "expected_validator": "required"
+    },
+    "invalid/payload-in-event.json": {
+      "expected_json_path": "$",
+      "expected_validator": "additionalProperties"
+    },
+    "invalid/ts-epoch-float.json": {
+      "expected_json_path": "$.ts",
+      "expected_validator": "type"
+    },
+    "invalid/unknown-stage.json": {
+      "expected_json_path": "$.stage",
+      "expected_validator": "enum"
+    }
+  },
+  "topics": {
+    "_tb.events": {
+      "expected_json_path": "$",
+      "expected_validator": "anyOf"
+    },
+    "_tb.prod.messages": {
+      "expected_json_path": "$",
+      "expected_validator": "anyOf"
+    },
+    "adt-to-fhir.raw": {
+      "expected_json_path": "$",
+      "expected_validator": "anyOf"
+    },
+    "prod.-adt.raw": {
+      "expected_json_path": "$",
+      "expected_validator": "anyOf"
+    },
+    "prod..raw": {
+      "expected_json_path": "$",
+      "expected_validator": "anyOf"
+    },
+    "prod.ADT-to-FHIR.raw": {
+      "expected_json_path": "$",
+      "expected_validator": "anyOf"
+    },
+    "prod.adt-to-fhir.out": {
+      "expected_json_path": "$",
+      "expected_validator": "anyOf"
+    },
+    "prod.adt-to-fhir.output": {
+      "expected_json_path": "$",
+      "expected_validator": "anyOf"
+    },
+    "prod.adt-to-fhir.raw.fhir-server": {
+      "expected_json_path": "$",
+      "expected_validator": "anyOf"
+    },
+    "prod.adt.to.fhir.raw": {
+      "expected_json_path": "$",
+      "expected_validator": "anyOf"
+    },
+    "prod.adt_to_fhir.raw": {
+      "expected_json_path": "$",
+      "expected_validator": "anyOf"
+    },
+    "production-environment-eu-west.adt-to-fhir.raw": {
+      "expected_json_path": "$",
+      "expected_validator": "anyOf"
+    }
+  }
+}
