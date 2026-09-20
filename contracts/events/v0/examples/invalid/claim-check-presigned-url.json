@@ -1,0 +1,14 @@
+{
+  "v": 0,
+  "kind": "message",
+  "ts": "2026-09-20T11:24:01.099Z",
+  "channel": "pacs-ingest",
+  "channel_version": 1,
+  "stage": "received",
+  "status": "ok",
+  "instance": "dicom-receiver:recv-01",
+  "message_id": "01930b80-1a2b-7def-a123-456789abcdef",
+  "content_type": "application/dicom",
+  "size_bytes": 0,
+  "claim_check": "https://tributary-claimcheck.s3.amazonaws.com/prod/pacs-ingest/01930b80?X-Amz-Signature=deadbeefcafe"
+}

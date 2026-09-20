@@ -1,7 +1,8 @@
 {
   "class": "reply",
   "topic": "prod.lab-query.reply",
-  "key": "01930b7e-4c88-7a10-b2d4-5e6f7a8b9c0d",
+  "key_present": true,
+  "key_size": 36,
   "payload_present": true,
   "payload_size": 96,
   "headers": {

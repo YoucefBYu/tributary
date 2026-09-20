@@ -8,9 +8,10 @@ wave's exit criteria here.
 - **Phase / wave:** Phase 0 (spikes), in progress
 - **Branch:** `wave/0`
 - **Last gate report:** none. `docs/spikes/PHASE-0-DECISION.md` is not written; it waits on S1-S6.
-- **Contracts:** v0 Draft published for envelope, topics and events, and **conformance-verified**:
-  `tests/conformance/test_contracts_v0.py`, 62 passed / 0 failed / 0 skipped, with every invalid
-  example confirmed to fail for its stated reason (`qa-engineer`, 2026-09-20).
+- **Contracts:** v0 Draft published for envelope, topics and events. Conformance passed 62 / 0 / 0 on
+  2026-09-20, then `security-reviewer` raised 5 HIGH findings; all 5 accepted and fixed in place (still
+  Draft, no version bump). **Conformance re-run is outstanding** — new counts: envelope 7 valid /
+  16 invalid, events 8 / 14, topic names 10 / 12.
 
 ### Spike reports filed
 
@@ -48,6 +49,8 @@ measurements — that happens in P0-3 synthesis, once the remaining reports are 
 | 2026-09-20 | Platform topics are environment-scoped (`_tb.<env>.events`). Deviates from ADR-001 5.3 prose; topic class unchanged. **Needs human confirmation at the gate** | ADR-002 D2 |
 | 2026-09-20 | Events carry a `kind` discriminator (`message` / `partition`) and an RFC 3339 `ts`, differing from the S5 spike emitter | `contracts/events/v0/README.md` |
 | 2026-09-20 | ADR-002 and ADR-003 drafted as skeletons with `TODO(Sn)` placeholders; no unmeasured number presented as a result | `docs/adr/README.md` |
+| 2026-09-20 | 5 HIGH security findings against contracts v0 all accepted, none disputed. Fixed in place while Draft: PHI key removed from the validation projection, `attrs` PHI rules made enforceable, claim-check URIs constrained, required security profile added, and the durability floor pinned per topic (an invariant-1 bug) | `contracts/CHANGELOG.md`, ADR-002 D8/D9 |
+| 2026-09-20 | Transport security and authorization belong in the topics contract, not deferred wholesale to ADR-004. Boundary: contract fixes mechanisms and ACL shape; ADR-004 plus a human own the role model, rotation and key management | ADR-002 D9 |
 
 ## Open questions for the human
 
@@ -60,6 +63,11 @@ measurements — that happens in P0-3 synthesis, once the remaining reports are 
   change.
 - Lite mode (RF=1) cannot satisfy RPO=0. Confirm that shipping it with a startup warning and explicit
   documentation is acceptable.
+- **ADR-004 scope, raised by the security review:** the Kafka role/ACL model, credential rotation and
+  key management for archive encryption and the `attrs` HMAC. `contracts/topics/v0` 3.4 states the
+  required mechanisms and ACL shape, but the model itself and anything touching key management is a
+  human decision per CLAUDE.md. Needed before the archiver or any production deployment, not before the
+  Phase 0 gate.
 
 ## Risks (live)
 
@@ -79,6 +87,7 @@ From ADR-001 section 13, with the evidence column that Phase 0 is meant to fill.
 
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
-| ~~Contract schemas have never been executed~~ **Closed 2026-09-20**: `tests/conformance/test_contracts_v0.py`, 62 passed / 0 failed, no schema bugs | — | — | Keep the suite in CI so a contract edit cannot silently break an example |
+| Contract schemas pass conformance, but the green run predates the security fixes; a re-run is outstanding | Medium | Low | `qa-engineer` re-runs `tests/conformance`; keep it in CI so a contract edit cannot silently break an example |
+| A contract can look complete and still omit a security control (the v0 config contract specified `acks` and `linger.ms` but no TLS, auth or ACLs; the durability floor was set per profile but not per topic) | Medium | High | Both fixed. Lesson applied going forward: every contract that configures a component states its required security posture and its failure-safe defaults explicitly, and `security-reviewer` sees contracts, not only code |
 | Claim-check (payloads over 1 MB) is untested by any Phase 0 spike | Medium | Medium | Call it out as an untested path in the Phase 1 plan; ADR-004 owns object lifecycle |
 | The record key is often a patient identifier, so any log, metric label or span attribute built from it is a PHI leak | Medium | High | Stated in `contracts/envelope/v0` section 4; reviewers treat it as Critical |

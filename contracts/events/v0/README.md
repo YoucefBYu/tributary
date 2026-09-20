@@ -100,13 +100,28 @@ invariant 6.
 2. **`error_message` is static text plus non-PHI values.** `"FHIR server returned 422"` is fine.
    `str(exception)` is not, because parser and validator libraries routinely include the offending
    field value. Producers must map exceptions to a code plus a fixed message.
-3. **`attrs` values that derive from a patient identifier are keyed hashes**, not clear text. The
-   convention is a `_hmac` suffix and a hex value: `{"mrn_hmac": "9f2a...", "trigger": "A01"}`.
-   The browser hashes the search term with the same key (ADR-001 6.6). Key management is ADR-004.
-4. **No record key in `attrs`.** The partition key is often the patient identifier
-   ([envelope contract](../../envelope/v0/README.md) section 4).
-5. Free-text `attrs` keys are `^[a-z][a-z0-9_]{0,31}$` and values ≤ 256 characters, so the column
-   stays a usable ClickHouse `Map` and cannot become a payload smuggling channel.
+3. **`attrs` entries that derive from a patient identifier are keyed hashes**, and the schema now
+   enforces it three ways rather than trusting the convention:
+   - a key ending `_hmac` MUST have a value of **exactly 64 hex characters**, so a clear-text value
+     cannot hide behind the suffix (`{"mrn_hmac": "0001234567"}` is rejected);
+   - a key from a **deny-list of names that denote a direct identifier** (`mrn`, `patient_id`, `dob`,
+     `name`, `accession`, `ssn`, `phone`, … — the full list is in the schema) is rejected in clear
+     form. It is admissible only hashed, as `<name>_hmac`;
+   - any other value must be a **short code**: `^[A-Za-z0-9][A-Za-z0-9._:+-]{0,63}$`, 64 characters
+     max, **no spaces**. Free text is where PHI arrives, so the column is shaped to refuse it.
+
+   Correct: `{"mrn_hmac": "9f2a…64 hex", "trigger": "A01", "step": "to_fhir_bundle"}`. The browser
+   hashes the search term with the same key (ADR-001 6.6). Key management is ADR-004.
+
+   **This is defence in depth, not a proof.** Nothing stops a determined producer putting a surname in
+   `attrs.reason`, because a surname is a valid short code. The deny-list catches the common mistake
+   and makes the intent unambiguous; code review and `security-reviewer` remain the real control.
+4. **No record key in `attrs`**, hashed or otherwise, under any name. The partition key is often the
+   patient identifier ([envelope contract](../../envelope/v0/README.md) section 4); `key`,
+   `message_key` and `partition_key` are on the deny-list for that reason.
+5. **`claim_check` follows the envelope's URI rules**: opaque locator, no query string, no fragment,
+   no userinfo. Events are persisted to ClickHouse and rendered in the browser, so a presigned URL
+   here is a stored credential that stays replayable in backups long after the URL's own expiry.
 
 Reviewers: an `error_message` built with an f-string from an exception is a Critical finding.
 

@@ -1,7 +1,7 @@
 {
   "contract": "tributary.envelope/v0",
   "schema": "../envelope.schema.json",
-  "note": "All keys and identifiers are synthetic (TRIBUTARY-SYNTH). Tests validate every 'valid' file expecting success and every 'invalid' file expecting exactly the documented violation.",
+  "note": "The projection carries key_present and key_size but never the key value, because the key is usually a patient identifier and a validator error embeds the failing instance. All remaining identifiers are synthetic. Tests validate every 'valid' file expecting success and every 'invalid' file expecting exactly the documented violation. A ValidationError from this schema must never be logged verbatim.",
   "valid": [
     {
       "file": "valid/raw-mllp-adt.json",
@@ -88,6 +88,14 @@
     {
       "file": "invalid/channel-name-not-topic-safe.json",
       "violates": "tb-channel must match ^[a-z][a-z0-9-]{0,63}$ so it can be a topic segment"
+    },
+    {
+      "file": "invalid/claim-check-presigned-url.json",
+      "violates": "tb-claim-check must not contain a query string; a presigned URL puts credentials in it and the envelope is persisted and shown to browsers"
+    },
+    {
+      "file": "invalid/claim-check-with-userinfo.json",
+      "violates": "tb-claim-check must not contain userinfo ('@'); that embeds object-store credentials in the envelope"
     }
   ]
 }

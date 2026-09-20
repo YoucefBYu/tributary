@@ -33,24 +33,39 @@ object a test builds from a real (or fixture) record.
 {
   "class": "raw",
   "topic": "prod.adt-to-fhir.raw",
-  "key": "TRIBUTARY-SYNTH-MRN-000123",
+  "key_present": true,
+  "key_size": 26,
   "headers": { "tb-msg-id": "018f3a5c-...", "...": "..." },
   "payload_present": true,
   "payload_size": 1180
 }
 ```
 
+**The projection carries no key value and no payload bytes, by construction.** A validator embeds the
+failing instance in its error message, and the record key is usually a patient identifier (section 4),
+so a projection containing the key would put PHI into exceptions, log lines and pytest output — the
+exact surfaces invariant 6 names. `key_present` and `key_size` express everything the schema was ever
+checking about the key. Two consequences:
+
+- A producer or test that builds a projection MUST derive it, never `json.dumps` the record.
+- A `ValidationError` from this schema MUST NOT be logged or printed verbatim. Log the error's
+  `json_path` and `validator` keyword, plus `tb-msg-id`. This holds even now that the key is gone:
+  headers still carry `tb-source` (a peer address) and `tb-usr-*` values.
+
+The key-identity rules per class (`dlq` keyed by `tb-msg-id`, `reply` by `tb-correlation-id`) are
+therefore checked in code, not by this schema.
+
 `class` is one of `raw`, `out`, `retry`, `dlq`, `reply` and drives the conditional rules. It is
 derivable from `topic` by the [topics contract](../../topics/v0/README.md); it is carried
 explicitly so the two schemas stay independent.
 
-`class`, `key`, `headers`, `payload_present` and `payload_size` are all required, even when the key
-is `null` or the size is `0`. An omitted field would pass the claim-check and size rules by
-accident, which is the opposite of what a conformance test is for. `topic` is optional.
+`class`, `key_present`, `key_size`, `headers`, `payload_present` and `payload_size` are all required,
+even when a size is `0`. An omitted field would pass the claim-check and size rules by accident, which
+is the opposite of what a conformance test is for. `topic` is optional.
 
-**Verified:** all 21 examples in this contract pass `tests/conformance/test_contracts_v0.py`
-(2026-09-20), and each invalid example fails for the reason its manifest states. See
-[`../../README.md`](../../README.md) for the run command.
+**Conformance re-run pending.** The 2026-09-20 run passed all examples, but it predates the same day's
+security fixes (projection no longer carries the key value; `tb-claim-check` URI constrained), so that
+result is superseded. 23 examples now: 7 valid, 16 invalid.
 
 ### 1.2 Strict producers, lenient consumers
 
@@ -151,6 +166,9 @@ searchable (the message browser), store a keyed hash, per ADR-001 6.6 and the
 This is the one place where an engine-internal value is PHI, and it is easy to leak by accident.
 Reviewers: treat any `log`/`metric`/`span` call that touches a record key as a Critical finding.
 
+The same reasoning removed the key from the validation projection (section 1.1) and keeps it out of
+`_tb.events.attrs` in clear text ([events contract](../../events/v0/README.md) section 3).
+
 ---
 
 ## 5. Payload and claim-check
@@ -162,6 +180,22 @@ Reviewers: treat any `log`/`metric`/`span` call that touches a record key as a C
 | Over the limit | Store the payload in the claim-check object store, set `tb-claim-check` to its URI, and produce the record with a **null** value. |
 | With `tb-claim-check` set | The value MUST be null, not empty bytes. An empty payload is otherwise indistinguishable from a bug. |
 | URI schemes | `s3://`, `gs://`, `az://`, `https://`. |
+| URI form | Opaque locator only: `<scheme>://<host-or-bucket>[:<port>]/<path segments>`. **No query string, no fragment, no userinfo.** Max 1024 bytes. |
+| Object key | Derived from non-PHI parts only: `<env>/<channel>/<yyyy>/<mm>/<dd>/<tb-msg-id>`. Never a patient identifier, accession number, file name from the sender, or anything taken from the payload. |
+| Signed URLs | Minted at read time by the API, with a short expiry. **Never** stored in an envelope, an event or the archive. |
+
+### 5.1 Why the URI is constrained
+
+A claim-check URI is persisted in Kafka, copied into `_tb.events`, written to ClickHouse and rendered
+in the message browser. Two things therefore must not appear in it:
+
+- **Credentials.** A presigned URL carries `X-Amz-Signature` (or an SAS token) in the query string, and
+  an embedded `user:password@host` carries them in userinfo. Either one turns a long-lived event record
+  into a stored credential that is replayable by anyone with archive or UI read access, and it will
+  outlive the URL's own expiry in backups. Hence: no query, no fragment, no `@`.
+- **Identifiers.** Object names are the classic accidental PHI channel — `.../SMITH_JOHN_20260920.dcm`
+  is a PHI leak into a database column that is not treated as PHI. Hence a key derived from
+  `tb-msg-id`, which is meaningless outside the engine.
 
 Claim-check objects follow the retention of the topic class that referenced them, and their
 lifecycle is owned by the archive design (ADR-004, not yet written). Deleting a claim-check object

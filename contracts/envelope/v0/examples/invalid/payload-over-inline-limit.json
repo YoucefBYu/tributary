@@ -1,7 +1,8 @@
 {
   "class": "raw",
   "topic": "prod.cda-ingest.raw",
-  "key": "TRIBUTARY-SYNTH-MRN-000999",
+  "key_present": true,
+  "key_size": 26,
   "payload_present": true,
   "payload_size": 1200000,
   "headers": {

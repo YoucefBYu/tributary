@@ -46,10 +46,14 @@ One parameterised test per contract walks the manifest: every `valid` file must 
 `invalid` file must fail. `qa-engineer` owns the suite in `tests/conformance/`. The topics contract
 uses inline string lists instead of files, since a topic name is one string.
 
-**Status: green.** `tests/conformance/test_contracts_v0.py` (`qa-engineer`, 2026-09-20): 62 passed,
-0 failed, 0 skipped — envelope 7 valid / 14 invalid, events 8 / 10, topic names 10 / 12. Each invalid
-example was also checked to fail for the reason its manifest states, not incidentally, and the two PHI
-guards (`payload-in-event`, `attrs-clear-text-key`) are asserted by name. No schema bugs found.
+**Status: re-run pending.** `tests/conformance/test_contracts_v0.py` (`qa-engineer`, 2026-09-20) passed
+62 / 0 / 0 and found no schema bugs — but that run covered the contracts *before* the security fixes of
+the same day (see `CHANGELOG.md`). Those fixes changed both schemas and added 6 examples, so the result
+is **superseded, not current**. New expected counts: envelope 7 valid / 16 invalid, events 8 / 14,
+topic names 10 / 12.
+
+Two fixture changes the suite must absorb: the envelope projection replaces `key` with `key_present`
+plus `key_size`, and a `ValidationError` from either schema must not be logged or printed verbatim.
 
 ```
 uv run --no-project --python 3.12 --with pytest --with jsonschema python -m pytest tests/conformance

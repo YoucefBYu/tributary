@@ -1,18 +1,31 @@
 {
   "contract": "tributary.topics/v0",
-  "note": "One machine-readable source for topic defaults and the client settings that invariant 1 depends on. Values marked TODO are placeholders until the named spike reports; nothing here has been measured yet.",
+  "note": "One machine-readable source for topic defaults, the security profile, and the client settings that invariant 1 depends on. Values marked TODO are placeholders until the named spike reports or until ADR-004 fixes deployment specifics; nothing here has been measured yet.",
+  "apply_order": [
+    "classes[*].configs",
+    "profiles[<profile>].class_config_overrides",
+    "per-channel spec overrides (retention only)"
+  ],
+  "apply_order_note": "A topic-creation tool MUST apply the class configs and THEN the profile overrides. Applying only the class configs is safe by default because they carry the production durability values.",
   "profiles": {
     "production": {
       "replication_factor": 3,
-      "min_insync_replicas": 2,
-      "rpo_zero": true
+      "rpo_zero": true,
+      "class_config_overrides": {}
     },
     "lite": {
       "replication_factor": 1,
-      "min_insync_replicas": 1,
       "rpo_zero": false,
-      "warning": "RF=1 cannot guarantee RPO=0 for acknowledged messages. Development and accepted-risk small sites only; the runtime must log this at startup."
+      "class_config_overrides": {
+        "min.insync.replicas": 1
+      },
+      "warning": "RF=1 with min.insync.replicas=1 cannot guarantee RPO=0 for acknowledged messages. Development and accepted-risk small sites only; the runtime must log this at startup. This is the ONLY place the durability floor may be lowered, and it is deliberately explicit rather than inherited."
     }
+  },
+  "durability_floor": {
+    "$comment": "Invariant 1. These two settings are repeated in every class below on purpose: min.insync.replicas is a TOPIC-level config, so a topic created without it inherits the broker default of 1, and acks=all is then satisfied by a single replica. A broker loss at that moment loses an acknowledged message. unclean.leader.election.enable is likewise topic-level and must be pinned per topic, not only cluster-wide.",
+    "min.insync.replicas": 2,
+    "unclean.leader.election.enable": "false"
   },
   "classes": {
     "raw": {
@@ -22,7 +35,9 @@
         "cleanup.policy": "delete",
         "retention.ms": 604800000,
         "max.message.bytes": 1048576,
-        "compression.type": "producer"
+        "compression.type": "producer",
+        "min.insync.replicas": 2,
+        "unclean.leader.election.enable": "false"
       }
     },
     "out": {
@@ -32,7 +47,9 @@
         "cleanup.policy": "delete",
         "retention.ms": 604800000,
         "max.message.bytes": 1048576,
-        "compression.type": "producer"
+        "compression.type": "producer",
+        "min.insync.replicas": 2,
+        "unclean.leader.election.enable": "false"
       }
     },
     "retry": {
@@ -41,7 +58,9 @@
         "cleanup.policy": "delete",
         "retention.ms": 259200000,
         "max.message.bytes": 1048576,
-        "compression.type": "producer"
+        "compression.type": "producer",
+        "min.insync.replicas": 2,
+        "unclean.leader.election.enable": "false"
       }
     },
     "dlq": {
@@ -51,7 +70,9 @@
         "cleanup.policy": "delete",
         "retention.ms": 2592000000,
         "max.message.bytes": 1048576,
-        "compression.type": "producer"
+        "compression.type": "producer",
+        "min.insync.replicas": 2,
+        "unclean.leader.election.enable": "false"
       }
     },
     "reply": {
@@ -61,7 +82,9 @@
         "retention.ms": 600000,
         "segment.ms": 60000,
         "max.message.bytes": 1048576,
-        "compression.type": "producer"
+        "compression.type": "producer",
+        "min.insync.replicas": 2,
+        "unclean.leader.election.enable": "false"
       }
     },
     "channels": {
@@ -71,7 +94,9 @@
         "min.cleanable.dirty.ratio": "0.1",
         "delete.retention.ms": 86400000,
         "max.message.bytes": 1048576,
-        "compression.type": "producer"
+        "compression.type": "producer",
+        "min.insync.replicas": 2,
+        "unclean.leader.election.enable": "false"
       }
     },
     "events": {
@@ -80,7 +105,9 @@
       "configs": {
         "cleanup.policy": "delete",
         "retention.ms": 259200000,
-        "compression.type": "producer"
+        "compression.type": "producer",
+        "min.insync.replicas": 2,
+        "unclean.leader.election.enable": "false"
       }
     },
     "audit": {
@@ -88,14 +115,47 @@
       "configs": {
         "cleanup.policy": "delete",
         "retention.ms": 2592000000,
-        "compression.type": "producer"
+        "compression.type": "producer",
+        "min.insync.replicas": 2,
+        "unclean.leader.election.enable": "false"
       }
     }
   },
   "broker": {
     "unclean.leader.election.enable": "false",
     "auto.create.topics.enable": "false",
-    "message.max.bytes": 1048576
+    "message.max.bytes": 1048576,
+    "min.insync.replicas": 2,
+    "default.replication.factor": 3
+  },
+  "security": {
+    "required": true,
+    "note": "A deployment that implements only the blocks above gets a plaintext, unauthenticated, unauthorized cluster carrying PHI. Transport security and authorization are part of this contract, not a separate hardening guide. Values marked TODO are deployment-specific; the requirement is not.",
+    "broker": {
+      "client_listeners": "SASL_SSL, or SSL with mTLS. PLAINTEXT is permitted only on a loopback-bound lite listener that no non-local client can reach.",
+      "inter.broker.listener.name": "an internal listener using SASL_SSL or mTLS",
+      "authorizer.class.name": "org.apache.kafka.metadata.authorizer.StandardAuthorizer",
+      "allow.everyone.if.no.acl.found": "false",
+      "super.users": "TODO deployment-specific. The topic-creation job and the control plane only; never a data-plane component.",
+      "ssl.client.auth": "required, when using mTLS"
+    },
+    "clients": {
+      "security.protocol": "SASL_SSL",
+      "sasl.mechanism": "SCRAM-SHA-512 or OAUTHBEARER. Never PLAIN on a listener without TLS.",
+      "ssl.endpoint.identification.algorithm": "https",
+      "ssl.endpoint.identification.algorithm_note": "Leave hostname verification enabled. Disabling it is the single most common way a TLS Kafka deployment silently accepts a man-in-the-middle.",
+      "credentials": "TODO deployment-specific, resolved from a secretRef or a secrets manager. Never in a channel spec, a Compose file or an image."
+    },
+    "acls": {
+      "model": "Deny by default, least privilege per component, granted on the topic prefix <env>.<channel>. so one channel's compromise does not read another's traffic.",
+      "receiver": "WRITE, DESCRIBE on <env>.<channel>.raw; IDEMPOTENT_WRITE on the cluster",
+      "pipeline_worker": "READ on <env>.<channel>.raw; WRITE on <env>.<channel>.out.*, .retry, .dlq; WRITE on _tb.<env>.events; READ on _tb.<env>.channels; READ on group tb.<env>.<channel>.pipeline*",
+      "loader": "READ on <env>.<channel>.out.<dest> and .retry; WRITE on .retry and .dlq; WRITE on _tb.<env>.events; READ on group tb.<env>.<channel>.loader.<dest>*",
+      "archiver": "READ on _tb.<env>.events; READ on group tb.<env>.archiver*",
+      "control_plane": "WRITE on _tb.<env>.channels and _tb.<env>.audit; DESCRIBE on the cluster",
+      "forbidden": "No data-plane component gets cluster-wide WRITE, DELETE or ALTER, and none gets WRITE on _tb.<env>.channels — a compromised worker must not be able to deploy a channel spec.",
+      "open_question": "The complete role model, credential rotation and key management are ADR-004 plus a human decision. This block is the minimum shape that the config contract must state, not the finished model."
+    }
   },
   "clients": {
     "receiver_producer": {

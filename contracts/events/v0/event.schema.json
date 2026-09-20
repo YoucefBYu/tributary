@@ -39,7 +39,12 @@
     "attempt": { "type": "integer", "minimum": 0, "maximum": 9999 },
     "content_type": { "type": "string", "maxLength": 255 },
     "size_bytes": { "type": "integer", "minimum": 0 },
-    "claim_check": { "type": "string", "maxLength": 2048, "pattern": "^(s3|gs|az|https)://[^\\s]{1,2040}$" },
+    "claim_check": {
+      "type": "string",
+      "maxLength": 1024,
+      "$comment": "Same rules as tb-claim-check: opaque locator, no query string, no fragment, no userinfo. Events are persisted to ClickHouse and rendered in the browser, so a presigned URL here becomes a stored, replayable credential.",
+      "pattern": "^(s3|gs|az|https)://[A-Za-z0-9._-]{1,253}(:[0-9]{2,5})?(/[A-Za-z0-9._-]{1,128}){1,16}$"
+    },
     "topic": { "type": "string", "minLength": 1, "maxLength": 249 },
     "partition": { "type": "integer", "minimum": 0 },
     "offset": { "type": "integer", "minimum": 0 },
@@ -56,10 +61,67 @@
     },
     "attrs": {
       "type": "object",
-      "description": "Searchable metadata. Identifiers are keyed hashes with an _hmac suffix, never clear text.",
+      "description": "Searchable metadata. Identifier-derived entries MUST use an _hmac suffix and a 64-hex-character value; a name known to denote a direct identifier is rejected in clear form. Other values are short low-cardinality codes: no spaces, 64 characters max, which is hostile to free text and to smuggled payload.",
       "maxProperties": 32,
-      "propertyNames": { "pattern": "^[a-z][a-z0-9_]{0,31}$" },
-      "additionalProperties": { "type": "string", "maxLength": 256 }
+      "propertyNames": {
+        "allOf": [
+          { "pattern": "^[a-z][a-z0-9_]{0,31}$" },
+          {
+            "$comment": "Deny-list of names that denote a direct identifier. These are only admissible hashed, i.e. as <name>_hmac. This catches the common mistake; it is not a proof, so code review and security-reviewer remain the real control.",
+            "not": {
+              "enum": [
+                "mrn",
+                "pid",
+                "patient",
+                "patient_id",
+                "patientid",
+                "patient_name",
+                "name",
+                "family_name",
+                "given_name",
+                "surname",
+                "first_name",
+                "last_name",
+                "dob",
+                "birth_date",
+                "birthdate",
+                "ssn",
+                "nhs_number",
+                "insurance_number",
+                "account",
+                "account_number",
+                "visit_number",
+                "encounter_id",
+                "accession",
+                "accession_number",
+                "address",
+                "street",
+                "postcode",
+                "zip",
+                "phone",
+                "telephone",
+                "email",
+                "identifier",
+                "key",
+                "message_key",
+                "partition_key"
+              ]
+            }
+          }
+        ]
+      },
+      "patternProperties": {
+        "_hmac$": {
+          "$comment": "Fixed-length hex only, so a clear-text value cannot hide behind an _hmac suffix.",
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      },
+      "additionalProperties": {
+        "type": "string",
+        "maxLength": 64,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9._:+-]{0,63}$"
+      }
     }
   },
   "allOf": [

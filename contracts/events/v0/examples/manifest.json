@@ -1,7 +1,7 @@
 {
   "contract": "tributary.events/v0",
   "schema": "../event.schema.json",
-  "note": "All identifiers are synthetic. The invalid set deliberately includes two PHI-shaped mistakes (payload-in-event, attrs-clear-text-key) so a regression cannot reintroduce them quietly.",
+  "note": "All identifiers are synthetic. The invalid set deliberately includes the PHI-shaped mistakes (payload-in-event, attrs-clear-text-mrn, attrs-hmac-not-fixed-length-hex, attrs-free-text-value, claim-check-presigned-url) so a regression cannot reintroduce them quietly. Keep these asserted, never skipped.",
   "valid": [
     { "file": "valid/received.json", "note": "Receive, with hashed searchable attributes" },
     { "file": "valid/filtered.json", "note": "Deliberate drop: status dropped, no error code" },
@@ -20,8 +20,12 @@
     { "file": "invalid/error-without-code.json", "violates": "status=error requires error_code" },
     { "file": "invalid/ts-epoch-float.json", "violates": "ts must be an RFC 3339 UTC string, not an epoch float" },
     { "file": "invalid/payload-in-event.json", "violates": "additionalProperties: no payload field exists; payload bytes must never enter _tb.events (invariant 6)" },
-    { "file": "invalid/attrs-clear-text-key.json", "violates": "attrs key must match ^[a-z][a-z0-9_]{0,31}$; identifiers must be hashed with an _hmac suffix" },
+    { "file": "invalid/attrs-clear-text-key.json", "violates": "attrs key must match ^[a-z][a-z0-9_]{0,31}$ (this one fails on casing and the hyphen only; see attrs-clear-text-mrn for the PHI rule)" },
+    { "file": "invalid/attrs-clear-text-mrn.json", "violates": "attrs key 'mrn' denotes a direct identifier and is rejected in clear form; it is admissible only as 'mrn_hmac'" },
+    { "file": "invalid/attrs-hmac-not-fixed-length-hex.json", "violates": "an _hmac-suffixed value must be exactly 64 hex characters, so a clear-text value cannot hide behind the suffix" },
+    { "file": "invalid/attrs-free-text-value.json", "violates": "non-hashed attrs values are short codes: no spaces, 64 characters max, which rejects free text that can carry PHI" },
     { "file": "invalid/claim-check-with-size.json", "violates": "claim_check present requires size_bytes 0" },
+    { "file": "invalid/claim-check-presigned-url.json", "violates": "claim_check must not contain a query string; a presigned URL becomes a stored, replayable credential in ClickHouse and the browser" },
     { "file": "invalid/unknown-stage.json", "violates": "stage enum: 'enriched' is a pipeline step name, not a lifecycle stage" }
   ]
 }

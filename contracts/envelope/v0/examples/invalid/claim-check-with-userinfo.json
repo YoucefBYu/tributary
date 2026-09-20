@@ -1,0 +1,19 @@
+{
+  "class": "raw",
+  "topic": "prod.pacs-ingest.raw",
+  "key_present": true,
+  "key_size": 26,
+  "payload_present": false,
+  "payload_size": 0,
+  "headers": {
+    "tb-msg-id": "01930b80-1a2b-7def-a123-456789abcdef",
+    "tb-channel": "pacs-ingest",
+    "tb-channel-version": "1",
+    "tb-source": "dicom-receiver:recv-01@10.0.3.7:11112",
+    "tb-received-at": "2026-09-20T11:24:01.007Z",
+    "tb-content-type": "application/dicom",
+    "tb-attempt": "0",
+    "tb-claim-check": "https://minioadmin:minioadmin@minio.internal:9000/claimcheck/prod/pacs-ingest/01930b80",
+    "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4737-0102030405060708-01"
+  }
+}

@@ -4,8 +4,8 @@
   "title": "Tributary message envelope (record projection), v0",
   "description": "Validates a JSON projection of one Kafka record: topic class, key, tb-* headers, payload size. See README.md. Strict on the produce side; consumers must not reject unknown headers at runtime.",
   "type": "object",
-  "required": ["class", "key", "headers", "payload_present", "payload_size"],
-  "$comment": "key, payload_present and payload_size are required even when null or zero: an omitted field would silently pass the claim-check and size rules below.",
+  "required": ["class", "key_present", "key_size", "headers", "payload_present", "payload_size"],
+  "$comment": "The projection carries NO record key value, only its presence and length: the key is usually a patient identifier, and a validator error message embeds the failing instance, which would put PHI into exceptions, logs and test output. The presence and length rules are all the schema ever checked anyway.",
   "additionalProperties": false,
   "properties": {
     "class": {
@@ -18,11 +18,15 @@
       "minLength": 1,
       "maxLength": 249
     },
-    "key": {
-      "description": "UTF-8 text of the record key, or null. May be a direct patient identifier: never log it (invariant 6).",
-      "type": ["string", "null"],
-      "minLength": 1,
-      "maxLength": 256
+    "key_present": {
+      "description": "False means the Kafka record key is null (allowed only when the channel declares ordering: none).",
+      "type": "boolean"
+    },
+    "key_size": {
+      "description": "Length of the record key in bytes, 0 when null. The key VALUE is deliberately not part of this projection; see the $comment at the root.",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 256
     },
     "payload_present": {
       "description": "False means the Kafka record value is null.",
@@ -233,8 +237,9 @@
         "tracestate": { "type": "string", "maxLength": 512 },
         "tb-claim-check": {
           "type": "string",
-          "maxLength": 2048,
-          "pattern": "^(s3|gs|az|https)://[^\\s]{1,2040}$"
+          "maxLength": 1024,
+          "$comment": "Opaque object locator only. No query string (presigned URLs put credentials there), no fragment, no userinfo (no '@'), no spaces. The object key is derived from non-PHI parts only: <env>/<channel>/<yyyy>/<mm>/<dd>/<tb-msg-id>. Signed URLs are minted at read time by the API and never stored in an envelope or an event.",
+          "pattern": "^(s3|gs|az|https)://[A-Za-z0-9._-]{1,253}(:[0-9]{2,5})?(/[A-Za-z0-9._-]{1,128}){1,16}$"
         },
         "tb-destination": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,63}$" },
         "tb-stage": { "$ref": "#/$defs/stage" },

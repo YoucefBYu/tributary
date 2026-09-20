@@ -121,11 +121,33 @@ implement delay tiers or DLQ triage without them. All additive.
 Deliberately **not** added: any header carrying human error text or payload excerpts. Exception text
 quotes payload, and headers reach logs, metrics and the archive (invariant 6).
 
-### D8. Claim-check threshold (decided, unverified)
+### D8. Claim-check threshold and URI form (decided, unverified)
 
 Inline payload ≤ 1,000,000 bytes; `message.max.bytes` 1,048,576; above that, object store plus
 `tb-claim-check` and a null Kafka value.
+
+The URI is an **opaque locator**: no query string, no fragment, no userinfo, and an object key derived
+only from `<env>/<channel>/<yyyy>/<mm>/<dd>/<tb-msg-id>`. Signed URLs are minted at read time by the
+API and never persisted. Added after a security review: a claim-check URI is copied into `_tb.events`,
+ClickHouse and the browser, so a presigned URL there becomes a stored, replayable credential that
+outlives its own expiry in backups, and an object name taken from the sender is a classic accidental
+PHI channel.
+
 TODO: no Phase 0 spike exercised claim-check. Flag as an untested path in the Phase 1 plan.
+
+### D9. Transport security and authorization are part of the config contract (decided)
+
+The topics contract states a required security profile (SASL_SSL or mTLS, deny-by-default authorizer,
+least-privilege prefix ACLs) rather than deferring all of it to ADR-004.
+
+**Why:** a contract that specifies `acks`, `linger.ms` and `min.insync.replicas` but is silent on
+authentication reads as a complete configuration, and an implementer who follows it exactly gets a
+plaintext, unauthenticated cluster carrying PHI. Silence in a config contract is a decision, and it was
+the wrong one.
+
+**Give up:** some overlap with ADR-004's scope. The boundary: this contract fixes the required
+mechanisms and the ACL shape; ADR-004 owns the role model, credential rotation and key management,
+which need a human decision (CLAUDE.md escalates cryptography and key management).
 
 ---
 
@@ -146,7 +168,9 @@ replay the primary recovery path; Kafka share groups for unordered destinations.
 
 | Item | Impact |
 |---|---|
-| Invariant 1 | Reinforced: `contracts/topics/v0` section 3 lists the broker and producer settings without which ACK-after-commit is a lie (`unclean.leader.election.enable=false` in particular). |
+| Invariant 1 | Reinforced: `contracts/topics/v0` section 3 lists the broker and producer settings without which ACK-after-commit is a lie. A security review found the first draft pinned `min.insync.replicas` only per profile, not per topic, so a topic created from the class defaults would satisfy `acks=all` with one replica — fixed by pinning the durability floor in every class. |
+| Invariant 3 | Reinforced by D9: no worker or loader gets `WRITE` on `_tb.<env>.channels`. Invariant 3 makes workers trust that topic completely, so write access to it is remote code execution across the data plane. |
+| Invariant 6 | Reinforced: the envelope validation projection carries no key value, and claim-check URIs cannot carry credentials or identifiers. |
 | Invariant 2 | Unchanged. D2 renames the physical platform topics, not the classes. |
 | Invariant 5 | Reinforced: the `out`/`raw` partition-count rule closes a silent reordering path. |
 | Invariant 8 | Implemented by `contracts/envelope/v0`. |
@@ -158,8 +182,9 @@ replay the primary recovery path; Kafka share groups for unordered destinations.
 ## 5. Follow-ups
 
 1. Fill every TODO(Sn) from the filed spike reports before the Phase 0 gate.
-2. ~~Conformance suite over both contracts' example manifests.~~ Done 2026-09-20:
-   `tests/conformance/test_contracts_v0.py`, 62 passed / 0 failed, no schema bugs. Keep it in CI.
+2. Conformance suite over both contracts' example manifests. First run 2026-09-20 passed 62 / 0 with no
+   schema bugs, but the same day's security fixes changed both schemas and added 6 examples, so a
+   **re-run is outstanding**. Keep it in CI afterwards.
 3. `platform-engineer`: reconcile `spikes/common/src/tbcommon/envelope.py` with the contract. Binding
    for `packages/tributary-sdk` and `-runtime` in Phase 1, not retroactively for throwaway spike code.
 4. **Phase 1, `devops-engineer`** (not on the Phase 0 team, so these are carried forward here rather

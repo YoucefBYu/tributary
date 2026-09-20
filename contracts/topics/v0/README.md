@@ -114,6 +114,14 @@ These are not tuning knobs. Invariant 1 (never ACK and drop) is false without th
 | `max.message.bytes` | 1048576 | Matches the envelope's 1 MB inline limit plus header headroom. |
 | `compression.type` | `producer` | Do not recompress on the broker. |
 
+**`min.insync.replicas` and `unclean.leader.election.enable` are set per topic, in every class in
+`topic-defaults.json`, not only cluster-wide.** Both are topic-level configs in Kafka: a topic created
+without `min.insync.replicas` inherits the broker default of 1, and `acks=all` is then satisfied by a
+single replica. The producer still gets a success, the receiver still ACKs the sender, and the next
+broker loss drops an acknowledged message — invariant 1 violated with every setting apparently
+correct. The per-class values carry the production floor so that a tool which applies class configs
+and forgets the profile overrides fails safe; only the explicit `lite` profile lowers it.
+
 Lite mode (RF=1) cannot satisfy RPO=0 and must say so in its documentation. It is for development and
 small sites that have accepted the risk, and the distribution should warn at startup.
 
@@ -143,7 +151,34 @@ available, it NACKs or refuses the connection. It never ACKs optimistically.
 | `isolation.level` | `read_committed` on topics written by a transactional stage | Otherwise a consumer sees aborted records. |
 | `max.poll.interval.ms` | ≥ the slowest destination timeout plus backoff | Otherwise a slow sink looks like a dead consumer and causes a rebalance loop. |
 
-### 3.4 Consumer group naming
+### 3.4 Transport security and authorization (required)
+
+A cluster built from sections 3.1 to 3.3 alone is plaintext, unauthenticated and unauthorized, and it
+carries PHI. These settings are part of the contract, not a separate hardening guide. Machine-readable
+in `topic-defaults.json` under `security`.
+
+| Area | Requirement |
+|---|---|
+| Client listeners | `SASL_SSL`, or `SSL` with mTLS. `PLAINTEXT` only on a loopback-bound lite listener. |
+| Inter-broker | A dedicated internal listener with `SASL_SSL` or mTLS. |
+| Authentication | `SCRAM-SHA-512` or `OAUTHBEARER`. Never `PLAIN` on a listener without TLS. |
+| Hostname verification | `ssl.endpoint.identification.algorithm=https`. Leaving this off is the most common way a TLS Kafka deployment silently accepts a man-in-the-middle. |
+| Authorization | `StandardAuthorizer` enabled and **`allow.everyone.if.no.acl.found=false`** — deny by default. |
+| `super.users` | The topic-creation job and the control plane only. Never a data-plane component. |
+| Credentials | From a `secretRef` or a secrets manager. Never in a channel spec, a Compose file or an image. |
+
+ACLs are least privilege on the topic prefix `<env>.<channel>.`, so compromising one channel's
+credentials does not grant read access to another channel's traffic. Per-component grants are listed in
+`topic-defaults.json` under `security.acls`. Two rules are load-bearing: no data-plane component gets
+cluster-wide `WRITE`, `DELETE` or `ALTER`; and no worker or loader gets `WRITE` on
+`_tb.<env>.channels`, because that topic is what invariant 3 makes workers trust completely — write
+access to it is remote code execution across the whole data plane.
+
+**Escalated, not decided here:** the complete role model, credential rotation and key management are
+ADR-004 plus a human decision. This section fixes the minimum shape the configuration contract must
+state; it does not design the authorization model or any cryptography.
+
+### 3.5 Consumer group naming
 
 ```
 tb.<env>.<channel>.<role>[.<destination>]     role = pipeline | loader | replier | archiver
@@ -164,4 +199,5 @@ each invalid one breaks. Tests validate each string against `topic-name.schema.j
 - Partition defaults and the topic-count ceiling are placeholders until S4 reports.
 - Tiered storage would let `raw` retention grow past 7 days and make replay the primary recovery
   path. Not in v0.
-- ACL templates per channel (prefix `<env>.<channel>.`) belong with the security work in ADR-004.
+- Section 3.4 states the required security profile and the ACL *shape*. The concrete ACL templates,
+  credential rotation and key management are ADR-004 plus a human decision, and are not settled here.
