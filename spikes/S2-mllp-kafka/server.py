@@ -21,8 +21,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import ssl
 import threading
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
@@ -38,7 +40,7 @@ Publisher = Callable[[bytes, str], Awaitable[bool]]
 @dataclass
 class Settings:
     port: int = 2575
-    host: str = "0.0.0.0"  # noqa: S104 - spike; product default must be explicit
+    host: str = "127.0.0.1"  # loopback by default (no peer auth); containers opt in with --host 0.0.0.0
     idle_timeout_s: float = 60.0
     write_timeout_s: float = 10.0
     ack_timeout_s: float = 8.0  # > kafka message.timeout.ms so Kafka's verdict wins
@@ -48,6 +50,17 @@ class Settings:
     max_msg: int = MAX_MSG
     tls_cert: str | None = None
     tls_key: str | None = None
+
+
+def new_msg_id() -> bytes:
+    """tb-msg-id as canonical UUIDv7 text, UTF-8 (48-bit unix ms, version 7, RFC 9562 variant).
+
+    Hand-rolled because the stdlib only gains uuid7 in Python 3.14. Spike code; the product
+    generator belongs in the SDK (platform-engineer)."""
+    ms = time.time_ns() // 1_000_000
+    rnd = int.from_bytes(os.urandom(10), "big")
+    v = (ms << 80) | (0x7 << 76) | (((rnd >> 62) & 0xFFF) << 64) | (0b10 << 62) | (rnd & ((1 << 62) - 1))
+    return str(uuid.UUID(int=v)).encode()
 
 
 @dataclass
@@ -98,7 +111,7 @@ class KafkaPublisher:
         self.producer.flush(5)
 
     async def __call__(self, payload: bytes, cid: str) -> bool:
-        return await self.publish(payload, cid, [("tb-msg-id", str(uuid.uuid4()).encode())])
+        return await self.publish(payload, cid, [("tb-msg-id", new_msg_id())])
 
     async def publish(self, payload: bytes, key: str, headers: list[tuple[str, bytes]],
                       partition: int = -1) -> bool:
@@ -221,7 +234,7 @@ class Server:
 
 
 async def amain(a: argparse.Namespace) -> None:
-    cfg = Settings(port=a.port, tls_cert=a.tls_cert, tls_key=a.tls_key, max_inflight=a.max_inflight)
+    cfg = Settings(host=a.host, port=a.port, tls_cert=a.tls_cert, tls_key=a.tls_key, max_inflight=a.max_inflight)
     loop = asyncio.get_running_loop()
     pub: Publisher
     kp: KafkaPublisher | None = None
@@ -254,6 +267,7 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--bootstrap", default="localhost:19092,localhost:29092,localhost:39092")
     p.add_argument("--topic", default="spike.s2.raw")
+    p.add_argument("--host", default="127.0.0.1", help="listen address; containers pass 0.0.0.0")
     p.add_argument("--port", type=int, default=2575)
     p.add_argument("--tls-cert")
     p.add_argument("--tls-key")

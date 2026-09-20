@@ -58,7 +58,7 @@ def trial(kind: str, i: int, rate: int, conns: int, seconds: int, kill_at: float
     ensure_topics([TopicSpec(topic, 12, 3)])
     sh("docker", "rm", "-f", "tb-s2-srv", check=False)
     sh("docker", "run", "-d", "--name", "tb-s2-srv", "--hostname", "mllp", "--network", NET,
-       "tb-s2", "server.py", "--bootstrap", INTERNAL, "--topic", topic, "--linger-ms", "2")
+       "tb-s2", "server.py", "--host", "0.0.0.0", "--bootstrap", INTERNAL, "--topic", topic, "--linger-ms", "2")
     for _ in range(50):
         if "listening" in sh("docker", "logs", "tb-s2-srv").stdout:
             break

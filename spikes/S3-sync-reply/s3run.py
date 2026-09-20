@@ -58,9 +58,9 @@ def start_server(kind: str, raw: str, rep: str, mode: str = "broadcast", timeout
     common = ["docker", "run", "-d", "--name", "tb-s3-srv", "--hostname", "mllp", "--network", NET,
               "-v", f"{RUNS}:/runs"]
     if kind == "async":
-        sh(*common, "tb-s3", "server.py", "--bootstrap", INTERNAL, "--topic", raw, "--linger-ms", "2")
+        sh(*common, "tb-s3", "server.py", "--host", "0.0.0.0", "--bootstrap", INTERNAL, "--topic", raw, "--linger-ms", "2")
     else:
-        sh(*common, "tb-s3", "sync_server.py", "--bootstrap", INTERNAL, "--topic", raw,
+        sh(*common, "tb-s3", "sync_server.py", "--host", "0.0.0.0", "--bootstrap", INTERNAL, "--topic", raw,
            "--reply-topic", rep, "--reply-mode", mode, "--reply-timeout", str(timeout),
            "--max-pending", str(max_pending), "--metrics-file", f"/runs/{metrics}")
     wait_log("tb-s3-srv", "listening")

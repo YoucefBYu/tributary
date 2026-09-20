@@ -29,9 +29,23 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass
 
 from mllp import build_ack
-from server import KafkaPublisher, Server, Settings
+from server import KafkaPublisher, Server, Settings, new_msg_id
 
+# SPIKE TRUST ASSUMPTION: any record on the reply topic whose tb-correlation-id matches a pending
+# entry is accepted as the worker's reply. There is no producer authentication or signature, so a
+# principal with write access to the reply topic can answer (or forge) replies for other senders.
+# The product must restrict reply-topic ACLs to workers and use unguessable correlation ids.
 H_CORR, H_REPLY_PART = "tb-correlation-id", "tb-x-reply-partition"
+
+
+def frame_reply(reply: bytes) -> bytes | None:
+    """MLLP-frame a worker reply, or None if it holds a framing byte (0x0B or 0x1C).
+
+    A reply is untrusted input: embedded framing bytes would let it end the frame early and
+    smuggle a second frame to the sender."""
+    if b"\x0b" in reply or b"\x1c" in reply:
+        return None
+    return b"\x0b" + reply + b"\x1c\x0d"
 
 
 @dataclass
@@ -40,6 +54,7 @@ class SyncStats:
     timeouts: int = 0
     busy: int = 0
     commit_fail: int = 0
+    bad_replies: int = 0  # worker reply rejected: contained an MLLP framing byte
     late_replies: int = 0  # reply for an unknown corr id: after timeout, duplicate, or not ours
     pending: int = 0
     pending_hwm: int = 0
@@ -121,14 +136,14 @@ class SyncServer(Server):
         if len(self.pending) >= self.max_pending:
             st.busy += 1
             return False
-        corr = uuid.uuid4().hex
+        corr = str(uuid.uuid4())  # canonical UUID text; uuid4 on purpose (unguessable, not time-ordered)
         fut: asyncio.Future[bytes] = asyncio.get_running_loop().create_future()
         self.pending[corr] = fut
         st.pending = len(self.pending)
         st.pending_hwm = max(st.pending_hwm, st.pending)
         t0 = time.monotonic()
         try:
-            headers = [("tb-msg-id", uuid.uuid4().bytes), (H_CORR, corr.encode())]
+            headers = [("tb-msg-id", new_msg_id()), (H_CORR, corr.encode())]
             if self.instance_part is not None:
                 headers.append((H_REPLY_PART, str(self.instance_part).encode()))
             if not await self.kp.publish(frame, corr, headers):
@@ -148,7 +163,11 @@ class SyncServer(Server):
 
     def render(self, cid: str, result: object) -> tuple[bytes, bool]:
         if isinstance(result, bytes) and result:
-            return b"\x0b" + result + b"\x1c\x0d", True  # worker's response goes to the sender
+            framed = frame_reply(result)  # worker's response goes to the sender
+            if framed is not None:
+                return framed, True
+            self.sstats.bad_replies += 1
+            return build_ack("AR", cid, "bad reply"), False
         if result == b"":
             return build_ack(self.timeout_code, cid, "reply timeout"), False
         return build_ack("AR", cid, "unavailable"), False
@@ -156,7 +175,7 @@ class SyncServer(Server):
 
 async def amain(a: argparse.Namespace) -> None:
     loop = asyncio.get_running_loop()
-    cfg = Settings(port=a.port, max_inflight=a.max_pending + 100, max_conns=1024,
+    cfg = Settings(host=a.host, port=a.port, max_inflight=a.max_pending + 100, max_conns=1024,
                    conn_pipeline=a.conn_pipeline, ack_timeout_s=a.reply_timeout + 5)
     kp = KafkaPublisher(a.bootstrap, a.topic, a.linger_ms, 5000, (a.max_pending + 100) * 2)
     kp.start(loop)
@@ -187,6 +206,7 @@ def main() -> None:
     p.add_argument("--timeout-code", choices=["AE", "AR"], default="AE")
     p.add_argument("--max-pending", type=int, default=20000)
     p.add_argument("--conn-pipeline", type=int, default=256)
+    p.add_argument("--host", default="127.0.0.1", help="listen address; containers pass 0.0.0.0")
     p.add_argument("--port", type=int, default=2575)
     p.add_argument("--linger-ms", type=int, default=2)
     p.add_argument("--metrics-file")

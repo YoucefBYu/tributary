@@ -34,7 +34,7 @@ def cell(rate: int, conns: int, tls: bool, seconds: int, linger: int) -> dict:
     ensure_topics([TopicSpec(topic, 12, 3)])
     sh("docker", "rm", "-f", "tb-s2-srv", check=False)
     srv = ["docker", "run", "-d", "--name", "tb-s2-srv", "--hostname", "mllp", "--network", NET,
-           "-v", f"{HERE / 'certs'}:/certs:ro", "tb-s2", "server.py", "--bootstrap", INTERNAL,
+           "-v", f"{HERE / 'certs'}:/certs:ro", "tb-s2", "server.py", "--host", "0.0.0.0", "--bootstrap", INTERNAL,
            "--topic", topic, "--linger-ms", str(linger)]
     if tls:
         srv += ["--tls-cert", "/certs/cert.pem", "--tls-key", "/certs/key.pem"]
