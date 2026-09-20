@@ -8,8 +8,9 @@ wave's exit criteria here.
 - **Phase / wave:** Phase 0 (spikes), in progress
 - **Branch:** `wave/0`
 - **Last gate report:** none. `docs/spikes/PHASE-0-DECISION.md` is not written; it waits on S1-S6.
-- **Contracts:** v0 Draft published for envelope, topics and events. Schemas reviewed by hand,
-  **never executed against a validator** — the first conformance run is part of publishing v0.
+- **Contracts:** v0 Draft published for envelope, topics and events, and **conformance-verified**:
+  `tests/conformance/test_contracts_v0.py`, 62 passed / 0 failed / 0 skipped, with every invalid
+  example confirmed to fail for its stated reason (`qa-engineer`, 2026-09-20).
 
 ### Spike reports filed
 
@@ -17,14 +18,15 @@ wave's exit criteria here.
 |---|---|---|---|
 | P0-1 corpus and harness | `qa-engineer` | not filed | |
 | P0-2 spike Kafka cluster | `platform-engineer` | not filed | |
-| S1 HL7 parse plus transform throughput | `qa-engineer` | not filed | |
+| S1 HL7 parse plus transform throughput | `qa-engineer` | `docs/spikes/S1-hl7-throughput.md` (**accepted** 2026-09-20) | PASS for a lazy parser (~27.7k msg/s/core) and `python-hl7` (~1,970); FAIL for `hl7apy` (~59). Threshold 200 msg/s/core. S1b (Rust/PyO3) not needed |
 | S2 MLLP ACK-after-commit | `connector-engineer` | not filed | |
 | S3 synchronous reply | `connector-engineer`, `platform-engineer` | not filed | |
 | S4 topic-count stress | `qa-engineer` | not filed | |
 | S5 ordering, blocking retry, DLQ | `platform-engineer` | not filed | |
 | S6 Mirth import corpus | `migration-engineer` | `docs/spikes/S6-mirth-import-corpus.md` | INCONCLUSIVE — no corpus available, scripts unexecuted |
 
-No threshold has a measured result yet. Nothing in ADR-001 has been updated with measurements.
+S1 is the only threshold with a measured result so far. ADR-001 has not yet been updated with
+measurements — that happens in P0-3 synthesis, once the remaining reports are in.
 
 ## Sign-offs (human)
 
@@ -66,7 +68,7 @@ From ADR-001 section 13, with the evidence column that Phase 0 is meant to fill.
 | Risk | Likelihood | Impact | Measured evidence | Mitigation |
 |---|---|---|---|---|
 | Kafka too heavy for small sites | Medium | High | none | Lite distribution, managed offerings, sizing guide |
-| Python hot-path throughput below estimate | Medium | Medium | none — S1 not filed | Benchmark, PyO3 parser, Rust receivers |
+| Python hot-path throughput below estimate | ~~Medium~~ **Low** | Medium | S1: parse plus ADT-to-FHIR transform at ~27.7k msg/s/core (lazy parser) and ~1,970 (`python-hl7`) against a 200 threshold, on a loaded Windows host. `hl7apy` fails at ~59 and is off the hot path | S1b (Rust/PyO3) **not needed** for this target. Re-measure on Linux CI and on a full production mapping with terminology lookups |
 | Migration cost from JavaScript deters adopters | High | High | none — S6 inconclusive, no corpus | Importer, compat shim, assisted porting, shadow diff |
 | Buyers want references, certification, support SLAs | High | High | none | Design partners, security docs, paid support |
 | Topic/partition explosion with many channels | Medium | Medium | none — S4 not filed | Topic sharing, partition defaults, load tests |
@@ -77,6 +79,6 @@ From ADR-001 section 13, with the evidence column that Phase 0 is meant to fill.
 
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
-| Contract schemas have never been executed, so the v0 examples may not validate | Medium | Low | First conformance run reports failures to `architect` as contract bugs |
+| ~~Contract schemas have never been executed~~ **Closed 2026-09-20**: `tests/conformance/test_contracts_v0.py`, 62 passed / 0 failed, no schema bugs | — | — | Keep the suite in CI so a contract edit cannot silently break an example |
 | Claim-check (payloads over 1 MB) is untested by any Phase 0 spike | Medium | Medium | Call it out as an untested path in the Phase 1 plan; ADR-004 owns object lifecycle |
 | The record key is often a patient identifier, so any log, metric label or span attribute built from it is a PHI leak | Medium | High | Stated in `contracts/envelope/v0` section 4; reviewers treat it as Critical |

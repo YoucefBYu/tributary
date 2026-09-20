@@ -46,6 +46,14 @@ One parameterised test per contract walks the manifest: every `valid` file must 
 `invalid` file must fail. `qa-engineer` owns the suite in `tests/conformance/`. The topics contract
 uses inline string lists instead of files, since a topic name is one string.
 
-**Status: unexecuted.** The v0 schemas and examples were reviewed by hand; no validator has been run
-against them, because the authoring session had no shell. Treat the first conformance run as part of
-publishing v0. Report failures to `architect` as contract bugs rather than adjusting the examples.
+**Status: green.** `tests/conformance/test_contracts_v0.py` (`qa-engineer`, 2026-09-20): 62 passed,
+0 failed, 0 skipped — envelope 7 valid / 14 invalid, events 8 / 10, topic names 10 / 12. Each invalid
+example was also checked to fail for the reason its manifest states, not incidentally, and the two PHI
+guards (`payload-in-event`, `attrs-clear-text-key`) are asserted by name. No schema bugs found.
+
+```
+uv run --no-project --python 3.12 --with pytest --with jsonschema python -m pytest tests/conformance
+```
+
+If a schema rejects something you believe is valid, that is a contract bug — message `architect`
+rather than adjusting the example.

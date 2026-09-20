@@ -5,6 +5,14 @@ breaking, and the reason. Breaking changes reference an ADR.
 
 ## 2026-09-20
 
+### All v0 contracts — conformance-verified (no contract change)
+
+`tests/conformance/test_contracts_v0.py` by `qa-engineer`: 62 passed, 0 failed, 0 skipped. Envelope
+7 valid / 14 invalid, events 8 / 10, topic names 10 / 12. Every invalid example was additionally
+checked to fail for the reason its manifest states rather than incidentally, and the two PHI guards
+(`payload-in-event`, `attrs-clear-text-key`) are asserted by name. No schema bugs found, so no
+contract text changed.
+
 ### `tributary.envelope/v0` — new, Draft
 
 First publication. ADR-001 section 5.4 made concrete: value encoding, a per-topic-class required

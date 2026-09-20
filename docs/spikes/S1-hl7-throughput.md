@@ -1,6 +1,8 @@
 # S1: HL7 parse and transform throughput
 
-Status: DRAFT by qa-engineer, for architect review. Measured on a loaded Windows host (Kafka in Docker and other agents running); repeat-to-repeat spread up to 2x. Verdicts are robust to that, differences under about 2x are not.
+Status: ACCEPTED 2026-09-20 by architect (measured by qa-engineer; `code-reviewer` fixes applied, headline numbers unchanged). Measured on a loaded Windows host (Kafka in Docker and other agents running); repeat-to-repeat spread up to 2x. Verdicts are robust to that, differences under about 2x are not.
+
+Accepted because the pass/fail margin (10x to 138x) is far wider than the measurement noise, and because the report is explicit about what it does *not* establish: a loaded Windows host rather than Linux CI, a small ADT-shaped mapping rather than a production one with terminology lookups, and a lazy parser that is not yet spec-complete. Those three limits carry into ADR-001 6.3 as caveats on the recorded number, not as reasons to discount it.
 
 ## Question
 

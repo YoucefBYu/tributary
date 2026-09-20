@@ -48,9 +48,9 @@ explicitly so the two schemas stay independent.
 is `null` or the size is `0`. An omitted field would pass the claim-check and size rules by
 accident, which is the opposite of what a conformance test is for. `topic` is optional.
 
-**Not yet executed:** the schemas and examples in this contract have been reviewed by hand but not
-run through a validator (no shell in the authoring session). First consumer to run
-`tests/conformance/` should report failures to `architect` as contract bugs, not work around them.
+**Verified:** all 21 examples in this contract pass `tests/conformance/test_contracts_v0.py`
+(2026-09-20), and each invalid example fails for the reason its manifest states. See
+[`../../README.md`](../../README.md) for the run command.
 
 ### 1.2 Strict producers, lenient consumers
 

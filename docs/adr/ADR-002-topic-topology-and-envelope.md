@@ -158,8 +158,8 @@ replay the primary recovery path; Kafka share groups for unordered destinations.
 ## 5. Follow-ups
 
 1. Fill every TODO(Sn) from the filed spike reports before the Phase 0 gate.
-2. `qa-engineer`: conformance suite over both contracts' example manifests (the schemas have never
-   been executed).
+2. ~~Conformance suite over both contracts' example manifests.~~ Done 2026-09-20:
+   `tests/conformance/test_contracts_v0.py`, 62 passed / 0 failed, no schema bugs. Keep it in CI.
 3. `platform-engineer`: reconcile `spikes/common/src/tbcommon/envelope.py` with the contract.
 4. `devops-engineer`: Helm and Compose read `topic-defaults.json` rather than hardcoding values.
 5. ADR-004 owns claim-check object lifecycle and retention.
