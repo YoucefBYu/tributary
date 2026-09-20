@@ -68,6 +68,8 @@ async def conn_worker(
                 msa = frame.split(b"\rMSA|")[1].split(b"|") if b"\rMSA|" in frame else [b"?", b""]
                 code, cid = msa[0].decode(), msa[1].decode()
                 t0 = sent.pop(cid, None)
+                if a.events and t0 is not None:
+                    res["events"].append((cid, res["wall0"] + (t0 - res["t_start"]), time.time(), code))
                 if code == "AA" and t0 is not None:
                     res["lat"].append((now - t0) * 1000)
                     res["tl"].append((int(t0 - res["t_start"]), (now - t0) * 1000))
@@ -111,6 +113,7 @@ async def main() -> None:
     p.add_argument("--drain-s", type=float, default=10)
     p.add_argument("--corpus", help="MLLP-framed corpus file; default built-in tiny ADT")
     p.add_argument("--warmup-s", type=int, default=3, help="excluded from 'steady' stats only")
+    p.add_argument("--events", action="store_true", help="record (cid, send_wall, ack_wall, code)")
     p.add_argument("--tls", action="store_true")
     p.add_argument("--cafile", help="trust this CA/self-signed cert (verification stays ON)")
     p.add_argument("--server-hostname", default=None)
@@ -124,7 +127,7 @@ async def main() -> None:
         if a.insecure_selfsigned:
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
-    res = {"corpus": load_corpus(a.corpus) if a.corpus else [], "sent": 0, "nack": 0, "unanswered": 0, "lat": [], "tl": [], "t_start": time.perf_counter(), "acked": []}
+    res = {"corpus": load_corpus(a.corpus) if a.corpus else [], "sent": 0, "nack": 0, "unanswered": 0, "lat": [], "tl": [], "events": [], "wall0": time.time(), "t_start": time.perf_counter(), "acked": []}
     interval = a.conns / a.rate
     await asyncio.gather(*(conn_worker(a, i, interval, res, ctx) for i in range(a.conns)))
     lat = sorted(res["lat"])
@@ -146,7 +149,7 @@ async def main() -> None:
                          "p99_ms": pct(tail, .99), "p999_ms": pct(tail, .999)}
     print(json.dumps(summary))
     with open(a.out, "w") as f:
-        json.dump({**summary, "corpus": a.corpus, "acked_ids": res["acked"]}, f)
+        json.dump({**summary, "events": res["events"], "corpus": a.corpus, "acked_ids": res["acked"]}, f)
 
 
 if __name__ == "__main__":
