@@ -54,8 +54,7 @@ def test_lifecycle_script_flagged() -> None:
 
 def test_trivial_lifecycle_stub_is_ok() -> None:
     xml = PASSTHROUGH.replace("<destinationConnectors/>",
-                              "<postprocessingScript>// x
-return;</postprocessingScript><destinationConnectors/>")
+                              "<postprocessingScript>return;</postprocessingScript><destinationConnectors/>")
     assert import_channel(xml)["fullyAutomatic"]
 
 
