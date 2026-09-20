@@ -12,6 +12,9 @@ Results are appended as JSON lines to benchmarks/results/s4.jsonl. Every record 
 the broker heap that TB_KAFKA_HEAP had when the compose file was started (pass --heap
 so it is written to the record; the script cannot see it otherwise).
 
+Every command deletes all s4.* topics on exit (even on error) unless the global --keep flag is
+given before the subcommand, e.g. `s4.py --keep --heap -Xmx3G topics ...`; run `cleanup` at the end.
+
 Do NOT run while another spike is timing on the cluster.
 """
 
@@ -339,8 +342,13 @@ def main() -> None:
     s.set_defaults(fn=cmd_shared)
     s = sub.add_parser("cleanup")
     s.set_defaults(fn=cmd_cleanup)
+    ap.add_argument("--keep", action="store_true", help="do not delete s4.* topics when the command exits (default: delete)")
     a = ap.parse_args()
-    a.fn(a)
+    try:
+        a.fn(a)
+    finally:
+        if a.cmd != "cleanup" and not a.keep:
+            cmd_cleanup(a)
 
 
 if __name__ == "__main__":
