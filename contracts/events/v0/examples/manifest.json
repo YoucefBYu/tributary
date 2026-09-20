@@ -1,0 +1,27 @@
+{
+  "contract": "tributary.events/v0",
+  "schema": "../event.schema.json",
+  "note": "All identifiers are synthetic. The invalid set deliberately includes two PHI-shaped mistakes (payload-in-event, attrs-clear-text-key) so a regression cannot reintroduce them quietly.",
+  "valid": [
+    { "file": "valid/received.json", "note": "Receive, with hashed searchable attributes" },
+    { "file": "valid/filtered.json", "note": "Deliberate drop: status dropped, no error code" },
+    { "file": "valid/sent.json", "note": "Successful delivery to one destination" },
+    { "file": "valid/retrying.json", "note": "Failed attempt with a code and a redacted message" },
+    { "file": "valid/dlq.json", "note": "Step failure routed to the DLQ" },
+    { "file": "valid/claim-checked-received.json", "note": "Claim-check: size_bytes 0 plus a URI" },
+    { "file": "valid/partition-paused.json", "note": "Blocking retry paused a partition; triggering message id included" },
+    { "file": "valid/partition-resumed.json", "note": "Partition resumed; duration_ms is the outage length" }
+  ],
+  "invalid": [
+    { "file": "invalid/missing-version.json", "violates": "required: v" },
+    { "file": "invalid/message-without-message-id.json", "violates": "kind=message requires message_id" },
+    { "file": "invalid/message-with-partition-stage.json", "violates": "partition_paused is not a message stage" },
+    { "file": "invalid/partition-without-topic.json", "violates": "kind=partition requires topic and partition" },
+    { "file": "invalid/error-without-code.json", "violates": "status=error requires error_code" },
+    { "file": "invalid/ts-epoch-float.json", "violates": "ts must be an RFC 3339 UTC string, not an epoch float" },
+    { "file": "invalid/payload-in-event.json", "violates": "additionalProperties: no payload field exists; payload bytes must never enter _tb.events (invariant 6)" },
+    { "file": "invalid/attrs-clear-text-key.json", "violates": "attrs key must match ^[a-z][a-z0-9_]{0,31}$; identifiers must be hashed with an _hmac suffix" },
+    { "file": "invalid/claim-check-with-size.json", "violates": "claim_check present requires size_bytes 0" },
+    { "file": "invalid/unknown-stage.json", "violates": "stage enum: 'enriched' is a pipeline step name, not a lifecycle stage" }
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "v": 0,
+  "kind": "message",
+  "ts": "2026-09-20T11:22:39.010Z",
+  "channel": "adt-to-fhir",
+  "channel_version": 7,
+  "stage": "partition_paused",
+  "status": "error",
+  "instance": "loader:fhir-server-1@worker-9",
+  "message_id": "018f3a5c-7d21-7b3e-9f01-2c4a6e8b0d13",
+  "error_code": "HTTP_503"
+}

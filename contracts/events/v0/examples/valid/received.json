@@ -1,0 +1,23 @@
+{
+  "v": 0,
+  "kind": "message",
+  "ts": "2026-09-20T11:22:33.128Z",
+  "channel": "adt-to-fhir",
+  "channel_version": 7,
+  "stage": "received",
+  "status": "ok",
+  "instance": "mllp-receiver:recv-7f3a",
+  "message_id": "018f3a5c-7d21-7b3e-9f01-2c4a6e8b0d13",
+  "content_type": "application/hl7-v2+er7",
+  "size_bytes": 1180,
+  "topic": "prod.adt-to-fhir.raw",
+  "partition": 4,
+  "offset": 918273,
+  "duration_ms": 4.7,
+  "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+  "attrs": {
+    "mrn_hmac": "9f2a1c7d4e5b6a8093c1d2e3f405162738495a6b7c8d9e0f1a2b3c4d5e6f7081",
+    "trigger": "A01",
+    "msg_type": "ADT"
+  }
+}

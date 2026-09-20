@@ -1,0 +1,11 @@
+{
+  "v": 0,
+  "kind": "message",
+  "ts": 1789305753.128,
+  "channel": "adt-to-fhir",
+  "channel_version": 7,
+  "stage": "received",
+  "status": "ok",
+  "instance": "mllp-receiver:recv-7f3a",
+  "message_id": "018f3a5c-7d21-7b3e-9f01-2c4a6e8b0d13"
+}

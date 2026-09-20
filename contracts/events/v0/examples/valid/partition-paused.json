@@ -1,0 +1,18 @@
+{
+  "v": 0,
+  "kind": "partition",
+  "ts": "2026-09-20T11:22:39.010Z",
+  "channel": "adt-to-fhir",
+  "channel_version": 7,
+  "stage": "partition_paused",
+  "status": "error",
+  "instance": "loader:fhir-server-1@worker-9",
+  "destination": "fhir-server",
+  "topic": "prod.adt-to-fhir.out.fhir-server",
+  "partition": 4,
+  "offset": 918110,
+  "message_id": "018f3a5c-7d21-7b3e-9f01-2c4a6e8b0d13",
+  "error_code": "HTTP_503",
+  "error_message": "blocking retry policy paused the partition to preserve order",
+  "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-bb22cc33dd44ee55-01"
+}

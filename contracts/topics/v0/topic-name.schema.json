@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tributary.dev/contracts/topics/v0/topic-name.schema.json",
+  "title": "Tributary topic name, v0",
+  "description": "Validates a single topic name string. See README.md section 1 for the grammar.",
+  "type": "string",
+  "minLength": 3,
+  "maxLength": 249,
+  "anyOf": [
+    {
+      "title": "data-plane topic without a destination",
+      "pattern": "^[a-z][a-z0-9-]{0,15}\\.[a-z][a-z0-9-]{0,63}\\.(raw|retry|dlq|reply)$"
+    },
+    {
+      "title": "per-destination out topic",
+      "pattern": "^[a-z][a-z0-9-]{0,15}\\.[a-z][a-z0-9-]{0,63}\\.out\\.[a-z][a-z0-9-]{0,63}$"
+    },
+    {
+      "title": "platform topic",
+      "pattern": "^_tb\\.[a-z][a-z0-9-]{0,15}\\.(channels|events|audit)$"
+    }
+  ],
+  "$defs": {
+    "env": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,15}$" },
+    "channel": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,63}$" },
+    "destination": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,63}$" },
+    "consumerGroup": {
+      "type": "string",
+      "description": "tb.<env>.<channel>.<role>[.<destination>][.shadow-<label>]",
+      "pattern": "^tb\\.[a-z][a-z0-9-]{0,15}\\.[a-z][a-z0-9-]{0,63}\\.(pipeline|loader|replier|archiver)(\\.[a-z][a-z0-9-]{0,63})?(\\.shadow-[a-z0-9-]{1,32})?$"
+    }
+  }
+}

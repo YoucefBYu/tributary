@@ -1,0 +1,17 @@
+{
+  "class": "raw",
+  "topic": "prod.adt-to-fhir.raw",
+  "key": "TRIBUTARY-SYNTH-MRN-000123",
+  "payload_present": true,
+  "payload_size": 1180,
+  "headers": {
+    "tb-msg-id": "c9a2f0de-1b44-4c8d-8e2f-77a1b3c5d7e9",
+    "tb-channel": "adt-to-fhir",
+    "tb-channel-version": "7",
+    "tb-source": "mllp-receiver:recv-7f3a@10.0.2.15:41522",
+    "tb-received-at": "2026-09-20T11:22:33.123Z",
+    "tb-content-type": "application/hl7-v2+er7",
+    "tb-attempt": "0",
+    "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+  }
+}

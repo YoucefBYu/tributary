@@ -1,0 +1,258 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tributary.dev/contracts/envelope/v0/envelope.schema.json",
+  "title": "Tributary message envelope (record projection), v0",
+  "description": "Validates a JSON projection of one Kafka record: topic class, key, tb-* headers, payload size. See README.md. Strict on the produce side; consumers must not reject unknown headers at runtime.",
+  "type": "object",
+  "required": ["class", "key", "headers", "payload_present", "payload_size"],
+  "$comment": "key, payload_present and payload_size are required even when null or zero: an omitted field would silently pass the claim-check and size rules below.",
+  "additionalProperties": false,
+  "properties": {
+    "class": {
+      "description": "Topic class the record is on. Derivable from 'topic' via the topics contract.",
+      "enum": ["raw", "out", "retry", "dlq", "reply"]
+    },
+    "topic": {
+      "description": "Physical topic name. Validated by contracts/topics/v0/topic-name.schema.json.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 249
+    },
+    "key": {
+      "description": "UTF-8 text of the record key, or null. May be a direct patient identifier: never log it (invariant 6).",
+      "type": ["string", "null"],
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "payload_present": {
+      "description": "False means the Kafka record value is null.",
+      "type": "boolean",
+      "default": true
+    },
+    "payload_size": {
+      "description": "Length of the record value in bytes. 0 when the value is null.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "headers": { "$ref": "#/$defs/headers" }
+  },
+  "allOf": [
+    {
+      "$comment": "Claim-check and inline payload are mutually exclusive (README section 5).",
+      "if": {
+        "properties": { "headers": { "required": ["tb-claim-check"] } },
+        "required": ["headers"]
+      },
+      "then": {
+        "properties": {
+          "payload_present": { "const": false },
+          "payload_size": { "const": 0 }
+        }
+      },
+      "else": {
+        "properties": { "payload_size": { "maximum": 1000000 } }
+      }
+    },
+    {
+      "$comment": "Class raw: no destination-, retry- or failure-specific headers.",
+      "if": { "properties": { "class": { "const": "raw" } }, "required": ["class"] },
+      "then": {
+        "properties": {
+          "headers": {
+            "allOf": [
+              { "$ref": "#/$defs/requiredCore" },
+              {
+                "not": {
+                  "anyOf": [
+                    { "required": ["tb-destination"] },
+                    { "required": ["tb-stage"] },
+                    { "required": ["tb-error-code"] },
+                    { "required": ["tb-retry-not-before"] }
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "$comment": "Class out: destination required, no failure headers yet.",
+      "if": { "properties": { "class": { "const": "out" } }, "required": ["class"] },
+      "then": {
+        "properties": {
+          "headers": {
+            "allOf": [
+              { "$ref": "#/$defs/requiredCore" },
+              { "required": ["tb-destination"] },
+              {
+                "not": {
+                  "anyOf": [
+                    { "required": ["tb-error-code"] },
+                    { "required": ["tb-retry-not-before"] }
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "$comment": "Class retry: a delivery already failed, so the failure context and the delay tier are mandatory.",
+      "if": { "properties": { "class": { "const": "retry" } }, "required": ["class"] },
+      "then": {
+        "properties": {
+          "headers": {
+            "allOf": [
+              { "$ref": "#/$defs/requiredCore" },
+              {
+                "required": [
+                  "tb-destination",
+                  "tb-stage",
+                  "tb-error-code",
+                  "tb-retry-not-before"
+                ],
+                "properties": { "tb-attempt": { "pattern": "^[1-9][0-9]{0,3}$" } }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "$comment": "Class dlq: failing stage and code required; destination only if the failure was at a destination.",
+      "if": { "properties": { "class": { "const": "dlq" } }, "required": ["class"] },
+      "then": {
+        "properties": {
+          "headers": {
+            "allOf": [
+              { "$ref": "#/$defs/requiredCore" },
+              { "required": ["tb-stage", "tb-error-code"] },
+              { "not": { "required": ["tb-retry-not-before"] } }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "$comment": "Class reply: correlation id is the whole point; tb-source and tb-attempt are optional.",
+      "if": { "properties": { "class": { "const": "reply" } }, "required": ["class"] },
+      "then": {
+        "properties": {
+          "headers": {
+            "required": [
+              "tb-msg-id",
+              "tb-channel",
+              "tb-channel-version",
+              "tb-received-at",
+              "tb-content-type",
+              "tb-correlation-id",
+              "traceparent"
+            ],
+            "not": {
+              "anyOf": [
+                { "required": ["tb-error-code"] },
+                { "required": ["tb-retry-not-before"] }
+              ]
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "requiredCore": {
+      "$comment": "Headers required on every data-plane class except reply.",
+      "required": [
+        "tb-msg-id",
+        "tb-channel",
+        "tb-channel-version",
+        "tb-source",
+        "tb-received-at",
+        "tb-content-type",
+        "tb-attempt",
+        "traceparent"
+      ]
+    },
+    "uuid7": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "uuidAny": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "rfc3339UtcMillis": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3,9}(Z|\\+00:00)$"
+    },
+    "stage": {
+      "type": "string",
+      "enum": [
+        "received",
+        "queued",
+        "filtered",
+        "transformed",
+        "routed",
+        "pending",
+        "sent",
+        "retrying",
+        "replied",
+        "error",
+        "dlq"
+      ]
+    },
+    "headers": {
+      "type": "object",
+      "description": "Kafka headers decoded to UTF-8 text, last value wins. At most 32 entries, 16 KiB total (not expressible here).",
+      "maxProperties": 32,
+      "additionalProperties": false,
+      "properties": {
+        "tb-msg-id": { "$ref": "#/$defs/uuid7" },
+        "tb-channel": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,63}$" },
+        "tb-channel-version": { "type": "string", "pattern": "^(0|[1-9][0-9]{0,9})$" },
+        "tb-source": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._:@/=\\[\\]-]{1,253}$",
+          "$comment": "Loose in v0. Recommended form <component>:<instance>@<peer>."
+        },
+        "tb-received-at": { "$ref": "#/$defs/rfc3339UtcMillis" },
+        "tb-content-type": {
+          "type": "string",
+          "maxLength": 255,
+          "pattern": "^[a-z]+/[a-zA-Z0-9.+_-]+( *; *[a-zA-Z0-9._-]+=[^;]{1,64})*$"
+        },
+        "tb-correlation-id": { "type": "string", "pattern": "^[A-Za-z0-9._:-]{1,128}$" },
+        "tb-parent-id": { "$ref": "#/$defs/uuidAny" },
+        "tb-attempt": { "type": "string", "pattern": "^(0|[1-9][0-9]{0,3})$" },
+        "traceparent": {
+          "type": "string",
+          "pattern": "^00-(?![0]{32})[0-9a-f]{32}-(?![0]{16})[0-9a-f]{16}-[0-9a-f]{2}$"
+        },
+        "tracestate": { "type": "string", "maxLength": 512 },
+        "tb-claim-check": {
+          "type": "string",
+          "maxLength": 2048,
+          "pattern": "^(s3|gs|az|https)://[^\\s]{1,2040}$"
+        },
+        "tb-destination": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,63}$" },
+        "tb-stage": { "$ref": "#/$defs/stage" },
+        "tb-error-code": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]{0,63}$" },
+        "tb-retry-not-before": { "$ref": "#/$defs/rfc3339UtcMillis" }
+      },
+      "patternProperties": {
+        "^tb-x-[a-z0-9-]{1,48}$": {
+          "type": "string",
+          "maxLength": 1024,
+          "$comment": "Experimental / spike-local. Never load-bearing."
+        },
+        "^tb-usr-[a-z0-9-]{1,48}$": {
+          "type": "string",
+          "maxLength": 1024,
+          "$comment": "Channel-defined. Propagated, never interpreted. No PHI (invariant 6)."
+        }
+      }
+    }
+  }
+}

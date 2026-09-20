@@ -1,0 +1,15 @@
+{
+  "class": "reply",
+  "topic": "prod.lab-query.reply",
+  "key": "01930b7e-4c88-7a10-b2d4-5e6f7a8b9c0d",
+  "payload_present": true,
+  "payload_size": 96,
+  "headers": {
+    "tb-msg-id": "01930b7e-5011-7c44-8e21-9a0b1c2d3e4f",
+    "tb-channel": "lab-query",
+    "tb-channel-version": "3",
+    "tb-received-at": "2026-09-20T11:22:33.123Z",
+    "tb-content-type": "application/hl7-v2+er7",
+    "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-aa11bb22cc33dd44-01"
+  }
+}

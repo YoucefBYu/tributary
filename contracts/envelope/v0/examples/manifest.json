@@ -1,0 +1,93 @@
+{
+  "contract": "tributary.envelope/v0",
+  "schema": "../envelope.schema.json",
+  "note": "All keys and identifiers are synthetic (TRIBUTARY-SYNTH). Tests validate every 'valid' file expecting success and every 'invalid' file expecting exactly the documented violation.",
+  "valid": [
+    {
+      "file": "valid/raw-mllp-adt.json",
+      "note": "MLLP receive, minimum required header set on class raw"
+    },
+    {
+      "file": "valid/out-fhir-destination.json",
+      "note": "Routed to one destination; content type rewritten by the transform step"
+    },
+    {
+      "file": "valid/retry-tier-two.json",
+      "note": "Second delivery attempt on the shared retry topic with a delay tier"
+    },
+    {
+      "file": "valid/dlq-transform-error.json",
+      "note": "Pipeline step failure: failing stage and error code present, no destination"
+    },
+    {
+      "file": "valid/reply-sync-ack.json",
+      "note": "Synchronous reply keyed by correlation id; tb-source and tb-attempt omitted"
+    },
+    {
+      "file": "valid/raw-claim-check-dicom.json",
+      "note": "Claim-check: null payload, object-store URI in tb-claim-check"
+    },
+    {
+      "file": "valid/raw-reprocessed-with-parent.json",
+      "note": "Reprocess: new tb-msg-id, tb-parent-id set, channel-defined tb-usr-* header"
+    }
+  ],
+  "invalid": [
+    {
+      "file": "invalid/missing-msg-id.json",
+      "violates": "headers.required: tb-msg-id"
+    },
+    {
+      "file": "invalid/msg-id-not-uuid7.json",
+      "violates": "tb-msg-id must be UUIDv7 (this is a v4)"
+    },
+    {
+      "file": "invalid/received-at-non-utc.json",
+      "violates": "tb-received-at offset must be Z or +00:00"
+    },
+    {
+      "file": "invalid/received-at-no-millis.json",
+      "violates": "tb-received-at needs 3 to 9 fractional second digits"
+    },
+    {
+      "file": "invalid/unregistered-tb-header.json",
+      "violates": "headers.additionalProperties: tb-mesg-id is not in the registry (typo caught at produce time)"
+    },
+    {
+      "file": "invalid/claim-check-with-inline-payload.json",
+      "violates": "tb-claim-check present requires a null payload"
+    },
+    {
+      "file": "invalid/payload-over-inline-limit.json",
+      "violates": "payload_size over 1000000 without tb-claim-check"
+    },
+    {
+      "file": "invalid/retry-missing-not-before.json",
+      "violates": "class retry requires tb-retry-not-before"
+    },
+    {
+      "file": "invalid/retry-attempt-zero.json",
+      "violates": "class retry requires tb-attempt >= 1"
+    },
+    {
+      "file": "invalid/dlq-missing-stage.json",
+      "violates": "class dlq requires tb-stage"
+    },
+    {
+      "file": "invalid/raw-with-failure-headers.json",
+      "violates": "class raw must not carry tb-destination or tb-error-code"
+    },
+    {
+      "file": "invalid/traceparent-all-zero-trace-id.json",
+      "violates": "traceparent trace id must not be all zeroes (W3C)"
+    },
+    {
+      "file": "invalid/reply-missing-correlation-id.json",
+      "violates": "class reply requires tb-correlation-id"
+    },
+    {
+      "file": "invalid/channel-name-not-topic-safe.json",
+      "violates": "tb-channel must match ^[a-z][a-z0-9-]{0,63}$ so it can be a topic segment"
+    }
+  ]
+}

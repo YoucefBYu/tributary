@@ -1,0 +1,20 @@
+{
+  "v": 0,
+  "kind": "message",
+  "ts": "2026-09-20T11:22:33.688Z",
+  "channel": "adt-to-fhir",
+  "channel_version": 7,
+  "stage": "sent",
+  "status": "ok",
+  "instance": "loader:fhir-server-1@worker-9",
+  "message_id": "018f3a5c-7d21-7b3e-9f01-2c4a6e8b0d13",
+  "destination": "fhir-server",
+  "attempt": 0,
+  "content_type": "application/fhir+json",
+  "size_bytes": 2044,
+  "topic": "prod.adt-to-fhir.out.fhir-server",
+  "partition": 4,
+  "offset": 918109,
+  "duration_ms": 61.2,
+  "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-7d9b0a1c2e3f4050-01"
+}

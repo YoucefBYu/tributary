@@ -1,0 +1,15 @@
+{
+  "v": 0,
+  "kind": "partition",
+  "ts": "2026-09-20T11:24:09.440Z",
+  "channel": "adt-to-fhir",
+  "channel_version": 7,
+  "stage": "partition_resumed",
+  "status": "ok",
+  "instance": "loader:fhir-server-1@worker-9",
+  "destination": "fhir-server",
+  "topic": "prod.adt-to-fhir.out.fhir-server",
+  "partition": 4,
+  "duration_ms": 130430,
+  "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-cc33dd44ee55ff66-01"
+}

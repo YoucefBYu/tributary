@@ -1,0 +1,11 @@
+{
+  "v": 0,
+  "kind": "partition",
+  "ts": "2026-09-20T11:22:39.010Z",
+  "channel": "adt-to-fhir",
+  "channel_version": 7,
+  "stage": "partition_paused",
+  "status": "error",
+  "instance": "loader:fhir-server-1@worker-9",
+  "error_code": "HTTP_503"
+}

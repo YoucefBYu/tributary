@@ -1,0 +1,18 @@
+{
+  "v": 0,
+  "kind": "message",
+  "ts": "2026-09-20T11:24:01.099Z",
+  "channel": "pacs-ingest",
+  "channel_version": 1,
+  "stage": "received",
+  "status": "ok",
+  "instance": "dicom-receiver:recv-01",
+  "message_id": "01930b80-1a2b-7def-a123-456789abcdef",
+  "content_type": "application/dicom",
+  "size_bytes": 0,
+  "claim_check": "s3://tributary-claimcheck/prod/pacs-ingest/01930b80",
+  "topic": "prod.pacs-ingest.raw",
+  "partition": 2,
+  "offset": 771,
+  "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4737-0102030405060708-01"
+}

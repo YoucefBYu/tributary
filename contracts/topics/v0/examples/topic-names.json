@@ -1,0 +1,30 @@
+{
+  "contract": "tributary.topics/v0",
+  "schema": "../topic-name.schema.json",
+  "valid": [
+    "prod.adt-to-fhir.raw",
+    "prod.adt-to-fhir.out.fhir-server",
+    "prod.adt-to-fhir.retry",
+    "prod.adt-to-fhir.dlq",
+    "prod.lab-query.reply",
+    "dev.a.raw",
+    "staging-eu.pacs-ingest.out.s3-archive",
+    "_tb.prod.channels",
+    "_tb.prod.events",
+    "_tb.dev.audit"
+  ],
+  "invalid": [
+    { "name": "prod.ADT-to-FHIR.raw", "reason": "uppercase in the channel segment" },
+    { "name": "prod.adt_to_fhir.raw", "reason": "underscore is not in the segment charset" },
+    { "name": "prod.adt.to.fhir.raw", "reason": "dot inside the channel name makes the name ambiguous" },
+    { "name": "prod.adt-to-fhir.output", "reason": "unknown kind" },
+    { "name": "prod.adt-to-fhir.out", "reason": "kind out requires a destination segment" },
+    { "name": "prod.adt-to-fhir.raw.fhir-server", "reason": "only out takes a destination segment" },
+    { "name": "adt-to-fhir.raw", "reason": "missing environment segment" },
+    { "name": "prod.-adt.raw", "reason": "segment must start with a letter" },
+    { "name": "_tb.events", "reason": "platform topics are environment-scoped in v0" },
+    { "name": "_tb.prod.messages", "reason": "unknown platform kind" },
+    { "name": "prod..raw", "reason": "empty channel segment" },
+    { "name": "production-environment-eu-west.adt-to-fhir.raw", "reason": "env segment over 16 characters" }
+  ]
+}

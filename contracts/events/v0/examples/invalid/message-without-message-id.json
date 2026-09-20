@@ -1,0 +1,10 @@
+{
+  "v": 0,
+  "kind": "message",
+  "ts": "2026-09-20T11:22:33.128Z",
+  "channel": "adt-to-fhir",
+  "channel_version": 7,
+  "stage": "received",
+  "status": "ok",
+  "instance": "mllp-receiver:recv-7f3a"
+}

@@ -1,0 +1,128 @@
+{
+  "contract": "tributary.topics/v0",
+  "note": "One machine-readable source for topic defaults and the client settings that invariant 1 depends on. Values marked TODO are placeholders until the named spike reports; nothing here has been measured yet.",
+  "profiles": {
+    "production": {
+      "replication_factor": 3,
+      "min_insync_replicas": 2,
+      "rpo_zero": true
+    },
+    "lite": {
+      "replication_factor": 1,
+      "min_insync_replicas": 1,
+      "rpo_zero": false,
+      "warning": "RF=1 cannot guarantee RPO=0 for acknowledged messages. Development and accepted-risk small sites only; the runtime must log this at startup."
+    }
+  },
+  "classes": {
+    "raw": {
+      "partitions": 12,
+      "partitions_source": "ADR-001 5.3 default, TODO confirm against S4",
+      "configs": {
+        "cleanup.policy": "delete",
+        "retention.ms": 604800000,
+        "max.message.bytes": 1048576,
+        "compression.type": "producer"
+      }
+    },
+    "out": {
+      "partitions": "match the raw topic of the same channel",
+      "constraint": "MUST equal the raw partition count when the channel declares per-key ordering, otherwise the key-to-partition mapping differs and per-key order breaks (invariant 5). The runtime refuses to start on a mismatch.",
+      "configs": {
+        "cleanup.policy": "delete",
+        "retention.ms": 604800000,
+        "max.message.bytes": 1048576,
+        "compression.type": "producer"
+      }
+    },
+    "retry": {
+      "partitions": "match the raw topic of the same channel",
+      "configs": {
+        "cleanup.policy": "delete",
+        "retention.ms": 259200000,
+        "max.message.bytes": 1048576,
+        "compression.type": "producer"
+      }
+    },
+    "dlq": {
+      "partitions": 3,
+      "partitions_source": "keyed by tb-msg-id, low volume, read by humans",
+      "configs": {
+        "cleanup.policy": "delete",
+        "retention.ms": 2592000000,
+        "max.message.bytes": 1048576,
+        "compression.type": "producer"
+      }
+    },
+    "reply": {
+      "partitions": 12,
+      "configs": {
+        "cleanup.policy": "delete",
+        "retention.ms": 600000,
+        "segment.ms": 60000,
+        "max.message.bytes": 1048576,
+        "compression.type": "producer"
+      }
+    },
+    "channels": {
+      "partitions": 6,
+      "configs": {
+        "cleanup.policy": "compact",
+        "min.cleanable.dirty.ratio": "0.1",
+        "delete.retention.ms": 86400000,
+        "max.message.bytes": 1048576,
+        "compression.type": "producer"
+      }
+    },
+    "events": {
+      "partitions": 24,
+      "partitions_source": "TODO confirm against the measured event rate in S1/S2",
+      "configs": {
+        "cleanup.policy": "delete",
+        "retention.ms": 259200000,
+        "compression.type": "producer"
+      }
+    },
+    "audit": {
+      "partitions": 6,
+      "configs": {
+        "cleanup.policy": "delete",
+        "retention.ms": 2592000000,
+        "compression.type": "producer"
+      }
+    }
+  },
+  "broker": {
+    "unclean.leader.election.enable": "false",
+    "auto.create.topics.enable": "false",
+    "message.max.bytes": 1048576
+  },
+  "clients": {
+    "receiver_producer": {
+      "acks": "all",
+      "enable.idempotence": true,
+      "max.in.flight.requests.per.connection": 5,
+      "delivery.timeout.ms": 120000,
+      "linger.ms": 5,
+      "linger.ms_source": "TODO set from the S2 ACK-latency-versus-throughput curve",
+      "compression.type": "lz4",
+      "compression.type_source": "assumption, unmeasured: cheaper CPU than zstd for small text records"
+    },
+    "transactional_stage_producer": {
+      "acks": "all",
+      "enable.idempotence": true,
+      "transactional.id": "tb.<env>.<channel>.pipeline.<instance>"
+    },
+    "worker_consumer": {
+      "enable.auto.commit": false,
+      "partition.assignment.strategy": "cooperative-sticky",
+      "group.instance.id": "set per instance (static membership)",
+      "isolation.level": "read_committed on topics written by a transactional stage",
+      "max.poll.interval.ms": "at least the slowest destination timeout plus backoff"
+    }
+  },
+  "consumer_groups": {
+    "pattern": "tb.<env>.<channel>.<role>[.<destination>][.shadow-<label>]",
+    "roles": ["pipeline", "loader", "replier", "archiver"]
+  }
+}

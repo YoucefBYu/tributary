@@ -1,0 +1,14 @@
+{
+  "v": 0,
+  "kind": "message",
+  "ts": "2026-09-20T11:22:34.002Z",
+  "channel": "adt-to-fhir",
+  "channel_version": 7,
+  "stage": "retrying",
+  "status": "error",
+  "instance": "loader:dwh-3@worker-9",
+  "message_id": "018f3a5c-7d21-7b3e-9f01-2c4a6e8b0d13",
+  "destination": "dwh",
+  "attempt": 2,
+  "error_message": "destination returned 503"
+}

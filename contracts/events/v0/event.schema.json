@@ -1,0 +1,126 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tributary.dev/contracts/events/v0/event.schema.json",
+  "title": "Tributary lifecycle event on _tb.<env>.events, v0",
+  "description": "One JSON object per record. See README.md. Producers validate strictly; consumers ignore unknown fields and higher 'v' values rather than failing.",
+  "type": "object",
+  "required": ["v", "kind", "ts", "channel", "channel_version", "stage", "status", "instance"],
+  "additionalProperties": false,
+  "properties": {
+    "v": { "const": 0 },
+    "kind": { "enum": ["message", "partition"] },
+    "ts": { "$ref": "#/$defs/rfc3339UtcMillis" },
+    "channel": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,63}$" },
+    "channel_version": { "type": "integer", "minimum": 0 },
+    "stage": {
+      "enum": [
+        "received",
+        "queued",
+        "filtered",
+        "transformed",
+        "routed",
+        "pending",
+        "sent",
+        "retrying",
+        "replied",
+        "error",
+        "dlq",
+        "partition_paused",
+        "partition_resumed",
+        "partition_halted"
+      ]
+    },
+    "status": { "enum": ["ok", "error", "timeout", "dropped"] },
+    "instance": { "type": "string", "minLength": 1, "maxLength": 253 },
+    "message_id": { "$ref": "#/$defs/uuidAny" },
+    "parent_id": { "$ref": "#/$defs/uuidAny" },
+    "correlation_id": { "type": "string", "pattern": "^[A-Za-z0-9._:-]{1,128}$" },
+    "destination": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,63}$" },
+    "attempt": { "type": "integer", "minimum": 0, "maximum": 9999 },
+    "content_type": { "type": "string", "maxLength": 255 },
+    "size_bytes": { "type": "integer", "minimum": 0 },
+    "claim_check": { "type": "string", "maxLength": 2048, "pattern": "^(s3|gs|az|https)://[^\\s]{1,2040}$" },
+    "topic": { "type": "string", "minLength": 1, "maxLength": 249 },
+    "partition": { "type": "integer", "minimum": 0 },
+    "offset": { "type": "integer", "minimum": 0 },
+    "error_code": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]{0,63}$" },
+    "error_message": {
+      "type": "string",
+      "maxLength": 512,
+      "description": "Redacted static text. Never str(exception), never payload bytes (invariant 6)."
+    },
+    "duration_ms": { "type": "number", "minimum": 0 },
+    "traceparent": {
+      "type": "string",
+      "pattern": "^00-(?![0]{32})[0-9a-f]{32}-(?![0]{16})[0-9a-f]{16}-[0-9a-f]{2}$"
+    },
+    "attrs": {
+      "type": "object",
+      "description": "Searchable metadata. Identifiers are keyed hashes with an _hmac suffix, never clear text.",
+      "maxProperties": 32,
+      "propertyNames": { "pattern": "^[a-z][a-z0-9_]{0,31}$" },
+      "additionalProperties": { "type": "string", "maxLength": 256 }
+    }
+  },
+  "allOf": [
+    {
+      "$comment": "Message events identify a message and use only message stages.",
+      "if": { "properties": { "kind": { "const": "message" } }, "required": ["kind"] },
+      "then": {
+        "required": ["message_id"],
+        "properties": {
+          "stage": {
+            "enum": [
+              "received",
+              "queued",
+              "filtered",
+              "transformed",
+              "routed",
+              "pending",
+              "sent",
+              "retrying",
+              "replied",
+              "error",
+              "dlq"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "$comment": "Partition events identify a partition and use only partition stages.",
+      "if": { "properties": { "kind": { "const": "partition" } }, "required": ["kind"] },
+      "then": {
+        "required": ["topic", "partition"],
+        "properties": {
+          "stage": {
+            "enum": ["partition_paused", "partition_resumed", "partition_halted"]
+          }
+        }
+      }
+    },
+    {
+      "$comment": "A failure must name a machine-readable cause, or alerting cannot group it.",
+      "if": {
+        "properties": { "status": { "enum": ["error", "timeout"] } },
+        "required": ["status"]
+      },
+      "then": { "required": ["error_code"] }
+    },
+    {
+      "$comment": "A claim-checked payload has no inline bytes.",
+      "if": { "required": ["claim_check"] },
+      "then": { "properties": { "size_bytes": { "const": 0 } } }
+    }
+  ],
+  "$defs": {
+    "uuidAny": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "rfc3339UtcMillis": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3,9}(Z|\\+00:00)$"
+    }
+  }
+}

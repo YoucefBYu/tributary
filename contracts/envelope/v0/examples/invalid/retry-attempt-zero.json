@@ -1,0 +1,21 @@
+{
+  "class": "retry",
+  "topic": "prod.adt-to-fhir.retry",
+  "key": "TRIBUTARY-SYNTH-MRN-000123",
+  "payload_present": true,
+  "payload_size": 2044,
+  "headers": {
+    "tb-msg-id": "018f3a5c-7d21-7b3e-9f01-2c4a6e8b0d13",
+    "tb-channel": "adt-to-fhir",
+    "tb-channel-version": "7",
+    "tb-source": "loader:dwh-3@worker-9",
+    "tb-received-at": "2026-09-20T11:22:33.123Z",
+    "tb-content-type": "application/fhir+json",
+    "tb-attempt": "0",
+    "tb-destination": "dwh",
+    "tb-stage": "retrying",
+    "tb-error-code": "HTTP_503",
+    "tb-retry-not-before": "2026-09-20T11:23:33.500Z",
+    "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-7d9b0a1c2e3f4050-01"
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "class": "raw",
+  "topic": "prod.cda-ingest.raw",
+  "key": "TRIBUTARY-SYNTH-MRN-000999",
+  "payload_present": true,
+  "payload_size": 1200000,
+  "headers": {
+    "tb-msg-id": "01930b82-0011-7c22-8933-aabbccddeeff",
+    "tb-channel": "cda-ingest",
+    "tb-channel-version": "2",
+    "tb-source": "http-receiver:recv-11@10.0.4.9:8443",
+    "tb-received-at": "2026-09-20T11:30:00.000Z",
+    "tb-content-type": "application/xml",
+    "tb-attempt": "0",
+    "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4738-1112131415161718-01"
+  }
+}
