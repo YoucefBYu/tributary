@@ -1,11 +1,11 @@
 # ADR-002: Topic Topology and Envelope Specification
 
-**Status:** Proposed — **SKELETON. Every number marked `TODO(Sn)` is a placeholder, not a result.**
-**Date:** 2026-09-20 (drafted), to be completed at P0-3 synthesis
+**Status:** Proposed — **completed at P0-3 2026-09-20. Every `TODO(Sn)` is filled from a filed spike report;** the one question that stayed unmeasured (`_tb.events` throughput) says so.
+**Date:** 2026-09-20 (drafted), completed at P0-3 synthesis
 **Deciders:** architect, with human sign-off at the Phase 0 gate
 **Relates to:** ADR-001 sections 5.3, 5.4, 7.2 · invariants 1, 2, 5, 8
 **Contracts:** `contracts/topics/v0`, `contracts/envelope/v0`
-**Evidence:** `docs/spikes/S2-*.md` (ACK path), `docs/spikes/S4-*.md` (topic count), `docs/spikes/S5-*.md` (ordering) — **none filed at the time of drafting**
+**Evidence:** `docs/spikes/S2-mllp-kafka.md` (ACK path), `docs/spikes/S4-topic-scale.md` (topic count), `docs/spikes/S5-ordering-retry.md` (ordering), rated in `docs/spikes/reviews/phase-0-evidence-review.md`. **All Phase 0 measurements come from one Windows/Docker-Desktop laptop and are lower bounds** — `docs/spikes/PHASE-0-DECISION.md` section 2.
 
 ---
 
@@ -29,14 +29,17 @@ Forces:
 
 ### 1.1 Measured evidence
 
+Filled at P0-3 from the filed reports. **Every number is from one Windows/Docker-Desktop laptop and
+is a lower bound, not a cluster limit** (`docs/spikes/PHASE-0-DECISION.md` section 2).
+
 | Question | Spike | Result |
 |---|---|---|
-| Partitions and topics a 3-node KRaft cluster tolerates before operations degrade | S4 | TODO(S4) |
-| Consumer-group startup and rebalance time at 500 and 1,000 channels | S4 | TODO(S4) — threshold: 500 channels, rebalance under 30 s |
-| Broker and controller memory at that topic count | S4 | TODO(S4) |
-| p99 receive-to-ACK with `acks=all`, RF=3, `min.insync.replicas=2` | S2 | TODO(S2) — threshold: under 50 ms at 1k msg/s |
-| Acknowledged-message loss on partition-leader kill | S2 | TODO(S2) — threshold: zero over 20 trials |
-| Whether `_tb.events` at ~4 events per message keeps up | S1/S2 | TODO |
+| Partitions and topics a 3-node KRaft cluster tolerates before operations degrade | S4 | **12,009 partitions healthy** (1,000 channels at 3 per topic, 1 GB heap); **about 21,000 fatal** — OOM and raft-quorum loss at about 425 to 450 channels at 12 per topic. Nothing tested between 12k and 21k. Degradation order: JVM heap first, then create latency, then `list_topics`, then produce-ACK |
+| Consumer-group startup and rebalance time at 500 and 1,000 channels | S4 | **PASS at 3 partitions per topic:** 100 groups over 1,000 channels reached full assignment in **4.3 s**; pattern-subscribed first join 0.9 s; cooperative adds 5.5 s / 5.3 s. **Static-member removal 43.8 s — bounded by the 45 s default `session.timeout.ms`, not by topic count** |
+| Broker and controller memory at that topic count | S4 | 0.5 to 0.6 GiB per broker container at 1,206 partitions, rising to **1.4 GiB at 12,009**. About 48 fds per channel per broker; fds are not the constraint |
+| p99 receive-to-ACK with `acks=all`, RF=3, `min.insync.replicas=2` | S2 | **NOT MET as measured, cause unresolved.** 1k-cell steady p99 **33 to 125 ms** across 11 cell runs (2 under 50 ms), p50 5 to 25 ms. A bare producer with no MLLP had p99 131 ms on the same cluster; the MLLP path with Kafka removed had p99 2.7 ms |
+| Acknowledged-message loss on partition-leader kill | S2 | **No loss observed, 20/20 trials**, 244,710 messages acknowledged. Rated "SUPPORTED (small-sample)"; 20 clean trials bound per-trial loss only to about 14% at 95% confidence |
+| Whether `_tb.events` at ~4 events per message keeps up | S1/S2 | **Still unmeasured.** No spike exercised the archive path under load; the events contract carries the TODO |
 
 ---
 
@@ -84,17 +87,72 @@ retransform on every retry makes delivery non-deterministic.
 
 **Give up:** topic count. Mitigation if S4 says the ceiling is near: topic sharing (D4).
 
-### D4. Topic sharing for small channels (conditional — TODO(S4))
+### D4. Topic sharing for small channels (decided from S4: keep it, trigger stated in partitions)
 
 Grammar needs no change: a share group takes the `channel` position and consumers filter on the
-`tb-channel` header. Enabled or not, and the volume threshold, wait on S4.
-TODO(S4): state the threshold and whether it ships in the MVP.
+`tb-channel` header.
 
-### D5. Partition defaults (TODO(S4))
+**The trigger is expressed in projected total partitions, not channels** — `channels x 4 x
+partitions`. Channels are the wrong unit because the same channel count is fine or fatal depending on
+the partition default, which is exactly what S4 found. For a 3-broker cluster with 1 GB heaps:
 
-Draft defaults in `contracts/topics/v0/topic-defaults.json`: 12 per channel topic, 3 for `dlq`, 24
-for `_tb.events`. These are ADR-001 planning values, not measurements.
-TODO(S4): confirm or revise, and state the per-cluster channel ceiling.
+| Trigger | Value | Basis |
+|---|---|---|
+| Warn | 8,000 projected partitions | **judgement, not a measurement** |
+| Switch new channels to shared topics | 12,000 | **measured** — the highest count tested healthy |
+| Believed fatal | about 20,000 | **one failure in one run at a computed count of about 21,000.** Nothing was tested between 12,000 and 21,000, so the real cliff could be anywhere in that range |
+
+**Does it ship in the MVP?** The *trigger and the warning* do; the sharing mechanism itself does not
+have to. At the new partition default of 3, a 1 GB three-broker cluster reaches 12,000 projected
+partitions at about 1,000 channels, which is past the 500-channel target with margin. Sharing is
+therefore a documented escape hatch with a measured trigger rather than day-one MVP scope. Revisit if
+a design partner runs more than about 750 channels on one cluster.
+
+**Give up:** a share group cannot cross a tenant or trust boundary (D12), so a large multi-tenant
+deployment hits the ceiling before sharing can help and needs more brokers instead. S4 measured no
+throughput or skew figures for shared topics — the `shared` scenario was not run — so the mechanism's
+cost is still unknown.
+
+### D5. Partition defaults (decided from S4: 3 per channel topic, revised down from 12)
+
+| Topic class | Default | Basis |
+|---|---|---|
+| `raw`, `out.<dest>`, `retry`, `dlq` | **3** | **Measured:** 1,000 channels (12,009 partitions) healthy at 1 GB heap. At 12 per topic the cluster was lost at about 425 to 450 channels — the plan's own 500-channel threshold **failed** |
+| `_tb.<env>.events` | 24 | ADR-001 planning value, **still unmeasured**: no spike exercised the archive path under load |
+| `_tb.<env>.channels`, `_tb.<env>.audit` | 6 | Planning value; low volume, not a measured constraint |
+
+Overridable per channel in the spec where throughput needs it. S4 suggests 1 partition for `retry`
+and `dlq` as a further saving; **not tested**, so not adopted.
+
+**Per-cluster channel ceiling, as measured:** at least 1,000 channels at 3 partitions per topic on
+3 brokers with 1 GB heaps; about 425 to 450 at 12. Both are lower bounds from a 7.4 GiB Docker VM on a
+Windows laptop, with idle topics carrying only a 300-message probe. **Re-measure on real broker memory
+before quoting either as a product limit**, and do not scale them with heap: the 2 GB runs disagreed
+with each other by more than 3x and are inconclusive.
+
+**Give up:** 3 partitions caps a single channel's consumer parallelism at 3 without an override, so a
+high-volume channel must opt into more. That is the right default for an estate of many small
+channels, which is the Mirth-replacement shape; it is the wrong default for a handful of very large
+ones, and the override exists for them.
+
+`out.<dest>` MUST match its `raw` partition count for per-key-ordered channels. Different counts
+change the key-to-partition mapping, so two messages for one patient can be consumed by different
+workers and delivered out of order — a silent invariant-5 violation. The runtime refuses to start on
+a mismatch.
+
+### D5.1 `session.timeout.ms` must be set explicitly (decided from S4 and S5)
+
+The Kafka default of 45 s is the wrong default for an ordered channel: it is the floor on how long a
+partition stops after a worker is killed. **Set it explicitly to 10 to 15 s, with
+`heartbeat.interval.ms` at a third of it.**
+
+Two independent measurements agree that recovery tracks this setting: S5 measured 10.01 s and 11.32 s
+takeover at a 10 s timeout, and S4 measured 43.8 s static-member removal against the 45 s default,
+from a different harness on a different workload.
+
+**Give up:** a shorter timeout makes spurious rebalances more likely on a loaded or GC-pausing worker.
+That trade must be documented for operators, and the value belongs in `topic-defaults.json` rather
+than in each component's code.
 
 `out.<dest>` MUST match its `raw` partition count for per-key-ordered channels. Different counts
 change the key-to-partition mapping, so two messages for one patient can be consumed by different

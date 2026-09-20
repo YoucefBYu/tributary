@@ -1,9 +1,10 @@
 # ADR-001: A Kafka-Centric, Python-Native Open-Source Integration Engine (Mirth Connect Competitor)
 
 **Working codename:** Tributary (placeholder, check trademarks before adopting)
-**Status:** Proposed
+**Status:** Proposed — **updated 2026-09-20 with Phase 0 measurements** (sections 5.3, 6.3, 7.1, 7.3, 13, 14). Awaiting human sign-off at the Phase 0 gate.
 **Date:** 2026-09-20
 **Deciders:** Project founders / architecture review board (to be named)
+**Phase 0 verdict:** GO WITH CHANGES — `docs/spikes/PHASE-0-DECISION.md`. No invariant changed. Two planning values were wrong and are corrected in place: the 12-partition default (5.3) and the 200-500 msg/s/core estimate (6.3).
 
 ---
 
@@ -203,7 +204,15 @@ Reference broker is Apache Kafka 4.x in KRaft mode (Apache 2.0, no ZooKeeper). K
 | `_tb.events` | Lifecycle events for every message and stage (feeds archiver, metrics, alerts) | message id | 3 days |
 | `_tb.audit` | Control-plane and access audit events | actor | 30 days (then archived) |
 
-**Partition sizing:** default 12 partitions per channel topic; raise for high-volume channels. With 500 channels and about 4 topics each, 12 partitions gives roughly 24k partitions, which is workable on a KRaft cluster but needs testing. Mitigation: topic-sharing groups for very small channels (channel id in header, separate consumer filters) as an opt-in.
+**Partition sizing — MEASURED, and the original planning value was wrong.** S4 tested exactly this assumption and it failed: at 12 partitions per topic the cluster was lost at about **425 to 450 channels**, short of the 500-channel target, at roughly 21,000 partitions (3 brokers, 1 GB heap each, 7.4 GiB Docker VM). At **3 partitions per topic, 1,000 channels (12,009 partitions) were healthy.**
+
+Default is therefore **3 partitions per channel topic** (`contracts/topics/v0/topic-defaults.json`, ADR-002 D5), overridable per channel where throughput needs more. The "roughly 24k partitions, workable but needs testing" sentence above was the assumption; the test says 24k is past the cliff on a cluster of that size.
+
+Topic sharing stays the mitigation, with its trigger expressed in **projected total partitions** rather than channels (`channels x 4 x partitions`): warn at 8,000, share new channels at 12,000 for a 3-broker 1 GB cluster (ADR-002 D4). 12,000 is measured; 8,000 is judgement; the fatal point is one failure at a computed count, and nothing was tested between 12,000 and 21,000.
+
+`out.<dest>` MUST match its `raw` partition count on per-key-ordered channels, or the key-to-partition mapping differs and order breaks silently (invariant 5).
+
+**Caveat:** these are lower bounds from one laptop-hosted cluster, not cluster limits. Re-measure on real broker memory before using them for sizing. See `docs/spikes/S4-topic-scale.md` and `docs/spikes/PHASE-0-DECISION.md` section 2.
 
 ### 5.4 Message envelope
 
@@ -335,7 +344,10 @@ SDK design rules:
 - One worker process per group of partitions; parallelism scales with processes across pods, which sidesteps the GIL. I/O-bound steps use asyncio inside a worker.
 - Hot-path libraries: `orjson`, pydantic v2 (Rust core), lazy HL7 segment parsing (parse only what a step touches).
 - Escape hatches, in order: PyO3/Rust extension for the HL7 parser, then Rust/Go receivers, then free-threaded Python builds as they mature.
-- **Planning estimate:** 2 to 5 ms per message for parse plus transform, so roughly 200 to 500 msg/s per core. This must be measured in the Phase 0 benchmark spike and published.
+- ~~**Planning estimate:** 2 to 5 ms per message for parse plus transform, so roughly 200 to 500 msg/s per core.~~ **MEASURED (S1), and the estimate was pessimistic by one to two orders of magnitude.** Parse plus ADT-to-FHIR transform, single core, solo host: a **minimal lazy parser at 36,322 msg/s/core** (27 us p50) and **`python-hl7` at 2,446 msg/s/core** (355 us p50). `hl7apy` manages **100 msg/s/core** (8.6 ms p50) and **fails** the 200 msg/s/core threshold, so it must stay off the hot path; it remains useful for validation and profile checks where 12 ms and 250 KB per message are acceptable.
+- **Consequence: the PyO3/Rust parser escape hatch is not needed for this target.** S1b was proposed if the threshold was missed; it was met with 12x margin on the conservative candidate. The escape-hatch ordering above stands for future needs, but nothing in Phase 0 justifies spending it now.
+- **Memory per parsed message** matters as much as speed for claim-check-sized and batch messages: lazy 0.8 KB, `python-hl7` 62 KB, `hl7apy` 251 KB, against a 465 B raw message.
+- **Caveats on the number.** Windows host, not Linux CI; a small ADT-shaped mapping, not a production one with terminology lookups; and the lazy parser is not spec-complete (no escape sequences or repetition handling), so 36k is a ceiling, not the figure for a finished parser. At the 200 msg/s/core threshold a message has a 5 ms budget, of which `python-hl7` already spends 0.5 ms. Re-measure on Linux and against a real mapping (`docs/spikes/S1-hl7-throughput.md`).
 
 ### 6.4 Delivery semantics, ordering and retries
 
@@ -473,6 +485,13 @@ Kafka makes these features cheap and they are the headline differentiators:
 | University hospital | 10 M | about 116 msg/s | about 1.2k msg/s | about 4 to 6 |
 | Regional HIE | 100 M | about 1.2k msg/s | about 11.6k msg/s | about 40 |
 
+**The core counts above are now conservative for transform, and say nothing about receive.** S1
+measured 2,446 msg/s/core with `python-hl7`, eight times the 300 msg/s/core used here, so transform
+is not the sizing constraint at these volumes. The binding constraint is the receive path: S2
+saturated a **single receiver process below 5k msg/s** on its host, so the Regional HIE peak needs
+multiple receiver processes and instances regardless of transform cost. Both figures are from one
+laptop-hosted cluster; do not size a deployment from them (`docs/spikes/PHASE-0-DECISION.md` 2).
+
 Storage for the 10 M/day case, assuming about 8 KB per message across raw and transformed topics and about 5x compression: about 16 GB/day, about 48 GB/day with RF=3, about 340 GB for 7-day retention cluster-wide. Archive in ClickHouse at about 8x compression: roughly 10 GB/day, about 3.6 TB/year. Python is not the bottleneck at these volumes; horizontal partitions are cheap.
 
 ### 7.2 Scaling
@@ -484,16 +503,24 @@ Storage for the 10 M/day case, assuming about 8 KB per message across raw and tr
 
 ### 7.3 Failure modes
 
-| Failure | Behavior |
-|---|---|
-| Receiver crashes mid-message | Sender sees no ACK and retransmits; optional edge dedupe |
-| Kafka broker down | RF=3 with `min.insync.replicas=2` keeps writing; below quorum, receivers NACK/refuse so senders retry (no silent loss) |
-| Worker crash | Rebalance; uncommitted offsets redelivered (at-least-once) |
-| Poison message | Retry in place, then DLQ with context; ordered channels can be configured to halt instead |
-| Destination outage | Backoff or circuit breaker; lag grows and alerts fire; other destinations unaffected |
-| ClickHouse or archiver down | Processing unaffected; archiver catches up from Kafka within retention |
-| PostgreSQL or API down | Data plane keeps running from compacted channel specs; deploys and UI edits unavailable |
-| Bad deploy | Roll back to previous digest; replay affected range from `raw` |
+Rows marked **measured** were exercised in Phase 0; the rest remain design intent.
+
+| Failure | Behavior | Evidence |
+|---|---|---|
+| Receiver crashes mid-message | Sender sees no ACK and retransmits; optional edge dedupe | not measured |
+| Kafka broker down (one of three) | RF=3 with `min.insync.replicas=2` keeps writing; below quorum, receivers NACK/refuse so senders retry (no silent loss) | **measured (S2):** no acknowledged loss observed in 20/20 leader-kill trials, 244,710 messages acknowledged. **New finding: ACKs stop for 7.5 to 12.7 s (median about 9.5 s) across *every* connection, not only the affected partition.** Cause inferred from code and timeline, not confirmed. Design consequence: per-connection head-of-line isolation is required in the product receiver |
+| Kafka below `min.insync.replicas` (two of three down) | Receivers refuse or NACK; nothing is acknowledged | **measured (S2):** 0 ACKs inside the outage window in 6/6 trials; first ACK 25 to 35 s after the kill; 10.6k to 13.7k NACKs per trial. Invariant 1 held |
+| Worker crash | Rebalance; uncommitted offsets redelivered (at-least-once) | **measured (S5):** 12 messages replayed after a `kill -9` at `commit_every=20`, **0 order violations, 0 loss**. Takeover is bounded below by `session.timeout.ms` (10.01 s at a 10 s setting; the 45 s default means a 45 s stop on an ordered partition) |
+| Worker restart with the same `group.instance.id` | Static membership avoids the session-timeout wait | **measured (S5):** 3.21 s recovery for 2.0 s downtime |
+| Adding a worker (scale-up) | Cooperative-sticky moves the minimum; unaffected partitions keep flowing | **measured (S5):** exactly 2 of 6 partitions moved, one from each founder; 0 duplicates, 0 losses, 0 reorderings |
+| Poison message | Retry in place, then DLQ with context; ordered channels can be configured to halt instead | **measured (S5):** exactly 8 of 8 dead-lettered, partition kept moving; `halt-partition` verified as the ordered alternative |
+| Transactional stage killed with a transaction open | Successor fences the dead producer, aborts the transaction, input offsets roll back | **measured (S5):** 50 records proven inside an open transaction at the kill; after restart, 2,000 records with 0 duplicates and 0 losses |
+| Destination outage | Backoff or circuit breaker; lag grows and alerts fire; other destinations unaffected | **partly measured (S5):** 598 blocking pause/seek/resume cycles, 0 loss, 0 skips. Outages of seconds only; a multi-minute outage against `max.poll.interval.ms` is untested |
+| Synchronous reply worker crash | Requests in flight time out; the receiver returns a NACK | **measured (S3, stand-in worker):** 5 to 6 s stall, 0 lost, no reply delivered to the wrong request. **The timed-out requests were already committed**, so a sender retry duplicates them downstream — sync mode requires loader idempotency on `tb-msg-id` and the timeout NACK means "committed, outcome unknown" |
+| ClickHouse or archiver down | Processing unaffected; archiver catches up from Kafka within retention | not measured |
+| PostgreSQL or API down | Data plane keeps running from compacted channel specs; deploys and UI edits unavailable | not measured |
+| Bad deploy | Roll back to previous digest; replay affected range from `raw` | not measured |
+| Broker loses quorum from partition-count pressure | — | **measured (S4):** at 12 partitions per topic the cluster died at about 425 to 450 channels, with metadata timeouts and raft election loss. This is a capacity failure mode the original table did not list |
 
 ### 7.4 Deployment topologies
 
@@ -626,15 +653,22 @@ MLLP/HTTP/SFTP/DB/Kafka/DICOM connectors, ACK semantics including sync mode, mes
 
 ## 13. Risks and Open Questions
 
-| Risk | Likelihood | Impact | Mitigation |
-|---|---|---|---|
-| Kafka is too heavy for target small sites | Medium | High | Lite distribution, managed offerings, sizing guide |
-| Python hot-path throughput below estimate | Medium | Medium | Phase 0 benchmark, PyO3 parser, Rust receivers as fallback |
-| Migration cost from JavaScript deters adopters | High | High | Importer, compat shim, assisted porting, shadow diff |
-| Healthcare buyers want references, certification, support SLAs | High | High | Early design partners, security documentation, paid support |
-| Topic/partition explosion with many channels | Medium | Medium | Topic sharing, partition defaults, load tests with 1k channels |
-| Contributor fragmentation with OIE | Medium | Medium | Open dialogue, interoperability, importer targeting OIE |
-| Security incident from arbitrary Python steps | Low to medium | High | Trust model, container isolation, signed bundles, review gates |
+Updated at the Phase 0 gate with the evidence column the spikes were meant to fill. Changes are in
+bold; the full version with ratings is `docs/spikes/PHASE-0-DECISION.md` section 9.
+
+| Risk | Likelihood | Impact | Measured evidence | Mitigation |
+|---|---|---|---|---|
+| Kafka is too heavy for target small sites | Medium | High | none — no spike addressed footprint | Lite distribution, managed offerings, sizing guide |
+| Python hot-path throughput below estimate | ~~Medium~~ **Low** | Medium | **S1: 2,446 msg/s/core (`python-hl7`), 36,322 (lazy), against a 200 threshold** | **PyO3 parser not needed**; re-measure on Linux and a production mapping |
+| Migration cost from JavaScript deters adopters | High | High | **none — S6 INCONCLUSIVE, no corpus available** | Importer, compat shim, assisted porting; **timebox Phase 1 effort rather than committing to an estimate** |
+| Healthcare buyers want references, certification, support SLAs | High | High | none | Early design partners, security documentation, paid support |
+| Topic/partition explosion with many channels | Medium | Medium | **S4: 12,009 partitions healthy, about 21,000 fatal at 1G heap; 500 channels FAIL at 12 partitions per topic, 1,000 PASS at 3** | **Partition default cut to 3; sharing trigger stated in projected partitions; re-measure on real broker memory** |
+| Contributor fragmentation with OIE | Medium | Medium | none | Open dialogue, interoperability, importer targeting OIE |
+| Security incident from arbitrary Python steps | Low to medium | High | none | Trust model, container isolation, signed bundles, review gates |
+| **Receiver-wide stall on a single broker loss** | **Medium** | **Medium** | **S2: 7.5 to 12.7 s across all connections, 20/20 trials; cause inferred** | **Per-connection head-of-line isolation; broker session and election tuning** |
+| **Sync-reply duplicates after a timeout NACK** | **High** | **Medium** | **S3: 1,026 of 9,000 requests timed out, all already committed** | **Loader idempotency on `tb-msg-id`; document `AE` as "committed, outcome unknown"** |
+| **ACK latency target unverified on production-like hardware** | **High** | **Medium** | **S2: p99 33 to 125 ms at 1k msg/s against a 50 ms threshold; a bare producer with no MLLP had p99 131 ms on the same cluster** | **Linux re-run with a dedicated cluster before any sizing or marketing claim** |
+| **Untested mechanisms carried forward** (`retry-topic` delay tiers, claim-check) | **Medium** | **Medium** | **none — neither was exercised in Phase 0** | **Spike both before implementing; claim-check is the largest single PHI store in the design** |
 
 **Open questions**
 1. Final name, trademark check, and governance (foundation, company, or community project).
@@ -649,13 +683,18 @@ MLLP/HTTP/SFTP/DB/Kafka/DICOM connectors, ACK semantics including sync mode, mes
 
 Timeline assumes a team of 3 to 5 engineers and is a rough planning estimate.
 
-**Phase 0: Spikes (4 to 6 weeks)**
-1. [ ] Benchmark Python HL7 v2 parse plus transform per core; compare pure Python and a Rust-backed parser.
-2. [ ] MLLP receiver with ACK-after-commit; measure p99 ACK latency and behavior on broker failure.
-3. [ ] Synchronous reply pattern prototype and timeout behavior.
-4. [ ] Topic-count stress test (500 to 1,000 channels) on a KRaft cluster.
-5. [ ] Blocking retry with partition pause/resume under rebalances.
-6. [ ] Import 10 real (anonymized) Mirth/OIE channels to size the migration effort.
+**Phase 0: Spikes — complete 2026-09-20. Verdict GO WITH CHANGES (`docs/spikes/PHASE-0-DECISION.md`).**
+1. [x] Benchmark Python HL7 v2 parse plus transform per core. **PASS** at 12x (`python-hl7`) and 182x (lazy); `hl7apy` FAILS. Rust-backed parser **not needed** — S1b dropped.
+2. [x] MLLP receiver with ACK-after-commit. **Zero-loss and no-ACK-while-unavailable MET; p99 ACK latency NOT MET as measured, cause unresolved** (environment-dominated; needs a Linux re-run). New finding: a single broker loss stalls all connections for 7.5 to 12.7 s.
+3. [x] Synchronous reply pattern prototype and timeout behavior. Established **against a stand-in worker**: +40 ms p50 at 100 msg/s, 4.6 KB per in-flight request, accurate timeouts, 0 loss across a worker restart. Timed-out requests are already committed, so sync mode needs loader idempotency.
+4. [x] Topic-count stress test. **500 channels FAIL at 12 partitions per topic, 1,000 channels PASS at 3.** Partition default changed to 3.
+5. [x] Blocking retry with partition pause/resume under rebalances. **PASS**, 0 order violations anywhere. `retry-topic` with delay tiers was **not implemented or measured** and still needs a spike.
+6. [ ] Import 10 real (anonymized) Mirth/OIE channels. **INCONCLUSIVE — no corpus was available.** Blocked on the human supplying anonymized exports; the estimate stays a guess until then.
+
+**Phase 0 follow-ups carried into Phase 1** (detail in `docs/spikes/PHASE-0-DECISION.md` section 8):
+re-run S1 and S2 on Linux CI with a dedicated cluster; spike `retry-topic` delay tiers and
+claim-check before implementing them; per-connection head-of-line isolation and multi-process
+receivers; build sync reply on the batched-commit path with fail-fast plus DLQ.
 
 **Phase 1: MVP (about 3 to 4 months)**
 7. [ ] Runtime: receivers (MLLP, HTTP, SFTP, Kafka), pipeline workers, loaders (HTTP/FHIR, PostgreSQL, ClickHouse, S3, SFTP, MLLP, Kafka).

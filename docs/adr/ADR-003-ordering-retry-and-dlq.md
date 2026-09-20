@@ -1,11 +1,11 @@
 # ADR-003: Ordering, Retry and DLQ Policy
 
-**Status:** Proposed — **SKELETON. Every number marked `TODO(Sn)` is a placeholder, not a result.**
-**Date:** 2026-09-20 (drafted), to be completed at P0-3 synthesis
+**Status:** Proposed — **completed at P0-3 2026-09-20.** Every `TODO(Sn)` is filled or, where the spike did not measure it, replaced by an explicit "not measured" with the decision deferred (D2, the retry-delay mechanism).
+**Date:** 2026-09-20 (drafted), completed at P0-3 synthesis
 **Deciders:** architect, with human sign-off at the Phase 0 gate
-**Relates to:** ADR-001 sections 5.5, 6.4, 7.3 · invariants 4, 5 · ADR-002
+**Relates to:** ADR-001 sections 5.5, 6.4, 6.5, 7.3 · invariants 4, 5 · ADR-002
 **Contracts:** `contracts/envelope/v0` (`tb-attempt`, `tb-stage`, `tb-error-code`, `tb-retry-not-before`), `contracts/events/v0`
-**Evidence:** `docs/spikes/S5-*.md` (ordering, retry, transactions), `docs/spikes/S2-*.md` (loss on broker failure) — **none filed at the time of drafting**
+**Evidence:** `docs/spikes/S5-ordering-retry.md` (ordering, retry, transactions), `docs/spikes/S2-mllp-kafka.md` (loss on broker failure), `docs/spikes/S3-sync-reply.md` (sync reply), rated in `docs/spikes/reviews/phase-0-evidence-review.md`. **All measurements come from one Windows/Docker-Desktop laptop** — `docs/spikes/PHASE-0-DECISION.md` section 2.
 
 ---
 
@@ -31,15 +31,19 @@ Forces:
 
 ### 1.1 Measured evidence
 
+Filled at P0-3. Ratings in parentheses are quoted from
+`docs/spikes/reviews/phase-0-evidence-review.md`; every number is from one laptop-hosted cluster.
+
 | Question | Spike | Result |
 |---|---|---|
-| Per-key order preserved across rebalances and consumer kills | S5 | TODO(S5) — threshold: order preserved |
-| Duplicate rate under fault injection | S5 | TODO(S5) — report, no threshold |
-| Commit-after-delivery verified | S5 | TODO(S5) |
-| Throughput cost of a transactional Kafka-to-Kafka stage vs at-least-once | S5 | TODO(S5) |
-| Partition pause/resume latency and behaviour under cooperative-sticky rebalance | S5 | TODO(S5) |
-| Acknowledged-message loss on partition-leader kill | S2 | TODO(S2) — threshold: zero over 20 trials |
-| Parse plus transform per core (sets how much headroom a blocking pause consumes) | S1 | TODO(S1) — threshold: at least 200 msg/s/core |
+| Per-key order preserved across rebalances and consumer kills | S5 | **0 violations** in 2,000 model fault schedules, 12 cluster scenarios, 13 integration tests — including a run where a `kill -9` replayed 12 messages ("SUPPORTED") |
+| Duplicate rate under fault injection | S5 | **0.60%** (`kill`, `static_restart` at `commit_every=20`), 0.10% (`broker_kill`), **0% without a fault**. Bounded by `commit_every` |
+| Commit-after-delivery verified | S5 | **0 violations**; online in the model's commit hook, and sampled every 250 ms through the kill window on the cluster, 144 samples ("SUPPORTED") |
+| Throughput cost of a transactional Kafka-to-Kafka stage vs at-least-once | S5 | **Not isolated.** `txn` ran 40 transactions of 50 with commit p50 under 1 ms and p99 78 ms, 0 aborts, but no side-by-side throughput comparison was run. The measured cost driver in the ordered path was `commit_every`, not transactions |
+| Partition pause/resume latency and behaviour under cooperative-sticky rebalance | S5 | **598 pause/seek/resume cycles, about 169 ms each — of which about 155 ms is the loader's 0.2 s poll timeout, not backoff or Kafka.** A joiner against a stable pair moved **exactly 2 of 6 partitions**, 0 duplicates, 0 reorderings ("SUPPORTED (single run; journal checked by the reviewer)") |
+| Acknowledged-message loss on partition-leader kill | S2 | **No loss observed, 20/20 trials**, 244,710 acknowledged ("SUPPORTED (small-sample)"). 20 clean trials bound per-trial loss only to about 14% at 95% confidence |
+| Parse plus transform per core (sets how much headroom a blocking pause consumes) | S1 | **2,446 msg/s/core** (`python-hl7`) and **36,322** (lazy) against the 200 threshold, so transform headroom is not what a blocking pause competes with |
+| `retry-topic` with delay tiers | S5 | **NOT IMPLEMENTED, NOT MEASURED.** The `retry` topic exists in the layout and is unused |
 
 ---
 
@@ -48,9 +52,16 @@ Forces:
 ### D1. Retry policy is per destination, declared in the spec (decided)
 
 `blocking` preserves order by pausing the partition; `retry-topic` maximises throughput and does not
-preserve order for retried messages. No default that silently reorders: TODO — confirm the default is
-`blocking`, since a healthcare integration engine that reorders by default is a patient-safety
-problem, and the operator cost (visible lag) is the safer failure.
+preserve order for retried messages.
+
+**Default: `blocking`.** A healthcare integration engine that reorders by default is a patient-safety
+problem (an A08 update applied before the A01 it updates), and the operator cost of the safe choice —
+visible lag — is the failure you can see. S5 measured what `blocking` costs: 598 real pause/seek/
+resume cycles at about 169 ms each, with **zero loss, zero reordering and zero offset skips**, and
+about 155 ms of each cycle was the loader's own poll timeout rather than anything inherent.
+
+**`retry-topic` may not be selected until it is spiked.** It was never implemented or measured in
+Phase 0, so it is a named option with no evidence behind it (section 5, follow-up 5).
 
 ### D2. Retry delay mechanism (options, TODO(S5) to choose)
 
@@ -63,8 +74,18 @@ Kafka has no per-record delay, so delay tiers need a mechanism.
 | (c) External scheduler re-injects due records | Control-plane timer | Flexible policy | Puts the control plane on the retry path, violating invariant 3 |
 
 (c) is rejected outright: invariant 3 requires the data plane to keep working when the control plane
-is down. The choice between (a) and (b) turns on the measured head-of-line cost.
-TODO(S5): choose, with the measurement.
+is down.
+
+**Not decided, because it was not measured.** S5 implemented and measured only `blocking` and
+DLQ-on-exhaustion; the head-of-line cost that separates (a) from (b) has no number behind it. S4
+supplies half the answer — option (b) multiplies topics per channel by the number of tiers, and at
+the measured budget (warn at 8,000 projected partitions, share at 12,000) three tiers would turn a
+1,000-channel estate into a 21,000-partition one, which is where S4's cluster died. That argues for
+(a) but does not establish that (a)'s head-of-line blocking is tolerable.
+
+**Decision deferred to a Phase 1 spike** covering both the delay mechanism and the head-of-line cost.
+`tb-retry-not-before` stays in `contracts/envelope/v0` either way: under (a) it is load-bearing, and
+under (b) it becomes advisory, which is an additive contract note rather than a break.
 
 ### D3. Exhaustion behaviour (decided shape, TODO default)
 
@@ -74,14 +95,26 @@ TODO(S5): choose, with the measurement.
 of growing lag and requiring a human. `dlq-and-continue` keeps the pipeline moving and moves the
 problem to the DLQ, at the cost of a gap in that key's order — later messages for a patient are
 delivered while an earlier one sits in the DLQ.
-TODO: set the default per policy (proposal: `blocking` defaults to `halt-partition`,
-`retry-topic` defaults to `dlq-and-continue`, since choosing `retry-topic` already accepts reordering).
+**Defaults: `blocking` → `halt-partition`; `retry-topic` → `dlq-and-continue`**, since choosing
+`retry-topic` already accepts reordering.
+
+S5 measured both halves. `halt-partition` works and is observable: in the `halt` scenario three
+partitions stopped and 443 messages were held behind them, with committed offsets well below the high
+watermarks — visible as lag and as `partition_halted` events, which is the point. `dlq-and-continue`
+also works: exactly 8 of 8 poison messages were dead-lettered and the partition kept moving.
+
+**What this costs:** `halt-partition` needs an operator, so alerting on `partition_halted` must exist
+before the MVP ships, not after. S5 did not measure a multi-minute outage — its pauses lasted seconds
+— so the interaction between a long pause and `max.poll.interval.ms` is an untested edge
+(follow-up 6).
 
 ### D4. Poison messages (decided)
 
-A step exception is retried in place a small configurable number of times (TODO: default, proposal 3),
-then routed to `dlq` with `tb-stage` and `tb-error-code` set and the original payload intact, so the
-message can be reprocessed after a code fix.
+A step exception is retried in place a small configurable number of times (**default 3**; not
+measured — S5 exercised the DLQ path, not the retry count — so this is a judgement, chosen because a
+step exception is usually deterministic and retrying it many times only delays the DLQ), then routed
+to `dlq` with `tb-stage` and `tb-error-code` set and the original payload intact, so the message can
+be reprocessed after a code fix.
 
 The DLQ record carries a **code, never exception text**. The redacted human message goes to
 `_tb.events.error_message`. Exception text from HL7 and FHIR parsers routinely quotes the offending
@@ -100,16 +133,45 @@ correctly idempotent on `tb-msg-id`.
 
 Transactions (read-process-write with offsets in the transaction) apply to `raw` → `out.<dest>`. No
 external destination gets exactly-once, because no external system offers the required atomicity.
-TODO(S5): report the throughput cost and state whether transactions are on by default or opt-in.
 
-### D7. Ordering under rebalance (TODO(S5))
+**Measured (S5):** exactly-once held **across a kill with a transaction open** — 50 records were
+proven to be inside an open transaction at the moment of the kill (the difference between a
+`read_uncommitted` and a `read_committed` read of `out`), and after restart on the same
+`transactional.id` the output held 2,000 records with 0 duplicates and 0 losses. The successor fenced
+the dead producer, aborted the transaction, and its input offsets rolled back with it. Commit p50 was
+under 1 ms, p99 78 ms, across 40 transactions of 50 records, with 0 aborts.
 
-Cooperative-sticky assignment plus static membership is required (`contracts/topics/v0` 3.3). Open:
-whether a paused partition's pause state survives a cooperative rebalance, or whether the new owner
-re-discovers the failure by retrying once.
-TODO(S5): state the observed behaviour. If pause state is lost, the first record after a rebalance is
-re-delivered, which at-least-once permits and idempotent loaders absorb — say so explicitly rather
-than implying order was broken.
+**Transactions stay opt-in, not on by default.** Two reasons, one measured and one not: the
+throughput cost against a plain at-least-once stage **was not isolated** in S5, so switching it on by
+default would be an unmeasured tax; and a `read_committed` consumer downstream stalls behind an open
+transaction if a producer dies, for up to `transaction.timeout.ms`. S5 hit the second edge as a bug —
+librdkafka refuses to construct a transactional producer whose `message.timeout.ms` exceeds
+`transaction.timeout.ms`, which is why the runtime clamps the former rather than raising the latter.
+
+**Give up:** channels that would benefit from exactly-once must ask for it. Measure the cost in
+Phase 1 before revisiting the default.
+
+### D7. Ordering under rebalance (measured, S5)
+
+Cooperative-sticky assignment plus static membership is required (`contracts/topics/v0` 3.3).
+**Observed behaviour, all with 0 order violations:**
+
+| Event | Measured | Why it behaves that way |
+|---|---|---|
+| A member joins a stable group | **Exactly 2 of 6 partitions moved**, one from each founder; the joiner delivered 540 records; **0 duplicates** | A cooperative revoke is a planned handover: the loader commits before giving up the partition, so the new owner resumes exactly where the old one stopped. The other four partitions were never revoked and kept flowing — the difference from eager assignment, which stops the whole channel |
+| A member is killed (`kill -9`) | **12 messages replayed** at `commit_every=20`; takeover **10.01 s** at a 10 s `session.timeout.ms` | The dying worker commits nothing, so the successor replays from the last commit. At-least-once permits this and idempotent loaders absorb it; **order was preserved through the replay** |
+| A member is killed with no replacement | Survivors pick the partitions up after **11.32 s** | Same session-timeout bound |
+| A member is restarted with the same `group.instance.id` | **3.21 s** for 2.0 s of downtime | Static membership skips the session-timeout wait for planned restarts |
+
+So static membership makes planned restarts cheap and unplanned deaths cost a full session timeout.
+**`session.timeout.ms` is the recovery-time floor for an ordered channel** and must be set explicitly
+(ADR-002 D5.1, `contracts/topics/v0` 3.3): at the 45 s Kafka default, an OOM-killed worker stops that
+partition for 45 s.
+
+**Pause state does not need to survive a rebalance.** The new owner re-discovers a failing destination
+by retrying once, which costs one redelivery — permitted by at-least-once, absorbed by an idempotent
+loader, and **not** a reordering. Zero duplicates in the cooperative-rebalance run and 12 after a kill
+are both the design working; they differ because one handover is planned and the other is not.
 
 ### D8. Edge duplicate suppression (deferred)
 
@@ -117,6 +179,35 @@ Optional dedupe on (sending application, MSH-10) within a window needs a state s
 RocksDB) and is a new dependency and failure mode. Not in the MVP unless a design partner needs it.
 Senders retransmitting on a missing ACK is the normal, correct behaviour that invariant 4 already
 covers.
+
+### D9. Synchronous reply requires downstream idempotency (decided from S3)
+
+**A timeout NACK in synchronous mode means "committed, outcome unknown" — never "not received".**
+
+S3 measured it: across a worker restart, 9,000 requests produced 7,974 `AA` and **1,026 `AE`
+timeouts, and every one of those 1,026 messages had already been committed to `raw`** before the wait
+began (invariant 1 requires exactly that ordering). The replacement worker then processed them and
+produced 1,026 late replies, which the receiver correctly dropped as unknown correlation ids. Loss
+across the restart was zero.
+
+The consequence is unavoidable rather than a defect: **a sender that retries after a timeout NACK
+creates a duplicate downstream.** Therefore:
+
+1. Every loader on a synchronous channel MUST be idempotent on `tb-msg-id` — invariant 4 already
+   requires this, and sync mode is where it stops being theoretical.
+2. The timeout NACK's meaning MUST be documented for integrators, who will otherwise read `AE` as
+   "resend it, nothing happened".
+3. The reply worker uses **fail-fast plus DLQ, not `blocking` retry**: pausing a partition to retry
+   one reply would stall every other sender's request on that partition, and the receiver's own
+   timeout is the correct control (S5's note to S3).
+4. The reply worker uses the **batched-commit path**. S5 measured `commit_every=1` at 4.9x the cost,
+   and S3's latency was already dominated by two Kafka commits per request.
+
+**Give up:** exactly-once semantics at the edge. No sender protocol offers it, and edge dedupe (D8)
+is the only mitigation — deferred, and a state store either way.
+
+**Caveat:** S3's numbers come from a **stand-in echo worker**, not a real pipeline worker. The
+mechanism and its failure semantics are established; the latency figures are not a product number.
 
 ---
 
@@ -141,7 +232,8 @@ partition pause means; Kafka share groups for unordered destinations.
 | Invariant 4 | Implemented: `tb-msg-id` is the idempotency key, duplicates are expected, reprocess mints a new id. |
 | Invariant 5 | Implemented: policy per destination, no silent reordering, partition pause is an event. |
 | Invariant 1 | Unaffected: nothing here acknowledges before a Kafka commit. |
-| No invariant change is proposed by this ADR. | If S5 shows per-key order cannot be preserved under rebalance, that **would** touch invariant 5 — escalate to the human with the measurement; do not weaken the invariant here. |
+| No invariant change is proposed by this ADR. | **S5 has now reported: 0 order violations across 2,000 model fault schedules, 12 cluster scenarios and 13 integration tests, including a kill that replayed 12 messages. Invariant 5 stands as written and nothing needs to be escalated.** |
+| Invariant 4 (again) | **Reinforced by measurement.** S5's ordering check judges the *first* delivery of each sequence number, so `1,2,3,1,3,2` passes — correct under at-least-once, and precisely why a loader that is not idempotent on `tb-msg-id` would experience a replay as a reordering. D9 makes the same point from the sync-reply side. |
 | `contracts/envelope/v0` | D2 depends on `tb-retry-not-before`; if option (b) wins, the header becomes advisory and the contract needs a note (additive). |
 | `contracts/events/v0` | Partition events are the observability contract for D3. |
 
@@ -149,8 +241,23 @@ partition pause means; Kafka share groups for unordered destinations.
 
 ## 5. Follow-ups
 
-1. Fill every TODO(Sn) from S5 and S2 before the Phase 0 gate.
+1. ~~Fill every TODO(Sn) from S5 and S2 before the Phase 0 gate.~~ **Done at P0-3**, except D2, which
+   is deferred with its reason.
 2. Loader idempotency matrix (ADR-001 6.4) becomes a tested table: one integration test per sink.
-3. Alert rules for `partition_halted` and DLQ arrival rate ship with the MVP, not after.
+3. Alert rules for `partition_halted` and DLQ arrival rate ship with the MVP, not after. D3's default
+   of `halt-partition` requires an operator, so the alert *is* the mitigation.
 4. Document the ordering and retry model for integrators in `docs/` — this is a migration blocker for
-   Mirth users, who expect per-destination queues with automatic retry.
+   Mirth users, who expect per-destination queues with automatic retry. Include D9's `AE` semantics.
+5. **Spike `retry-topic` with delay tiers** (D2) before any destination may select it: choose between
+   one topic plus `tb-retry-not-before` and one topic per tier, and measure the head-of-line cost that
+   separates them. It is the only policy in ADR-001 6.4 with no evidence behind it.
+6. **Decouple resume from the poll timeout** in `tributary-runtime`: about 155 ms of each 169 ms retry
+   cycle was `poll_timeout_s`, not backoff (S5 follow-up 1).
+7. **Test a multi-minute destination outage** against `max.poll.interval.ms`. S5's pauses lasted
+   seconds; a 30 s backoff cap under a 300 s poll interval is safe by arithmetic, and that should be a
+   test rather than an argument.
+8. **Measure the transactional stage against a plain at-least-once stage** before revisiting D6's
+   opt-in default.
+9. Port `test_librdkafka_semantics.py` into the runtime's test suite. It is four small tests that pin
+   the client behaviours the whole design assumes — including the one that proves pause-then-resume
+   without seeking back **silently loses the failed message**.

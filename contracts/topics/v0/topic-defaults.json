@@ -1,6 +1,6 @@
 {
   "contract": "tributary.topics/v0",
-  "note": "One machine-readable source for topic defaults, the security profile, and the client settings that invariant 1 depends on. Values marked TODO are placeholders until the named spike reports or until ADR-004 fixes deployment specifics; nothing here has been measured yet.",
+  "note": "One machine-readable source for topic defaults, the security profile, and the client settings that invariant 1 depends on. Partition defaults and session.timeout.ms are MEASURED (S4, S5, 2026-09-20) on a 3-broker 1 GB-heap cluster in a 7.4 GiB Docker VM on a Windows laptop: they are lower bounds, not cluster limits. Values marked TODO await ADR-004 or a Linux re-measurement.",
   "apply_order": [
     "classes[*].configs",
     "profiles[<profile>].class_config_overrides",
@@ -29,8 +29,8 @@
   },
   "classes": {
     "raw": {
-      "partitions": 12,
-      "partitions_source": "ADR-001 5.3 default, TODO confirm against S4",
+      "partitions": 3,
+      "partitions_source": "MEASURED (S4, ADR-002 D5): 1,000 channels at 3 partitions per topic = 12,009 partitions, healthy on 3 brokers with 1 GB heap. At the former default of 12 the cluster was lost at about 425-450 channels, failing the 500-channel threshold. Override per channel where throughput needs more.",
       "configs": {
         "cleanup.policy": "delete",
         "retention.ms": 604800000,
@@ -65,7 +65,7 @@
     },
     "dlq": {
       "partitions": 3,
-      "partitions_source": "keyed by tb-msg-id, low volume, read by humans",
+      "partitions_source": "keyed by tb-msg-id, low volume, read by humans. S4 suggests 1 would do for retry and dlq, but that was not tested, so it is not adopted.",
       "configs": {
         "cleanup.policy": "delete",
         "retention.ms": 2592000000,
@@ -76,7 +76,8 @@
       }
     },
     "reply": {
-      "partitions": 12,
+      "partitions": 3,
+      "partitions_source": "matches the channel default (S4). Sync-reply channels add a fifth topic, so the sharing trigger's channels x 4 x partitions projection understates them.",
       "configs": {
         "cleanup.policy": "delete",
         "retention.ms": 600000,
@@ -101,7 +102,7 @@
     },
     "events": {
       "partitions": 24,
-      "partitions_source": "TODO confirm against the measured event rate in S1/S2",
+      "partitions_source": "ADR-001 planning value, STILL UNMEASURED: no Phase 0 spike exercised the archive path under load. TODO(Phase 1): confirm against the measured event rate.",
       "configs": {
         "cleanup.policy": "delete",
         "retention.ms": 259200000,
@@ -189,8 +190,22 @@
       "partition.assignment.strategy": "cooperative-sticky",
       "group.instance.id": "set per instance (static membership)",
       "isolation.level": "read_committed on topics written by a transactional stage",
-      "max.poll.interval.ms": "at least the slowest destination timeout plus backoff"
+      "max.poll.interval.ms": "at least the slowest destination timeout plus backoff",
+      "session.timeout.ms": 15000,
+      "heartbeat.interval.ms": 5000,
+      "session.timeout.ms_source": "MEASURED (S5 and S4, ADR-002 D5.1). This is the recovery-time floor for an ordered channel: a killed worker's partitions cannot move until its session expires. S5 measured 10.01 s and 11.32 s takeover at a 10 s setting; S4 measured 43.8 s static-member removal at the 45 s Kafka default, from a different harness. 10-15 s is the recommended band; shorter raises the risk of spurious rebalances on a loaded or GC-pausing worker.",
+      "commit_every": "tunable per destination, default well above 1",
+      "commit_every_source": "MEASURED (S5): committing every 50 records instead of every 1 gave 4.9x throughput (151 -> 733 msg/s) for a replay window of 50 instead of 1. Invariant 4 requires loader idempotency on tb-msg-id anyway, so a window of 1 buys little."
     }
+  },
+  "partition_budget": {
+    "$comment": "MEASURED (S4, ADR-002 D4). Projected total partitions = channels x 4 x partitions (a sync-reply channel has 5 topics). Applies per tenant partition group, since a share group may not cross a tenant boundary.",
+    "warn_at_partitions": 8000,
+    "warn_at_partitions_basis": "judgement, NOT a measurement",
+    "share_new_channels_at_partitions": 12000,
+    "share_new_channels_at_partitions_basis": "measured: highest count tested healthy (1,000 channels at 3 partitions per topic, 1 GB heap, 3 brokers)",
+    "believed_fatal_at_partitions": 20000,
+    "believed_fatal_at_partitions_basis": "ONE failure in ONE run at a computed count of about 21,000. Nothing was tested between 12,000 and 21,000, so the cliff could be anywhere in that range. Do not scale with heap: the 2 GB runs were inconclusive."
   },
   "consumer_groups": {
     "pattern": "tb.<env>.<channel>.<role>[.<destination>][.shadow-<label>]",

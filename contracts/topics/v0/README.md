@@ -1,7 +1,7 @@
 # Contract: topic naming, defaults and required configuration — v0 (draft)
 
 **Contract id:** `tributary.topics/v0`
-**Status:** Draft. Partition and retention defaults carry TODO markers until S4 reports.
+**Status:** Draft. Partition defaults and `session.timeout.ms` are **measured** (S4, S5, 2026-09-20) and are lower bounds from a laptop-hosted cluster; `_tb.<env>.events` partitions and audit retention are still open.
 **Owner:** `architect`.
 **Source:** ADR-001 sections 5.3 and 6.4, refined by ADR-002.
 **Schema:** [`topic-name.schema.json`](topic-name.schema.json) · **Defaults:** [`topic-defaults.json`](topic-defaults.json) · **Examples:** [`examples/topic-names.json`](examples/topic-names.json)
@@ -100,13 +100,13 @@ Helm read one source instead of hardcoding three.
 
 | Class | Partitions | Retention | Cleanup |
 |---|---|---|---|
-| `raw` | 12 (TODO: confirm against S4) | 7 d | delete |
-| `out.<dest>` | 12, matching `raw` | 7 d | delete |
-| `retry` | 12, matching `raw` | 3 d | delete |
+| `raw` | **3** (measured, S4) | 7 d | delete |
+| `out.<dest>` | 3, matching `raw` | 7 d | delete |
+| `retry` | 3, matching `raw` | 3 d | delete |
 | `dlq` | 3 | 30 d | delete |
-| `reply` | 12 | 10 min | delete |
+| `reply` | 3 | 10 min | delete |
 | `_tb.<env>.channels` | 6 | compacted | compact |
-| `_tb.<env>.events` | 24 (TODO: confirm against S1/S2 event rate) | 3 d | delete |
+| `_tb.<env>.events` | 24 (**still unmeasured**, section 2.2) | 3 d | delete |
 | `_tb.<env>.audit` | 6 | 30 d (**TODO(human)**, section 2.1) | delete |
 
 `out.<dest>` MUST have the same partition count as its `raw` topic when the channel declares
@@ -148,6 +148,36 @@ Three questions for the human, carried in `docs/agent-team/STATUS.md`:
 Until that is answered, the 30-day value stands and is marked `TODO(human)` in
 [`topic-defaults.json`](topic-defaults.json). The `_tb.<env>.audit` event contract itself is unwritten
 (see the events contract, section 6), so nothing depends on this yet.
+
+### 2.2 Why 3 partitions, not 12 — and the partition budget
+
+**3 is measured, and it replaces a planning value that S4 disproved.** ADR-001 5.3 assumed 12 per
+channel topic. At 12, the plan's own 500-channel target killed the cluster at about **425 to 450
+channels** (roughly 21,000 partitions: JVM OOM, then loss of the raft quorum). At 3, **1,000 channels
+— 12,009 partitions — were healthy**, with `list_topics` at 0.17 s and 1.4 GiB per broker container.
+
+Budget for deciding when a cluster needs more brokers or topic sharing, in **projected total
+partitions** (`channels x 4 x partitions`; a sync-reply channel has five topics, so it counts for
+more):
+
+| Trigger | Partitions | Basis |
+|---|---|---|
+| Warn | 8,000 | **judgement, not a measurement** |
+| Share new channels | 12,000 | **measured** — the highest count tested healthy |
+| Believed fatal | about 20,000 | **one failure, one run, computed count.** Nothing was tested between 12,000 and 21,000 |
+
+Applies **per tenant partition group**, because a share group may not cross a tenant boundary
+(section 1.3). A large multi-tenant deployment therefore reaches the ceiling before sharing can help
+and needs more brokers instead.
+
+**All of this is from 3 brokers with 1 GB heaps in a 7.4 GiB Docker VM on a Windows laptop, with idle
+topics.** It is a lower bound, not a cluster limit. Do not scale it with heap: the 2 GB runs disagreed
+with each other by more than 3x and are inconclusive. Re-measure on real broker memory before using
+any of it for sizing (`docs/spikes/S4-topic-scale.md`).
+
+**`_tb.<env>.events` at 24 partitions is still a planning value.** No Phase 0 spike measured the
+archive path under load, so whether the archiver keeps up at roughly four events per message is
+unknown.
 
 ---
 
@@ -199,6 +229,8 @@ available, it NACKs or refuses the connection. It never ACKs optimistically.
 | `enable.auto.commit` | `false` | Commit after the side effect, never before (invariant 4). |
 | `partition.assignment.strategy` | `cooperative-sticky` | Avoid stop-the-world rebalances with many channels. |
 | `group.instance.id` | set (static membership) | A rolling restart must not trigger a full rebalance. |
+| `session.timeout.ms` | **15000** (band: 10000-15000), `heartbeat.interval.ms` at a third | **Measured (S5, S4).** This is the recovery-time floor for an ordered channel: a killed worker's partitions cannot move until its session expires, so the 45 s Kafka default means a 45 s stop on that partition. S5 measured 10.01 s and 11.32 s takeover at a 10 s setting; S4 measured 43.8 s static-member removal at the default. Shorter raises the risk of spurious rebalances on a loaded or GC-pausing worker — document the trade for operators. |
+| `commit_every` (runtime, not librdkafka) | tunable per destination, default well above 1 | **Measured (S5):** committing every 50 records rather than every 1 gave 4.9x throughput (151 → 733 msg/s) for a replay window of 50 instead of 1. Invariant 4 requires loader idempotency on `tb-msg-id` anyway, so a window of 1 buys little. |
 | `isolation.level` | `read_committed` on topics written by a transactional stage | Otherwise a consumer sees aborted records. |
 | `max.poll.interval.ms` | ≥ the slowest destination timeout plus backoff | Otherwise a slow sink looks like a dead consumer and causes a rebalance loop. |
 
@@ -271,7 +303,9 @@ each invalid one breaks. Tests validate each string against `topic-name.schema.j
 
 ## 5. Open items for v1
 
-- Partition defaults and the topic-count ceiling are placeholders until S4 reports.
+- Partition defaults and the topic-count ceiling are **measured** (section 2.2) but only on a
+  laptop-hosted cluster. Re-measure on real broker memory before publishing them as product limits.
+  `_tb.<env>.events` at 24 partitions remains unmeasured.
 - Tiered storage would let `raw` retention grow past 7 days and make replay the primary recovery
   path. Not in v0.
 - Section 3.4 states the required security profile and the ACL *shape*. The concrete ACL templates,

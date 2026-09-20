@@ -3,6 +3,29 @@
 Newest first. Each entry names the contract, the version, whether the change is additive or
 breaking, and the reason. Breaking changes reference an ADR.
 
+## 2026-09-20 (P0-3) — `tributary.topics/v0`: partition defaults and consumer timeouts, from measurements
+
+Still Draft, so these land in place without a version bump. Had v0 been frozen this would be
+**breaking for any deployment that already created topics**: partition counts cannot be changed on an
+existing topic without recreating it, and on an ordered channel `out.<dest>` must keep matching
+`raw`.
+
+| Change | From | To | Basis |
+|---|---|---|---|
+| Partitions per channel topic (`raw`, `out`, `retry`, `reply`) | 12 | **3** | **S4 measured.** At 12, the cluster was lost at about 425-450 channels — the plan's own 500-channel threshold failed. At 3, 1,000 channels (12,009 partitions) were healthy |
+| Partition budget | absent | `partition_budget` block: warn at 8,000 projected partitions, share at 12,000, believed fatal about 20,000 | S4. **12,000 measured; 8,000 judgement; 20,000 is one failure in one run at a computed count, with nothing tested between 12,000 and 21,000** |
+| `session.timeout.ms` | unset (Kafka default 45 s) | **15000**, band 10000-15000, `heartbeat.interval.ms` 5000 | **S5 and S4 independently.** It is the recovery-time floor for an ordered channel: 10.01 s and 11.32 s takeover at a 10 s setting (S5); 43.8 s static-member removal at the 45 s default (S4) |
+| `commit_every` | absent | tunable per destination, default well above 1 | **S5 measured:** 4.9x throughput (151 → 733 msg/s) for a replay window of 50 instead of 1 |
+| `_tb.<env>.events` partitions | 24, "TODO confirm against S1/S2" | 24, **"still unmeasured"** | No Phase 0 spike exercised the archive path under load. Honest label, not a new number |
+
+Every figure above is a **lower bound from one laptop-hosted cluster** (3 brokers, 1 GB heap, 7.4 GiB
+Docker VM on Windows, idle topics, mostly single runs) and must be re-measured on real broker memory
+before being used for sizing. Do not scale them with heap: the 2 GB runs disagreed with each other by
+more than 3x. See `docs/spikes/S4-topic-scale.md`, `docs/spikes/S5-ordering-retry.md` and
+`docs/spikes/PHASE-0-DECISION.md`.
+
+No schema changed, so the conformance suite is unaffected.
+
 ## 2026-09-20 (round 2) — security review, findings 6-14
 
 Second round against the same v0 Draft, from `docs/security/contracts-v0-review.md`. Nine findings:
