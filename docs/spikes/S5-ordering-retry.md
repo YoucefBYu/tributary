@@ -3,8 +3,9 @@
 Status: MEASURED 2026-09-20 by platform-engineer against the shared 3-broker spike cluster; awaiting architect verdict.
 
 **Threshold result: per-key order preserved, zero violations.** No counterexample in 2,000
-randomised fault schedules against the model, 13 real-cluster fault-injection scenarios, or 13
-real-cluster integration tests. `reordered_key_count` was 0 in every run.
+randomised fault schedules against the model, 12 real-cluster fault-injection scenarios, or 13
+real-cluster integration tests. `reordered_key_count` was 0 in every run, including the runs
+where a kill replayed 12 messages and where four partitions changed hands mid-flight.
 
 ### Which runs this report quotes
 
@@ -16,7 +17,7 @@ tables below therefore distinguish two run sets under `spikes/S5-ordering-retry/
 |---|---|---|
 | `*-14xxxx` (14:02-14:20) | First `s5.runner` run set, 2,000 messages | Superseded for `kill`, `static_restart`, `rebalance`; still the source for the other scenarios |
 | `*-142xxx` (14:25-14:31) | The `pytest -m integration` run set, 600 messages | Correctness only; never quoted for numbers |
-| `*-19xxxx` (19:29 onward) | Re-run after the review, 2,000 messages | **The source for `kill`, `static_restart`, `rebalance`, `txn_crash`** |
+| `*-19xxxx` and `*-20xxxx` (19:29-20:03) | Re-run after the review, 2,000 messages | **The source for `kill`, `static_restart`, `rebalance`, `txn_crash`** |
 
 Every number below names its run set where the two differ. The two High findings and what they
 changed are in "What the first runs did not demonstrate".
@@ -137,10 +138,10 @@ asserted.
 | `kill` (re-run) | 2012 | 2000 | **12** | 0.60% | 0 | yes | 0/0 | 131 | `commit_every=20`, killed mid-window; takeover gap **10.01 s** |
 | `static_hold` | 2000 | 2000 | 0 | 0% | 0 | yes | 0/0 | 81 | takeover gap **11.32 s**, nobody replaced the dead member |
 | `static_restart` (re-run) | 2012 | 2000 | **12** | 0.60% | 0 | yes | 0/0 | 124 | recovery **3.21 s** against 2.0 s downtime |
-| `rebalance` (re-run) | pending | | | | | | | | re-run blocked: cluster taken down mid-slot |
+| `rebalance` (re-run) | 2000 | 2000 | 0 | 0% | 0 | yes | 0/0 | 137 | worker-c delivered **628**; 4 partitions moved while worker-a was still running |
 | `broker_kill` | 2002 | 2000 | **2** | 0.10% | 0 | yes | 0/0 | 53 | 7.7 s to healthy; both workers dropped out of the group |
 | `txn` | 2000 | 2000 | 0 | 0% | 0 | yes | - | - | 40 transactions, commit p99 78 ms |
-| `txn_crash` | 2000 | 2000 | 0 | 0% | 0 | yes | - | - | killed mid-transaction, restarted on the same `transactional.id` |
+| `txn_crash` (re-run) | 2000 | 2000 | 0 | 0% | 0 | yes | - | - | **50 records proven inside an open transaction at the kill**; restarted on the same `transactional.id` |
 
 `commit_after_delivery_violations` was empty and `phi_findings` was empty in all twelve.
 `undrained_partitions` was empty in all except `halt`, where three partitions are *supposed* to
@@ -195,17 +196,51 @@ configured backoff. The remaining ~155 ms is the loader's `poll_timeout_s=0.2` -
 checked at the top of the poll loop, so the poll timeout, not Kafka, sets the retry latency
 floor. That is a fixable implementation detail, not a property of the approach (follow-up 1).
 
+### Cooperative rebalance (re-run, `rebalance-200152`)
+
+A third member joined a tenth of the way through a 2,000-message run. Evidence that partitions
+actually moved, from the timestamped journal rather than from end-of-run revoke counts:
+
+| Evidence | Value |
+|---|---|
+| Partitions moved after the join | **4** (0, 1, 2, 3) |
+| Revokes by a worker that was *still running* | worker-a: 4; worker-b: 0; worker-c: 0 |
+| Partitions assigned to the joining member | 0 and 2 |
+| Records delivered by the joining member | **628** |
+| Duplicates / losses / reorderings | 0 / 0 / 0 |
+
+**Zero duplicates here is the correct result, not a weak one.** A cooperative revoke is a planned
+handover: `_on_revoke` commits before the partitions are given up, so the new owner starts exactly
+where the old one stopped and nothing is replayed. That is the contrast with `kill`, where the
+dying worker commits nothing and 12 messages are replayed. Both behaviours are the design working,
+and the distinction only became visible once shutdown revokes were separated from rebalance
+revokes.
+
 ### Transactions
 
 `txn`: 2,000 consumed, 2,000 produced, 40 transactions of 50, 0 aborts, 0 abortable and 0
 retriable errors, transaction commit p50 <1 ms and p99 78 ms.
 
-`txn_crash`: the stage was killed with a transaction open and restarted with the same
-`transactional.id`. The restarted process consumed 1,550 (the first incarnation had committed
-450) and the output topic, read with `read_committed`, held **2,000 records with 0 duplicates and
-0 losses**. The dangling transaction was aborted by `init_transactions` on the successor and its
-input offsets rolled back with it. Exactly-once holds across a kill for a Kafka-to-Kafka stage,
-which is the only place ADR-001 claims it.
+`txn_crash` (re-run, `txn_crash-200243`): the stage was killed mid-flight and restarted with the
+same `transactional.id`. Measured **between the kill and the restart**, which is the only window
+in which an open transaction is observable:
+
+| Read of `out` at the moment of the kill | Records |
+|---|---|
+| `read_uncommitted` | 500 |
+| `read_committed` | 450 |
+| **Inside the open transaction** | **50** |
+
+So a transaction holding 50 records really was open when the process died: those records were
+written but invisible to a `read_committed` reader. After the restart the output topic held
+**2,000 records with 0 duplicates and 0 losses**, so `init_transactions` in the successor fenced
+the dead producer and aborted that transaction, and its input offsets rolled back with it -- the
+restarted process re-consumed 1,550 records (the first incarnation had committed 450) and produced
+each exactly once. Exactly-once holds across a kill for a Kafka-to-Kafka stage, which is the only
+place ADR-001 claims it.
+
+Without the uncommitted-vs-committed read this scenario could have killed the stage between
+transactions and still passed; the run now fails if no transaction was open.
 
 ### Lifecycle events and PHI
 
@@ -243,7 +278,8 @@ and every worker revokes its partitions on clean shutdown. So High 2 applies to 
 test, not to the cluster scenario, but the evidence for both was worthless either way. Workers
 now write a timestamped assign/revoke/lost journal and count `revokes_while_running`, so a
 rebalance revoke is distinguishable from a shutdown revoke, and the joining member starts at a
-tenth of the run.
+tenth of the run. **Resolved by the re-run**: 4 partitions moved from a still-running worker and
+the joining member delivered 628 records (`rebalance-200152`).
 
 **4. Commit-after-delivery on the cluster was a final-state check.** It compared the last
 committed offset against the whole delivery log, which cannot catch a commit that ran ahead of
@@ -254,7 +290,8 @@ window: 144 samples in `kill`, zero violations.
 **5. `txn_crash` did not prove a transaction was open at the kill.** It could have killed the
 stage between transactions and still passed. The re-run reads `out` with `read_uncommitted` and
 `read_committed` between the kill and the restart; the difference is the open transaction, and
-the run now fails if there was none.
+the run now fails if there was none. **Resolved by the re-run**: 50 records were inside an open
+transaction at the kill (`txn_crash-200243`).
 
 **6. Property tests never asserted a fault fired.** A fault scheduled for poll 30 never runs if
 the loader finishes at poll 12, so small examples could be vacuous. Firing is now counted,
@@ -299,17 +336,9 @@ Reported because the first version of each *passed*:
 | Duplicate rate reported | 0.60% (`kill` and `static_restart`, `commit_every=20`), 0.10% (`broker_kill`), 0% without a fault; bounded by `commit_every` | **PASS** (reported) |
 | Commit-after-delivery verified | 0 violations; online in the model (commit hook) and sampled every 250 ms through the kill window on the cluster (144 samples) | **PASS** |
 | Blocking retry with partition pause and resume | 598 real cycles, 0 loss, 0 skips; seek-before-resume proven necessary by measurement, and a mutant that omits it is caught | **PASS** |
-| Cooperative-sticky and static membership | Static cost quantified in both directions and corroborated by S4. Cooperative partition movement: **re-run pending** (cluster taken down mid-slot) | **PASS** for static membership; `rebalance` **PENDING RE-RUN** |
-| Transactional Kafka-to-Kafka stage | Exactly-once held across a kill; proof that a transaction was open at the kill is **pending re-run** | **PASS**, open-transaction proof PENDING RE-RUN |
+| Cooperative-sticky and static membership | Static cost quantified in both directions and corroborated by S4. Cooperative movement: 4 partitions moved from a still-running worker to the joining member, which then delivered 628 records, with 0 duplicates and 0 losses | **PASS** |
+| Transactional Kafka-to-Kafka stage | Exactly-once held across a kill, with 50 records proven to be inside an open transaction at the moment of the kill | **PASS** |
 | Poison message to DLQ | Exactly the 8 poison messages dead-lettered, partition kept moving; `halt-partition` verified as the order-preserving alternative | **PASS** |
-
-Two rows are PENDING RE-RUN because the cluster was taken down during the re-run slot after
-`kill` and `static_restart` completed. The code for both is committed and the fast suite is
-green; they need about 3 minutes of cluster time. Until they are re-run, the `rebalance` claim
-rests on `rebalance-141321` (worker-c delivered 323 records, so partitions did move) with the
-weak revoke-count evidence described above, and the `txn_crash` claim rests on the observed
-outcome (2,000 in, 2,000 out, 0 duplicates) without proof that a transaction was open at the
-moment of the kill.
 
 **Recommendation: GO for the ordering and retry design in ADR-001 6.4, with the defaults below.**
 Nothing measured here contradicts invariants 1-5 or 7. No ADR change is required; three defaults
