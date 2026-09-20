@@ -1,0 +1,22 @@
+{"kind": "baseline", "heap": "2G", "partitions_per_topic": 12, "ts": 1789921634.7221467, "list_topics_median_s": 0.06307770000421442, "list_topics_max_s": 0.07511430000158725, "topics": 1, "partitions": 12, "stats": {"tb-kafka1": {"mem": "376.4MiB / 7.436GiB", "mem_pct": "4.94%", "cpu": "4.93%", "proc": "fds=199 VmRSS: 408700 kB Threads: 120"}, "tb-kafka2": {"mem": "377.6MiB / 7.436GiB", "mem_pct": "4.96%", "cpu": "15.61%", "proc": "fds=198 VmRSS: 390920 kB Threads: 121"}, "tb-kafka3": {"mem": "393MiB / 7.436GiB", "mem_pct": "5.16%", "cpu": "4.65%", "proc": "fds=206 VmRSS: 385548 kB Threads: 1
+{"kind": "tier", "heap": "2G", "partitions_per_topic": 12, "ts": 1789921681.84707, "tier": 100, "channels_created": 100, "topics": 400, "partitions": 4800, "create_seconds": 35.825685300005716, "batches": [{"channels": 25, "seconds": 0.32459400000516325}, {"channels": 25, "seconds": 15.292860399997153}, {"channels": 25, "seconds": 10.591634800002794}, {"channels": 25, "seconds": 9.615755300001183}], "failed": null, "metadata": {"list_topics_median_s": 0.08288080000056652, "list_topics_max_s": 0.09374910000042291, "topics": 401, "partitions": 4812}, "stats": {"tb-kafka1": {"mem": "754.1MiB / 7.
+{"kind": "tier", "heap": "2G", "partitions_per_topic": 12, "ts": 1789921742.8714664, "tier": 250, "channels_created": 250, "topics": 1000, "partitions": 12000, "create_seconds": 44.829786400005105, "batches": [{"channels": 25, "seconds": 0.7961897000059253}, {"channels": 25, "seconds": 9.301085699997202}, {"channels": 25, "seconds": 8.473900299999514}, {"channels": 25, "seconds": 8.603441200000816}, {"channels": 25, "seconds": 7.91937820000021}, {"channels": 25, "seconds": 9.734365999996953}], "failed": null, "metadata": {"list_topics_median_s": 0.10749260000011418, "list_topics_max_s": 0.1279
+{"kind": "tier", "heap": "2G", "partitions_per_topic": 12, "ts": 1789921906.122896, "tier": 500, "channels_created": 500, "topics": 2000, "partitions": 24000, "create_seconds": 120.19997110000259, "batches": [{"channels": 25, "seconds": 0.842220599995926}, {"channels": 25, "seconds": 12.694629199999326}, {"channels": 25, "seconds": 12.852179100002104}, {"channels": 25, "seconds": 9.718342799998936}, {"channels": 25, "seconds": 11.971930700005032}, {"channels": 25, "seconds": 11.247751299997617}, {"channels": 25, "seconds": 11.327306500003033}, {"channels": 25, "seconds": 9.81112160000339}, {"c
+Traceback (most recent call last):
+  File "C:\Users\benye\.dev\healthcare-data-integration-saas\tributary\spikes\S4-topic-scale\s4.py", line 361, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "C:\Users\benye\.dev\healthcare-data-integration-saas\tributary\spikes\S4-topic-scale\s4.py", line 354, in main
+    a.fn(a)
+  File "C:\Users\benye\.dev\healthcare-data-integration-saas\tributary\spikes\S4-topic-scale\s4.py", line 145, in cmd_topics
+    metadata=metadata_latency(), stats=docker_stats(), probe=probe_produce(a.heap, f"tier{tier}"))
+                                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\benye\.dev\healthcare-data-integration-saas\tributary\spikes\S4-topic-scale\s4.py", line 101, in probe_produce
+    tbadmin.ensure_topics([tbadmin.TopicSpec(name, partitions=3)])
+  File "C:\Users\benye\.dev\healthcare-data-integration-saas\tributary\spikes\common\src\tbcommon\admin.py", line 66, in ensure_topics
+    existing = set(client.list_topics(timeout=10.0).topics)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\benye\.dev\healthcare-data-integration-saas\tributary\spikes\common\.venv\Lib\site-packages\confluent_kafka\admin\__init__.py", line 659, in list_topics
+    return super(AdminClient, self).list_topics(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+cimpl.KafkaException: KafkaError{code=_TRANSPORT,val=-195,str="Failed to get metadata: Local: Broker transport failure"}
