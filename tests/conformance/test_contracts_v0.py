@@ -19,9 +19,15 @@ EVENT_PHI_GUARDS = {
     "invalid/attrs-clear-text-mrn.json",
     "invalid/attrs-hmac-not-fixed-length-hex.json",
     "invalid/attrs-free-text-value.json",
+    "invalid/attrs-too-many-entries.json",
+    "invalid/attrs-hl7-delimiters.json",
     "invalid/claim-check-presigned-url.json",
 }
-ENVELOPE_CREDENTIAL_GUARDS = {"invalid/claim-check-presigned-url.json", "invalid/claim-check-with-userinfo.json"}
+ENVELOPE_PHI_GUARDS = {
+    "invalid/claim-check-presigned-url.json",
+    "invalid/claim-check-with-userinfo.json",
+    "invalid/correlation-id-sender-token.json",
+}
 
 
 def _safe(errors: list[Any]) -> list[str]:
@@ -77,7 +83,7 @@ def test_topic_name(schema: Path, name: str, should_pass: bool) -> None:
 
 @pytest.mark.parametrize(
     ("contract", "guards"),
-    [("events", EVENT_PHI_GUARDS), ("envelope", ENVELOPE_CREDENTIAL_GUARDS)],
+    [("events", EVENT_PHI_GUARDS), ("envelope", ENVELOPE_PHI_GUARDS)],
 )
 def test_guards_are_listed_and_enforced(contract: str, guards: set[str]) -> None:
     """Guards must stay in the manifest (not silently dropped) and must fail validation."""
