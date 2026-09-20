@@ -224,7 +224,10 @@ def cmd_regex_group(a: argparse.Namespace) -> None:
     def pump() -> None:
         while not stop.is_set():
             for c in list(members):
-                c.poll(0.05)
+                try:
+                    c.poll(0.05)
+                except RuntimeError:  # victim closed concurrently by the main thread
+                    pass
 
     threading.Thread(target=pump, daemon=True).start()
 
