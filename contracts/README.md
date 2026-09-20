@@ -18,7 +18,7 @@ for approval before implementing.
 |---|---|---|---|
 | Channel spec | JSON Schema plus examples | Phase 1 wave 1 | control plane, runtime, CLI, UI, migration |
 | Control-plane API | OpenAPI 3.1 | Phase 1 wave 1 | API, UI client generation, CLI, tests |
-| Audit events (`_tb.<env>.audit`) | JSON Schema | Phase 1, with RBAC | control plane, archive |
+| Audit events (`_tb.<env>.audit`) | JSON Schema | Phase 1, with RBAC — **blocked on the retention decision** (`topics/v0/README.md` 2.1): whether Kafka, ClickHouse or object storage is the system of record changes the contract, so settle that first | control plane, archive |
 
 ## Rules
 
@@ -46,11 +46,16 @@ One parameterised test per contract walks the manifest: every `valid` file must 
 `invalid` file must fail. `qa-engineer` owns the suite in `tests/conformance/`. The topics contract
 uses inline string lists instead of files, since a topic name is one string.
 
-**Status: re-run pending.** `tests/conformance/test_contracts_v0.py` (`qa-engineer`, 2026-09-20) passed
-62 / 0 / 0 and found no schema bugs — but that run covered the contracts *before* the security fixes of
-the same day (see `CHANGELOG.md`). Those fixes changed both schemas and added 6 examples, so the result
-is **superseded, not current**. New expected counts: envelope 7 valid / 16 invalid, events 8 / 14,
-topic names 10 / 12.
+**Status: re-run pending, expected 74 tests.** History, newest first:
+
+| Run | Result | Covers |
+|---|---|---|
+| after security round 2 | **not yet run** — expected **74**: envelope 7 valid / 18 invalid, events 8 / 16, topic names 10 / 12, plus 3 guard tests | Four invalid examples added for findings 7, 9 and 13 |
+| commit `ae4d3bd` | 70 / 0 / 0 | The five HIGH security fixes of round 1 |
+| 2026-09-20, first run | 62 / 0 / 0, no schema bugs | The contracts as first published; **superseded** |
+
+No schema changed at P0-3 (the partition-default change is in `topic-defaults.json`, which the suite
+does not validate), so the expected count is unchanged by it.
 
 Two fixture changes the suite must absorb: the envelope projection replaces `key` with `key_present`
 plus `key_size`, and a `ValidationError` from either schema must not be logged or printed verbatim.

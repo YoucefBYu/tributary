@@ -25,7 +25,8 @@ Forces:
 - **Invariant 8** puts metadata in headers and keeps the payload opaque, which forces every routing
   and retry decision to be expressible in headers.
 - ADR-001 7.1 projects 500 channels × ~4 topics × 12 partitions ≈ 24k partitions and calls it
-  "workable but needs testing". S4 is that test.
+  "workable but needs testing". S4 was that test, and **the projection failed**: the cluster was lost
+  at about 425-450 channels at 12 partitions per topic. D5 cuts the default to 3.
 
 ### 1.1 Measured evidence
 

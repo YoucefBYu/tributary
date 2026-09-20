@@ -2,7 +2,8 @@
 
 **Verdict: GO WITH CHANGES.**
 
-Author: `architect`, 2026-09-20. Inputs: `docs/spikes/S1`-`S6`, raw data in `docs/spikes/data/`,
+Author: `architect`, 2026-09-20; the S2-S6 reports were stamped accepted on 2026-09-21 from this
+memo's conclusions. Inputs: `docs/spikes/S1`-`S6`, raw data in `docs/spikes/data/`,
 `docs/spikes/reviews/phase-0-evidence-review.md`, `docs/security/contracts-v0-review.md`,
 `docs/agent-team/STATUS.md`.
 

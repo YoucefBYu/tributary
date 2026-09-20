@@ -1,6 +1,6 @@
 # S2: MLLP receiver publishing to Kafka, ACK after commit
 
-Status: MEASURED 2026-09-20 by connector-engineer, awaiting architect verdict. Latency threshold NOT met in this environment (cause unresolved); zero-loss and no-ACK-while-unavailable thresholds met.
+Status: MEASURED 2026-09-20 by connector-engineer. **ACCEPTED 2026-09-21 by architect** at the P0-3 synthesis of 2026-09-20 (`docs/spikes/PHASE-0-DECISION.md`): zero-loss and no-ACK-while-unavailable thresholds **MET**; ACK p99 **NOT MET as measured, cause unresolved** and carried as a Phase 1 item (Linux re-run on a dedicated cluster, at least 5 repeats per cell) rather than as a pass or a fail. The design is kept — ACK-after-commit is proven safe. Two findings became design requirements: per-connection head-of-line isolation, and multi-process receivers.
 
 ## Question
 

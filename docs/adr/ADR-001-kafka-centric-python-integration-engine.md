@@ -276,7 +276,7 @@ metadata:
 spec:
   ordering: per-key
   partitionKey: "hl7:PID.3.1"
-  partitions: 12
+  partitions: 12            # explicit override; the measured default is 3 (section 5.3, ADR-002 D5)
   retention: {raw: 7d, dlq: 30d}
   source:
     type: mllp

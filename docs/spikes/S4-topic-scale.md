@@ -1,6 +1,6 @@
 # S4: topic-count scale (channels x topics x partitions)
 
-Status: MEASURED by qa-engineer 2026-09-20, awaiting architect acceptance. Feeds ADR-002 D4 (partition default) and D5 (topic-sharing fallback).
+Status: MEASURED by qa-engineer 2026-09-20. **ACCEPTED 2026-09-21 by architect** at the P0-3 synthesis (`docs/spikes/PHASE-0-DECISION.md`). Both recommendations adopted: **the partition default drops from 12 to 3** (ADR-002 D5, `contracts/topics/v0/topic-defaults.json`) and the sharing trigger is stated in projected partitions (ADR-002 D4), with each figure carrying the basis label this report gave it — 12,000 measured, 8,000 judgement, about 20,000 one failure at a computed count. `session.timeout.ms` is now set explicitly (ADR-002 D5.1), corroborated by S5. The 2G heap result is recorded as inconclusive and no heap-scaling claim is made.
 
 **Scope: every number is a lower bound and applies only to this setup: 3 Kafka brokers with 1 GB heap (2G inconclusive), a 7.4 GiB Docker Desktop VM on a Windows host, idle topics carrying only a 300-message probe, and mostly single runs. It is not a cluster limit and not a Linux number.**
 

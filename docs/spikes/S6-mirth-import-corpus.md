@@ -2,6 +2,8 @@
 
 **Status: DOCUMENTATION-ONLY, LOW CONFIDENCE. No real corpus was available. Prototype and analyzer were executed against synthetic XML only (see Environment).**
 
+**ACCEPTED 2026-09-21 by architect as INCONCLUSIVE** at the P0-3 synthesis (`docs/spikes/PHASE-0-DECISION.md`): accepted as an honest null result, not as an estimate. The 43-60+ person-days and the "5 to 20 percent importable" figure are **not** carried into any plan as numbers. Consequence for Phase 1: `mirth-import` is **timeboxed with a review point rather than committed**, and migration cost stays the highest-likelihood, highest-impact open risk in ADR-001 section 13 — the one risk Phase 0 could not reduce. Unblocking it is a human decision (supply anonymized exports in `samples/mirth/`).
+
 ## Question
 How much of a typical Mirth/OIE channel estate can the importer convert with no manual work, and how big is the effort for the importer and `mirth_compat`?
 

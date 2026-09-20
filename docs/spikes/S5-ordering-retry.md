@@ -1,6 +1,6 @@
 # S5: ordering, blocking retry, transactions and DLQ
 
-Status: MEASURED 2026-09-20 by platform-engineer against the shared 3-broker spike cluster; awaiting architect verdict.
+Status: MEASURED 2026-09-20 by platform-engineer against the shared 3-broker spike cluster. **ACCEPTED 2026-09-21 by architect** at the P0-3 synthesis (`docs/spikes/PHASE-0-DECISION.md`): **PASS**, and the recommendation "GO for the ordering and retry design in ADR-001 6.4" is adopted. No invariant changes — invariant 5 stands on 0 measured violations. All three recommended defaults are written down (ADR-002 D5.1 for `session.timeout.ms`, ADR-003 D1/D3/D6/D7 for the retry policy, transactions and rebalance behaviour; `commit_every` in `contracts/topics/v0` 3.3). `retry-topic` is recorded as **not implemented and not measured**, and no destination may select it until it is spiked (ADR-003 D2).
 
 **Threshold result: per-key order preserved, zero violations.** No counterexample in 2,000
 randomised fault schedules against the model, 12 real-cluster fault-injection scenarios, or 13

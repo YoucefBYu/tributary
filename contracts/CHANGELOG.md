@@ -112,7 +112,8 @@ platform topics would let a dev control plane publish specs that production work
 topic *class* `_tb.events` named in invariant 2 is unchanged.
 
 Partition defaults (12 per channel topic, 24 for events) are ADR-001 planning values and carry TODO
-markers until S4 reports.
+markers until S4 reports. **Superseded by the P0-3 entry at the top of this file: S4 disproved the 12,
+which is now 3. The 24 for events is still unmeasured.**
 
 ### `tributary.events/v0` — new, Draft
 
