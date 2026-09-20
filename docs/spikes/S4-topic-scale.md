@@ -24,11 +24,13 @@ Baseline had 986 leftover partitions from earlier spikes (added to the counts be
 |---|---|---|---|---|---|---|
 | 100 | 5,786 | 31 s | 0.09 s | 95 / 558 ms | 1.3 to 1.6 GiB | fine |
 | 250 | 11,789 | 48 s (batches about 9.7 s / 25 ch) | 0.21 s | 195 / 621 ms | 1.5 to 1.7 GiB | fine |
-| 450 (batch 425-450) | about 21,000 | n/a | metadata request timed out (10 s client limit) | n/a | n/a | **cluster died** |
+| 450 (batch 425-450) | about 21,000 | n/a | metadata request timed out (a MetadataRequest in flight timed out after 60.5 s; the later cleanup `list_topics` timed out at 120 s) | n/a | n/a | **cluster died** |
 
-At 12:37 kafka3 lost raft quorum contact (election timeouts, ISR shrinks), OOM at 12:39:25 (`java.lang.OutOfMemoryError: Java heap space` in the raft IO thread, fatal fault); kafka2 OOM at 12:42:48 (metadata image publisher); kafka1 shut down at 12:43:15 after losing quorum. The container was never OOM-killed: it is the JVM heap. Roughly 48 fds per channel per broker; 22k fds at 250 channels against a 1M limit, so fds are not the constraint.
+Evidence limits: the tracked log (`s4-1g-12p-topics.log`) shows only the failed create batch and those timeouts. The cause (JVM heap exhaustion) was read from the broker logs at the time. Those container logs are lost (containers destroyed afterwards), so it is **not independently reproducible from tracked data**; `data/S4/s4-1g-12p-broker-log-excerpt.txt` is a hand transcription of the lines I saw, marked as such. The partition counts are computed (425 channels x 48 partitions plus 986 leftover baseline partitions, about 21,000) from a single run, not read from a metadata call at the failure point.
 
-**500 channels at 12 partitions on a 1G heap: FAIL (0.9x, cluster lost at about 425 to 450).** Ceiling on this signal: about 20k partitions (60k replicas) across 3 brokers with 1 GB heap each, about 20k replicas per broker.
+From the transcribed logs: at 12:37 kafka3 lost raft quorum contact (election timeouts, ISR shrinks), OOM at 12:39:25 (`java.lang.OutOfMemoryError: Java heap space` in the raft IO thread, fatal fault); kafka2 OOM at 12:42:48 (metadata image publisher); kafka1 exited at 12:43:15 with an orderly-looking shutdown, and I did not see an OOM line for it (inferred: it lost quorum). `docker inspect` showed OOMKilled=false for all three, consistent with a JVM-heap failure, not the kernel OOM killer. Roughly 48 fds per channel per broker; 22k fds at 250 channels against a 1M limit, so fds are not the constraint.
+
+**500 channels at 12 partitions on a 1G heap: FAIL (0.9x, cluster lost at about 425 to 450).** Ceiling on this signal (one run, computed count): about 20k partitions (60k replicas) across 3 brokers with 1 GB heap each, about 20k replicas per broker.
 
 ### 1G heap, 3 partitions per topic (12 per channel), (`s4-1g-3p*`)
 
@@ -61,7 +63,7 @@ Run A (`s4-2g-12p*`, fresh cluster): 100 ch 4.8k partitions create 36 s, ACK p99
 
 Run B (`s4-2g-12p-runB*`, fresh cluster, same heap): 250 ch (9.6k partitions) took 174 s to create and ACK p50 was 6.3 s; the next batch failed (`Broker transport failure`) at channels 250-275 (13.2k partitions). The regex-group measurement in run B is invalid (only about 275 channels existed but 500 were expected); `groups` with 100 groups completed in 14.4 s.
 
-Runs A and B disagree by more than 3x at similar partition counts (run A created 12k partitions in 45 s; run B 9.6k in 174 s), and both differ from the 1G run at 12k partitions (48 s, ACK p99 0.6 s). I did not isolate the cause. My hypothesis, unverified: 3 x 2 GB heap leaves the 7.4 GiB VM with little page cache, so it is memory-pressure sensitive. So at 2G, 12 partitions per topic, **500 channels: FAIL, not "operating normally"** (in run A creates completed but ACK latency was 17 s; run B failed at 275). Doubling the heap did not buy headroom in this VM: the failure mode changed from JVM OOM to control-plane saturation (create time, raft leader churn, metadata timeouts).
+Runs A and B disagree by more than 3x at similar partition counts (run A created 12k partitions in 45 s; run B 9.6k in 174 s), and both differ from the 1G run at 12k partitions (48 s, ACK p99 0.6 s). The cause is unresolved. One unverified hypothesis: 3 x 2 GB heap leaves the 7.4 GiB VM with little page cache. A further unexplained item: in run B the tier-250 `list_topics` reported 9,612 partitions although 250 channels (12,000 partitions) had been created without error, so the metadata view was incomplete or the create was partly not applied; I did not investigate. What the data supports: at 2G and 12 partitions per topic, **500 channels did not operate normally in either run** (run A created 500 channels but with 17 s ACK latency, run B failed at 250-275), and 2G behaviour was unstable and not reproducible across two runs. No JVM OOM was seen at 2G; the symptoms were slow creates, high ACK latency, raft leader churn and metadata timeouts. Two runs are not enough to say whether 2G is better or worse than 1G at the same partition count.
 
 ### Not measured
 
@@ -79,14 +81,14 @@ Measured under 3 brokers, RF=3, 7.4 GiB Docker VM:
 4. **Produce-ACK latency** degrades once the controller is saturated, independent of data volume (p99 11 to 17 s in the 2G runs at 12k to 24k partitions).
 5. **Rebalance time** did not degrade in any tested state (4 to 8 s; static-member removal is dominated by session timeout).
 
-In short: on this VM the ceiling is about 12k partitions healthy and about 20k fatal at 1G, and 2G did not reliably raise it. That is 250 channels at 48 partitions per channel, and at least 1,000 channels at 12 partitions per channel.
+In short: on this VM the ceiling is about 12k partitions healthy and about 20k fatal at 1G (single run, computed count), and 2G was unstable in two runs that disagree, so no heap-scaling claim is made. That is 250 channels at 48 partitions per channel, and at least 1,000 channels at 12 partitions per channel.
 
 ## Recommendations for ADR-002
 
 - **D4 partition default: 3 partitions per topic** for channel topics (`raw`, `out`, `retry`, `dlq`), overridable per channel in the spec where throughput needs more. 3 gives 12 partitions per channel and meets the 500-channel threshold with margin up to 1,000 channels. Consider 1 partition for `retry` and `dlq` (not tested).
-- **D5 sharing trigger, stated in partitions, not channels:** define the fallback trigger on projected total partitions per cluster, `channels x 4 x partitions`. On 1 GB broker heap and 3 brokers: warn at 8,000 and switch new channels to shared topics at 12,000 (the highest tested healthy value). Above about 20,000 the cluster is lost. Scale these linearly with heap only after re-measuring on Linux; 2G in this VM was not a reliable improvement.
+- **D5 sharing trigger, stated in partitions, not channels:** define the fallback trigger on projected total partitions per cluster, `channels x 4 x partitions`. On 1 GB broker heap and 3 brokers: warn at 8,000 and switch new channels to shared topics at 12,000 (the highest tested healthy value). Above about 20,000 the cluster is lost. Do not scale these with heap without re-measuring on Linux; the 2G runs were inconsistent.
 - Topic sharing must not cross a tenant boundary (per contracts): the trigger applies per tenant partition group, so a large multi-tenant deployment reaches the ceiling before the fallback can help, and needs more brokers rather than more sharing.
-- Ask platform-engineer: `ensure_topics` uses a fixed 10 s `list_topics` timeout; make it configurable, and the compose stack should set a 1G or larger heap knowingly (default 1G is the tested case).
+- Ask platform-engineer: `ensure_topics` used a fixed 10 s `list_topics` timeout in its own calls (now configurable, platform-engineer commit 8ff13ef), and the compose stack should set a 1G or larger heap knowingly (default 1G is the tested case).
 - Static membership: set `session.timeout.ms` explicitly (default 45 s makes failure detection slower than 30 s).
 
 ## Environment gotchas

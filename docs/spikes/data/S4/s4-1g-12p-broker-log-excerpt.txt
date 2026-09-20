@@ -1,0 +1,32 @@
+TRANSCRIBED from `docker logs tb-kafka{1,2,3}` by qa-engineer on 2026-09-20 after the 1G-heap, 12-partition run.
+The original container logs are LOST (containers were destroyed by `docker compose down` and a later Docker Desktop reset). This file is a
+hand transcription of lines seen in the session transcript, truncated as displayed; it is not independently reproducible from tracked data.
+State from `docker inspect` at the time: all three containers exited, exit code 1, OOMKilled=false (the JVM exited, not the kernel OOM killer).
+Container times are UTC.
+
+== tb-kafka3 (State.FinishedAt 2026-09-20T12:39:32Z)
+[2026-09-20 12:37:18,132] INFO [RaftManager id=3] Election timed out before receiving sufficient vote responses to become candidate. ...
+[2026-09-20 12:37:19,727] INFO [RaftManager id=3] Disconnecting from node 1 due to request timeout. (org.apache.kafka.clients.NetworkClient)
+[2026-09-20 12:37:19,728] INFO [RaftManager id=3] Disconnecting from node 2 due to request timeout. (org.apache.kafka.clients.NetworkClient)
+[2026-09-20 12:37:21,462] INFO [BrokerLifecycleManager id=3] Unable to send a heartbeat because the RPC got timed out before it could be sent.
+[2026-09-20 12:37:21,464] INFO [Partition s4.c0416.retry-11 broker=3] Shrinking ISR from 3,1,2 to 3. ... (also s4.c0418.retry-10, s4.c0417.out-8, s4.c0400.out-3, s4.c0419.retry-8)
+[2026-09-20 12:39:25,396] ERROR Uncaught exception in thread 'data-plane-kafka-socket-acceptor-ListenerName(INTERNAL)-PLAINTEXT-9092': (org.apache.kafka.common.utils.KafkaThread)
+java.lang.OutOfMemoryError: Java heap space
+[2026-09-20 12:39:25,396] ERROR Uncaught exception in scheduled task 'PeriodicProducerExpirationCheck' (org.apache.kafka.server.util.KafkaScheduler)
+java.lang.OutOfMemoryError: Java heap space
+[2026-09-20 12:39:25,396] ERROR Encountered fatal fault: Unexpected error in raft IO thread (org.apache.kafka.server.fault.ProcessTerminatingFaultHandler)
+java.lang.OutOfMemoryError: Java heap space: failed reallocation of scalar replaced objects
+
+== tb-kafka2 (State.FinishedAt 2026-09-20T12:42:52Z; it had been restarted at 12:27:51 by the S5 broker-kill scenario)
+[2026-09-20 12:42:48,360] ERROR [kafka-2-raft-outbound-request-thread]: unhandled exception caught in InterBrokerSendThread
+java.lang.OutOfMemoryError: Java heap space
+[2026-09-20 12:42:48,679] ERROR Encountered fatal fault: Unexpected error in raft IO thread (ProcessTerminatingFaultHandler)
+java.lang.OutOfMemoryError: Java heap space
+[2026-09-20 12:42:48,988] ERROR [GroupCoordinator id=2] Execution of Load(tp=__consumer_offsets-10, epoch=16) failed due to Java heap space.
+[2026-09-20 12:42:49,321] ERROR Encountered fatal fault: Unhandled error publishing the new metadata image ending at 91204 with publisher BrokerMetadataPublisher
+java.lang.OutOfMemoryError: Java heap space
+
+== tb-kafka1 (State.FinishedAt 2026-09-20T12:43:15Z)
+Orderly shutdown lines only in the tail I read (QuorumController closed, SharedServer stopping, metrics reporters closed at 12:43:14). The
+tail did not include the cause; whether kafka1 itself hit an OOM is not established (a later `grep -c OutOfMemory` on its log was not run
+before the logs were lost). I inferred it stopped after losing quorum with the other two.
