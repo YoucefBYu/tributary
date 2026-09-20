@@ -43,3 +43,4 @@ INCONCLUSIVE for the estimate (no corpus). The prototype approach (mechanical se
 2. Check element names against one real export (tests already pass on synthetic XML).
 3. Correct the "no manual work" definition once the corpus exists (currently: no script bodies and supported connector types only).
 4. Create the `packages/tributary-mirth-import/` and `docs/migration/` parity checklist in Phase 1; the ADR-001 section 9.1 table is the starting checklist (all items currently Missing).
+5. Phase 1 requirement (from architect): channel names must slugify to topic segments matching `^[a-z][a-z0-9-]{0,63}$` (`contracts/topics/v0`; also the `tb-channel` value). The slugifier must be collision-free: names differing only in case or punctuation get a numeric suffix or an error, never a silent collision. Record the original name in the spec `metadata`. Note: the current prototype does not slugify.
