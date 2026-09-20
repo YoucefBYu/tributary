@@ -1,0 +1,30 @@
+[project]
+name = "tb-spike-common"
+version = "0.0.0"
+description = "Throwaway shared helpers for Tributary Phase 0 spikes. Not importable from packages/."
+requires-python = ">=3.12"
+dependencies = [
+    "confluent-kafka>=2.6.0",   # Apache-2.0
+    "orjson>=3.10.0",           # Apache-2.0 / MIT
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",              # MIT
+    "hypothesis>=6.112",        # MPL-2.0, unmodified test-only dependency (CLAUDE.md stack table)
+    "pytest-timeout>=2.3",      # MIT
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tbcommon"]
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: needs the spike Kafka cluster (spikes/common/docker-compose.yml)",
+    "chaos: injects broker/consumer faults",
+    "bench: measurement run, not a pass/fail test",
+]

@@ -1,0 +1,113 @@
+# Tributary Phase 0 spike cluster: 3-broker Apache Kafka 4.x in KRaft mode.
+#
+# Owner: platform-engineer (task P0-2). Shared by all Phase 0 spikes.
+# DO NOT start a second cluster: agree here first (phase-0.md coordination note).
+#
+# Licensing: apache/kafka is the Apache Software Foundation image (Apache-2.0).
+# Do not swap in confluentinc/cp-* images -- those ship under the Confluent
+# Community License, which is not on the allowed list in CLAUDE.md.
+#
+# Storage is intentionally ephemeral (no named volumes):
+#   * `docker compose restart|stop|start kafka2`  -> container filesystem and
+#     log dirs survive. This is what the S5 fault-injection scenarios use.
+#   * `docker compose down`                       -> clean cluster, new state.
+# Avoiding named volumes also avoids the root-owned-empty-volume permission
+# trap on Windows/WSL2, where the broker runs as uid 1000.
+
+name: tributary-spikes
+
+x-kafka-common: &kafka-common
+  image: apache/kafka:4.0.0
+  # `no`, deliberately. `docker kill` DOES trigger a restart policy (only
+  # `docker stop` sets the "manually stopped" flag that `unless-stopped`
+  # honours), so any restart policy would silently resurrect a broker inside
+  # the outage window of a fault-injection test and make the result a lie.
+  # `tbcommon.faults` restarts brokers explicitly instead.
+  restart: "no"
+  healthcheck:
+    test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1 || exit 1"]
+    interval: 10s
+    timeout: 10s
+    retries: 18
+    start_period: 20s
+
+x-kafka-env: &kafka-env
+  # Fixed cluster id so `down` + `up` gives a reproducible cluster.
+  CLUSTER_ID: MkU3OEVCNTcwNTJENDM2Qk
+  KAFKA_PROCESS_ROLES: broker,controller
+  KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka1:9093,2@kafka2:9093,3@kafka3:9093
+  KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+  KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+  KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+  # Durability defaults that match ADR-001 section 2.2 (RF=3, min.insync=2).
+  KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+  KAFKA_MIN_INSYNC_REPLICAS: 2
+  KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+  KAFKA_OFFSETS_TOPIC_NUM_PARTITIONS: 12
+  KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+  KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+  KAFKA_TRANSACTION_MAX_TIMEOUT_MS: 900000
+  KAFKA_NUM_PARTITIONS: 12
+  KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+  # 0 so a spike consumer group forms immediately instead of waiting 3s.
+  KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+  # Keep the classic rebalance protocol available; the spikes exercise
+  # cooperative-sticky + static membership, which is the classic protocol.
+  # KIP-848 ("consumer") is also enabled so S4/S5 can compare.
+  KAFKA_GROUP_COORDINATOR_REBALANCE_PROTOCOLS: classic,consumer
+  # Raise TB_KAFKA_HEAP for the S4 topic-count stress run (e.g. -Xmx3G -Xms3G).
+  KAFKA_HEAP_OPTS: ${TB_KAFKA_HEAP:--Xmx1G -Xms1G}
+
+services:
+  kafka1:
+    <<: *kafka-common
+    container_name: tb-kafka1
+    hostname: kafka1
+    ports:
+      - "19092:19092"
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENERS: INTERNAL://:9092,CONTROLLER://:9093,EXTERNAL://:19092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka1:9092,EXTERNAL://localhost:19092
+
+  kafka2:
+    <<: *kafka-common
+    container_name: tb-kafka2
+    hostname: kafka2
+    ports:
+      - "29092:29092"
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 2
+      KAFKA_LISTENERS: INTERNAL://:9092,CONTROLLER://:9093,EXTERNAL://:29092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka2:9092,EXTERNAL://localhost:29092
+
+  kafka3:
+    <<: *kafka-common
+    container_name: tb-kafka3
+    hostname: kafka3
+    ports:
+      - "39092:39092"
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 3
+      KAFKA_LISTENERS: INTERNAL://:9092,CONTROLLER://:9093,EXTERNAL://:39092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka3:9092,EXTERNAL://localhost:39092
+
+  # Optional. `docker compose --profile tools up -d` -> http://localhost:8080
+  # kafbat/kafka-ui is Apache-2.0. It is a developer convenience only and is
+  # not part of any shipped distribution.
+  kafka-ui:
+    image: kafbat/kafka-ui:v1.1.0
+    container_name: tb-kafka-ui
+    profiles: ["tools"]
+    depends_on:
+      kafka1:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      DYNAMIC_CONFIG_ENABLED: "true"
+      KAFKA_CLUSTERS_0_NAME: tributary-spikes
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka1:9092,kafka2:9092,kafka3:9092
