@@ -44,7 +44,7 @@ def _ts(dt: datetime) -> str:
 
 def _msh(mtype: str, ctrl: str, now: datetime) -> str:
     return (
-        f"MSH|^~\&|{SENDING_APP}|SYNTH-FAC|TRIBUTARY-DST|DST-FAC|{_ts(now)}||{mtype}|{ctrl}|P|2.5.1"
+        f"MSH|^~\\&|{SENDING_APP}|SYNTH-FAC|TRIBUTARY-DST|DST-FAC|{_ts(now)}||{mtype}|{ctrl}|P|2.5.1"
     )
 
 
