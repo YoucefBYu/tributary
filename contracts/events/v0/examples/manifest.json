@@ -3,7 +3,7 @@
   "schema": "../event.schema.json",
   "note": "All identifiers are synthetic. The invalid set deliberately includes the PHI-shaped mistakes (payload-in-event, attrs-clear-text-mrn, attrs-hmac-not-fixed-length-hex, attrs-free-text-value, claim-check-presigned-url) so a regression cannot reintroduce them quietly. Keep these asserted, never skipped.",
   "valid": [
-    { "file": "valid/received.json", "note": "Receive, with hashed searchable attributes" },
+    { "file": "valid/received.json", "note": "Receive, with a hashed searchable attribute. The 64-hex SHAPE is what the schema checks; the hashing mechanism is UNRESOLVED (README 3.1), so do not read this example as a recommendation to emit identifier-derived attrs yet" },
     { "file": "valid/filtered.json", "note": "Deliberate drop: status dropped, no error code" },
     { "file": "valid/sent.json", "note": "Successful delivery to one destination" },
     { "file": "valid/retrying.json", "note": "Failed attempt with a code and a redacted message" },
@@ -24,6 +24,8 @@
     { "file": "invalid/attrs-clear-text-mrn.json", "violates": "attrs key 'mrn' denotes a direct identifier and is rejected in clear form; it is admissible only as 'mrn_hmac'" },
     { "file": "invalid/attrs-hmac-not-fixed-length-hex.json", "violates": "an _hmac-suffixed value must be exactly 64 hex characters, so a clear-text value cannot hide behind the suffix" },
     { "file": "invalid/attrs-free-text-value.json", "violates": "non-hashed attrs values are short codes: no spaces, 64 characters max, which rejects free text that can carry PHI" },
+    { "file": "invalid/attrs-too-many-entries.json", "violates": "attrs is capped at 16 entries; 17 short codes is a metadata column being used as a payload channel (security finding 7)" },
+    { "file": "invalid/attrs-hl7-delimiters.json", "violates": "an attrs value may not contain HL7 delimiters (| ^ ~ \\ &) or CR/LF, so a segment cannot be carried verbatim into the archive (security finding 7)" },
     { "file": "invalid/claim-check-with-size.json", "violates": "claim_check present requires size_bytes 0" },
     { "file": "invalid/claim-check-presigned-url.json", "violates": "claim_check must not contain a query string; a presigned URL becomes a stored, replayable credential in ClickHouse and the browser" },
     { "file": "invalid/unknown-stage.json", "violates": "stage enum: 'enriched' is a pipeline step name, not a lifecycle stage" }

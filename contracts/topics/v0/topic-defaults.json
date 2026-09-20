@@ -112,6 +112,7 @@
     },
     "audit": {
       "partitions": 6,
+      "retention_open_question": "TODO(human): 30 days is an engineering default, not a compliance decision. A six-year retention duty may apply to an audit trail (HIPAA 164.316(b)(2)(i)); if it does, the system of record is probably ClickHouse or object storage with Kafka as a buffer, not a larger retention.ms. Unverified, no legal review. See README.md section 2.1.",
       "configs": {
         "cleanup.policy": "delete",
         "retention.ms": 2592000000,
@@ -145,6 +146,16 @@
       "ssl.endpoint.identification.algorithm": "https",
       "ssl.endpoint.identification.algorithm_note": "Leave hostname verification enabled. Disabling it is the single most common way a TLS Kafka deployment silently accepts a man-in-the-middle.",
       "credentials": "TODO deployment-specific, resolved from a secretRef or a secrets manager. Never in a channel spec, a Compose file or an image."
+    },
+    "encryption_at_rest": {
+      "required": true,
+      "note": "Kafka has no built-in encryption at rest. Volume-level encryption protects a lost disk, a decommissioned disk and a shared snapshot; it does NOT protect against a compromised broker, an over-broad ACL or an unaudited Kafka UI. See README.md 3.5.",
+      "broker_data_dirs": "encrypted volumes (LUKS, cloud disk encryption, or an encrypted storage class)",
+      "claim_check_bucket": "bucket-default encryption on (SSE-KMS, SSE-S3 or the MinIO equivalent). Largest single PHI store in the system: whole payloads.",
+      "archive_volumes": "ClickHouse and PostgreSQL on encrypted volumes",
+      "backups": "encrypted, same rules as the source volume",
+      "application_level_encryption": "NOT required in v0 and not designed here; it is key management, which is ADR-004 plus a human decision",
+      "key_custody": "TODO(ADR-004): cloud-managed versus customer-managed KMS keys. The requirement that encryption be on is not a TODO."
     },
     "acls": {
       "model": "Deny by default, least privilege per component, granted on the topic prefix <env>.<channel>. so one channel's compromise does not read another's traffic.",

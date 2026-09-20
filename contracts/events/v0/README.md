@@ -68,7 +68,7 @@ events; that made `message_id` meaninglessly non-null.
 | `error_code` | `^[A-Z][A-Z0-9_]{0,63}$` | no | Same vocabulary as `tb-error-code`. Required when `status` is `error` or `timeout`. |
 | `error_message` | string ≤ 512 | no | **Redacted, static text only.** Section 3. |
 | `duration_ms` | number ≥ 0 | no | Time spent in the stage the event closes. Lets the archiver compute stage latency without joining two events. |
-| `attrs` | object, string→string | no | Searchable metadata. Section 3. At most 32 entries. |
+| `attrs` | object, string→string | no | Searchable metadata. Section 3. At most 16 entries and 1024 serialized bytes. `tb-usr-*` headers are **not** projected here ([envelope contract](../../envelope/v0/README.md) 2.2). |
 | `traceparent` | W3C traceparent | no | Links the event to the trace. |
 
 ### 2.1 Stages
@@ -101,14 +101,20 @@ invariant 6.
    `str(exception)` is not, because parser and validator libraries routinely include the offending
    field value. Producers must map exceptions to a code plus a fixed message.
 3. **`attrs` entries that derive from a patient identifier are keyed hashes**, and the schema now
-   enforces it three ways rather than trusting the convention:
-   - a key ending `_hmac` MUST have a value of **exactly 64 hex characters**, so a clear-text value
-     cannot hide behind the suffix (`{"mrn_hmac": "0001234567"}` is rejected);
+   enforces it four ways rather than trusting the convention:
+   - a key ending `_hmac` MUST have a value of **exactly 64 lowercase hex characters**, so a
+     clear-text value cannot hide behind the suffix (`{"mrn_hmac": "0001234567"}` is rejected).
+     The shape is enforced; **the hashing mechanism is not specified in v0** — section 3.1;
    - a key from a **deny-list of names that denote a direct identifier** (`mrn`, `patient_id`, `dob`,
      `name`, `accession`, `ssn`, `phone`, … — the full list is in the schema) is rejected in clear
      form. It is admissible only hashed, as `<name>_hmac`;
    - any other value must be a **short code**: `^[A-Za-z0-9][A-Za-z0-9._:+-]{0,63}$`, 64 characters
-     max, **no spaces**. Free text is where PHI arrives, so the column is shaped to refuse it.
+     max, **no spaces**. Free text is where PHI arrives, so the column is shaped to refuse it. The
+     allow-list also excludes the HL7 delimiters `| ^ ~ \ &` and CR/LF, so a segment or a repeating
+     field cannot be pasted in whole;
+   - the object is capped at **16 entries**, and producers MUST additionally keep it under **1024
+     serialized bytes** — a cap JSON Schema cannot express, so it is a producer-side check. Sixteen
+     short codes is a metadata column; a hundred is a payload in disguise.
 
    Correct: `{"mrn_hmac": "9f2a…64 hex", "trigger": "A01", "step": "to_fhir_bundle"}`. The browser
    hashes the search term with the same key (ADR-001 6.6). Key management is ADR-004.
@@ -116,14 +122,64 @@ invariant 6.
    **This is defence in depth, not a proof.** Nothing stops a determined producer putting a surname in
    `attrs.reason`, because a surname is a valid short code. The deny-list catches the common mistake
    and makes the intent unambiguous; code review and `security-reviewer` remain the real control.
+
+   What the budget does buy, and the reason the numbers moved: the first draft allowed 32 entries of
+   256 characters, about 8 KiB of channel-controlled text per event, against a typical ADT message of
+   1-2 KiB. A buggy or hostile step could reassemble a whole message inside the archive while passing
+   validation, so the claim that `attrs` "cannot become a payload smuggling channel" was simply
+   false. At 16 entries, 64-character values and 1024 serialized bytes, `attrs` no longer has room
+   for an ADT message, and the character allow-list means a segment cannot be carried verbatim in any
+   case: `|`, `^`, `~`, `\`, `&`, CR and LF are all rejected. Chunking a payload across many events is
+   still possible in principle. That is a code-review problem, and the contract says so rather than
+   claiming otherwise.
 4. **No record key in `attrs`**, hashed or otherwise, under any name. The partition key is often the
    patient identifier ([envelope contract](../../envelope/v0/README.md) section 4); `key`,
    `message_key` and `partition_key` are on the deny-list for that reason.
 5. **`claim_check` follows the envelope's URI rules**: opaque locator, no query string, no fragment,
    no userinfo. Events are persisted to ClickHouse and rendered in the browser, so a presigned URL
    here is a stored credential that stays replayable in backups long after the URL's own expiry.
+6. **`tb-usr-*` headers are not projected into events.** There is no field that can hold them and
+   none is being added: see [envelope contract](../../envelope/v0/README.md) 2.2. A step that wants
+   channel metadata searchable emits an `attrs` entry deliberately, under the rules above.
+7. **`correlation_id` is an engine-minted UUID**, never a sender-supplied token
+   ([envelope contract](../../envelope/v0/README.md) 3.2). It reaches ClickHouse and the browser in
+   clear text, so the constraint is what keeps a payload-derived value out of an archive column that
+   nothing treats as sensitive.
 
 Reviewers: an `error_message` built with an f-string from an exception is a Critical finding.
+
+### 3.1 The `_hmac` mechanism is UNRESOLVED
+
+The schema enforces the **shape** of a hashed attribute — exactly 64 lowercase hex characters. It
+cannot enforce the **mechanism**, and v0 deliberately does not specify one.
+
+Why that matters: an unkeyed `sha256(mrn)` is also 64 lowercase hex characters, and an unkeyed digest
+over a bounded identifier space is reversible by exhaustive search. A producer that follows this
+contract to the letter with `sha256` publishes something that is, for practical purposes, the
+identifier itself — stored in ClickHouse, rendered in the browser, and retained in backups. The
+schema raises the cost of the careless mistake; it does not prevent this one.
+
+Open, and **escalated to ADR-004 plus a human decision** — CLAUDE.md forbids an agent designing
+cryptography or key management, so nothing below is settled here:
+
+- Which construction: HMAC-SHA-256, keyed BLAKE2, or a per-channel pepper. The 64-hex shape fits all
+  three, which is why the shape was chosen now and the mechanism left open.
+- Key scope: one key per deployment, per environment, or per channel.
+- Rotation: a rotated key makes old and new events for the same patient hash differently, so search
+  across a rotation boundary either breaks or requires retaining superseded keys. Retention
+  (`_tb.<env>.events` at 3 days, the archive far longer) decides how bad that is.
+- Where the key lives and who may read it. The browser must hash the search term with the same key
+  (ADR-001 6.6), so either the key reaches the API process or hashing becomes an API-side operation
+  behind an authorization check.
+- Whether a hashed identifier is de-identified **at all**. Under HIPAA Safe Harbor a keyed hash of an
+  MRN is a re-identifiable code, not de-identified data. Until a human rules otherwise, treat
+  `_hmac` values in ClickHouse as PHI, with the same access controls as any other PHI column.
+
+**Until ADR-004 lands, producers SHOULD NOT emit identifier-derived `attrs` at all.** `attrs` is for
+low-cardinality operational codes (`trigger`, `step`, `dest`); a message is already findable by
+`message_id`, and per-patient search in the browser is a feature that depends on this unresolved
+decision, not on the event contract. UNVERIFIED: no implementation exists, so no claim here has been
+tested against one.
 
 ---
 

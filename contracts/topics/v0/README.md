@@ -68,9 +68,28 @@ silent failure mode the first time someone shares a cluster.
 
 ADR-001 5.3 proposes topic sharing for very small channels. v0 needs no new grammar for it: a share
 group occupies the `channel` position (for example `prod.shared-small-a.raw`), and consumers filter
-on the `tb-channel` header. Costs: no per-channel retention, no per-channel ACL, no per-channel lag
-metric, and a consumer reads and discards other channels' records. Opt-in only, and the defaults wait
-on S4 measurements.
+on the `tb-channel` header. Costs: no per-channel retention, no per-channel lag metric, and a
+consumer reads and discards other channels' records. The defaults wait on S4 measurements.
+
+**Restriction, not a cost: a share group MUST NOT span a tenant or trust boundary.** Channels on a
+shared topic have no per-channel ACL — the ACL grammar is prefix-based on `<env>.<channel>.`, and the
+share group *is* the channel position — so every consumer of a shared topic can read every record on
+it, including channels it does not own. `tb-channel` filtering is a convention in consumer code, not
+an access control. In a multi-tenant deployment that means one tenant's credentials read another
+tenant's PHI, which is a breach, not a trade-off.
+
+Therefore:
+
+1. All channels in a share group MUST belong to one tenant and one trust boundary, and the control
+   plane MUST refuse to deploy a channel into a share group that violates this.
+2. The share group inherits the union of its members' sensitivity: its ACL grants, retention and
+   audit scope are those of the most sensitive member.
+3. A channel that needs its own ACL needs its own topics. That is the cost of isolation, and it is
+   the correct default — sharing is the exception, justified by topic count (S4), never by
+   convenience.
+
+Listing this as "opt-in only" in the first draft was not enough: opt-in describes who turns it on,
+not who can read the data afterwards.
 
 ---
 
@@ -88,7 +107,7 @@ Helm read one source instead of hardcoding three.
 | `reply` | 12 | 10 min | delete |
 | `_tb.<env>.channels` | 6 | compacted | compact |
 | `_tb.<env>.events` | 24 (TODO: confirm against S1/S2 event rate) | 3 d | delete |
-| `_tb.<env>.audit` | 6 | 30 d | delete |
+| `_tb.<env>.audit` | 6 | 30 d (**TODO(human)**, section 2.1) | delete |
 
 `out.<dest>` MUST have the same partition count as its `raw` topic when the channel declares
 per-key ordering. Different counts change the hash-to-partition mapping, so two messages for one
@@ -97,6 +116,38 @@ a silent violation of invariant 5. The runtime MUST refuse to start a channel wh
 disagree.
 
 `dlq` gets fewer partitions because it is keyed by message id, low volume, and read by humans.
+
+### 2.1 Audit retention is a human decision, not an engineering default
+
+`_tb.<env>.audit` retains 30 days. That number was chosen to match the DLQ and keep a small cluster
+small. It is an engineering default and it may be wrong by two orders of magnitude.
+
+`security-reviewer` raised this (finding 12). HIPAA §164.316(b)(2)(i) requires that policies,
+procedures and *the records of actions, activities and assessments* the rule requires be retained for
+six years. Whether that duty reaches a control-plane and access audit trail like this one is an
+interpretation question, and many covered entities and their contracts read it that way; some state
+rules and customer agreements go further. **UNVERIFIED — no legal review has been done, and no agent
+should perform one.** If a six-year duty does apply, 30 days on a Kafka topic is not a retention
+policy, it is a deletion policy: the evidence is gone before the first annual audit.
+
+The architect is not deciding this. It is a compliance and cost question, and it probably has an
+architectural answer rather than a bigger number: six years at RF=3 is a storage and tiering decision,
+and the durable system of record for audit is more likely ClickHouse or object storage, with Kafka
+retention acting only as a transport buffer in front of it. That is a different design from raising
+`retention.ms`, so the question must be answered before the audit contract is written rather than
+after.
+
+Three questions for the human, carried in `docs/agent-team/STATUS.md`:
+
+1. What retention duty applies to the control-plane and access audit trail?
+2. Is the system of record for it Kafka, the ClickHouse archive, or object storage?
+3. Does the same answer change `_tb.<env>.events` (3 d) and `raw` (7 d)? Those are the other two
+   places a "what happened to this message, and who touched it" question is answered, and `raw` is
+   also the replay source. A retention duty that covers the audit trail may or may not cover them.
+
+Until that is answered, the 30-day value stands and is marked `TODO(human)` in
+[`topic-defaults.json`](topic-defaults.json). The `_tb.<env>.audit` event contract itself is unwritten
+(see the events contract, section 6), so nothing depends on this yet.
 
 ---
 
@@ -178,7 +229,31 @@ access to it is remote code execution across the whole data plane.
 ADR-004 plus a human decision. This section fixes the minimum shape the configuration contract must
 state; it does not design the authorization model or any cryptography.
 
-### 3.5 Consumer group naming
+### 3.5 Encryption at rest (required)
+
+3.4 encrypts PHI in flight and then writes it to unencrypted disks. Kafka has no built-in
+encryption at rest, which is exactly why a contract that omits the requirement reads as though none
+is needed.
+
+| Surface | Requirement |
+|---|---|
+| Broker data directories | Encrypted volumes (LUKS, cloud provider disk encryption, or an encrypted storage class in Kubernetes). |
+| Claim-check object store | Bucket-default encryption on (SSE-KMS, SSE-S3, or the MinIO equivalent). Objects here are whole payloads, so this is the largest single PHI store in the system. |
+| ClickHouse and PostgreSQL volumes | Encrypted volumes. Named here because the archive is fed from these topics; the archive contract owns the detail. |
+| Backups and snapshots | Encrypted, with the same rules as the volume they came from. A backup of an encrypted disk written to an unencrypted bucket is the usual gap. |
+
+Volume-level encryption protects a lost or decommissioned disk and a misconfigured snapshot share. It
+does **not** protect against a compromised broker process, an over-broad ACL, or an unaudited Kafka
+UI — those are 3.4 and the envelope contract's section 4. Stating which threat each control covers is
+the point: encryption at rest is often treated as the answer to all of them, and it is the answer to
+one.
+
+Application-level or per-topic payload encryption is **not** required in v0 and is not designed here:
+it means key management, which CLAUDE.md escalates. If a deployment needs it, ADR-004 plus a human
+decides. Key custody for the options above (cloud-managed keys versus customer-managed KMS keys) is
+likewise an ADR-004 question; the requirement that encryption be on is not.
+
+### 3.6 Consumer group naming
 
 ```
 tb.<env>.<channel>.<role>[.<destination>]     role = pipeline | loader | replier | archiver
@@ -201,3 +276,9 @@ each invalid one breaks. Tests validate each string against `topic-name.schema.j
   path. Not in v0.
 - Section 3.4 states the required security profile and the ACL *shape*. The concrete ACL templates,
   credential rotation and key management are ADR-004 plus a human decision, and are not settled here.
+- Section 3.5 requires encryption at rest. What is deferred is **key custody only** (cloud-managed
+  versus customer-managed KMS keys) and application-level payload encryption, both ADR-004. The
+  requirement itself is not deferred — a v0 deployment with unencrypted broker disks does not
+  conform.
+- Audit retention (section 2.1) is an open human decision, and the `_tb.<env>.audit` event contract
+  is unwritten. Both must be settled together.

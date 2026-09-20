@@ -10,8 +10,17 @@ wave's exit criteria here.
 - **Last gate report:** none. `docs/spikes/PHASE-0-DECISION.md` is not written; it waits on S1-S6.
 - **Contracts:** v0 Draft published for envelope, topics and events. Conformance passed 62 / 0 / 0 on
   2026-09-20, then `security-reviewer` raised 5 HIGH findings; all 5 accepted and fixed in place (still
-  Draft, no version bump). **Conformance re-run is outstanding** — new counts: envelope 7 valid /
-  16 invalid, events 8 / 14, topic names 10 / 12.
+  Draft, no version bump). The suite then passed 70 / 0 / 0 on those fixes at commit `ae4d3bd` — envelope 7 valid /
+  16 invalid, events 8 / 14, topic names 10 / 12. (Reported by the lead; the architect has no shell
+  and did not run it. The working tree has moved past `ae4d3bd`, so that result covers the committed
+  state, not the current one.)
+  **Round 2 (findings 6-14) is triaged: 7 fixed, 1 escalated, 1 referred to the human, none
+  disputed.** Finding 6 (the `_hmac` mechanism) is answered as UNRESOLVED-by-design and escalated to
+  ADR-004 plus a human; finding 12 (audit retention) is in the open questions below. The other seven
+  are fixed in place — per-finding record in `contracts/CHANGELOG.md`, status table in
+  `docs/security/contracts-v0-review.md`. Four invalid examples added, so the expected conformance
+  count is now **74** (envelope 7 valid / 18 invalid, events 8 / 16, topic names 10 / 12, 3 guard
+  tests). **That run is outstanding** — the architect has no shell.
 
 ### Spike reports filed
 
@@ -51,6 +60,11 @@ measurements — that happens in P0-3 synthesis, once the remaining reports are 
 | 2026-09-20 | ADR-002 and ADR-003 drafted as skeletons with `TODO(Sn)` placeholders; no unmeasured number presented as a result | `docs/adr/README.md` |
 | 2026-09-20 | 5 HIGH security findings against contracts v0 all accepted, none disputed. Fixed in place while Draft: PHI key removed from the validation projection, `attrs` PHI rules made enforceable, claim-check URIs constrained, required security profile added, and the durability floor pinned per topic (an invariant-1 bug) | `contracts/CHANGELOG.md`, ADR-002 D8/D9 |
 | 2026-09-20 | Transport security and authorization belong in the topics contract, not deferred wholesale to ADR-004. Boundary: contract fixes mechanisms and ACL shape; ADR-004 plus a human own the role model, rotation and key management | ADR-002 D9 |
+| 2026-09-20 | Security review round 2 (findings 6-14): 7 fixed, 1 escalated (6), 1 referred to the human (12), none disputed | `contracts/CHANGELOG.md`, `docs/security/contracts-v0-review.md` |
+| 2026-09-20 | `tb-correlation-id` is a UUID minted by the engine, not free text. A sender-supplied token is mapped by the receiver in memory and never becomes the reply record key | ADR-002 D10, `contracts/envelope/v0/README.md` 3.2 |
+| 2026-09-20 | `tb-usr-*` headers are **not** projected into `_tb.events` in v0. Chose this over defining a header-to-`attrs` mapping: an automatic projection makes every channel-defined header a silent archive column | ADR-002 D11, `contracts/envelope/v0/README.md` 2.2 |
+| 2026-09-20 | Topic sharing must not span a tenant or trust boundary — a restriction enforced by the control plane, not a documented cost | `contracts/topics/v0/README.md` 1.3 |
+| 2026-09-20 | Encryption at rest is required by the topics contract (broker disks, claim-check bucket, archive volumes, backups), stated with the threats it does not cover. Key custody stays with ADR-004 | `contracts/topics/v0/README.md` 3.5 |
 
 ## Open questions for the human
 
@@ -68,6 +82,27 @@ measurements — that happens in P0-3 synthesis, once the remaining reports are 
   required mechanisms and ACL shape, but the model itself and anything touching key management is a
   human decision per CLAUDE.md. Needed before the archiver or any production deployment, not before the
   Phase 0 gate.
+- **The `attrs` `_hmac` mechanism is UNRESOLVED (security finding 6, HIGH).** The events schema pins
+  the *shape* (exactly 64 lowercase hex) but cannot pin the mechanism, and an unkeyed `sha256(mrn)`
+  has the same shape while being reversible by exhaustive search over a bounded identifier space. No
+  agent will choose the construction, the key scope, the rotation story or the key store — that is
+  cryptography and key management, which CLAUDE.md escalates. Open questions are written out in
+  `contracts/events/v0/README.md` 3.1 and belong to ADR-004. Interim position in the contract:
+  producers SHOULD NOT emit identifier-derived `attrs` at all, and `_hmac` values must be treated as
+  PHI in ClickHouse. Also needs a human answer: is a keyed hash of an MRN de-identified for your
+  compliance purposes? (Under a Safe Harbor reading it is not.)
+- **Audit retention: 30 days versus a possible six-year duty (security finding 12, MEDIUM).**
+  `_tb.<env>.audit` retains 30 days, a number picked to match the DLQ, not a compliance decision.
+  HIPAA §164.316(b)(2)(i) requires six-year retention of the records of required actions and
+  activities; whether that reaches a control-plane and access audit trail is an interpretation
+  question, and **no legal review has been done — none should be done by an agent.** If the duty does
+  apply, 30 days is a deletion policy: the evidence is gone before the first annual audit. The likely
+  answer is architectural rather than a bigger number — six years at RF=3 points at ClickHouse or
+  object storage as the system of record with Kafka as a transport buffer. Three questions:
+  (a) what duty applies, (b) what is the system of record, (c) does the answer also change
+  `_tb.<env>.events` (3 d) and `raw` (7 d), which is also the replay source. Written up in
+  `contracts/topics/v0/README.md` 2.1; the value is unchanged and marked `TODO(human)`. Not a Phase 0
+  gate blocker, but it must be settled before the `_tb.<env>.audit` contract is written.
 
 ## Risks (live)
 

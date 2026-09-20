@@ -209,7 +209,7 @@
     },
     "headers": {
       "type": "object",
-      "description": "Kafka headers decoded to UTF-8 text, last value wins. At most 32 entries, 16 KiB total (not expressible here).",
+      "description": "Kafka headers decoded to UTF-8 text, last value wins. At most 32 entries; the 16 KiB total is a producer-side check, but per-value maxima bound the worst case well inside it.",
       "maxProperties": 32,
       "additionalProperties": false,
       "properties": {
@@ -227,7 +227,10 @@
           "maxLength": 255,
           "pattern": "^[a-z]+/[a-zA-Z0-9.+_-]+( *; *[a-zA-Z0-9._-]+=[^;]{1,64})*$"
         },
-        "tb-correlation-id": { "type": "string", "pattern": "^[A-Za-z0-9._:-]{1,128}$" },
+        "tb-correlation-id": {
+          "$ref": "#/$defs/uuidAny",
+          "$comment": "UUID only, minted by the engine (ADR-001 6.5). It is the reply-topic record key and reaches _tb.events, ClickHouse and the browser in clear text, so a sender-supplied token that might contain an identifier must be mapped by the receiver, not passed through."
+        },
         "tb-parent-id": { "$ref": "#/$defs/uuidAny" },
         "tb-attempt": { "type": "string", "pattern": "^(0|[1-9][0-9]{0,3})$" },
         "traceparent": {
@@ -246,16 +249,17 @@
         "tb-error-code": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]{0,63}$" },
         "tb-retry-not-before": { "$ref": "#/$defs/rfc3339UtcMillis" }
       },
+      "$comment": "Value budget: the 16 KiB total is a producer-side check, but the schema bounds the worst case so open-ended headers cannot blow it. The 16 registered header values sum to about 2.5 KiB, and the 16 remaining slots can only be tb-usr-*/tb-x-* at 256 bytes each, so a schema-valid header set is roughly 7 KiB including names - comfortably inside 16 KiB. The earlier 1024-byte allowance for those two prefixes admitted about 32 KiB, twice the budget.",
       "patternProperties": {
         "^tb-x-[a-z0-9-]{1,48}$": {
           "type": "string",
-          "maxLength": 1024,
-          "$comment": "Experimental / spike-local. Never load-bearing."
+          "maxLength": 256,
+          "$comment": "Experimental / spike-local. Never load-bearing. 256 bytes, not 1024: see the header budget $comment above."
         },
         "^tb-usr-[a-z0-9-]{1,48}$": {
           "type": "string",
-          "maxLength": 1024,
-          "$comment": "Channel-defined. Propagated, never interpreted. No PHI (invariant 6)."
+          "maxLength": 256,
+          "$comment": "Channel-defined. Propagated, never interpreted, and NOT projected into _tb.events in v0. No PHI (invariant 6): a header is readable by anything with topic read access. Must never carry the record key (README section 4)."
         }
       }
     }

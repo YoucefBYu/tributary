@@ -149,6 +149,70 @@ the wrong one.
 mechanisms and the ACL shape; ADR-004 owns the role model, credential rotation and key management,
 which need a human decision (CLAUDE.md escalates cryptography and key management).
 
+### D10. `tb-correlation-id` is an engine-minted UUID (decided)
+
+**Options:** (a) free text up to 128 characters, as first drafted; (b) free text plus a written rule
+"must not be derived from patient data"; (c) UUID only, with the receiver mapping any sender token in
+memory.
+
+**Chose (c).** The correlation id is the `reply` record key and is copied into `_tb.events`,
+ClickHouse and the browser in clear text. Option (a) invites the obvious implementation — reuse
+MSH-10 or the sender's request id — and senders in the field put visit and accession numbers there.
+Option (b) is the same data with a paragraph asking people not to. A UUID cannot represent a
+payload-derived value at all, which is the difference between a rule and a constraint. ADR-001 6.5
+already has the receiver generating the id, so this ratifies the flow rather than changing it.
+
+**Give up:** a sender cannot search the browser by its own token, and receivers must hold a
+token-to-UUID map for the life of the pending request (they already hold the open connection there).
+
+### D11. `tb-usr-*` does not reach `_tb.events` (decided)
+
+**Options:** (a) define a normative header-to-`attrs` mapping; (b) state that `tb-usr-*` stays in
+headers and is never projected; (c) leave it as it was, describing a projection that no field can
+hold.
+
+**Chose (b).** Option (c) was the bug: the contract promised a path the schema could not express, so
+each implementer would have invented one. Option (a) turns every channel-defined header into a silent
+new archive column, populated by channel code, in the one place invariant 6 is hardest to police —
+the archive is where PHI becomes durable, searchable and widely readable.
+
+**Give up:** a step that wants metadata searchable must emit it deliberately as an `attrs` short code
+through `ctx`, so metadata is set in two places, and the browser cannot show `tb-usr-*` in a list
+view. Revisit in v1 with a per-channel allow-list if a real channel needs it.
+
+### D12. Topic sharing is bounded by the tenant, not by preference (decided)
+
+A share group occupies the `channel` position, and ACLs are prefix-based on `<env>.<channel>.`, so
+every consumer of a shared topic can read every record on it. `tb-channel` filtering is consumer-side
+convention, not access control. Therefore a share group MUST NOT span a tenant or trust boundary, the
+control plane refuses such a deployment, and the group inherits the union of its members'
+sensitivity.
+
+**Why this is not a trade-off:** the first draft listed "no per-channel ACL" as a cost of sharing. In
+a multi-tenant deployment that cost is one tenant reading another tenant's PHI, which is a breach.
+"Opt-in" describes who enables sharing, not who can read the data afterwards.
+
+**Give up:** small channels in different tenants cannot be consolidated, so the topic-count pressure
+S4 is measuring is only relieved within a tenant.
+
+### D13. Encryption at rest is required, and scoped honestly (decided)
+
+Required: encrypted broker data directories, bucket-default encryption on the claim-check store,
+encrypted ClickHouse and PostgreSQL volumes, encrypted backups (topics contract 3.5).
+
+**Why it belongs here:** the same reasoning as D9. Kafka has no built-in encryption at rest, so a
+contract that configures durability and transport but says nothing about disks reads as though none
+is needed.
+
+**Scoped honestly:** volume encryption covers a lost or decommissioned disk and a mis-shared
+snapshot. It does not cover a compromised broker process, an over-broad ACL, or an unaudited Kafka
+UI — D9 and the envelope contract's section 4 own those. Encryption at rest is routinely treated as
+the answer to all three.
+
+**Give up / escalated:** application-level or per-topic payload encryption is not required and not
+designed here, and key custody (cloud-managed versus customer-managed KMS) is ADR-004 plus a human.
+The requirement that encryption be on is not deferred.
+
 ---
 
 ## 3. Consequences
@@ -170,7 +234,7 @@ replay the primary recovery path; Kafka share groups for unordered destinations.
 |---|---|
 | Invariant 1 | Reinforced: `contracts/topics/v0` section 3 lists the broker and producer settings without which ACK-after-commit is a lie. A security review found the first draft pinned `min.insync.replicas` only per profile, not per topic, so a topic created from the class defaults would satisfy `acks=all` with one replica — fixed by pinning the durability floor in every class. |
 | Invariant 3 | Reinforced by D9: no worker or loader gets `WRITE` on `_tb.<env>.channels`. Invariant 3 makes workers trust that topic completely, so write access to it is remote code execution across the data plane. |
-| Invariant 6 | Reinforced: the envelope validation projection carries no key value, and claim-check URIs cannot carry credentials or identifiers. |
+| Invariant 6 | Reinforced repeatedly by the two security rounds: the envelope validation projection carries no key value; claim-check URIs cannot carry credentials or identifiers; `tb-correlation-id` is a UUID so it cannot carry payload-derived content (D10); `tb-usr-*` does not reach the archive (D11); the record-key prohibition now names URLs, browser storage and sender-facing errors, and any tool that can display a key is treated as a PHI viewer; `attrs` is bounded so it cannot hold a message. |
 | Invariant 2 | Unchanged. D2 renames the physical platform topics, not the classes. |
 | Invariant 5 | Reinforced: the `out`/`raw` partition-count rule closes a silent reordering path. |
 | Invariant 8 | Implemented by `contracts/envelope/v0`. |
@@ -183,8 +247,10 @@ replay the primary recovery path; Kafka share groups for unordered destinations.
 
 1. Fill every TODO(Sn) from the filed spike reports before the Phase 0 gate.
 2. Conformance suite over both contracts' example manifests. First run 2026-09-20 passed 62 / 0 with no
-   schema bugs, but the same day's security fixes changed both schemas and added 6 examples, so a
-   **re-run is outstanding**. Keep it in CI afterwards.
+   schema bugs; the same day's security fixes changed both schemas and added 6 examples, and the re-run
+   passed 70 / 0 at commit `ae4d3bd`. The second security round added four invalid examples, so the
+   expected count is 74 and **that run is outstanding**. Keep it in CI, which is the point: a contract
+   edit that invalidates its own examples must fail a build, not wait for a reviewer.
 3. `platform-engineer`: reconcile `spikes/common/src/tbcommon/envelope.py` with the contract. Binding
    for `packages/tributary-sdk` and `-runtime` in Phase 1, not retroactively for throwaway spike code.
 4. **Phase 1, `devops-engineer`** (not on the Phase 0 team, so these are carried forward here rather
@@ -195,3 +261,18 @@ replay the primary recovery path; Kafka share groups for unordered destinations.
      retentions in a third and fourth place.
    - Lite mode logs the RF=1 / no-RPO=0 warning at startup (`contracts/topics/v0` section 3.1).
 5. ADR-004 owns claim-check object lifecycle and retention, which no Phase 0 spike exercised.
+6. **ADR-004 also owns the `attrs` `_hmac` mechanism, left UNRESOLVED on purpose** (security finding
+   6, HIGH). The events schema pins the 64-lowercase-hex shape, which is all a schema can do: an
+   unkeyed `sha256(mrn)` has the identical shape and is reversible by exhaustive search over a
+   bounded identifier space. Construction, key scope, rotation, key store, and whether a keyed hash
+   counts as de-identified are cryptography and key management, which CLAUDE.md escalates to a human.
+   Open questions are enumerated in `contracts/events/v0/README.md` 3.1. Interim contract position:
+   producers SHOULD NOT emit identifier-derived `attrs`, and `_hmac` values are treated as PHI in
+   ClickHouse. This blocks the per-patient search feature in the message browser (ADR-001 6.6), not
+   the Phase 0 gate.
+7. **Audit retention is an open human decision** (security finding 12, MEDIUM):
+   `contracts/topics/v0/README.md` 2.1. The 30-day default may be two orders of magnitude short of a
+   six-year duty, and the fix is likely architectural (ClickHouse or object storage as the system of
+   record, Kafka as a buffer) rather than a larger `retention.ms`. Settle it before the
+   `_tb.<env>.audit` event contract is written; it also puts `_tb.<env>.events` (3 d) and `raw` (7 d)
+   in scope.

@@ -1,0 +1,30 @@
+{
+  "v": 0,
+  "kind": "message",
+  "ts": "2026-09-20T11:22:33.128Z",
+  "channel": "adt-to-fhir",
+  "channel_version": 7,
+  "stage": "received",
+  "status": "ok",
+  "instance": "mllp-receiver:recv-7f3a",
+  "message_id": "018f3a5c-7d21-7b3e-9f01-2c4a6e8b0d13",
+  "attrs": {
+    "c01": "A01",
+    "c02": "A02",
+    "c03": "A03",
+    "c04": "A04",
+    "c05": "A05",
+    "c06": "A06",
+    "c07": "A07",
+    "c08": "A08",
+    "c09": "A09",
+    "c10": "A10",
+    "c11": "A11",
+    "c12": "A12",
+    "c13": "A13",
+    "c14": "A14",
+    "c15": "A15",
+    "c16": "A16",
+    "c17": "A17"
+  }
+}

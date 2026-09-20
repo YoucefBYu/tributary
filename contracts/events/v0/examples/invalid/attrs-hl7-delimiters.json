@@ -1,0 +1,14 @@
+{
+  "v": 0,
+  "kind": "message",
+  "ts": "2026-09-20T11:22:33.128Z",
+  "channel": "adt-to-fhir",
+  "channel_version": 7,
+  "stage": "transformed",
+  "status": "ok",
+  "instance": "worker:pipeline-2@worker-4",
+  "message_id": "018f3a5c-7d21-7b3e-9f01-2c4a6e8b0d13",
+  "attrs": {
+    "segment_echo": "OBX|5|TX|NOTE^SUB"
+  }
+}

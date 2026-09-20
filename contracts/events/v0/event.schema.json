@@ -34,7 +34,10 @@
     "instance": { "type": "string", "minLength": 1, "maxLength": 253 },
     "message_id": { "$ref": "#/$defs/uuidAny" },
     "parent_id": { "$ref": "#/$defs/uuidAny" },
-    "correlation_id": { "type": "string", "pattern": "^[A-Za-z0-9._:-]{1,128}$" },
+    "correlation_id": {
+      "$ref": "#/$defs/uuidAny",
+      "$comment": "UUID only, engine-minted. It reaches ClickHouse and the browser in clear text, so it must not be derivable from a patient identifier or any payload field."
+    },
     "destination": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,63}$" },
     "attempt": { "type": "integer", "minimum": 0, "maximum": 9999 },
     "content_type": { "type": "string", "maxLength": 255 },
@@ -61,8 +64,8 @@
     },
     "attrs": {
       "type": "object",
-      "description": "Searchable metadata. Identifier-derived entries MUST use an _hmac suffix and a 64-hex-character value; a name known to denote a direct identifier is rejected in clear form. Other values are short low-cardinality codes: no spaces, 64 characters max, which is hostile to free text and to smuggled payload.",
-      "maxProperties": 32,
+      "description": "Searchable metadata. Identifier-derived entries MUST use an _hmac suffix and a 64-hex-character value; a name known to denote a direct identifier is rejected in clear form. Other values are short low-cardinality codes: no spaces, 64 characters max, and no HL7 delimiter characters (| ^ ~ \\ &) or CR/LF, so a segment cannot be pasted in. Producers must also keep the whole attrs object under 1024 serialized bytes, which JSON Schema cannot express. This RAISES THE COST of smuggling payload into attrs; it does not make it impossible.",
+      "maxProperties": 16,
       "propertyNames": {
         "allOf": [
           { "pattern": "^[a-z][a-z0-9_]{0,31}$" },
@@ -112,7 +115,7 @@
       },
       "patternProperties": {
         "_hmac$": {
-          "$comment": "Fixed-length hex only, so a clear-text value cannot hide behind an _hmac suffix.",
+          "$comment": "Fixed-length lowercase hex only, so a clear-text value cannot hide behind an _hmac suffix. WARNING: this shape does NOT prove the value is a keyed hash — an unkeyed SHA-256 digest is also 64 hex characters. The hashing mechanism itself is UNRESOLVED and escalated to a human via ADR-004; see README section 3.1.",
           "type": "string",
           "pattern": "^[0-9a-f]{64}$"
         }

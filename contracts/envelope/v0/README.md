@@ -63,9 +63,9 @@ explicitly so the two schemas stay independent.
 even when a size is `0`. An omitted field would pass the claim-check and size rules by accident, which
 is the opposite of what a conformance test is for. `topic` is optional.
 
-**Conformance re-run pending.** The 2026-09-20 run passed all examples, but it predates the same day's
-security fixes (projection no longer carries the key value; `tb-claim-check` URI constrained), so that
-result is superseded. 23 examples now: 7 valid, 16 invalid.
+**Conformance.** 25 examples: 7 valid, 18 invalid. The suite passed at commit `ae4d3bd` (70 tests
+across all three contracts) after the first round of security fixes; the second round added two
+invalid envelope examples, so the expected count is now 74. That re-run has not happened yet.
 
 ### 1.2 Strict producers, lenient consumers
 
@@ -87,11 +87,25 @@ result is superseded. 23 examples now: 7 valid, 16 invalid.
 | Timestamps | RFC 3339, UTC, 3 to 9 fractional digits, offset `Z` or `+00:00`. Example `2026-09-20T11:22:33.123Z`. |
 | UUIDs | Canonical lowercase hyphenated form. |
 | Absent | Omit the header. Never send an empty value to mean "absent". |
-| Limits | At most 32 headers; name ≤ 64 bytes; value ≤ 1024 bytes (`tb-claim-check` ≤ 2048); all headers together ≤ 16 KiB. |
+| Limits | At most 32 headers; name ≤ 64 bytes; registered header values ≤ 1024 bytes, `tb-claim-check` included; `tb-usr-*` and `tb-x-*` values ≤ 256 bytes; all headers together ≤ 16 KiB. |
 
 Rationale for text values: `kcat`, the Kafka UI, ClickHouse and a human debugging a production
 incident can all read them. The cost is a few bytes per record and a parse step for integers, which
 does not register next to payload size.
+
+That readability has a price, and the contract states it rather than leaving it implied: **any tool
+that can read a data-plane topic is a PHI viewer.** `kcat`, a Kafka UI, a ClickHouse client and the
+message browser all show the record key and every header. Deployments MUST put topic read access
+behind the same authentication, authorization and audit as the message browser
+([topics contract](../../topics/v0/README.md) 3.4), and MUST NOT run a shared, unauthenticated Kafka
+UI against a production cluster. Recommending `kcat` for debugging without that sentence was how the
+first draft turned an operational convenience into an unaudited PHI viewer.
+
+The 16 KiB total is a producer-side check — JSON Schema cannot sum value lengths. The schema instead
+bounds the worst case: the 16 registered header values sum to about 2.5 KiB, and the 16 remaining
+slots can only be `tb-usr-*` or `tb-x-*` at 256 bytes each, so a schema-valid header set is roughly
+7 KiB including names, comfortably inside the budget. The earlier 1024-byte allowance for those two
+prefixes admitted about 32 KiB, twice the stated budget.
 
 ### 2.1 Reserved prefixes
 
@@ -99,10 +113,36 @@ does not register next to payload size.
 |---|---|---|
 | `tb-` | Normative. Only names in section 3. | Load-bearing. |
 | `tb-x-` | Experimental or spike-local (for example `tb-x-seq` in S5). | Never load-bearing. Must not survive into a released package. |
-| `tb-usr-` | Channel-defined metadata set by a step through `ctx`. | Propagated, never interpreted by the engine. |
+| `tb-usr-` | Channel-defined metadata set by a step through `ctx`. | Propagated, never interpreted by the engine. Not projected into `_tb.events`. |
 
-`tb-usr-*` and `tb-x-*` values fall under invariant 6: no PHI. They reach `_tb.events`, ClickHouse
-and the browser.
+`tb-usr-*` and `tb-x-*` values fall under invariant 6: no PHI. A Kafka header is readable by anything
+with topic read access — `kcat`, a Kafka UI, and the record detail view in the message browser — so
+"it is only a header" is not a containment argument.
+
+### 2.2 `tb-usr-*` does not reach `_tb.events` in v0
+
+An earlier draft said these headers flow into `_tb.events`, ClickHouse and the browser. The events
+contract has no field that can hold them: `attrs` keys are `^[a-z][a-z0-9_]{0,31}$`, which cannot
+represent a hyphenated 48-character header name, and `additionalProperties: false` blocks a new
+top-level field. The contract described a path that does not exist, and an implementer who needed it
+would have invented a mapping — the ad-hoc route by which unvetted tenant metadata reaches the
+archive.
+
+**Decision: `tb-usr-*` is propagated between hops in headers and is NOT copied into `_tb.events`.**
+
+**Why this rather than defining the mapping:** an automatic header-to-archive projection makes every
+channel-defined header a silent new archive column, populated by channel code, in the one place
+invariant 6 is hardest to police. Making it explicit costs a step author one line and gives the
+reviewer something to review.
+
+**Give up:** a step that wants its metadata searchable must emit it deliberately, as an `attrs` entry
+through `ctx`, under the events contract's short-code rules ([events contract](../../events/v0/README.md)
+section 3). Two places to set metadata instead of one, and the browser cannot show a `tb-usr-*` value
+in a list view — only in the record detail, which reads the record itself.
+
+Revisit in v1 if a real channel needs it, with an explicit per-channel allow-list of which
+`tb-usr-*` headers project into `attrs` and under which names. That is policy, which section 8
+already assigns to ADR-004.
 
 ---
 
@@ -120,7 +160,7 @@ and the browser.
 | `tb-content-type` | R | R | R | R | R | Media type of the current payload. Changes when a step changes the format. Section 3.1. |
 | `tb-attempt` | R | R | R | R | O | Delivery attempt for the current stage. `0` at receive. |
 | `traceparent` | R | R | R | R | R | W3C trace context. Same trace id across hops, new span id per hop. |
-| `tb-correlation-id` | C | C | C | C | R | Required on `raw` when the channel uses synchronous reply mode (ADR-001 6.5), and propagated wherever it was set. Also links split and aggregate flows. |
+| `tb-correlation-id` | C | C | C | C | R | **A UUID minted by the engine, never a sender-supplied token.** Required on `raw` when the channel uses synchronous reply mode (ADR-001 6.5), and propagated wherever it was set. Also links split and aggregate flows. Section 3.2. |
 | `tb-parent-id` | C | C | C | C | O | Required when this message was produced by a split, or re-injected by reprocess or replay. Any UUID version: it may be an id from an external system. |
 | `tb-claim-check` | C | C | C | C | C | Required when the payload exceeded the inline limit. Section 5. |
 | `tb-destination` | – | R | R | C | O | Destination name from the channel spec. **New in v0** (not in ADR-001 5.4): `retry` and `dlq` are per channel, not per destination, so without it a retry consumer cannot tell which loader owns the record. On `dlq` it is required only when the failure happened at a destination. |
@@ -146,6 +186,33 @@ subtype only, ignoring unknown parameters. Default charset when the parameter is
 except `application/hl7-v2+er7` where the channel spec decides (HL7 v2 in the field is frequently
 ISO-8859-1 or a Japanese encoding, and guessing corrupts names).
 
+### 3.2 Correlation ids are engine-minted UUIDs
+
+`tb-correlation-id` is a UUID (any version), not free text. The first draft allowed
+`^[A-Za-z0-9._:-]{1,128}$`, which invited the obvious implementation: reuse the sender's token —
+MSH-10, a query tag, an HTTP request id — as the correlation id.
+
+**Why that is a PHI leak and not a style point.** The correlation id is the `reply` topic's record
+key, it is copied into `_tb.events`, ClickHouse and the browser in clear text, and unlike the message
+key (section 4) nothing marked it as sensitive. A sender-controlled token is sender-controlled
+content: systems in the field put visit numbers, accession numbers and worse into MSH-10. Constrained
+to a UUID it cannot carry a value derived from the payload, and no "do not log the correlation id"
+rule is needed, because there is nothing in it to leak.
+
+Consequences, which ADR-001 6.5 already implies — the receiver generates the correlation id there:
+
+1. The receiver MUST mint a fresh UUID per request and keep the sender's token only in its in-memory
+   pending map, next to the open connection. That map is the mapping; nothing durable holds both.
+2. A correlation id MUST NOT be derived from a patient identifier or any payload field — not even by
+   hashing one into a UUIDv5 namespace, which would make it a stable pseudonym for that patient
+   across every reply record and every archive row.
+3. A split or aggregate flow reuses the existing correlation id rather than deriving a new one from
+   content.
+
+**Give up:** a sender cannot correlate by its own token in the message browser. Search by
+`tb-msg-id` instead, or have the channel put the token in `attrs` as a short code if it is genuinely
+not an identifier — a judgement a reviewer makes per channel, which is the intent.
+
 ---
 
 ## 4. Message key
@@ -158,13 +225,29 @@ ISO-8859-1 or a Japanese encoding, and guessing corrupts names).
 | Per class | `raw`, `out`, `retry`: ordering key. `dlq`: `tb-msg-id`. `reply`: `tb-correlation-id`. |
 
 **The key is frequently a direct patient identifier** — ADR-001's worked example is `hl7:PID.3.1`.
-Therefore, under invariant 6, the key MUST NOT appear in a log line, a metric label, a trace
-attribute, an exception message or test output in clear text. Log `tb-msg-id`. Where a key must be
-searchable (the message browser), store a keyed hash, per ADR-001 6.6 and the
-[events contract](../../events/v0/README.md).
+Therefore, under invariant 6, the key MUST NOT appear in clear text in any of:
+
+| Surface | Note |
+|---|---|
+| Log lines, metric labels, trace attributes, exception messages, test output | Invariant 6 as written. Log `tb-msg-id`. |
+| **URLs** — UI routes, query strings, API paths, and any HTTP loader or lookup URL the engine builds | A URL is logged by every proxy, gateway and access log between here and the destination, and lands in browser history. Put the identifier in the request body or a header. Where a destination API only accepts it in the path or query (FHIR `?identifier=`), that is a deliberate, documented channel behaviour, and Tributary MUST NOT log the URL it sent. |
+| **Browser storage** — `localStorage`, `sessionStorage`, cookies, and the UI's client-side caches | Survives the session and the logout, on a machine Tributary does not control. |
+| **Error responses returned to a sender**, including NACK text and HTTP error bodies | The sender's own logs are outside our trust boundary, and a NACK that echoes the key sends PHI to a system that may not expect to receive it. Return a code plus `tb-msg-id`. |
+| **Other headers** — `tb-usr-*`, `tb-x-*`, `tb-source`, `tb-correlation-id` | Copying the key into a header launders it past every rule above, because headers are propagated and archived. Section 3.2 constrains `tb-correlation-id` structurally; the rest is a rule a reviewer enforces. |
+| **`_tb.events.attrs`**, hashed or otherwise, under any name | [Events contract](../../events/v0/README.md) section 3, rule 4. |
+
+Where a key must be searchable (the message browser), store a keyed hash, per ADR-001 6.6 and the
+[events contract](../../events/v0/README.md) — noting that the hashing mechanism itself is
+unresolved (events contract section 3.1).
+
+Anything that can display a record key or a raw record — the message browser, `kcat`, a Kafka UI, a
+ClickHouse client — is a PHI viewer, and MUST be authenticated, authorized and audited like one
+(section 2, and [topics contract](../../topics/v0/README.md) 3.4). "It is only a debugging tool" is
+not an exemption; it is how the access gets left unlogged.
 
 This is the one place where an engine-internal value is PHI, and it is easy to leak by accident.
-Reviewers: treat any `log`/`metric`/`span` call that touches a record key as a Critical finding.
+Reviewers: treat any `log`/`metric`/`span` call, URL construction, or sender-facing error message
+that touches a record key as a Critical finding.
 
 The same reasoning removed the key from the validation projection (section 1.1) and keeps it out of
 `_tb.events.attrs` in clear text ([events contract](../../events/v0/README.md) section 3).
