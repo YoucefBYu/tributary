@@ -160,6 +160,13 @@ replay the primary recovery path; Kafka share groups for unordered destinations.
 1. Fill every TODO(Sn) from the filed spike reports before the Phase 0 gate.
 2. ~~Conformance suite over both contracts' example manifests.~~ Done 2026-09-20:
    `tests/conformance/test_contracts_v0.py`, 62 passed / 0 failed, no schema bugs. Keep it in CI.
-3. `platform-engineer`: reconcile `spikes/common/src/tbcommon/envelope.py` with the contract.
-4. `devops-engineer`: Helm and Compose read `topic-defaults.json` rather than hardcoding values.
-5. ADR-004 owns claim-check object lifecycle and retention.
+3. `platform-engineer`: reconcile `spikes/common/src/tbcommon/envelope.py` with the contract. Binding
+   for `packages/tributary-sdk` and `-runtime` in Phase 1, not retroactively for throwaway spike code.
+4. **Phase 1, `devops-engineer`** (not on the Phase 0 team, so these are carried forward here rather
+   than assigned now):
+   - CI runs `tests/conformance` on every change to `contracts/**`. The value is catching a contract
+     edit that silently invalidates its own examples; the run command is in `contracts/README.md`.
+   - Helm and Compose read `topic-defaults.json` rather than hardcoding partition counts and
+     retentions in a third and fourth place.
+   - Lite mode logs the RF=1 / no-RPO=0 warning at startup (`contracts/topics/v0` section 3.1).
+5. ADR-004 owns claim-check object lifecycle and retention, which no Phase 0 spike exercised.
