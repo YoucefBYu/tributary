@@ -7,10 +7,32 @@ wave's exit criteria here.
 
 - **Phase / wave:** Phase 0 complete. **P0-3 synthesis filed 2026-09-20; awaiting human sign-off at the gate.**
 - **Branch:** `wave/0`
-- **Last gate report:** `docs/spikes/PHASE-0-DECISION.md` — **GO WITH CHANGES.** No invariant changes.
-  Two planning values were disproved and corrected: the 12-partition default (now 3) and the
-  200-500 msg/s/core estimate (measured 2,446 with `python-hl7`). Two thresholds were not met as
-  written: S2's 50 ms ACK p99 (cause unresolved, environment-dominated) and S4's 500 channels at 12
+- **Blocking the gate — four items, three of which need the human.** Full list and evidence in the gate
+  report section 7. (a) the damaged `.gitignore`, below; (b) **the spike Kafka cluster and MLLP listener
+  are unauthenticated on all interfaces** (`security-reviewer` High 2: `PLAINTEXT` on `0.0.0.0`, no
+  authorizer, `kafka-ui` with dynamic config and no login) — any LAN host has read/write/admin while it
+  runs, and could forge S3 replies; the fix is localhost binding by `platform-engineer` and
+  `connector-engineer`, and the lead is asking whether to stop the cluster now; (c) **human confirmation
+  of three MPL-2.0 dependencies** — `orjson` (shipping runtime; its metadata declares
+  `MPL-2.0 AND (Apache-2.0 OR MIT)`, which corrects an earlier assessment of mine), `hypothesis`
+  (test-only) and `pathspec` (build-time), each architect-approved as unmodified but escalated because
+  CLAUDE.md sends licensing to a human; (d) human sign-off on the nine decisions.
+- **The `.gitignore` item in full:** the root `.gitignore` was damaged by
+  commit `3fb0049` (31 lines cut to 2) and no longer ignores `samples/mirth/*`, `.env`, `.env.*`,
+  `secrets/`, `benchmarks/results/` or `.claude/settings.local.json`. Nothing has leaked and no secret
+  is or ever was tracked, but the control is gone on paths CLAUDE.md calls sensitive — and decision #9
+  invites real anonymized Mirth exports into `samples/mirth/`. Restoring it was permission-denied for
+  agents: `git checkout 2c25448 -- .gitignore && rm Dockerfile` (the root `Dockerfile` is of unknown
+  origin). `security-reviewer` verified the current behaviour: `.env`, `secrets/x`,
+  `samples/mirth/foo.xml` and `benchmarks/results/*` are not ignored at HEAD, and the content hook does
+  not run on commits.
+- **Last gate report:** [`docs/agent-team/gates/phase-0-spikes.md`](gates/phase-0-spikes.md) — the
+  exit-criteria check, the invariant 1-10 audit and the reviewer findings. Its recommendation is
+  **GO WITH CONDITIONS**; the conditions are listed there.
+  The technical decision memo behind it is `docs/spikes/PHASE-0-DECISION.md` — **GO WITH CHANGES**, no
+  invariant changes. Two planning values were disproved and corrected: the 12-partition default (now 3)
+  and the 200-500 msg/s/core estimate (measured 2,446 with `python-hl7`). Two thresholds were not met
+  as written: S2's 50 ms ACK p99 (cause unresolved, environment-dominated) and S4's 500 channels at 12
   partitions per topic. **9 decisions wait on the human** — see below.
 - **Contracts:** v0 Draft published for envelope, topics and events. Conformance passed 62 / 0 / 0 on
   2026-09-20, then `security-reviewer` raised 5 HIGH findings; all 5 accepted and fixed in place (still
@@ -22,9 +44,9 @@ wave's exit criteria here.
   disputed.** Finding 6 (the `_hmac` mechanism) is answered as UNRESOLVED-by-design and escalated to
   ADR-004 plus a human; finding 12 (audit retention) is in the open questions below. The other seven
   are fixed in place — per-finding record in `contracts/CHANGELOG.md`, status table in
-  `docs/security/contracts-v0-review.md`. Four invalid examples added, so the expected conformance
-  count is now **74** (envelope 7 valid / 18 invalid, events 8 / 16, topic names 10 / 12, 3 guard
-  tests). **That run is outstanding** — the architect has no shell.
+  `docs/security/contracts-v0-review.md`. **Conformance: 74 passed at HEAD** (envelope 7 valid / 18
+  invalid, events 8 / 16, topic names 10 / 12, 3 guard tests), run by the lead at the Phase 0 gate.
+  No schema bugs. The architect has no shell and did not run it.
 
 ### Spike reports filed
 
@@ -45,7 +67,7 @@ All six filed and synthesised. Full threshold table with evidence ratings quoted
 
 | Checkpoint | Decision | Date | Notes |
 |---|---|---|---|
-| Phase 0 go/no-go | **pending human** | | `docs/spikes/PHASE-0-DECISION.md` filed 2026-09-20: **GO WITH CHANGES**, 9 decisions for the human in its section 7 |
+| Phase 0 go/no-go | **NOT signed** | | The human decided the **nine memo items** on 2026-09-21 ("proceed with the recommendations of the decisions"): 7 adopted or approved, audit retention still open, Mirth corpus not decided — decisions log above, gate report section 8. **The gate sign-off itself is outstanding**, and three conditions remain: restore the root `.gitignore`, confirm the MPL dependencies (`orjson`, `hypothesis`, `pathspec`), and bind the spike infra to localhost. Gate report: `gates/phase-0-spikes.md` |
 | Phase 1 wave 1 exit | pending | | |
 | Phase 1 wave 2 exit | pending | | |
 | Phase 1 wave 3 exit | pending | | |
@@ -75,51 +97,73 @@ All six filed and synthesised. Full threshold table with evidence ratings quoted
 | 2026-09-20 | Kafka transactions stay **opt-in**, not on by default: their cost against a plain at-least-once stage was never isolated, and a dead producer stalls `read_committed` consumers for up to `transaction.timeout.ms` | ADR-003 D6 |
 | 2026-09-20 | The retry-delay mechanism (one `retry` topic plus `tb-retry-not-before` versus one topic per tier) is **deferred to a Phase 1 spike** rather than decided on no evidence | ADR-003 D2 |
 | 2026-09-20 | Synchronous reply requires loader idempotency on `tb-msg-id`; the timeout NACK means "committed, outcome unknown"; the reply worker uses fail-fast plus DLQ and the batched-commit path | ADR-003 D9 |
+| 2026-09-21 | **Human, "proceed with the recommendations of the decisions":** invariants 1-10 confirmed unchanged — **ADOPTED** | gate report section 8 |
+| 2026-09-21 | **Human:** `_tb.<env>.*` platform topic naming (ADR-002 D2) confirmed as a refinement of ADR-001 5.3 prose, not an invariant-2 change — **ADOPTED** | ADR-002 D2, gate report section 8 |
+| 2026-09-21 | **Human:** lite mode with RF=1 — **ADOPTED** as a documented profile with a startup warning and no RPO=0 promise. Recorded as an explicit, human-approved **profile exception to invariant 1's durability promise**; the invariant is not edited and the exception lives in ADR-002 D14, `contracts/topics/v0` and the docs | ADR-002 D14 |
+| 2026-09-21 | **Human:** `_hmac` mechanism — recommendation **ADOPTED**: leave UNRESOLVED until before the archiver is built, no agent designs it, and per-patient message-browser search stays blocked on it | `contracts/events/v0/README.md` 3.1 |
+| 2026-09-21 | **Human:** ADR-004 scope **APPROVED** — Kafka role/ACL model, credential rotation, key custody for encryption at rest and the `_hmac` key, claim-check object lifecycle. Needed before the archiver or production | gate report section 8 |
+| 2026-09-21 | **Human:** Linux re-run of S1 and S2 **APPROVED** as the first Phase 1 CI task, before the receiver is built | `PHASE-0-DECISION.md` section 7 item 7 |
+| 2026-09-21 | **Human:** revised Phase 1 scope (`PHASE-0-DECISION.md` section 8) **APPROVED** | `PHASE-0-DECISION.md` section 8 |
+| 2026-09-21 | Lead stopped the running spike cluster (`docker compose down`) because of the all-interfaces exposure (`security-reviewer` High 2). Nothing lost; storage was ephemeral | gate report 1.1 |
 
 ## Open questions for the human
 
-**The Phase 0 gate list, with a recommendation for each, is `docs/spikes/PHASE-0-DECISION.md`
-section 7 (9 items).** It includes the five marked **[gate]** below plus four more: confirm that no
-invariant changes (the recommendation is that none does — nothing measured contradicted one), approve
-a Linux re-run of S1 and S2 as the first Phase 1 CI task, approve the revised Phase 1 scope, and
-supply a Mirth corpus or accept that the migration estimate stays a guess. The items below are the
-standing list and are not superseded by it.
+**Seven of the nine Phase 0 gate items were decided on 2026-09-21** — see the decisions log above. What
+remains open is listed here. Items struck through were decided and are kept for one revision so the
+change is visible.
 
+**Open and blocking the Phase 0 gate:**
+
+- **Restore the root `.gitignore` and remove the stray `Dockerfile`** — the first bullet of "Current"
+  above. Human action; permission-denied for agents.
+- **Confirm the MPL-2.0 dependencies**: `orjson` (shipping runtime; metadata declares
+  `MPL-2.0 AND (Apache-2.0 OR MIT)`), `hypothesis` (test-only), `pathspec` (build-time). Each is
+  architect-approved as unmodified and escalated because CLAUDE.md sends licensing and non-permissive
+  dependencies to a human. If the posture is rejected, `orjson` is the costly one — it is on the hot
+  path.
+- **Sign the Phase 0 gate** (exit criterion 5), once the above and the spike-infra binding are done.
+
+**Open, not blocking the gate:**
+
+- **Audit retention — still open, and it blocks the `_tb.<env>.audit` contract.** What retention duty
+  applies to the control-plane and access audit trail? HIPAA §164.316(b)(2)(i) requires six-year
+  retention of records of required actions and activities; whether that reaches this audit trail is a
+  legal-interpretation question and **no legal review has been done, nor should an agent do one**. No
+  number has been written: the current 30 days is marked `TODO(human)`. The likely answer is
+  architectural (ClickHouse or object storage as the system of record, Kafka as a buffer), and it also
+  puts `_tb.<env>.events` (3 d) and `raw` (7 d, the replay source) in scope.
+- **Mirth corpus — not decided.** Supply anonymized exports in `samples/mirth/`, or accept that the
+  migration estimate stays a guess. S6 is INCONCLUSIVE without them, and migration cost is the
+  highest-likelihood, highest-impact risk in ADR-001 section 13. **Note the ordering risk:** that
+  directory is currently not git-ignored (first bullet of "Current"), so restore the `.gitignore` before
+  any export lands on disk.
 - Project name and trademark check (codename Tributary).
 - License and governance model (ADR-006).
 - Whether to engage the Open Integration Engine community, and how.
-- Whether anonymized Mirth channel exports can be provided for `samples/mirth/` — S6 is
-  INCONCLUSIVE without them, so the migration effort estimate stays a guess.
-- Confirm ADR-002 D2 (environment-scoped platform topics) as a refinement rather than an invariant-2
-  change.
-- Lite mode (RF=1) cannot satisfy RPO=0. Confirm that shipping it with a startup warning and explicit
-  documentation is acceptable.
-- **ADR-004 scope, raised by the security review:** the Kafka role/ACL model, credential rotation and
-  key management for archive encryption and the `attrs` HMAC. `contracts/topics/v0` 3.4 states the
-  required mechanisms and ACL shape, but the model itself and anything touching key management is a
-  human decision per CLAUDE.md. Needed before the archiver or any production deployment, not before the
-  Phase 0 gate.
-- **The `attrs` `_hmac` mechanism is UNRESOLVED (security finding 6, HIGH).** The events schema pins
-  the *shape* (exactly 64 lowercase hex) but cannot pin the mechanism, and an unkeyed `sha256(mrn)`
-  has the same shape while being reversible by exhaustive search over a bounded identifier space. No
-  agent will choose the construction, the key scope, the rotation story or the key store — that is
-  cryptography and key management, which CLAUDE.md escalates. Open questions are written out in
-  `contracts/events/v0/README.md` 3.1 and belong to ADR-004. Interim position in the contract:
-  producers SHOULD NOT emit identifier-derived `attrs` at all, and `_hmac` values must be treated as
-  PHI in ClickHouse. Also needs a human answer: is a keyed hash of an MRN de-identified for your
-  compliance purposes? (Under a Safe Harbor reading it is not.)
-- **Audit retention: 30 days versus a possible six-year duty (security finding 12, MEDIUM).**
-  `_tb.<env>.audit` retains 30 days, a number picked to match the DLQ, not a compliance decision.
-  HIPAA §164.316(b)(2)(i) requires six-year retention of the records of required actions and
-  activities; whether that reaches a control-plane and access audit trail is an interpretation
-  question, and **no legal review has been done — none should be done by an agent.** If the duty does
-  apply, 30 days is a deletion policy: the evidence is gone before the first annual audit. The likely
-  answer is architectural rather than a bigger number — six years at RF=3 points at ClickHouse or
-  object storage as the system of record with Kafka as a transport buffer. Three questions:
-  (a) what duty applies, (b) what is the system of record, (c) does the answer also change
-  `_tb.<env>.events` (3 d) and `raw` (7 d), which is also the replay source. Written up in
-  `contracts/topics/v0/README.md` 2.1; the value is unchanged and marked `TODO(human)`. Not a Phase 0
-  gate blocker, but it must be settled before the `_tb.<env>.audit` contract is written.
+
+**Decided 2026-09-21** (detail in the decisions log and gate report section 8):
+
+- ~~Confirm ADR-002 D2 (environment-scoped platform topics) as a refinement rather than an invariant-2
+  change.~~ **ADOPTED.**
+- ~~Lite mode (RF=1) cannot satisfy RPO=0. Confirm that shipping it with a startup warning and explicit
+  documentation is acceptable.~~ **ADOPTED**, and recorded as an explicit human-approved profile
+  exception to invariant 1's durability promise (ADR-002 D14). The invariant itself is unchanged.
+- ~~Confirm that no invariant changes.~~ **ADOPTED**: invariants 1-10 unchanged.
+- ~~ADR-004 scope~~ **APPROVED**: the Kafka role/ACL model, credential rotation, key custody for
+  encryption at rest and the `_hmac` key, and claim-check object lifecycle. `contracts/topics/v0` 3.4
+  and 3.5 state the required mechanisms and ACL shape; the model and anything touching key management
+  stay a human decision. Needed before the archiver or any production deployment.
+- ~~Linux re-run of S1 and S2~~ **APPROVED** as the first Phase 1 CI task, before the receiver is built.
+- ~~Revised Phase 1 scope~~ **APPROVED** (`PHASE-0-DECISION.md` section 8).
+- ~~The `attrs` `_hmac` mechanism (security finding 6, HIGH).~~ **Recommendation ADOPTED: it stays
+  deliberately UNRESOLVED** until before the archiver is built, no agent designs it, and per-patient
+  search in the message browser stays blocked on it. The schema pins the 64-lowercase-hex *shape*, which
+  is all a schema can do — an unkeyed `sha256(mrn)` has the same shape and is reversible by exhaustive
+  search over a bounded identifier space. Construction, key scope, rotation and key custody are ADR-004
+  (approved scope) plus a human. Interim contract position stands: producers SHOULD NOT emit
+  identifier-derived `attrs`, and `_hmac` values are PHI in ClickHouse. One question still needs a human
+  answer when ADR-004 is written: is a keyed hash of an MRN de-identified for your compliance purposes?
+  (Under a Safe Harbor reading it is not.) Detail: `contracts/events/v0/README.md` 3.1.
 
 ## Risks (live)
 

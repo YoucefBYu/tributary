@@ -89,8 +89,18 @@ Sources to re-check: openintegrationengine.org and the OIE GitHub repository (li
 
 ### 2.3 Constraints
 
-- Open-source dependencies only (Apache 2.0, MIT, BSD, MPL). Avoid source-available licenses (BSL and similar) in the default distribution.
-- Clean-room implementation: do not copy Mirth/OIE source. MPL 2.0 is file-level copyleft and would complicate an Apache-2.0 core.
+- Open-source dependencies only. **Permissive by default: Apache-2.0, MIT, BSD, ISC, PSF.** MPL-2.0 is
+  **not** in the default allow-list: it is admissible only as an **unmodified** dependency approved by
+  the architect, and CLAUDE.md escalates any non-permissive dependency to a human. No GPL, AGPL, SSPL or
+  BSL in the default distribution. **Corrected at the Phase 0 gate** (`security-reviewer` LOW 9): the
+  original wording listed MPL alongside the permissive licences, which is looser than CLAUDE.md's
+  invariant 10 and contradicted the sentence immediately below. CLAUDE.md governs.
+- Clean-room implementation: do not copy Mirth/OIE source. MPL 2.0 is file-level copyleft and would complicate an Apache-2.0 core — which is exactly why it is approval-gated rather than allowed.
+- **MPL items currently in the tree**, each architect-approved as unmodified and **pending human
+  confirmation** (`docs/agent-team/gates/phase-0-spikes.md` section 5, invariant 10): `orjson` (metadata
+  declares `MPL-2.0 AND (Apache-2.0 OR MIT)`; a **shipping runtime** dependency), `hypothesis`
+  (MPL-2.0, test-only, named in CLAUDE.md's stack table), `pathspec` (MPL-2.0, build-time via
+  hatchling).
 - Python 3.12+; type hints required in the SDK.
 
 ---

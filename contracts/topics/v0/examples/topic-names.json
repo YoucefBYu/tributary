@@ -1,6 +1,7 @@
 {
   "contract": "tributary.topics/v0",
   "schema": "../topic-name.schema.json",
+  "expectation_note": "Each 'invalid' entry carries expected_json_path and expected_validator, measured by qa-engineer against jsonschema Draft 2020-12 (code-reviewer Medium 2, Phase 0 gate). For topic names all twelve pin 'anyOf' at '$', which is DELIBERATELY WEAK EVIDENCE and is accepted as such: a topic name is one string checked against one grammar, so every rejection is 'matched no branch'. Splitting the schema into named branches would not improve it - a bad env charset and an unknown kind would still fail the same anyOf - so the schema is not being restructured for this. The 'reason' text is what records WHY; the assertion records THAT. Architect decision at the Phase 0 gate; do not relitigate without a concrete better mechanism.",
   "valid": [
     "prod.adt-to-fhir.raw",
     "prod.adt-to-fhir.out.fhir-server",
@@ -14,17 +15,17 @@
     "_tb.dev.audit"
   ],
   "invalid": [
-    { "name": "prod.ADT-to-FHIR.raw", "reason": "uppercase in the channel segment" },
-    { "name": "prod.adt_to_fhir.raw", "reason": "underscore is not in the segment charset" },
-    { "name": "prod.adt.to.fhir.raw", "reason": "dot inside the channel name makes the name ambiguous" },
-    { "name": "prod.adt-to-fhir.output", "reason": "unknown kind" },
-    { "name": "prod.adt-to-fhir.out", "reason": "kind out requires a destination segment" },
-    { "name": "prod.adt-to-fhir.raw.fhir-server", "reason": "only out takes a destination segment" },
-    { "name": "adt-to-fhir.raw", "reason": "missing environment segment" },
-    { "name": "prod.-adt.raw", "reason": "segment must start with a letter" },
-    { "name": "_tb.events", "reason": "platform topics are environment-scoped in v0" },
-    { "name": "_tb.prod.messages", "reason": "unknown platform kind" },
-    { "name": "prod..raw", "reason": "empty channel segment" },
-    { "name": "production-environment-eu-west.adt-to-fhir.raw", "reason": "env segment over 16 characters" }
+    { "name": "prod.ADT-to-FHIR.raw", "reason": "uppercase in the channel segment", "expected_json_path": "$", "expected_validator": "anyOf" },
+    { "name": "prod.adt_to_fhir.raw", "reason": "underscore is not in the segment charset", "expected_json_path": "$", "expected_validator": "anyOf" },
+    { "name": "prod.adt.to.fhir.raw", "reason": "dot inside the channel name makes the name ambiguous", "expected_json_path": "$", "expected_validator": "anyOf" },
+    { "name": "prod.adt-to-fhir.output", "reason": "unknown kind", "expected_json_path": "$", "expected_validator": "anyOf" },
+    { "name": "prod.adt-to-fhir.out", "reason": "kind out requires a destination segment", "expected_json_path": "$", "expected_validator": "anyOf" },
+    { "name": "prod.adt-to-fhir.raw.fhir-server", "reason": "only out takes a destination segment", "expected_json_path": "$", "expected_validator": "anyOf" },
+    { "name": "adt-to-fhir.raw", "reason": "missing environment segment", "expected_json_path": "$", "expected_validator": "anyOf" },
+    { "name": "prod.-adt.raw", "reason": "segment must start with a letter", "expected_json_path": "$", "expected_validator": "anyOf" },
+    { "name": "_tb.events", "reason": "platform topics are environment-scoped in v0", "expected_json_path": "$", "expected_validator": "anyOf" },
+    { "name": "_tb.prod.messages", "reason": "unknown platform kind", "expected_json_path": "$", "expected_validator": "anyOf" },
+    { "name": "prod..raw", "reason": "empty channel segment", "expected_json_path": "$", "expected_validator": "anyOf" },
+    { "name": "production-environment-eu-west.adt-to-fhir.raw", "reason": "env segment over 16 characters", "expected_json_path": "$", "expected_validator": "anyOf" }
   ]
 }

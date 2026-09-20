@@ -272,6 +272,36 @@ the answer to all three.
 designed here, and key custody (cloud-managed versus customer-managed KMS) is ADR-004 plus a human.
 The requirement that encryption be on is not deferred.
 
+### D14. The lite profile (RF=1) is an explicit, human-approved exception to invariant 1's durability promise (decided by the human, 2026-09-21)
+
+**The invariant is not edited and no agent may weaken it.** What is recorded here is a named exception
+for one deployment profile, approved by the human on 2026-09-21 ("proceed with the recommendations of
+the decisions").
+
+**What the exception says.** Invariant 1 promises that an acknowledged message is durably committed
+before the sender is ACKed. With `replication.factor=1` and `min.insync.replicas=1`, `acks=all` is
+satisfied by a single replica, so an acknowledged message can still be lost if that broker's disk dies:
+**lite mode cannot guarantee RPO=0.** `contracts/topics/v0/topic-defaults.json` already makes this the
+only place the durability floor may be lowered, and does it explicitly through
+`profiles.lite.class_config_overrides` rather than by inheritance, so a tool that applies class configs
+and forgets the profile fails **safe** (production values).
+
+**Conditions of the approval:**
+
+1. The runtime **logs the RF=1 / no-RPO=0 warning at startup** — required, not advisory.
+2. The documentation states the limitation wherever lite mode is offered. "Development and accepted-risk
+   small sites only" is the wording in the contract.
+3. **No production deployment uses it.** Production means `replication.factor=3`,
+   `min.insync.replicas=2`.
+4. The exception is confined to this profile. It does not license any other weakening of invariant 1,
+   and nothing in the data-plane code may branch on it beyond reading the profile's configuration.
+
+**Why approve it rather than refuse.** Small sites and development environments need a single-broker
+option, and the realistic alternative is those users running an unsupported configuration with the same
+risk and no warning. **What we give up is real**, which is why it is written here as an exception and not
+as a footnote: for that profile, the strongest promise the product makes is weaker than its own
+invariant. An honest warning is the mitigation, and there is no engineering fix short of more brokers.
+
 ---
 
 ## 3. Consequences
@@ -297,7 +327,8 @@ replay the primary recovery path; Kafka share groups for unordered destinations.
 | Invariant 2 | Unchanged. D2 renames the physical platform topics, not the classes. |
 | Invariant 5 | Reinforced: the `out`/`raw` partition-count rule closes a silent reordering path. |
 | Invariant 8 | Implemented by `contracts/envelope/v0`. |
-| No invariant change is proposed by this ADR. | |
+| Invariant 1 | **One human-approved profile exception, D14:** lite mode (RF=1) cannot guarantee RPO=0. The invariant text is unchanged; the exception is confined to that profile, requires a startup warning, and is barred from production. |
+| No invariant change is proposed by this ADR. | D14 is an exception for one deployment profile, approved by the human on 2026-09-21, not a change to invariant 1's wording. |
 | `contracts/envelope/v0`, `contracts/topics/v0` | Published as Draft; frozen at the Phase 1 wave 1 gate. |
 
 ---
@@ -310,8 +341,23 @@ replay the primary recovery path; Kafka share groups for unordered destinations.
    passed 70 / 0 at commit `ae4d3bd`. The second security round added four invalid examples, so the
    expected count is 74 and **that run is outstanding**. Keep it in CI, which is the point: a contract
    edit that invalidates its own examples must fail a build, not wait for a reviewer.
-3. `platform-engineer`: reconcile `spikes/common/src/tbcommon/envelope.py` with the contract. Binding
-   for `packages/tributary-sdk` and `-runtime` in Phase 1, not retroactively for throwaway spike code.
+3. **Contract reconciliation, widened at the Phase 0 gate.** Binding for `packages/tributary-sdk` and
+   `-runtime` in Phase 1, **not** retroactively for throwaway spike code — but the spikes are what
+   Phase 1 will be written from, so these are acceptance criteria on the runtime and receiver tasks
+   rather than a cleanup pass. The gate audit (`docs/agent-team/gates/phase-0-spikes.md` section 6)
+   found:
+   - `spikes/common/src/tbcommon/envelope.py` uses `tb-x-stage`; the registered header is `tb-stage`.
+     `tb-x-seq` and `tb-x-reply-partition` are legitimate experiments and simply do not travel.
+   - `spikes/S3-sync-reply/sync_server.py` writes `tb-msg-id` as **raw UUIDv4 bytes** — binary, so it
+     breaks invariant 8's text rule, and v4, so it loses the time ordering `tb-msg-id` is specified
+     for — and mints `tb-correlation-id` as unhyphenated `uuid4().hex`. Engine-minted and not
+     payload-derived, which is what D10 requires, but the wrong encoding.
+   - `spikes/S5-ordering-retry/src/s5/events.py` would fail `contracts/events/v0`: no `v`, no `kind`,
+     epoch-float `ts`, and `worker` where the contract says `instance`.
+   - `spikes/S5-ordering-retry/src/s5/topics.py` produces names the topic grammar rejects
+     (`spike.s5.<run>.raw`, `spike.s5.<run>._tb.events`). S4's `s4.c0001.raw` conforms, so the grammar
+     is workable.
+   Owner: `platform-engineer` for the runtime and event emitter, `connector-engineer` for the receiver.
 4. **Phase 1, `devops-engineer`** (not on the Phase 0 team, so these are carried forward here rather
    than assigned now):
    - CI runs `tests/conformance` on every change to `contracts/**`. The value is catching a contract

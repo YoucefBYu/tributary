@@ -2,6 +2,7 @@
   "contract": "tributary.envelope/v0",
   "schema": "../envelope.schema.json",
   "note": "The projection carries key_present and key_size but never the key value, because the key is usually a patient identifier and a validator error embeds the failing instance. All remaining identifiers are synthetic. Tests validate every 'valid' file expecting success and every 'invalid' file expecting exactly the documented violation. A ValidationError from this schema must never be logged verbatim.",
+  "expectation_note": "Each 'invalid' entry carries expected_json_path and expected_validator: the failing location and JSON Schema keyword that example MUST produce, so an example that fails for the wrong reason goes red instead of passing (code-reviewer Medium 2, Phase 0 gate). Values were MEASURED by qa-engineer against jsonschema Draft 2020-12 and hand-checked against each 'violates' line; they are paths and keywords only, never instance values, so they are PHI-safe. An example may fail on more than one pair; the test asserts the pinned pair is among the failures.",
   "valid": [
     {
       "file": "valid/raw-mllp-adt.json",
@@ -35,75 +36,112 @@
   "invalid": [
     {
       "file": "invalid/missing-msg-id.json",
-      "violates": "headers.required: tb-msg-id"
+      "violates": "headers.required: tb-msg-id",
+      "expected_json_path": "$.headers",
+      "expected_validator": "required"
     },
     {
       "file": "invalid/msg-id-not-uuid7.json",
-      "violates": "tb-msg-id must be UUIDv7 (this is a v4)"
+      "violates": "tb-msg-id must be UUIDv7 (this is a v4)",
+      "expected_json_path": "$.headers['tb-msg-id']",
+      "expected_validator": "pattern"
     },
     {
       "file": "invalid/received-at-non-utc.json",
-      "violates": "tb-received-at offset must be Z or +00:00"
+      "violates": "tb-received-at offset must be Z or +00:00",
+      "expected_json_path": "$.headers['tb-received-at']",
+      "expected_validator": "pattern"
     },
     {
       "file": "invalid/received-at-no-millis.json",
-      "violates": "tb-received-at needs 3 to 9 fractional second digits"
+      "violates": "tb-received-at needs 3 to 9 fractional second digits",
+      "expected_json_path": "$.headers['tb-received-at']",
+      "expected_validator": "pattern"
     },
     {
       "file": "invalid/unregistered-tb-header.json",
-      "violates": "headers.additionalProperties: tb-mesg-id is not in the registry (typo caught at produce time)"
+      "violates": "headers.additionalProperties: tb-mesg-id is not in the registry (typo caught at produce time)",
+      "expected_json_path": "$.headers",
+      "expected_validator": "additionalProperties"
     },
     {
       "file": "invalid/claim-check-with-inline-payload.json",
-      "violates": "tb-claim-check present requires a null payload"
+      "violates": "tb-claim-check present requires a null payload",
+      "expected_json_path": "$.payload_present",
+      "expected_validator": "const",
+      "expectation_note": "Fails on two pairs, both correct: $.payload_present const and $.payload_size const. The first is pinned; the test asserts the pinned pair is among the failures, so the second is not lost"
     },
     {
       "file": "invalid/payload-over-inline-limit.json",
-      "violates": "payload_size over 1000000 without tb-claim-check"
+      "violates": "payload_size over 1000000 without tb-claim-check",
+      "expected_json_path": "$.payload_size",
+      "expected_validator": "maximum"
     },
     {
       "file": "invalid/retry-missing-not-before.json",
-      "violates": "class retry requires tb-retry-not-before"
+      "violates": "class retry requires tb-retry-not-before",
+      "expected_json_path": "$.headers",
+      "expected_validator": "required"
     },
     {
       "file": "invalid/retry-attempt-zero.json",
-      "violates": "class retry requires tb-attempt >= 1"
+      "violates": "class retry requires tb-attempt >= 1",
+      "expected_json_path": "$.headers['tb-attempt']",
+      "expected_validator": "pattern"
     },
     {
       "file": "invalid/dlq-missing-stage.json",
-      "violates": "class dlq requires tb-stage"
+      "violates": "class dlq requires tb-stage",
+      "expected_json_path": "$.headers",
+      "expected_validator": "required"
     },
     {
       "file": "invalid/raw-with-failure-headers.json",
-      "violates": "class raw must not carry tb-destination or tb-error-code"
+      "violates": "class raw must not carry tb-destination or tb-error-code",
+      "expected_json_path": "$.headers",
+      "expected_validator": "not"
     },
     {
       "file": "invalid/traceparent-all-zero-trace-id.json",
-      "violates": "traceparent trace id must not be all zeroes (W3C)"
+      "violates": "traceparent trace id must not be all zeroes (W3C)",
+      "expected_json_path": "$.headers.traceparent",
+      "expected_validator": "pattern"
     },
     {
       "file": "invalid/reply-missing-correlation-id.json",
-      "violates": "class reply requires tb-correlation-id"
+      "violates": "class reply requires tb-correlation-id",
+      "expected_json_path": "$.headers",
+      "expected_validator": "required"
     },
     {
       "file": "invalid/correlation-id-sender-token.json",
-      "violates": "tb-correlation-id must be a UUID minted by the engine, never a sender-supplied token: it is the reply record key and reaches ClickHouse and the browser in clear text, so sender-controlled content in it is a PHI leak (security finding 9)"
+      "violates": "tb-correlation-id must be a UUID minted by the engine, never a sender-supplied token: it is the reply record key and reaches ClickHouse and the browser in clear text, so sender-controlled content in it is a PHI leak (security finding 9)",
+      "expected_json_path": "$.headers['tb-correlation-id']",
+      "expected_validator": "pattern"
     },
     {
       "file": "invalid/usr-header-over-length.json",
-      "violates": "tb-usr-* and tb-x-* values are capped at 256 bytes so the 16 KiB total header budget cannot be blown by open-ended headers (security finding 13)"
+      "violates": "tb-usr-* and tb-x-* values are capped at 256 bytes so the 16 KiB total header budget cannot be blown by open-ended headers (security finding 13)",
+      "expected_json_path": "$.headers['tb-usr-oversized-note']",
+      "expected_validator": "maxLength"
     },
     {
       "file": "invalid/channel-name-not-topic-safe.json",
-      "violates": "tb-channel must match ^[a-z][a-z0-9-]{0,63}$ so it can be a topic segment"
+      "violates": "tb-channel must match ^[a-z][a-z0-9-]{0,63}$ so it can be a topic segment",
+      "expected_json_path": "$.headers['tb-channel']",
+      "expected_validator": "pattern"
     },
     {
       "file": "invalid/claim-check-presigned-url.json",
-      "violates": "tb-claim-check must not contain a query string; a presigned URL puts credentials in it and the envelope is persisted and shown to browsers"
+      "violates": "tb-claim-check must not contain a query string; a presigned URL puts credentials in it and the envelope is persisted and shown to browsers",
+      "expected_json_path": "$.headers['tb-claim-check']",
+      "expected_validator": "pattern"
     },
     {
       "file": "invalid/claim-check-with-userinfo.json",
-      "violates": "tb-claim-check must not contain userinfo ('@'); that embeds object-store credentials in the envelope"
+      "violates": "tb-claim-check must not contain userinfo ('@'); that embeds object-store credentials in the envelope",
+      "expected_json_path": "$.headers['tb-claim-check']",
+      "expected_validator": "pattern"
     }
   ]
 }
