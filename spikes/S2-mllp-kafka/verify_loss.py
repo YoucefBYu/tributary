@@ -18,6 +18,8 @@ def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--bootstrap", default="localhost:9092")
     p.add_argument("--topic", default="spike.s2.raw")
+    p.add_argument("--id-from", choices=["key", "msh10"], default="key",
+                   help="msh10: control id parsed from the message value (S3 keys records by corr id)")
     p.add_argument("runs", nargs="+")
     a = p.parse_args()
     acked: set[str] = set()
@@ -41,7 +43,10 @@ def main() -> int:
         if m is None or m.error():
             continue
         pos[m.partition()] = m.offset()
-        seen.add(m.key().decode())
+        if a.id_from == "key":
+            seen.add(m.key().decode())
+        else:
+            seen.add(m.value().split(bytes([13]), 1)[0].split(b"|")[9].decode())
     lost = acked - seen
     print(json.dumps({"acked": len(acked), "in_topic": len(seen & acked),
                       "duplicates_or_unacked_extra": len(seen - acked), "lost": len(lost),
