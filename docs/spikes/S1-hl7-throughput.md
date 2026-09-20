@@ -52,9 +52,43 @@ Multi-process, parse+extract+fhir, total msg/s:
 
 Scaling is sub-linear and noisy. python-hl7 went from 1,994 (1 process) to 8,501 (8 processes), 4.3x on 8 processes (54% efficiency); lazy 9.5x on 8 was above linear only because its 1-process figure is depressed by noise; hl7apy 7x. Going to 16 processes (SMT threads) added 34% (python-hl7) and 54% (lazy) over 8. python-hl7 at 4 processes (3,682) is below 2 processes (4,062): that is a non-monotonic result I attribute to co-running load (Docker Kafka, other agents) but did not isolate, so treat the scaling curve as indicative only. The 1-process multi-run figures differ from the in-process table for the same reason. Even the worst per-process rate for python-hl7 (about 710 msg/s at 16 processes) stays above the 200 msg/s/core threshold.
 
+## Re-run 2: solo host (2026-09-20)
+
+Same command and corpus as above. Run with no other agents active; `docker stats` beforehand showed the three Kafka brokers idle (3.5% CPU each, about 1.3 to 1.4 GiB each). Raw: `benchmarks/results/s1-run2.log` and `s1.json` (run 1 kept as `s1-run1.json`; both git-ignored).
+
+Single core, median of 3 (run 1 loaded, in brackets):
+
+| Parser | Mode | msg/s | p50 | p99 |
+|---|---|---|---|---|
+| lazy | parse | 1,786,671 (1,625,171) | 0.4 us | 0.8 us |
+| lazy | parse+extract | 174,453 (106,855) | 4.8 us | 12.1 us |
+| lazy | parse+extract+fhir | 36,322 (27,669) | 21.2 us | 76 us |
+| python-hl7 | parse | 3,083 (2,356) | 287 us | 781 us |
+| python-hl7 | parse+extract | 2,764 (2,319) | 317 us | 914 us |
+| python-hl7 | parse+extract+fhir | 2,446 (1,967) | 355 us | 1,039 us |
+| hl7apy | parse | 108 (64) | 7.9 ms | 31.7 ms |
+| hl7apy | parse+extract | 104 (67) | 8.3 ms | 30.9 ms |
+| hl7apy | parse+extract+fhir | 100 (59) | 8.6 ms | 34.7 ms |
+
+Repeat spread is now small (python-hl7 fhir 2,292 to 2,451; hl7apy fhir 96 to 104; lazy fhir 34.7k to 38.4k), against up to 2x before. Solo numbers are 1.3x to 1.7x higher than the loaded run.
+
+Multi-process, parse+extract+fhir, total msg/s (run 1 in brackets):
+
+| Procs | lazy | python-hl7 | hl7apy |
+|---|---|---|---|
+| 1 | 39,651 (11,194) | 2,465 (1,994) | 108 (55) |
+| 2 | 63,596 (19,542) | 5,008 (4,062) | 196 (150) |
+| 4 | 132,640 (65,061) | 8,778 (3,682) | 346 (262) |
+| 8 | 151,874 (105,862) | 13,865 (8,501) | 500 (384) |
+| 16 | 232,816 (163,263) | 17,607 (11,359) | 663 (529) |
+
+The scaling curve is now monotonic (the run 1 python-hl7 dip at 4 processes is gone, confirming it was load). python-hl7: 5.6x on 8 processes (70% efficiency), 7.1x on 16 (SMT, 8 physical cores; 1,100 msg/s/process). Lazy scales 3.8x on 8 (its single-process figure includes interpreter start effects and is not a clean baseline). Memory per message is unchanged (lazy 0.8 KB, python-hl7 62 KB, hl7apy 251 KB).
+
+Threshold, solo run: lazy 36,322 (182x), python-hl7 2,446 (12.2x), hl7apy 100 (0.50x, short by 100 msg/s). Verdicts unchanged: lazy PASS, python-hl7 PASS, hl7apy FAIL; S1b still not needed. The headline figures in this report for ADR use should be the solo-run numbers, with the loaded-run numbers as the conservative lower bound. Still not Linux CI.
+
 ## Threshold
 
-Plan threshold: at least 200 msg/s/core for parse plus transform.
+Plan threshold (loaded-run figures; see Re-run 2 for solo): at least 200 msg/s/core for parse plus transform.
 
 | Candidate | parse+extract+fhir msg/s/core | Verdict |
 |---|---|---|
