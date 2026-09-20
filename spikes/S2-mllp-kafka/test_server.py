@@ -317,3 +317,37 @@ def test_tls_plaintext_client_is_rejected(tmp_path: Path) -> None:
 def test_build_ack_used_by_server_matches_helper() -> None:
     # sanity: server ACKs are byte-identical in shape to the unit-tested helper
     assert build_ack("AA", "X").startswith(SB)
+
+
+class Gated:
+    """Publish futures the test resolves by hand: stands in for the producer delivery report."""
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.gate: asyncio.Future[bool] | None = None
+
+    async def __call__(self, payload: bytes, cid: str) -> bool:
+        self.gate = asyncio.get_running_loop().create_future()
+        self.started.set()
+        return await self.gate
+
+
+@pytest.mark.parametrize(("verdict", "expected"), [(True, "AA"), (False, "AR")])
+def test_ack_withheld_until_delivery_report(verdict: bool, expected: str) -> None:
+    """Invariant 1: no ACK bytes of any kind before the publish future resolves; the code follows the verdict."""
+
+    async def client(port: int, pub: Gated) -> None:
+        r, w = await asyncio.open_connection("127.0.0.1", port)
+        w.write(frame(adt("C1")))
+        await w.drain()
+        await asyncio.wait_for(pub.started.wait(), 5)  # publish has been attempted, future still pending
+        with pytest.raises(asyncio.TimeoutError):  # nothing on the wire while the delivery report is outstanding
+            await asyncio.wait_for(r.read(1), 0.5)
+        assert pub.gate is not None and not pub.gate.done()
+        pub.gate.set_result(verdict)
+        [f] = await _read_frames(r, 1)
+        assert msa(f) == (expected, "C1")
+        w.close()
+
+    pub = Gated()
+    asyncio.run(_run(Settings(port=0), pub, lambda port: client(port, pub)))
