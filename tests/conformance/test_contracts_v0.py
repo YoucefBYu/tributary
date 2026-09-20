@@ -15,11 +15,6 @@ from jsonschema import Draft202012Validator, FormatChecker
 from jsonschema.validators import validator_for
 
 CONTRACTS = Path(__file__).resolve().parents[2] / "contracts"
-# Interim source of expected failures. The manifests (architect-owned) may carry `expected_json_path` and `expected_validator`
-# on invalid entries; when they do, those win. Until then this sidecar is the source.
-EXPECTED = json.loads(
-    (Path(__file__).parent / "expected_failures.json").read_text(encoding="utf-8")
-)
 EVENT_PHI_GUARDS = {
     "invalid/payload-in-event.json",
     "invalid/attrs-clear-text-mrn.json",
@@ -56,11 +51,12 @@ def _mismatch(actual: set[Failure], expected: Failure) -> str | None:
     return f"expected {expected[1]} at {expected[0]}; got {sorted(actual)[:5]}"
 
 
-def _expected(contract: str, key: str, entry: dict[str, Any]) -> Failure:
-    if "expected_json_path" in entry and "expected_validator" in entry:
-        return entry["expected_json_path"], entry["expected_validator"]
-    side = EXPECTED[contract][key]
-    return side["expected_json_path"], side["expected_validator"]
+def _expected(name: str, entry: dict[str, Any]) -> Failure:
+    """The manifest is the only source; an invalid entry without expectation fields fails the suite."""
+    assert "expected_json_path" in entry and "expected_validator" in entry, (
+        f"{name}: no expected_json_path/expected_validator"
+    )
+    return entry["expected_json_path"], entry["expected_validator"]
 
 
 def _load(path: Path) -> Any:
@@ -92,7 +88,7 @@ def _file_cases() -> list[Any]:
                 schema,
                 base / e["file"],
                 False,
-                _expected(name, e["file"], e),
+                _expected(f"{name}:{e['file']}", e),
                 id=f"{name}:invalid:{e['file']}",
             )
             for e in m["invalid"]
@@ -128,7 +124,7 @@ def _topic_cases() -> list[Any]:
             schema,
             e["name"],
             False,
-            _expected("topics", e["name"], e),
+            _expected(f"topics:{e['name']}", e),
             id=f"topic:invalid:{e['name']}",
         )
         for e in m["invalid"]
@@ -153,23 +149,30 @@ def test_every_invalid_entry_has_an_expectation() -> None:
     for name in ("envelope", "events"):
         m = _load(CONTRACTS / name / "v0/examples/manifest.json")
         for e in m["invalid"]:
-            _expected(name, e["file"], e)
+            _expected(f"{name}:{e['file']}", e)
     t = _load(CONTRACTS / "topics/v0/examples/topic-names.json")
     for e in t["invalid"]:
-        _expected("topics", e["name"], e)
+        _expected(f"topics:{e['name']}", e)
 
 
 def test_negative_control_wrong_reason_fails() -> None:
     """An example that fails for a different reason than documented must make test_example fail."""
     env = CONTRACTS / "envelope/v0/examples"
-    schema = (env / _load(env / "manifest.json")["schema"]).resolve()
+    m = _load(env / "manifest.json")
+    schema = (env / m["schema"]).resolve()
+    by_file = {e["file"]: e for e in m["invalid"]}
     example = env / "invalid/missing-msg-id.json"
-    wrong = _expected("envelope", "invalid/msg-id-not-uuid7.json", {})
+    wrong = _expected("wrong", by_file["invalid/msg-id-not-uuid7.json"])
     with pytest.raises(AssertionError):
         test_example(schema, example, False, wrong)
     test_example(
-        schema, example, False, _expected("envelope", "invalid/missing-msg-id.json", {})
+        schema,
+        example,
+        False,
+        _expected("right", by_file["invalid/missing-msg-id.json"]),
     )
+    with pytest.raises(AssertionError):
+        _expected("missing", {"file": "invalid/x.json"})
 
 
 @pytest.mark.parametrize(
