@@ -243,6 +243,15 @@ def analyse(
     )
     result.delivered_ids = {o.msg_id for o in observed}
 
+    # Throughput from the delivery log, not from `wall_s`: the latter includes
+    # process startup and the idle_exit_s wait at the end, which would make
+    # every scenario look several times slower than it is.
+    if records:
+        stamps = [float(r["ts"]) for r in records]
+        span = max(stamps) - min(stamps)
+        result.notes["delivery_span_s"] = round(span, 2)
+        result.notes["throughput_msg_s"] = round(len(records) / span, 1) if span > 0 else None
+
     dlq = readback.read_all(layout.dlq)
     result.dlq_ids = {r.msg_id for r in dlq}
     result.expected_dlq_ids = set() if expect_halt else plan.poison_ids()
@@ -381,6 +390,31 @@ def scenario_baseline(opts: Options) -> RunResult:
     pool.start("worker-b", extra=_common(opts))
     pool.wait_all()
     return analyse("baseline", layout, group, run_dir, plan, pool, wall_s=time.monotonic() - t0)
+
+
+def scenario_baseline_batched(opts: Options) -> RunResult:
+    """Baseline again, committing every 50 deliveries instead of every one.
+
+    `commit_every=1` costs an OffsetCommit round trip per message, which on this
+    host is the dominant cost. This scenario exists to put a number on the
+    trade the runtime will have to make: throughput against the size of the
+    replay window after a kill.
+    """
+    layout, group, run_dir, plan = _setup("baseline_batched", opts)
+    pool = WorkerPool(run_dir, layout, group)
+    t0 = time.monotonic()
+    extra = [*_common(opts), "--commit-every", "50", "--commit-interval-s", "0.5"]
+    pool.start("worker-a", extra=extra)
+    pool.start("worker-b", extra=extra)
+    pool.wait_all()
+    result = analyse(
+        "baseline_batched", layout, group, run_dir, plan, pool, wall_s=time.monotonic() - t0
+    )
+    result.notes["commit_every"] = 50
+    result.notes["commits"] = sum(
+        (s or {}).get("stats", {}).get("commits", 0) for s in result.worker_stats.values()
+    )
+    return result
 
 
 def scenario_blocking_retry(opts: Options) -> RunResult:
@@ -612,7 +646,12 @@ def scenario_txn(opts: Options, *, crash: bool = False) -> RunResult:
         proc.wait(timeout=30)
         log.info("killed the transactional stage mid-flight; restarting with the same txn id")
         proc = launch("txn-a")  # same instance id AND same transactional.id
-    proc.wait(timeout=300)
+    try:
+        proc.wait(timeout=300)
+    except subprocess.TimeoutExpired:
+        log.warning("transactional stage did not exit; terminating")
+        proc.kill()
+        proc.wait(timeout=30)
 
     out = readback.read_all(layout.out, read_committed=True, timeout_s=90.0)
     observed = [checks.Observation(key=r.key, seq=r.seq, msg_id=r.msg_id) for r in out]
@@ -656,6 +695,7 @@ def _wait_for_records(topic: str, *, at_least: int, timeout_s: float) -> int:
 
 SCENARIOS: dict[str, Callable[[Options], RunResult]] = {
     "baseline": scenario_baseline,
+    "baseline_batched": scenario_baseline_batched,
     "blocking_retry": scenario_blocking_retry,
     "poison_dlq": scenario_poison_dlq,
     "halt": scenario_halt,

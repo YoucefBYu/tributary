@@ -69,9 +69,14 @@ def transactional_producer_config(transactional_id: str, **overrides: Any) -> di
 def make_transactional_producer(transactional_id: str, **overrides: Any) -> Producer:
     """Producer for a read-process-write stage.
 
-    ``transactional.id`` must be *stable per input partition set*, otherwise
-    zombie fencing does not work across restarts. S5 derives it from
-    ``<group>.<topic>.<partition>``.
+    ``transactional.id`` must be **one per worker and stable across restarts**:
+    that is what lets ``init_transactions`` fence the previous incarnation and
+    abort whatever it left open. Since KIP-447 (Kafka 2.5+),
+    ``send_offsets_to_transaction`` fences zombies through the consumer group
+    metadata, so the id does not need to follow the partition assignment -- and
+    must not, because under cooperative-sticky the assignment changes while the
+    worker lives. Deriving the id per input partition is EOS v1 advice; it is
+    wrong here and breaks as soon as a rebalance moves a partition.
     """
     p = Producer(transactional_producer_config(transactional_id, **overrides))
     p.init_transactions(30)
