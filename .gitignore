@@ -1,2 +1,31 @@
-runs/
+# Local Claude Code settings
+.claude/settings.local.json
+.claude/agent-memory-local/
+
+# Sensitive samples
+samples/mirth/*
+!samples/mirth/README.md
+
+# Python
 __pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+
+# Node
+node_modules/
+ui/dist/
+
+# Environment and secrets
+.env
+.env.*
+secrets/
+
+# Benchmark and spike outputs
+benchmarks/results/
+spikes/**/out/
