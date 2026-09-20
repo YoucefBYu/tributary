@@ -39,7 +39,7 @@ ROOT = Path(__file__).resolve().parents[2]
 OUT = ROOT / "benchmarks/results/s4.jsonl"
 PREFIX = "s4"
 SUFFIXES = ("raw", "out", "retry", "dlq")
-PARTITIONS = 12
+PARTITIONS = 12  # overridden by --partitions
 BROKERS = ("tb-kafka1", "tb-kafka2", "tb-kafka3")
 
 
@@ -49,7 +49,7 @@ def topic_names(channel: int) -> list[str]:
 
 def record(kind: str, heap: str, **data: Any) -> None:
     OUT.parent.mkdir(parents=True, exist_ok=True)
-    rec = {"kind": kind, "heap": heap, "ts": time.time(), **data}
+    rec = {"kind": kind, "heap": heap, "partitions_per_topic": PARTITIONS, "ts": time.time(), **data}
     with OUT.open("a") as f:
         f.write(json.dumps(rec, default=str) + "\n")
     print(json.dumps(rec, default=str), flush=True)
@@ -323,6 +323,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--heap", default="unknown", help="broker heap the cluster was started with, e.g. '-Xmx3G'")
     ap.add_argument("--timeout", type=float, default=300)
+    ap.add_argument("--partitions", type=int, default=12, help="partitions per topic")
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("topics")
     s.add_argument("--tiers", default="100,250,500,750,1000")
@@ -344,6 +345,8 @@ def main() -> None:
     s.set_defaults(fn=cmd_cleanup)
     ap.add_argument("--keep", action="store_true", help="do not delete s4.* topics when the command exits (default: delete)")
     a = ap.parse_args()
+    global PARTITIONS
+    PARTITIONS = a.partitions
     try:
         a.fn(a)
     finally:

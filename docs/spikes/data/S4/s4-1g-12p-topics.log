@@ -1,0 +1,35 @@
+{"kind": "baseline", "heap": "1G", "ts": 1789907399.9993002, "list_topics_median_s": 0.07295589999921503, "list_topics_max_s": 0.07624070000019856, "topics": 79, "partitions": 986, "stats": {"tb-kafka1": {"mem": "1.169GiB / 7.436GiB", "mem_pct": "15.73%", "cpu": "10.40%", "proc": "fds=1289 VmRSS: 1140196 kB Threads: 123"}, "tb-kafka2": {"mem": "1.294GiB / 7.436GiB", "mem_pct": "17.40%", "cpu": "6.00%", "proc": "fds=1280 VmRSS: 967692 kB Threads: 118"}, "tb-kafka3": {"mem": "1.631GiB / 7.436GiB", "mem_pct": "21.93%", "cpu": "208.25%", "proc": "fds=1286 VmRSS: 1270432 kB Threads: 124"}}}
+{"kind": "tier", "heap": "1G", "ts": 1789907445.120485, "tier": 100, "channels_created": 100, "topics": 400, "partitions": 4800, "create_seconds": 31.108666899999662, "batches": [{"channels": 25, "seconds": 0.7561273999999685}, {"channels": 25, "seconds": 11.018974899998284}, {"channels": 25, "seconds": 9.616110499999195}, {"channels": 25, "seconds": 9.716483800002607}], "failed": null, "metadata": {"list_topics_median_s": 0.09294360000058077, "list_topics_max_s": 0.13611610000225483, "topics": 479, "partitions": 5786}, "stats": {"tb-kafka1": {"mem": "1.33GiB / 7.436GiB", "mem_pct": "17.89%", "cpu": "61.42%", "proc": "fds=5057 VmRSS: 1231912 kB Threads: 123"}, "tb-kafka2": {"mem": "1.468GiB / 7.436GiB", "mem_pct": "19.74%", "cpu": "40.67%", "proc": "fds=5012 VmRSS: 1087812 kB Threads: 120"}, "tb-kafka3": {"mem": "1.563GiB / 7.436GiB", "mem_pct": "21.01%", "cpu": "72.74%", "proc": "fds=5064 VmRSS: 1279220 kB Threads: 124"}}, "probe": {"acks": 300, "ack_p50_ms": 95.32930000204942, "ack_p99_ms": 557.9515999997966}}
+{"kind": "tier", "heap": "1G", "ts": 1789907500.1404648, "tier": 250, "channels_created": 250, "topics": 1000, "partitions": 12000, "create_seconds": 48.46891009999672, "batches": [{"channels": 25, "seconds": 0.757816900000762}, {"channels": 25, "seconds": 9.922623700000258}, {"channels": 25, "seconds": 9.62326899999971}, {"channels": 25, "seconds": 9.728971399999864}, {"channels": 25, "seconds": 9.678824099999474}, {"channels": 25, "seconds": 8.75614829999904}], "failed": null, "metadata": {"list_topics_median_s": 0.20997340000030817, "list_topics_max_s": 0.23197529999742983, "topics": 980, "partitions": 11789}, "stats": {"tb-kafka1": {"mem": "1.473GiB / 7.436GiB", "mem_pct": "19.81%", "cpu": "58.72%", "proc": "fds=12128 VmRSS: 1277772 kB Threads: 123"}, "tb-kafka2": {"mem": "1.691GiB / 7.436GiB", "mem_pct": "22.74%", "cpu": "333.78%", "proc": "fds=12131 VmRSS: 1232900 kB Threads: 120"}, "tb-kafka3": {"mem": "1.612GiB / 7.436GiB", "mem_pct": "21.68%", "cpu": "87.99%", "proc": "fds=12222 VmRSS: 1281836 kB Threads: 124"}}, "probe": {"acks": 300, "ack_p50_ms": 195.21420000091894, "ack_p99_ms": 620.8941000004415}}
+FAILED channels 425-450: KafkaException(KafkaError{code=_TIMED_OUT,val=-185,str="Failed to get metadata: Local: Timed out"})
+%5|1789907758.865|REQTMOUT|rdkafka#producer-59| [thrd:localhost:19092/1]: localhost:19092/1: Timed out MetadataRequest in flight (after 60539ms, timeout #0)
+%4|1789907758.865|REQTMOUT|rdkafka#producer-59| [thrd:localhost:19092/1]: localhost:19092/1: Timed out 1 in-flight, 0 retry-queued, 0 out-queue, 0 partially-sent requests
+%5|1789907770.000|REQTMOUT|rdkafka#producer-59| [thrd:localhost:19092/1]: localhost:19092/1: Timed out ApiVersionRequest in flight (after 10113ms, timeout #0)
+%4|1789907770.000|FAIL|rdkafka#producer-59| [thrd:localhost:19092/1]: localhost:19092/1: ApiVersionRequest failed: Local: Timed out: probably due to broker version < 0.10 (see api.version.request configuration) (after 10114ms in state APIVERSION_QUERY)
+%4|1789907770.001|REQTMOUT|rdkafka#producer-59| [thrd:localhost:19092/1]: localhost:19092/1: Timed out 1 in-flight, 0 retry-queued, 0 out-queue, 0 partially-sent requests
+%5|1789907780.103|REQTMOUT|rdkafka#producer-59| [thrd:localhost:19092/1]: localhost:19092/1: Timed out ApiVersionRequest in flight (after 10087ms, timeout #0)
+%4|1789907780.103|FAIL|rdkafka#producer-59| [thrd:localhost:19092/1]: localhost:19092/1: ApiVersionRequest failed: Local: Timed out: probably due to broker version < 0.10 (see api.version.request configuration) (after 10087ms in state APIVERSION_QUERY, 1 identical error(s) suppressed)
+%4|1789907780.103|REQTMOUT|rdkafka#producer-59| [thrd:localhost:19092/1]: localhost:19092/1: Timed out 1 in-flight, 0 retry-queued, 0 out-queue, 0 partially-sent requests
+%5|1789907790.378|REQTMOUT|rdkafka#producer-59| [thrd:localhost:19092/1]: localhost:19092/1: Timed out ApiVersionRequest in flight (after 10073ms, timeout #0)
+%4|1789907790.378|REQTMOUT|rdkafka#producer-59| [thrd:localhost:19092/1]: localhost:19092/1: Timed out 1 in-flight, 0 retry-queued, 0 out-queue, 0 partially-sent requests
+%5|1789907800.485|REQTMOUT|rdkafka#producer-59| [thrd:localhost:19092/1]: localhost:19092/1: Timed out ApiVersionRequest in flight (after 10104ms, timeout #0)
+%4|1789907800.486|REQTMOUT|rdkafka#producer-59| [thrd:localhost:19092/1]: localhost:19092/1: Timed out 1 in-flight, 0 retry-queued, 0 out-queue, 0 partially-sent requests
+%5|1789907812.384|REQTMOUT|rdkafka#producer-59| [thrd:localhost:19092/1]: localhost:19092/1: Timed out ApiVersionRequest in flight (after 10077ms, timeout #0)
+%4|1789907812.384|FAIL|rdkafka#producer-59| [thrd:localhost:19092/1]: localhost:19092/1: ApiVersionRequest failed: Local: Timed out: probably due to broker version < 0.10 (see api.version.request configuration) (after 10078ms in state APIVERSION_QUERY, 3 identical error(s) suppressed)
+%4|1789907812.384|REQTMOUT|rdkafka#producer-59| [thrd:localhost:19092/1]: localhost:19092/1: Timed out 1 in-flight, 0 retry-queued, 0 out-queue, 0 partially-sent requests
+Traceback (most recent call last):
+  File "C:\Users\benye\.dev\healthcare-data-integration-saas\tributary\spikes\S4-topic-scale\s4.py", line 355, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "C:\Users\benye\.dev\healthcare-data-integration-saas\tributary\spikes\S4-topic-scale\s4.py", line 348, in main
+    a.fn(a)
+  File "C:\Users\benye\.dev\healthcare-data-integration-saas\tributary\spikes\S4-topic-scale\s4.py", line 145, in cmd_topics
+    metadata=metadata_latency(), stats=docker_stats(), probe=probe_produce(a.heap, f"tier{tier}"))
+             ^^^^^^^^^^^^^^^^^^
+  File "C:\Users\benye\.dev\healthcare-data-integration-saas\tributary\spikes\S4-topic-scale\s4.py", line 90, in metadata_latency
+    md = tbadmin.admin().list_topics(timeout=120.0)
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\benye\.dev\healthcare-data-integration-saas\tributary\spikes\common\.venv\Lib\site-packages\confluent_kafka\admin\__init__.py", line 659, in list_topics
+    return super(AdminClient, self).list_topics(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+cimpl.KafkaException: KafkaError{code=_TIMED_OUT,val=-185,str="Failed to get metadata: Local: Timed out"}
