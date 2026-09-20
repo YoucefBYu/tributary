@@ -45,6 +45,8 @@ Pending reached 10,006 and held (entries expire only at the 60 s deadline). Rece
 
 9,000 sent: 7,974 replied `AA`, 1,026 `AE` (reply timeout), 0 unanswered. Reply flow stopped about 1 s after the kill (59 of 200 replies in the second of the kill, 0 for 4 s) and resumed 5 to 6 s later (114 of 199), then every message was answered, until the end of the run. **Loss check: 7,974 acked, 7,974 in topic, 0 lost.** The 1,026 timed-out messages were committed to `raw` (that is the 1,026 "unacked extras"); the replacement worker consumed them afterwards, producing 1,026 late replies which the receiver dropped (`replies_seen` 9,000 = all requests eventually got a reply; `late_replies` 1,026). No AA reply was delivered to the wrong request (the load generator matches MSA-2 to MSH-10). Pending map ended at 0.
 
+Design consequence for sync mode: the 1,026 timed-out messages were committed and processed by the worker, so a sender retry after an `AE` duplicates them downstream. Sync mode therefore requires downstream idempotency keyed on `tb-msg-id` (invariant 4), and the timeout NACK means "committed, outcome unknown".
+
 Consistent with the stand-in's at-least-once design: work restarted from the last committed offset, and the reply path tolerates duplicates and late replies. Whether the real worker commits offsets after the reply is delivered, and how long its group rebalance takes, decides whether this holds; the stand-in uses cooperative-sticky with a 10 s session timeout.
 
 ## Threshold and verdict
@@ -70,4 +72,4 @@ Verdict: the receiver-side sync-reply mechanism is viable and safe under these t
 
 ## Raw data
 
-`spikes/S2-mllp-kafka/runs/s3.jsonl` plus the scenario logs `s3-*.log`, `s3-restart-verify.json` (the `runs/` directory is git-ignored, so these files exist only on the measuring host). Reproduce: `cd spikes/S2-mllp-kafka && uv run python ../S3-sync-reply/s3run.py latency` (also `timeout`, `memory`, `restart`); needs the `tb-s2` and `tb-s3` images.
+Tracked in `docs/spikes/data/S3/`: `s3.jsonl` (all four scenarios, one record each for latency cells), `s3-restart-verify.json`. Per-message event dumps are not kept; regenerate with `cd spikes/S2-mllp-kafka && uv run python ../S3-sync-reply/s3run.py latency|timeout|memory|restart` (needs the `tb-s2` and `tb-s3` images).
