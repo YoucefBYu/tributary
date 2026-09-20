@@ -29,6 +29,21 @@ def synth(cid: str) -> bytes:
     ).encode()
 
 
+def load_corpus(path: str) -> list[bytes]:
+    """Payloads from an MLLP-framed corpus file (benchmarks.gen output)."""
+    data = open(path, "rb").read()
+    return [f[1:] for f in data.split(EB + CR) if len(f) > 1]
+
+
+def with_cid(msg: bytes, cid: str) -> bytes:
+    """Replace MSH-10 so every send is uniquely identifiable for the loss check."""
+    end = msg.find(b"
+")
+    f = msg[:end].split(b"|")
+    f[9] = cid.encode()
+    return b"|".join(f) + msg[end:]
+
+
 def pct(v: list[float], q: float) -> float:
     return v[min(len(v) - 1, int(len(v) * q))] if v else float("nan")
 
@@ -36,7 +51,7 @@ def pct(v: list[float], q: float) -> float:
 async def conn_worker(
     a: argparse.Namespace, idx: int, interval: float, res: dict, ctx: ssl.SSLContext | None
 ) -> None:
-    r, w = await asyncio.open_connection(a.host, a.port, ssl=ctx)
+    r, w = await asyncio.open_connection(a.host, a.port, ssl=ctx, server_hostname=a.server_hostname if ctx else None)
     sent: dict[str, float] = {}
     done = asyncio.Event()
 
@@ -69,7 +84,8 @@ async def conn_worker(
     while (now := time.perf_counter()) < end:
         cid = f"{a.run_id}-{idx}-{n}"
         sent[cid] = time.perf_counter()
-        w.write(SB + synth(cid) + EB + CR)
+        body = with_cid(res["corpus"][(idx * 7919 + n) % len(res["corpus"])], cid) if res["corpus"] else synth(cid)
+        w.write(SB + body + EB + CR)
         res["sent"] += 1
         n += 1
         nxt = start + n * interval
@@ -93,18 +109,21 @@ async def main() -> None:
     p.add_argument("--conns", type=int, default=10)
     p.add_argument("--seconds", type=float, default=30)
     p.add_argument("--drain-s", type=float, default=10)
+    p.add_argument("--corpus", help="MLLP-framed corpus file; default built-in tiny ADT")
     p.add_argument("--tls", action="store_true")
+    p.add_argument("--cafile", help="trust this CA/self-signed cert (verification stays ON)")
+    p.add_argument("--server-hostname", default=None)
     p.add_argument("--insecure-selfsigned", action="store_true", help="spike only: skip verify of self-signed cert")
     p.add_argument("--run-id", default=uuid.uuid4().hex[:8])
     p.add_argument("--out", default="run.json")
     a = p.parse_args()
     ctx = None
     if a.tls:
-        ctx = ssl.create_default_context()
+        ctx = ssl.create_default_context(cafile=a.cafile)
         if a.insecure_selfsigned:
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
-    res = {"sent": 0, "nack": 0, "unanswered": 0, "lat": [], "acked": []}
+    res = {"corpus": load_corpus(a.corpus) if a.corpus else [], "sent": 0, "nack": 0, "unanswered": 0, "lat": [], "acked": []}
     interval = a.conns / a.rate
     await asyncio.gather(*(conn_worker(a, i, interval, res, ctx) for i in range(a.conns)))
     lat = sorted(res["lat"])
@@ -116,7 +135,7 @@ async def main() -> None:
     }
     print(json.dumps(summary))
     with open(a.out, "w") as f:
-        json.dump({**summary, "acked_ids": res["acked"]}, f)
+        json.dump({**summary, "corpus": a.corpus, "acked_ids": res["acked"]}, f)
 
 
 if __name__ == "__main__":
