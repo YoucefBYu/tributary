@@ -48,7 +48,7 @@ Multi-process, parse+extract+fhir, total msg/s:
 | 8 | 105,862 | 8,501 | 384 |
 | 16 | 163,263 | 11,359 | 529 |
 
-Scaling is sub-linear and noisy. python-hl7 went from 1,994 (1 process) to 8,501 (8 processes), 4.3x on 8 processes (54% efficiency); lazy 9.5x on 8 was above linear only because its 1-process figure is depressed by noise; hl7apy 7x. Going to 16 processes (SMT threads) added 25 to 40% over 8 for python-hl7 and lazy. python-hl7 at 4 processes (3,682) is below 2 processes (4,062): that is a non-monotonic result I attribute to co-running load (Docker Kafka, other agents) but did not isolate, so treat the scaling curve as indicative only. The 1-process multi-run figures differ from the in-process table for the same reason. Even the worst per-process rate for python-hl7 (about 710 msg/s at 16 processes) stays above the 200 msg/s/core threshold.
+Scaling is sub-linear and noisy. python-hl7 went from 1,994 (1 process) to 8,501 (8 processes), 4.3x on 8 processes (54% efficiency); lazy 9.5x on 8 was above linear only because its 1-process figure is depressed by noise; hl7apy 7x. Going to 16 processes (SMT threads) added 34% (python-hl7) and 54% (lazy) over 8. python-hl7 at 4 processes (3,682) is below 2 processes (4,062): that is a non-monotonic result I attribute to co-running load (Docker Kafka, other agents) but did not isolate, so treat the scaling curve as indicative only. The 1-process multi-run figures differ from the in-process table for the same reason. Even the worst per-process rate for python-hl7 (about 710 msg/s at 16 processes) stays above the 200 msg/s/core threshold.
 
 ## Threshold
 

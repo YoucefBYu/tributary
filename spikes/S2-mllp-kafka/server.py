@@ -98,6 +98,10 @@ class KafkaPublisher:
         self.producer.flush(5)
 
     async def __call__(self, payload: bytes, cid: str) -> bool:
+        return await self.publish(payload, cid, [("tb-msg-id", str(uuid.uuid4()).encode())])
+
+    async def publish(self, payload: bytes, key: str, headers: list[tuple[str, bytes]],
+                      partition: int = -1) -> bool:
         loop = self._loop
         assert loop is not None
         fut: asyncio.Future[bool] = loop.create_future()
@@ -106,13 +110,8 @@ class KafkaPublisher:
             loop.call_soon_threadsafe(lambda: fut.done() or fut.set_result(err is None))
 
         try:
-            self.producer.produce(
-                self.topic,
-                value=payload,
-                key=cid.encode(),
-                headers=[("tb-msg-id", str(uuid.uuid4()).encode())],
-                on_delivery=cb,
-            )
+            self.producer.produce(self.topic, value=payload, key=key.encode(), headers=headers,
+                                  on_delivery=cb)
         except BufferError:
             return False  # local queue full -> refuse rather than buffer unboundedly
         return await fut
@@ -141,18 +140,23 @@ class Server:
         except Exception:  # noqa: BLE001 - any failure means "not committed" -> AR
             return False
 
+    def render(self, cid: str, result: object) -> tuple[bytes, bool]:
+        """Wire bytes for a finished publish. Subclasses (S3 sync reply) override."""
+        ok = result is True
+        return (build_ack("AA", cid) if ok else build_ack("AR", cid, "unavailable")), ok
+
     async def _ack_writer(self, q: asyncio.Queue[tuple[str, object] | None],
                           w: asyncio.StreamWriter) -> None:
         dead = False
         while (item := await q.get()) is not None:
             cid, what = item
             if isinstance(what, str):
-                code, text = "AR", what  # pre-decided rejection (e.g. oversize)
+                out = build_ack("AR", cid, what)  # pre-decided rejection (e.g. oversize)
                 self.stats.oversize += 1
             else:
                 assert isinstance(what, asyncio.Task)
-                ok = await what  # ACK only after the commit verdict
-                code, text = ("AA", "") if ok else ("AR", "unavailable")
+                result = await what  # ACK only after the commit verdict
+                out, ok = self.render(cid, result)
                 if ok:
                     self.stats.acked += 1
                 else:
@@ -160,7 +164,7 @@ class Server:
             if dead:
                 continue  # keep draining so the reader never blocks on a dead peer
             try:
-                w.write(build_ack(code, cid, text))
+                w.write(out)
                 await asyncio.wait_for(w.drain(), self.cfg.write_timeout_s)
             except (ConnectionError, OSError, TimeoutError):
                 dead = True
