@@ -2,6 +2,8 @@
 
 Status: MEASURED by qa-engineer 2026-09-20, awaiting architect acceptance. Feeds ADR-002 D4 (partition default) and D5 (topic-sharing fallback).
 
+**Scope: every number is a lower bound and applies only to this setup: 3 Kafka brokers with 1 GB heap (2G inconclusive), a 7.4 GiB Docker Desktop VM on a Windows host, idle topics carrying only a 300-message probe, and mostly single runs. It is not a cluster limit and not a Linux number.**
+
 ## Question
 
 Threshold (phase-0.md S4): 500 channels operate normally, rebalance under 30 s. Where does the cluster degrade first, and what per-channel partition default and topic-sharing trigger follow?
@@ -26,7 +28,7 @@ Baseline had 986 leftover partitions from earlier spikes (added to the counts be
 | 250 | 11,789 | 48 s (batches about 9.7 s / 25 ch) | 0.21 s | 195 / 621 ms | 1.5 to 1.7 GiB | fine |
 | 450 (batch 425-450) | about 21,000 | n/a | metadata request timed out (a MetadataRequest in flight timed out after 60.5 s; the later cleanup `list_topics` timed out at 120 s) | n/a | n/a | **cluster died** |
 
-Evidence limits: the tracked log (`s4-1g-12p-topics.log`) shows only the failed create batch and those timeouts. The cause (JVM heap exhaustion) was read from the broker logs at the time. Those container logs are lost (containers destroyed afterwards), so it is **not independently reproducible from tracked data**; `data/S4/s4-1g-12p-broker-log-excerpt.txt` is a hand transcription of the lines I saw, marked as such. The partition counts are computed (425 channels x 48 partitions plus 986 leftover baseline partitions, about 21,000) from a single run, not read from a metadata call at the failure point.
+Evidence limits: the tracked log (`s4-1g-12p-topics.log`) shows only the failed create batch and those timeouts, and `s4-1g-12p.jsonl` has no record for the failed tier (the script died before writing one), so the failure is evidenced only by that log line plus the transcribed broker excerpt. The cause (JVM heap exhaustion) was read from the broker logs at the time. Those container logs are lost (containers destroyed afterwards), so it is **not independently reproducible from tracked data**; `data/S4/s4-1g-12p-broker-log-excerpt.txt` is a hand transcription of the lines I saw, marked as such. The partition counts are computed (425 channels x 48 partitions plus 986 leftover baseline partitions, about 21,000) from a single run, not read from a metadata call at the failure point.
 
 From the transcribed logs: at 12:37 kafka3 lost raft quorum contact (election timeouts, ISR shrinks), OOM at 12:39:25 (`java.lang.OutOfMemoryError: Java heap space` in the raft IO thread, fatal fault); kafka2 OOM at 12:42:48 (metadata image publisher); kafka1 exited at 12:43:15 with an orderly-looking shutdown, and I did not see an OOM line for it (inferred: it lost quorum). `docker inspect` showed OOMKilled=false for all three, consistent with a JVM-heap failure, not the kernel OOM killer. Roughly 48 fds per channel per broker; 22k fds at 250 channels against a 1M limit, so fds are not the constraint.
 
@@ -57,7 +59,7 @@ Rebalance at 3 partitions, 1G:
 
 Caveats: the first regex-group run's remove step hit a bug in my script (pump thread died on a concurrently closed consumer, fixed in `s4.py`), and its rerun's first join timed out (stale static ids from the killed earlier process, plus a segfault on exit inside confluent-kafka teardown). I used run 1 for join and add, run 2 for remove; both are in `s4-1g-3p-groups-regex.jsonl` and `s4-1g-3p-regex-run2.log`.
 
-### 2G heap, 12 partitions per topic (two runs, inconsistent)
+### 2G heap, 12 partitions per topic (two runs, inconsistent: inconclusive in a 7.4 GiB VM)
 
 Run A (`s4-2g-12p*`, fresh cluster): 100 ch 4.8k partitions create 36 s, ACK p99 1.1 s; 250 ch 12.0k partitions create 45 s, list 0.11 s, **ACK p99 11.5 s** (new producers timed out on ApiVersion after 10 s); 500 ch 24.0k partitions create 120 s, list_topics 0.58 s, **ACK p50 17.3 s**. The tier-750 create then completed, but every metadata call timed out, the brokers stayed at 100 to 260% CPU for over 10 minutes, and raft leadership flapped (epoch 56 to 57, repeated election timeouts). No OOM at 2G (containers about 2.1 GiB). Cluster at about 35k partitions: list_topics 1.5 s median, 3.3 s max, produce ACK probe 0 of 300 acked.
 
@@ -79,14 +81,16 @@ Measured under 3 brokers, RF=3, 7.4 GiB Docker VM:
 2. **Create latency** grows with partitions per batch (about 9.7 s per 25 channels at 48 partitions per channel, versus 2 to 4 s at 12 per channel) and is the first soft signal.
 3. **list_topics latency** is the mildest: 0.09 s (1.2k to 6k partitions), 0.17 to 0.21 s (12k), 0.58 s (24k), 1.5 s median (35k). It does not degrade before the others, but it matters because every client pays it at startup and `ensure_topics` uses a fixed 10 s timeout.
 4. **Produce-ACK latency** degrades once the controller is saturated, independent of data volume (p99 11 to 17 s in the 2G runs at 12k to 24k partitions).
-5. **Rebalance time** did not degrade in any tested state (4 to 8 s; static-member removal is dominated by session timeout).
+5. **Rebalance time** did not degrade at 1G with 3 partitions per topic (4 to 8 s for joins and adds; static-member removal is dominated by session timeout). At 2G with 12 partitions it is inconclusive: 100 groups took 14.4 s in run B, and the regex-group result there is invalid.
 
-In short: on this VM the ceiling is about 12k partitions healthy and about 20k fatal at 1G (single run, computed count), and 2G was unstable in two runs that disagree, so no heap-scaling claim is made. That is 250 channels at 48 partitions per channel, and at least 1,000 channels at 12 partitions per channel.
+In short: on this VM the ceiling is about 12k partitions healthy and about 20k fatal at 1G (single run, computed count), and 2G was unstable in two runs that disagree, so the 2G result is inconclusive in a 7.4 GiB VM and no heap-scaling claim is made. That is 250 channels at 48 partitions per channel, and at least 1,000 channels at 12 partitions per channel.
 
 ## Recommendations for ADR-002
 
-- **D4 partition default: 3 partitions per topic** for channel topics (`raw`, `out`, `retry`, `dlq`), overridable per channel in the spec where throughput needs more. 3 gives 12 partitions per channel and meets the 500-channel threshold with margin up to 1,000 channels. Consider 1 partition for `retry` and `dlq` (not tested).
-- **D5 sharing trigger, stated in partitions, not channels:** define the fallback trigger on projected total partitions per cluster, `channels x 4 x partitions`. On 1 GB broker heap and 3 brokers: warn at 8,000 and switch new channels to shared topics at 12,000 (the highest tested healthy value). Above about 20,000 the cluster is lost. Do not scale these with heap without re-measuring on Linux; the 2G runs were inconsistent.
+These hold only for the setup on the Status line (3 brokers, 1 GB heap, 7.4 GiB Docker Desktop VM on Windows, idle topics, single runs). Re-measure on Linux with real broker memory before adopting the numbers as product limits. Each default is labelled by its basis.
+
+- **D4 partition default: 3 partitions per topic** (basis: measured, 1,000 channels = 12,000 partitions healthy at 1G) for channel topics (`raw`, `out`, `retry`, `dlq`), overridable per channel in the spec where throughput needs more. 3 gives 12 partitions per channel and meets the 500-channel threshold with margin up to 1,000 channels. Consider 1 partition for `retry` and `dlq` (not tested).
+- **D5 sharing trigger, stated in partitions, not channels:** define the fallback trigger on projected total partitions per cluster, `channels x 4 x partitions`. On 1 GB broker heap and 3 brokers: warn at 8,000 and switch new channels to shared topics at 12,000. Bases: **12,000 is measured** (the highest partition count tested healthy); **8,000 is a judgement, not a measurement**; **about 20,000 fatal is one failure in one run at a computed count of about 21,000, and nothing was tested between 12,000 and 21,000, so the real cliff could be anywhere in that range**. Do not scale these with heap without re-measuring; the 2G runs were inconclusive.
 - Topic sharing must not cross a tenant boundary (per contracts): the trigger applies per tenant partition group, so a large multi-tenant deployment reaches the ceiling before the fallback can help, and needs more brokers rather than more sharing.
 - Ask platform-engineer: `ensure_topics` used a fixed 10 s `list_topics` timeout in its own calls (now configurable, platform-engineer commit 8ff13ef), and the compose stack should set a 1G or larger heap knowingly (default 1G is the tested case).
 - Static membership: set `session.timeout.ms` explicitly (default 45 s makes failure detection slower than 30 s).
