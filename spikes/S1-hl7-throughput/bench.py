@@ -249,14 +249,30 @@ def memory(parser: str, corpus: list[bytes], n: int = 500) -> dict[str, float]:
     return {"retained_bytes_per_msg": cur / n, "peak_bytes_per_msg": peak / n, "expansion_vs_raw": cur / raw}
 
 
+def verify(corpus: list[bytes]) -> int:
+    """Check every parser yields a byte-identical Bundle to the lazy reference. Returns mismatch count."""
+    bad = {k: 0 for k in PARSERS if k != "lazy"}
+    for raw in corpus:
+        ref = to_bundle(x_lazy(p_lazy(raw)))
+        for k in bad:
+            p, x = PARSERS[k]
+            if to_bundle(x(p(raw))) != ref:
+                bad[k] += 1
+    print(f"verify: {len(corpus)} messages, mismatches {bad}")
+    return sum(bad.values())
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--count", type=int, default=10000)
     ap.add_argument("--repeats", type=int, default=3)
     ap.add_argument("--procs", default="1,2,4,8")
     ap.add_argument("--skip-multi", action="store_true")
+    ap.add_argument("--verify", action="store_true", help="cross-check Bundles across parsers on the first 1000 messages and exit")
     a = ap.parse_args()
     corpus = [m.encode("ascii") for m in generate(a.count, 1)]
+    if a.verify:
+        sys.exit(1 if verify(corpus[:1000]) else 0)
     import importlib.metadata as md
 
     out: dict[str, Any] = {
