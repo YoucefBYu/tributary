@@ -32,7 +32,13 @@
       "Bash(ls*)",
       "Bash(cat *)",
       "Bash(jq *)",
-      "Bash(mkdir *)"
+      "Bash(mkdir *)",
+      "Bash(command *)",
+      "Bash(docker *)",
+      "Bash(python *)",
+      "Bash(echo *)",
+      "Bash(find *)",
+      "Bash(grep *)"
     ],
     "deny": [
       "Bash(git push*)",
