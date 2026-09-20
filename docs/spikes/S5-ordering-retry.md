@@ -5,7 +5,7 @@ Status: MEASURED 2026-09-20 by platform-engineer against the shared 3-broker spi
 **Threshold result: per-key order preserved, zero violations.** No counterexample in 2,000
 randomised fault schedules against the model, 12 real-cluster fault-injection scenarios, or 13
 real-cluster integration tests. `reordered_key_count` was 0 in every run, including the runs
-where a kill replayed 12 messages and where four partitions changed hands mid-flight.
+where a kill replayed 12 messages and where partitions changed hands mid-flight.
 
 ### Which runs this report quotes
 
@@ -17,7 +17,7 @@ tables below therefore distinguish three run sets under `spikes/S5-ordering-retr
 |---|---|---|
 | `*-14xxxx` (14:02-14:20) | First `s5.runner` run set, 2,000 messages | Superseded for `kill`, `static_restart`, `rebalance`; still the source for the other scenarios |
 | `*-142xxx` (14:25-14:31) | The `pytest -m integration` run set, 600 messages | Correctness only; never quoted for numbers |
-| `*-19xxxx` and `*-20xxxx` (19:29-20:03) | Re-run after the review, 2,000 messages | **The source for `kill`, `static_restart`, `rebalance`, `txn_crash`** |
+| `*-19xxxx` and `*-20xxxx` (19:29-20:20) | Re-run after the review, 2,000 messages | **The source for `kill`, `static_restart`, `rebalance`, `txn_crash`** |
 
 Every number below names its run set where the two differ. The two High findings and what they
 changed are in "What the first runs did not demonstrate".
@@ -138,7 +138,7 @@ asserted.
 | `kill` (re-run) | 2012 | 2000 | **12** | 0.60% | 0 | yes | 0/0 | 131 | `commit_every=20`, killed mid-window; takeover gap **10.01 s** |
 | `static_hold` | 2000 | 2000 | 0 | 0% | 0 | yes | 0/0 | 81 | takeover gap **11.32 s**, nobody replaced the dead member |
 | `static_restart` (re-run) | 2012 | 2000 | **12** | 0.60% | 0 | yes | 0/0 | 124 | recovery **3.21 s** against 2.0 s downtime |
-| `rebalance` (re-run) | 2000 | 2000 | 0 | 0% | 0 | yes | 0/0 | 137 | worker-c delivered **628**; 4 partitions moved while worker-a was still running |
+| `rebalance` (re-run) | 2000 | 2000 | 0 | 0% | 0 | yes | 0/0 | 141 | joined a **stable** pair; exactly 2 of 6 partitions moved, joiner delivered **540** |
 | `broker_kill` | 2002 | 2000 | **2** | 0.10% | 0 | yes | 0/0 | 53 | 7.7 s to healthy; both workers dropped out of the group |
 | `txn` | 2000 | 2000 | 0 | 0% | 0 | yes | - | - | 40 transactions, commit p99 78 ms |
 | `txn_crash` (re-run) | 2000 | 2000 | 0 | 0% | 0 | yes | - | - | **50 records proven inside an open transaction at the kill**; restarted on the same `transactional.id` |
@@ -213,47 +213,46 @@ configured backoff. The remaining ~155 ms is the loader's `poll_timeout_s=0.2` -
 checked at the top of the poll loop, so the poll timeout, not Kafka, sets the retry latency
 floor. That is a fixable implementation detail, not a property of the approach (follow-up 1).
 
-### Cooperative rebalance (re-run, `rebalance-200152`)
+### Cooperative rebalance (re-run, `rebalance-202000`)
 
-**What this run actually shows: a cooperative revoke and resume mid-run is safe.** It does *not*
-show a third member joining a stable pair, and the first version of this section claimed that it
-did. The journal is unambiguous:
+A third member joined a **stable** pair, with `founders_stable_before_join: true` recorded by
+waiting until both founders owned partitions before starting it. The journal attributes the
+movement unambiguously:
 
 ```
-313.789  worker-a  assign  [0,1,2,3,4,5]
-316.898  worker-b  assign  []              <- worker-b's own join
-316.907  worker-a  revoke  [0,1,2,3]       <- caused by b joining, not c
-320.010  worker-c  assign  [0,2]
+402.595  worker-a  assign  [0,1,2,3,4,5]
+405.690  worker-b  assign  []            <- b joins
+405.696  worker-a  revoke  [0,1,2]
+408.800  worker-b  assign  [0,1,2]       <- founders now stable: a=[3,4,5], b=[0,1,2]
+411.901  worker-c  assign  []            <- c joins
+411.908  worker-a  revoke  [3]           <- caused by c
+411.909  worker-b  revoke  [0]           <- caused by c
+414.993  worker-c  assign  [0,3]
 ```
-
-worker-b's join at 316.898 is what triggered worker-a's revoke nine milliseconds later; worker-c
-was not assigned anything until 320.010, three seconds later. So worker-a and worker-b were still
-settling when worker-c was started, the four partitions were given up in a single revoke, and
-`revokes_while_running_after` cannot attribute that revoke to worker-c rather than worker-b. The
-200 deliveries that triggered the join threshold were all worker-a's, for the same reason.
-
-What is supported, and is still the point of the scenario:
 
 | Evidence | Value |
 |---|---|
-| Partitions given up by a **still-running** worker mid-delivery | **4** (0, 1, 2, 3) |
-| Revokes while running | worker-a: 4; worker-b: 0; worker-c: 0 |
-| Partitions ultimately assigned to worker-c | 0 and 2 |
-| Records delivered by worker-c after taking them | **628** |
-| Duplicates / losses / reorderings across the handover | 0 / 0 / 0 |
+| Founders stable before the joiner started | **yes** |
+| Partitions moved, caused by the joiner | **2** (0 and 3) |
+| Revokes while running, after the join | worker-a: [3]; worker-b: [0] |
+| Records delivered by the joining member | **540** |
+| Duplicates / losses / reorderings | 0 / 0 / 0 |
 
-So partitions did move from an actively-delivering worker to new owners, and 628 records were
-delivered by a member that owned nothing when the run started, with nothing lost or reordered.
-What is not established is which joiner caused it.
+**Cooperative-sticky moved the minimum.** Six partitions across three members is two each, and
+exactly two partitions moved -- one from each founder -- while the other four were never revoked
+and kept flowing throughout. That is the difference from eager assignment, which would have
+revoked all six and stopped the channel. For an ordered channel this is the property that
+matters: adding capacity stalls only the partitions that actually change hands.
 
 **Zero duplicates here is the correct result, not a weak one.** A cooperative revoke is a planned
 handover: `_on_revoke` commits before the partitions are given up, so the new owner starts exactly
 where the old one stopped and nothing is replayed. That is the contrast with `kill`, where the
 dying worker commits nothing and 12 messages are replayed. Both are the design working.
 
-`s5.runner` now waits for every founding member to own partitions before starting the joiner
-(`wait_for_stable_assignment`, recorded as `founders_stable_before_join`), so a future run can
-make the stronger claim. This run predates that fix and is reported as what it is.
+The earlier run of this scenario (`rebalance-200152`) could not support this claim: worker-b's own
+join caused the revoke three seconds before worker-c was assigned anything, so the movement could
+not be attributed to worker-c. It is superseded, and the fix that made the difference --
+`wait_for_stable_assignment` -- is why this run's attribution is sound.
 
 ### Transactions
 
@@ -317,12 +316,12 @@ and every worker revokes its partitions on clean shutdown. So High 2 applies to 
 test, not to the cluster scenario, but the evidence for both was worthless either way. Workers
 now write a timestamped assign/revoke/lost journal and count `revokes_while_running`, so a
 rebalance revoke is distinguishable from a shutdown revoke, and the joining member starts at a
-tenth of the run. **Partly resolved by the re-run**: 4 partitions were given up by a
-still-running worker and worker-c delivered 628 records (`rebalance-200152`), so revoke-and-resume
-mid-run is now demonstrated. But the journal shows worker-b's own join caused that revoke three
-seconds before worker-c was assigned anything, so the run does not show a third member joining a
-*stable* pair. `s5.runner` now waits for the founders to be stable first; making the stronger
-claim needs one more run.
+tenth of the run. **Resolved in two steps.** The first re-run (`rebalance-200152`) showed
+revoke-and-resume mid-run was safe but could not attribute the movement: the journal showed
+worker-b's own join caused the revoke three seconds before worker-c was assigned anything. After
+adding `wait_for_stable_assignment`, the second re-run (`rebalance-202000`) has the founders
+stable before the joiner starts, and the journal attributes exactly 2 moved partitions to
+worker-c's join.
 
 **4. Commit-after-delivery on the cluster was a final-state check.** It compared the last
 committed offset against the whole delivery log, which cannot catch a commit that ran ahead of
@@ -394,7 +393,7 @@ Reported because the first version of each *passed*:
 | Duplicate rate reported | 0.60% (`kill` and `static_restart`, `commit_every=20`), 0.10% (`broker_kill`), 0% without a fault; bounded by `commit_every` | **PASS** (reported) |
 | Commit-after-delivery verified | 0 violations; online in the model (commit hook) and sampled every 250 ms through the kill window on the cluster (144 samples) | **PASS** |
 | Blocking retry with partition pause and resume | 598 real cycles, 0 loss, 0 skips; seek-before-resume proven necessary by measurement, and a mutant that omits it is caught | **PASS** |
-| Cooperative-sticky and static membership | Static cost quantified in both directions and corroborated by S4. Cooperative movement: 4 partitions given up by a still-running worker mid-delivery and picked up by a member that started with none, which delivered 628 records, with 0 duplicates and 0 losses. Which of the two joiners triggered it is **not** established (see the rebalance section) | **PASS** for revoke-and-resume safety; attribution to a specific joiner NOT established |
+| Cooperative-sticky and static membership | Static cost quantified in both directions and corroborated by S4. A member joining a stable pair moved exactly 2 of 6 partitions, one from each founder, leaving the other 4 uninterrupted; the joiner delivered 540 records with 0 duplicates, 0 losses and 0 reorderings | **PASS** |
 | Transactional Kafka-to-Kafka stage | Exactly-once held across a kill, with 50 records proven to be inside an open transaction at the moment of the kill | **PASS** |
 | Poison message to DLQ | Exactly the 8 poison messages dead-lettered, partition kept moving; `halt-partition` verified as the order-preserving alternative | **PASS** |
 
