@@ -72,4 +72,4 @@ Verdict: the receiver-side sync-reply mechanism is viable and safe under these t
 
 ## Raw data
 
-Tracked in `docs/spikes/data/S3/`: `s3.jsonl` (all four scenarios, one record each for latency cells), `s3-restart-verify.json`. Per-message event dumps are not kept; regenerate with `cd spikes/S2-mllp-kafka && uv run python ../S3-sync-reply/s3run.py latency|timeout|memory|restart` (needs the `tb-s2` and `tb-s3` images).
+Tracked in `docs/spikes/data/S3/`: `s3.jsonl` (all four scenarios, one record each for latency cells) and `s3-restart-verify.json`. The `restart` record in `s3.jsonl` carries a false `verify` result (`lost: 7974`) caused by a runner defect (`verify_loss.py` was called without `--id-from msh10`); it is annotated in the record and superseded by `s3-restart-verify.json` (7,974 acked, 7,974 in topic, 0 lost), which is the source of the report's loss figure. The runner is fixed. Per-message event dumps are not kept; regenerate with `cd spikes/S2-mllp-kafka && uv run python ../S3-sync-reply/s3run.py latency|timeout|memory|restart` (needs the `tb-s2` and `tb-s3` images).

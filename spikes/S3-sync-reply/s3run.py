@@ -179,7 +179,7 @@ def restart() -> None:
         per_s.setdefault(int(e[1] - SKEW - t0), []).append(e[3] == "AA")
     timeline = {s: f"{sum(v)}/{len(v)}" for s, v in sorted(per_s.items()) if s >= 8}
     v = sh(sys.executable, str(S2 / "verify_loss.py"), "--bootstrap", HOST_BOOT, "--topic", raw,
-           str(RUNS / f"{tag}.json"), check=False)
+           "--id-from", "msh10", str(RUNS / f"{tag}.json"), check=False)
     emit({"scenario": "restart", "kill_rel_s": round(t_kill - t0, 1), "restart_rel_s": round(t_up - t0, 1),
           "sent": r["sent"], "codes": codes, "unanswered": r["unanswered"],
           "aa_over_sent_by_second": timeline, "server": metrics(f"{tag}-m.json"),
