@@ -55,15 +55,22 @@ def wait_for_cluster(expected_brokers: int = 3, timeout: float = 120.0) -> list[
     raise TimeoutError(f"only {len(last)} broker(s) visible after {timeout}s: {last}")
 
 
-def ensure_topics(specs: list[TopicSpec], timeout: float = 60.0) -> None:
+def ensure_topics(
+    specs: list[TopicSpec], timeout: float = 60.0, *, metadata_timeout: float = 10.0
+) -> None:
     """Create topics, tolerating ones that already exist.
 
     Gotcha: ``create_topics`` returns immediately after the controller accepts
     the request; leaders may not be elected yet. We poll metadata afterwards so
     a following producer does not hit ``UNKNOWN_TOPIC_OR_PART``.
+
+    ``metadata_timeout`` covers the ``list_topics`` calls. The 10 s default is
+    ample on an idle cluster but not on one with thousands of topics, where the
+    metadata response itself gets large (S4) -- raise it there rather than
+    reading a timeout as a broken cluster.
     """
     client = admin()
-    existing = set(client.list_topics(timeout=10.0).topics)
+    existing = set(client.list_topics(timeout=metadata_timeout).topics)
     todo = [s for s in specs if s.name not in existing]
     if todo:
         futures = client.create_topics([s.to_new_topic() for s in todo], request_timeout=timeout)
@@ -74,14 +81,16 @@ def ensure_topics(specs: list[TopicSpec], timeout: float = 60.0) -> None:
                 if "already exists" not in str(exc).lower():
                     raise
                 log.debug("topic %s already exists", name)
-    _await_leaders([s.name for s in specs], timeout=timeout)
+    _await_leaders(
+        [s.name for s in specs], timeout=timeout, metadata_timeout=metadata_timeout
+    )
 
 
-def _await_leaders(names: list[str], timeout: float) -> None:
+def _await_leaders(names: list[str], timeout: float, metadata_timeout: float = 10.0) -> None:
     client = admin()
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        md = client.list_topics(timeout=10.0)
+        md = client.list_topics(timeout=metadata_timeout)
         ok = True
         for name in names:
             topic = md.topics.get(name)

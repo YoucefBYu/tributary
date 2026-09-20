@@ -33,6 +33,7 @@ import json
 import logging
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -40,6 +41,7 @@ from pathlib import Path
 from typing import Any
 
 import orjson
+from confluent_kafka import Consumer, KafkaException, TopicPartition
 from tbcommon import admin, checks, clients, config, faults
 
 from . import readback, topics
@@ -117,6 +119,7 @@ class WorkerPool:
             "--events-topic", self.layout.events,
             "--log", str(log_path),
             "--stats", str(stats_path),
+            "--journal", str(self.run_dir / "rebalances.jsonl"),
             *(("--instance-id", name) if static else ()),
             *(("--poison-file", str(self.poison_file)) if self.poison_file else ()),
             *extra,
@@ -182,19 +185,55 @@ class RunResult:
     phi_findings: list[str] = field(default_factory=list)
     notes: dict[str, Any] = field(default_factory=dict)
     wall_s: float = 0.0
+    sampled_commits: int = 0
+    #: Scenarios that kill a worker with an open uncommitted window MUST produce
+    #: duplicates. Zero duplicates there does not mean "no replay happened and
+    #: all is well", it means the scenario failed to exercise replay at all.
+    require_duplicates: bool = False
+    #: Kafka-to-Kafka scenarios must be exactly-once, so for them a duplicate is
+    #: a hard failure rather than the expected cost of at-least-once.
+    require_exactly_once: bool = False
+    #: `txn_crash` must catch the stage with a transaction actually open,
+    #: otherwise it tests nothing about abort or zombie fencing.
+    require_open_transaction: bool = False
+
+    @property
+    def verdict_failures(self) -> list[str]:
+        """Why this run is not a pass. Empty means it is."""
+        why: list[str] = []
+        if not self.report.order_preserved:
+            why.append(f"per-key reordering on {len(self.report.reordered_keys)} key(s)")
+        if not self.report.no_loss:
+            why.append(f"{len(self.report.lost)} message(s) lost")
+        if self.commit_violations:
+            why.append(f"{len(self.commit_violations)} commit-after-delivery violation(s)")
+        if self.phi_findings:
+            why.append(f"{len(self.phi_findings)} PHI finding(s)")
+        # Exactly the poison messages, no more and no fewer. Without this an
+        # injection harness that forgot to inject anything reports success.
+        if self.dlq_ids != self.expected_dlq_ids:
+            why.append(
+                f"DLQ mismatch: {len(self.dlq_ids - self.expected_dlq_ids)} unexpected, "
+                f"{len(self.expected_dlq_ids - self.dlq_ids)} missing"
+            )
+        if self.require_duplicates and self.report.duplicates == 0:
+            why.append("no duplicates, so replay-after-kill was never exercised")
+        if self.require_exactly_once and self.report.duplicates:
+            why.append(f"{self.report.duplicates} duplicate(s) in an exactly-once stage")
+        if self.require_open_transaction:
+            held = int(self.notes.get("open_transaction_at_kill", {}).get(
+                "records_in_open_transaction", 0
+            ))
+            if held <= 0:
+                why.append(
+                    "no transaction was open at the kill, so abort and fencing were not tested"
+                )
+        return why
 
     @property
     def ok(self) -> bool:
-        """The verdict the report quotes. Duplicates are not a failure."""
-        return (
-            self.report.order_preserved
-            and self.report.no_loss
-            and not self.commit_violations
-            and not self.phi_findings
-            # Exactly the poison messages, no more and no fewer. Without this an
-            # injection harness that forgot to inject anything reports success.
-            and self.dlq_ids == self.expected_dlq_ids
-        )
+        """The verdict the report quotes. Duplicates alone are not a failure."""
+        return not self.verdict_failures
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -219,7 +258,9 @@ class RunResult:
             "workers": self.worker_stats,
             "event_stages": self.event_stages,
             "phi_findings": self.phi_findings,
+            "sampled_commits": self.sampled_commits,
             "notes": self.notes,
+            "verdict_failures": self.verdict_failures,
             "ok": self.ok,
         }
 
@@ -321,6 +362,135 @@ def analyse(
     return result
 
 
+class CommitSampler:
+    """Polls the group's committed offsets while the scenario runs.
+
+    Without this, commit-after-delivery on the cluster is only a *final-state*
+    check: it compares the last committed offset against the whole delivery log,
+    which cannot catch a commit that ran ahead of its delivery and was then
+    caught up with. Sampling during the kill window turns it into a sequence of
+    point-in-time checks.
+
+    The timestamp is taken *after* the fetch returns, so the recorded time is at
+    or later than the moment the commit became visible. That biases the check
+    towards false negatives rather than false positives: a delivery dated after
+    the sample really did happen after that commit.
+    """
+
+    def __init__(self, group: str, topic: str, interval_s: float = 0.25) -> None:
+        self.group = group
+        self.topic = topic
+        self.interval_s = interval_s
+        self.samples: list[tuple[float, dict[int, int]]] = []
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, name="commit-sampler", daemon=True)
+
+    def _loop(self) -> None:
+        consumer = Consumer(clients.consumer_config(self.group))
+        try:
+            tps = [TopicPartition(self.topic, p) for p in range(readback.partition_count(self.topic))]
+            while not self._stop.is_set():
+                try:
+                    committed = consumer.committed(tps, timeout=10)
+                except KafkaException:  # a broker kill can make this fail transiently
+                    self._stop.wait(self.interval_s)
+                    continue
+                offsets = {tp.partition: tp.offset for tp in committed if tp.offset >= 0}
+                self.samples.append((time.time(), offsets))
+                self._stop.wait(self.interval_s)
+        finally:
+            consumer.close()
+
+    def __enter__(self) -> CommitSampler:
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self._stop.set()
+        self._thread.join(timeout=30)
+
+
+def check_sampled_commits(
+    run_dir: Path, samples: list[tuple[float, dict[int, int]]], dlq: list[readback.Readback]
+) -> list[str]:
+    """Every sampled commit must be backed by deliveries that already happened."""
+    records = read_delivery_log(run_dir / "deliveries-*.jsonl")
+    delivered_at: dict[tuple[int, int], float] = {}
+    for record in records:
+        key = (int(record["partition"]), int(record["offset"]))
+        ts = float(record["ts"])
+        delivered_at[key] = min(delivered_at.get(key, ts), ts)
+    for entry in dlq:
+        part = int(entry.headers.get("tb-source-partition", "-1"))
+        off = int(entry.headers.get("tb-source-offset", "-1"))
+        # No timestamp for a DLQ record; the produce is flushed before the offset
+        # is stored, so treat it as always-already-handled.
+        delivered_at.setdefault((part, off), 0.0)
+
+    violations: list[str] = []
+    for ts, offsets in samples:
+        for part, committed in offsets.items():
+            for off in range(committed):
+                handled = delivered_at.get((part, off))
+                if handled is None:
+                    violations.append(
+                        f"commit {part}@{committed} observed at {ts:.3f} but offset {off} "
+                        f"was never delivered or dead-lettered"
+                    )
+                    break
+                if handled > ts:
+                    violations.append(
+                        f"commit {part}@{committed} observed at {ts:.3f} but offset {off} "
+                        f"was only delivered at {handled:.3f}"
+                    )
+                    break
+    return violations
+
+
+def read_journal(run_dir: Path) -> list[dict[str, Any]]:
+    """Every assign/revoke/lost any worker recorded, ordered by wall time."""
+    path = run_dir / "rebalances.jsonl"
+    if not path.exists():
+        return []
+    entries: list[dict[str, Any]] = []
+    with path.open("rb") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(orjson.loads(line))
+            except orjson.JSONDecodeError:  # a partial line from a killed worker
+                continue
+    entries.sort(key=lambda e: float(e["ts"]))
+    return entries
+
+
+def rebalance_evidence(run_dir: Path, since_wall: float) -> dict[str, Any]:
+    """Did a real rebalance happen after ``since_wall``, and who moved?
+
+    "Real" means a revoke or lost by a worker that was still running. A worker's
+    own shutdown also revokes its partitions, and counting those as evidence is
+    how the first `rebalance` run claimed a rebalance it never had.
+    """
+    entries = read_journal(run_dir)
+    after = [e for e in entries if float(e["ts"]) >= since_wall]
+    moves = [
+        e for e in after if e["kind"] in ("revoke", "lost") and not e.get("shutting_down", False)
+    ]
+    return {
+        "revokes_while_running_after": [
+            {"worker": e["worker"], "kind": e["kind"], "partitions": e["partitions"]} for e in moves
+        ],
+        "assigns_after": [
+            {"worker": e["worker"], "partitions": e["partitions"]}
+            for e in after
+            if e["kind"] == "assign"
+        ],
+        "partitions_moved": sorted({p for e in moves for p in e["partitions"]}),
+    }
+
+
 def takeover_gap_s(
     run_dir: Path, dead: str, killed_wall: float, *, by_others_only: bool = True
 ) -> float | None:
@@ -357,6 +527,9 @@ class Options:
     seed: int = 1
     keep_topics: bool = False
     session_timeout_ms: int = 10_000
+    #: Commit window for the kill scenarios. Must be > 1 or the kill replays
+    #: nothing and proves nothing.
+    replay_commit_every: int = 20
 
 
 def _setup(scenario: str, opts: Options) -> tuple[Layout, str, Path, Plan]:
@@ -517,20 +690,44 @@ def scenario_halt(opts: Options) -> RunResult:
 
 
 def scenario_kill(opts: Options) -> RunResult:
-    """``kill -9`` a worker mid-run; a fresh member takes the partitions over."""
+    """``kill -9`` a worker mid-run; a fresh member takes the partitions over.
+
+    Committing every ``opts.replay_commit_every`` deliveries rather than every
+    one, on purpose. With ``commit_every=1`` the uncommitted window is a single
+    message, so the kill lands between commits and replays almost nothing: the
+    first version of this scenario reported 0 or 1 duplicates and therefore did
+    not actually exercise "replay from the last commit preserves order". A
+    window of 20 forces a real replay, and the verdict now *requires*
+    duplicates, so a run that replayed nothing counts as a failure to test
+    rather than as a pass.
+    """
     layout, group, run_dir, plan = _setup("kill", opts)
     pool = _pool(run_dir, layout, group, plan)
+    extra = [
+        *_common(opts, idle_exit_s=20.0),
+        "--commit-every", str(opts.replay_commit_every),
+        # Long enough that the time-based commit does not quietly shrink the
+        # window back to ~1 and defeat the point of the scenario.
+        "--commit-interval-s", "30",
+    ]
     t0 = time.monotonic()
-    a = pool.start("worker-a", extra=_common(opts, idle_exit_s=20.0))
-    pool.start("worker-b", extra=_common(opts, idle_exit_s=20.0))
-    pool.wait_for_deliveries(max(50, opts.count // 4))
-    killed = a.kill()
-    pool.start("worker-c", extra=_common(opts, idle_exit_s=20.0))
-    pool.wait_all()
+    with CommitSampler(group, layout.raw) as sampler:
+        a = pool.start("worker-a", extra=extra)
+        pool.start("worker-b", extra=extra)
+        pool.wait_for_deliveries(max(50, opts.count // 4))
+        killed = a.kill()
+        pool.start("worker-c", extra=extra)
+        pool.wait_all()
     result = analyse("kill", layout, group, run_dir, plan, pool, wall_s=time.monotonic() - t0)
+    result.require_duplicates = True
     result.notes["killed"] = "worker-a"
+    result.notes["commit_every"] = opts.replay_commit_every
     result.notes["takeover_gap_s"] = takeover_gap_s(run_dir, "worker-a", killed)
     result.notes["session_timeout_ms"] = opts.session_timeout_ms
+    result.sampled_commits = len(sampler.samples)
+    result.commit_violations.extend(
+        check_sampled_commits(run_dir, sampler.samples, readback.read_all(layout.dlq))
+    )
     return result
 
 
@@ -564,45 +761,78 @@ def scenario_static_restart(opts: Options) -> RunResult:
     """
     layout, group, run_dir, plan = _setup("static_restart", opts)
     pool = _pool(run_dir, layout, group, plan)
+    # Same reason as `kill`: a one-message uncommitted window means the restart
+    # replays nothing and the scenario only measures rejoin time.
+    extra = [
+        *_common(opts, idle_exit_s=20.0),
+        "--commit-every", str(opts.replay_commit_every),
+        "--commit-interval-s", "30",
+    ]
     t0 = time.monotonic()
-    a = pool.start("worker-a", extra=_common(opts, idle_exit_s=20.0))
-    b = pool.start("worker-b", extra=_common(opts, idle_exit_s=20.0))
+    a = pool.start("worker-a", extra=extra)
+    b = pool.start("worker-b", extra=extra)
     pool.wait_for_deliveries(max(50, opts.count // 4))
     killed = a.kill()
     time.sleep(2.0)  # well inside session.timeout.ms
-    pool.start("worker-a", extra=_common(opts, idle_exit_s=20.0))  # same instance id
+    pool.start("worker-a", extra=extra)  # same instance id
     pool.wait_all()
     result = analyse(
         "static_restart", layout, group, run_dir, plan, pool, wall_s=time.monotonic() - t0
     )
+    result.require_duplicates = True
     result.notes["restarted"] = "worker-a"
+    result.notes["commit_every"] = opts.replay_commit_every
     result.notes["downtime_s"] = 2.0
     # Not takeover: the same member comes back and resumes its own partitions.
     result.notes["recovery_gap_s"] = takeover_gap_s(
         run_dir, "worker-a", killed, by_others_only=False
     )
-    result.notes["survivor_revokes"] = (b.stats() or {}).get("stats", {}).get("revokes")
+    # `revokes` alone includes the survivor's own shutdown revoke, so the
+    # meaningful number is the one taken while it was still running: a static
+    # rejoin inside the session timeout should leave it at 0.
+    survivor = (b.stats() or {}).get("stats", {})
+    result.notes["survivor_revokes_total"] = survivor.get("revokes")
+    result.notes["survivor_revokes_while_running"] = survivor.get("revokes_while_running")
     result.notes["session_timeout_ms"] = opts.session_timeout_ms
     return result
 
 
 def scenario_rebalance(opts: Options) -> RunResult:
-    """A third member joins mid-run: cooperative-sticky, incremental assignment."""
+    """A third member joins mid-run: cooperative-sticky, incremental assignment.
+
+    Two things the first version of this scenario got wrong, both of which made
+    it pass without testing anything:
+
+    * worker-c was started a quarter of the way in, which at small message
+      counts meant the run was over before it was assigned anything -- it
+      delivered 0 records and the "rebalance" never happened;
+    * the evidence was each worker's total `revokes`, but every worker revokes
+      its partitions on clean shutdown too, so that counter is non-zero whether
+      or not a rebalance occurred.
+
+    Now c joins at a tenth of the way in, and the evidence is the timestamped
+    journal: a revoke by a *still-running* worker after c started, plus c
+    actually delivering records.
+    """
     layout, group, run_dir, plan = _setup("rebalance", opts)
     pool = _pool(run_dir, layout, group, plan)
     t0 = time.monotonic()
     pool.start("worker-a", extra=_common(opts, idle_exit_s=15.0))
     pool.start("worker-b", extra=_common(opts, idle_exit_s=15.0))
-    pool.wait_for_deliveries(max(50, opts.count // 5))
+    pool.wait_for_deliveries(max(20, opts.count // 10))
+    joined_at = time.time()
     pool.start("worker-c", extra=_common(opts, idle_exit_s=15.0))
     pool.wait_all()
     result = analyse("rebalance", layout, group, run_dir, plan, pool, wall_s=time.monotonic() - t0)
-    result.notes["revokes"] = {
-        name: (s or {}).get("stats", {}).get("revokes") for name, s in result.worker_stats.items()
+    result.notes["joined_at_deliveries"] = max(20, opts.count // 10)
+    result.notes["worker_c_delivered"] = (
+        (result.worker_stats.get("worker-c") or {}).get("stats", {}).get("delivered", 0)
+    )
+    result.notes["revokes_while_running"] = {
+        name: (s or {}).get("stats", {}).get("revokes_while_running")
+        for name, s in result.worker_stats.items()
     }
-    result.notes["lost"] = {
-        name: (s or {}).get("stats", {}).get("lost") for name, s in result.worker_stats.items()
-    }
+    result.notes["rebalance_evidence"] = rebalance_evidence(run_dir, joined_at)
     return result
 
 
@@ -674,11 +904,25 @@ def scenario_txn(opts: Options, *, crash: bool = False) -> RunResult:
             stderr=(run_dir / f"{instance}.stderr.log").open("wb"),
         )
 
+    open_txn: dict[str, int] | None = None
     proc = launch("txn-a")
     if crash:
         _wait_for_records(layout.out, at_least=max(50, opts.count // 5), timeout_s=120.0)
         proc.kill()
         proc.wait(timeout=30)
+        # Prove a transaction really was open at the kill, rather than assuming
+        # it. Records written inside an uncommitted transaction are visible to a
+        # `read_uncommitted` reader and invisible to a `read_committed` one, so
+        # a positive difference here IS the open transaction. Read before the
+        # restart, because `init_transactions` in the successor aborts it.
+        uncommitted = len(readback.read_all(layout.out, read_committed=False))
+        committed = len(readback.read_all(layout.out, read_committed=True))
+        open_txn = {
+            "uncommitted_visible": uncommitted,
+            "committed_visible": committed,
+            "records_in_open_transaction": uncommitted - committed,
+        }
+        log.info("open transaction at kill held %d record(s)", uncommitted - committed)
         log.info("killed the transactional stage mid-flight; restarting with the same txn id")
         proc = launch("txn-a")  # same instance id AND same transactional.id
     try:
@@ -710,9 +954,17 @@ def scenario_txn(opts: Options, *, crash: bool = False) -> RunResult:
         result.worker_stats["txn-a"] = json.loads(stats_file.read_text(encoding="utf-8"))
     events = readback.read_events(layout.events)
     result.event_stages = readback.stage_counts(events)
+    # A duplicate here is a hard failure, not the accepted cost of
+    # at-least-once: this is the one place ADR-001 claims exactly-once.
+    result.require_exactly_once = True
     result.notes["exactly_once"] = result.report.duplicates == 0
     result.notes["out_records"] = len(out)
     result.notes["crashed_mid_transaction"] = crash
+    if open_txn is not None:
+        # Without this the scenario can silently degrade into "killed between
+        # transactions", which proves nothing about abort or zombie fencing.
+        result.require_open_transaction = True
+        result.notes["open_transaction_at_kill"] = open_txn
     return result
 
 

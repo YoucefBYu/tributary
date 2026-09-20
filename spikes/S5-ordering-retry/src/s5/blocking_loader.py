@@ -32,7 +32,9 @@ import threading
 import time
 from dataclasses import dataclass, field
 from enum import StrEnum
+from pathlib import Path
 
+import orjson
 from confluent_kafka import KafkaException, TopicPartition
 from tbcommon.envelope import Envelope
 
@@ -75,6 +77,10 @@ class LoaderStats:
     offset_skips_corrected: int = 0
     assigns: int = 0
     revokes: int = 0
+    #: Revokes that happened while the loader was still working, i.e. caused by
+    #: a real rebalance rather than by its own shutdown. `revokes` alone cannot
+    #: tell those apart, which made "a rebalance happened" unfalsifiable.
+    revokes_while_running: int = 0
     lost: int = 0
     total_backoff_s: float = 0.0
 
@@ -92,6 +98,7 @@ class LoaderStats:
             "offset_skips_corrected": self.offset_skips_corrected,
             "assigns": self.assigns,
             "revokes": self.revokes,
+            "revokes_while_running": self.revokes_while_running,
             "lost": self.lost,
             "total_backoff_s": round(self.total_backoff_s, 3),
         }
@@ -115,6 +122,11 @@ class LoaderConfig:
     #: Stop after this long with no message and no paused partition.
     idle_exit_s: float | None = None
     seed: int = 1
+    #: Append a timestamped line per assign/revoke/lost here. Without it a
+    #: revoke caused by a member joining mid-run is indistinguishable from the
+    #: revoke every worker does on a clean shutdown, which made the `rebalance`
+    #: scenario's evidence unfalsifiable.
+    journal_path: Path | None = None
 
 
 class BlockingLoader:
@@ -136,6 +148,9 @@ class BlockingLoader:
         self._rng = random.Random(cfg.seed)
         self._since_commit = 0
         self._last_commit = time.monotonic()
+        #: Set before the closing revoke, so the journal and the stats can tell a
+        #: shutdown revoke from a rebalance revoke.
+        self._shutting_down = False
 
         # KafkaDriver in production; s5.fakekafka.FakeCluster in the fast
         # property tests. See driver.py for why the seam exists.
@@ -156,6 +171,30 @@ class BlockingLoader:
             **(consumer_overrides or {}),
         )
 
+    # --------------------------------------------------------------- journal
+    def _journal(self, kind: str, partitions: list[TopicPartition]) -> None:
+        """Record a group-membership transition with a wall-clock timestamp.
+
+        Wall clock, not monotonic: the runner has to line these up against the
+        moment it started or killed another process.
+        """
+        if self.cfg.journal_path is None:
+            return
+        line = orjson.dumps(
+            {
+                "ts": time.time(),
+                "worker": self.worker,
+                "kind": kind,
+                "partitions": sorted(tp.partition for tp in partitions),
+                "shutting_down": self._shutting_down,
+            }
+        )
+        try:
+            with self.cfg.journal_path.open("ab") as fh:
+                fh.write(line + b"\n")
+        except OSError:  # observability must never break delivery
+            log.debug("journal write failed", exc_info=True)
+
     # ---------------------------------------------------------------- events
     def _emit(self, stage: Stage, env: Envelope, **kw: object) -> None:
         if self._emitter is not None:
@@ -164,12 +203,16 @@ class BlockingLoader:
     # ----------------------------------------------------------- rebalancing
     def _on_assign(self, _c: ConsumerLike, partitions: list[TopicPartition]) -> None:
         self.stats.assigns += len(partitions)
+        self._journal("assign", partitions)
         for tp in partitions:
             # Fresh state: a re-assigned partition is never still paused.
             self.states[(tp.topic, tp.partition)] = PartitionState()
 
     def _on_revoke(self, c: ConsumerLike, partitions: list[TopicPartition]) -> None:
         self.stats.revokes += len(partitions)
+        if not self._shutting_down:
+            self.stats.revokes_while_running += len(partitions)
+        self._journal("revoke", partitions)
         # Commit what we have delivered before giving the partitions up. This
         # is what keeps the duplicate rate low across a planned rebalance.
         self._commit(force=True, consumer=c)
@@ -179,6 +222,7 @@ class BlockingLoader:
     def _on_lost(self, _c: ConsumerLike, partitions: list[TopicPartition]) -> None:
         # Do NOT commit: another member already owns these.
         self.stats.lost += len(partitions)
+        self._journal("lost", partitions)
         for tp in partitions:
             self.states.pop((tp.topic, tp.partition), None)
 
@@ -430,6 +474,7 @@ class BlockingLoader:
 
     def _shutdown(self) -> None:
         """Graceful drain: commit what we delivered, then leave the group."""
+        self._shutting_down = True
         try:
             self._commit(force=True)
         except Exception:  # noqa: BLE001

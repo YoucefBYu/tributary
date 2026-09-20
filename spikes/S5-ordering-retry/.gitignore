@@ -1,0 +1,11 @@
+# Spike-local artefacts. The report in docs/spikes/S5-ordering-retry.md is the
+# durable record; everything here is regenerable with `python -m s5.runner`.
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.hypothesis/
+
+# Per-run output: delivery logs (one line per delivery), worker stderr and the
+# rebalance journal. Large, and superseded by the report's tables.
+runs/

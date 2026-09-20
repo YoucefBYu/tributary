@@ -47,6 +47,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--events-topic", default=None)
     p.add_argument("--log", required=True, type=Path, help="delivery log (JSONL)")
     p.add_argument("--stats", default=None, type=Path, help="written on clean exit only")
+    p.add_argument(
+        "--journal",
+        default=None,
+        type=Path,
+        help="append assign/revoke/lost with timestamps (shared across workers)",
+    )
     p.add_argument("--destination", default="fhir")
     # failure injection in the *sink*, i.e. the downstream system
     p.add_argument("--transient-rate", type=float, default=0.0)
@@ -130,6 +136,7 @@ def main(argv: list[str] | None = None) -> int:
         commit_interval_s=args.commit_interval_s,
         idle_exit_s=args.idle_exit_s,
         seed=args.seed,
+        journal_path=args.journal,
     )
     overrides: dict[str, object] = {}
     if args.session_timeout_ms is not None:

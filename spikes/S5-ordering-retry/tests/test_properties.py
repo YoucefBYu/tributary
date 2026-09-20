@@ -25,16 +25,19 @@ from __future__ import annotations
 
 import itertools
 import os
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import pytest
-from hypothesis import HealthCheck, given, settings
+from confluent_kafka import TopicPartition
+from hypothesis import HealthCheck, event, given, settings
 from hypothesis import strategies as st
 from s5 import fakekafka, generator
 from s5.backoff import Backoff, Jitter
 from s5.blocking_loader import BlockingLoader, LoaderConfig, OnExhaust
+from s5.driver import MessageLike
 from s5.fakekafka import FakeCluster, SimulatedCrash
 from s5.sink import FailurePlan, FileSink, read_delivery_log
 from tbcommon import checks
@@ -160,6 +163,12 @@ class Outcome:
     dlq_ids: set[str]
     tracker: Tracker
     stats: dict[str, float | int]
+    #: Faults requested by the strategy, and faults that actually ran. These
+    #: differ whenever the loader finished before reaching the scheduled poll
+    #: number, which on small examples is most of the time -- so without this
+    #: number a passing property run can be completely vacuous.
+    faults_requested: int = 0
+    faults_fired: int = 0
 
 
 def run_scenario(
@@ -199,13 +208,24 @@ def run_scenario(
 
     first = _loader(cluster, tracker, log_path, plan=failing, instance_id="worker-a")
     consumer = cluster.consumers[-1]
+    fired: list[str] = []
+
+    def _record(kind: str, action: Any) -> Any:
+        """Wrap a scheduled fault so we can tell whether it ever ran."""
+
+        def run() -> None:
+            fired.append(kind)
+            action()
+
+        return run
+
     for at_poll, kind in faults:
-        if kind == "rebalance":
-            consumer.schedule(at_poll, consumer.rebalance)
-        elif kind == "lose":
-            consumer.schedule(at_poll, consumer.lose)
-        elif kind == "crash":
-            consumer.schedule(at_poll, consumer.crash)
+        action = {
+            "rebalance": consumer.rebalance,
+            "lose": consumer.lose,
+            "crash": consumer.crash,
+        }[kind]
+        consumer.schedule(at_poll, _record(kind, action))
     _drain(first)
 
     # Successors until nothing is left. Two are enough: the first may itself be
@@ -224,6 +244,8 @@ def run_scenario(
         dlq_ids={r.msg_id for r in fakekafka.dlq_records(cluster, DLQ)},
         tracker=tracker,
         stats=first.stats.as_dict(),
+        faults_requested=len(faults),
+        faults_fired=len(fired),
     )
 
 
@@ -263,6 +285,20 @@ PROPERTY_SETTINGS = settings(
 
 
 # ------------------------------------------------------------------ properties
+def _note_coverage(outcome: Outcome) -> None:
+    """Record what each example actually exercised.
+
+    Hypothesis prints these as a coverage summary, which is the only way to see
+    that a green property run was not simply a few thousand no-fault examples.
+    A scheduled fault fires only if the loader reaches that poll number, so the
+    requested count is not the fired count.
+    """
+    event(f"faults_fired={outcome.faults_fired}/{outcome.faults_requested}")
+    event(f"paused={bool(outcome.stats['pauses'])}")
+    event(f"dead_lettered={bool(outcome.dlq_ids)}")
+    event(f"duplicates={bool(outcome.report.duplicates)}")
+
+
 @given(scenario=scenarios())
 @PROPERTY_SETTINGS
 def test_per_key_order_holds_under_arbitrary_fault_schedules(
@@ -270,6 +306,7 @@ def test_per_key_order_holds_under_arbitrary_fault_schedules(
 ) -> None:
     """Invariant 5. The headline property of S5."""
     outcome = run_scenario(tmp_path, **scenario)
+    _note_coverage(outcome)
     assert outcome.report.order_preserved, (
         f"per-key reordering: {outcome.report.reordered_keys} (scenario={scenario})"
     )
@@ -478,3 +515,119 @@ def test_duplicate_rate_is_bounded_by_the_commit_interval(
     # At most commit_every-1 messages can be in the uncommitted window.
     assert report.duplicates <= max(1, commit_every - 1), report.summary()
     assert not tracker.violations
+
+
+# ------------------------------------------------- does the harness have teeth?
+def test_the_injected_faults_actually_fire(tmp_path: Path) -> None:
+    """A scheduled fault only fires if the loader reaches that poll number.
+
+    Without this, every property above could be green because nothing was ever
+    injected. Here the schedule is chosen so firing is guaranteed, and the
+    counter is asserted rather than assumed.
+    """
+    outcome = run_scenario(
+        tmp_path,
+        partitions=2,
+        count=40,
+        keys=4,
+        transient_rate=0.0,
+        poison_every=None,
+        faults=[(3, "rebalance"), (6, "lose")],
+        seed=17,
+    )
+    assert outcome.faults_requested == 2
+    assert outcome.faults_fired == 2, (
+        f"only {outcome.faults_fired} of 2 faults fired; the property runs may be vacuous"
+    )
+
+
+class _SkippingLoader(BlockingLoader):
+    """Mutant: resumes at the next offset instead of seeking back to the failure.
+
+    This is the librdkafka trap written into the loader on purpose. It is what
+    the code looked like before the seek, and the checks must catch it.
+    """
+
+    def _resume_due(self) -> None:
+        now = time.monotonic()
+        for (topic, partition), st in self.states.items():
+            if not st.paused or st.halted or now < st.resume_at:
+                continue
+            self._consumer.resume([TopicPartition(topic, partition)])
+            st.paused = False
+            # No seek(): librdkafka refetches from last-consumed + 1, so the
+            # message that failed is skipped forever.
+            st.next_offset = -1
+            self.stats.resumes += 1
+
+
+class _CommitBeforeDeliveryLoader(BlockingLoader):
+    """Mutant: stores and commits the offset before attempting the delivery."""
+
+    def _handle(self, msg: MessageLike) -> None:
+        self._consumer.store_offsets(message=msg)
+        self._since_commit += 1
+        self._commit(force=True)
+        super()._handle(msg)
+
+
+@pytest.mark.parametrize(
+    ("mutant", "what_must_break"),
+    [
+        (_SkippingLoader, "loss"),
+        (_CommitBeforeDeliveryLoader, "commit-after-delivery"),
+    ],
+)
+def test_a_broken_loader_is_caught_by_these_checks(
+    tmp_path: Path, mutant: type[BlockingLoader], what_must_break: str
+) -> None:
+    """Mutation control: the checks must fail on a loader that is wrong.
+
+    A green test suite only means something if it can go red. Each mutant
+    reintroduces one of the two bugs this spike exists to prevent, and the
+    corresponding check has to catch it. If a mutant passes, the property tests
+    above are decoration.
+    """
+    cluster = FakeCluster(default_partitions=1)
+    cluster.create_topic(RAW, 1)
+    cluster.create_topic(DLQ, 1)
+    plan_out = generator.publish(cluster.producer(), RAW, count=20, keys=1, seed=23)
+    tracker = Tracker()
+    _install_commit_hook(cluster, tracker, DLQ)
+    log_path = tmp_path / "d.jsonl"
+
+    sink = TrackingSink(
+        FileSink(path=log_path, plan=FailurePlan(transient_rate=0.5, seed=23), fsync=False), tracker
+    )
+    cfg = LoaderConfig(
+        topic=RAW,
+        dlq_topic=DLQ,
+        group=GROUP,
+        instance_id="mutant",
+        max_attempts=MAX_ATTEMPTS,
+        backoff=FAST_BACKOFF,
+        commit_every=1,
+        commit_interval_s=0.0,
+        poll_timeout_s=0.0,
+        idle_exit_s=0.02,
+    )
+    loader = mutant(cfg, sink, driver=cluster, worker="mutant")  # type: ignore[arg-type]
+    _drain(loader)
+
+    records = read_delivery_log(log_path)
+    observed = [
+        checks.Observation(key=str(r["key"]), seq=int(r["seq"]), msg_id=str(r["msg_id"]))
+        for r in records
+    ]
+    report = checks.check(observed, expected=plan_out.deliverable)
+
+    if what_must_break == "loss":
+        assert not report.no_loss, (
+            "a loader that resumes without seeking back skipped nothing -- the no-loss "
+            "check cannot detect the bug it exists for"
+        )
+    else:
+        assert tracker.violations, (
+            "a loader that commits before delivering produced no violation -- the "
+            "commit-after-delivery check is not actually checking anything"
+        )
