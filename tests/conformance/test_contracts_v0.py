@@ -14,7 +14,19 @@ from jsonschema import Draft202012Validator, FormatChecker
 from jsonschema.validators import validator_for
 
 CONTRACTS = Path(__file__).resolve().parents[2] / "contracts"
-PHI_GUARDS = {"invalid/payload-in-event.json", "invalid/attrs-clear-text-key.json"}
+EVENT_PHI_GUARDS = {
+    "invalid/payload-in-event.json",
+    "invalid/attrs-clear-text-mrn.json",
+    "invalid/attrs-hmac-not-fixed-length-hex.json",
+    "invalid/attrs-free-text-value.json",
+    "invalid/claim-check-presigned-url.json",
+}
+ENVELOPE_CREDENTIAL_GUARDS = {"invalid/claim-check-presigned-url.json", "invalid/claim-check-with-userinfo.json"}
+
+
+def _safe(errors: list[Any]) -> list[str]:
+    """Describe failures without the instance: a ValidationError message embeds the failing value (PHI risk, invariant 6)."""
+    return [f"{e.json_path} [{e.validator}]" for e in errors][:5]
 
 
 def _load(path: Path) -> Any:
@@ -44,7 +56,7 @@ def _file_cases() -> list[Any]:
 def test_example(schema: Path, example: Path, should_pass: bool) -> None:
     errors = list(_validator(schema).iter_errors(_load(example)))
     if should_pass:
-        assert not errors, [e.message for e in errors][:3]
+        assert not errors, _safe(errors)
     else:
         assert errors, f"{example.name} validated but the manifest says it must fail"
 
@@ -63,7 +75,22 @@ def test_topic_name(schema: Path, name: str, should_pass: bool) -> None:
     assert ok is should_pass
 
 
-def test_phi_guards_are_listed_in_manifest() -> None:
-    m = _load(CONTRACTS / "events/v0/examples/manifest.json")
-    listed = {e["file"] for e in m["invalid"]}
-    assert PHI_GUARDS <= listed
+@pytest.mark.parametrize(
+    ("contract", "guards"),
+    [("events", EVENT_PHI_GUARDS), ("envelope", ENVELOPE_CREDENTIAL_GUARDS)],
+)
+def test_guards_are_listed_and_enforced(contract: str, guards: set[str]) -> None:
+    """Guards must stay in the manifest (not silently dropped) and must fail validation."""
+    mp = CONTRACTS / contract / "v0/examples/manifest.json"
+    m = _load(mp)
+    assert guards <= {e["file"] for e in m["invalid"]}
+    v = _validator((mp.parent / m["schema"]).resolve())
+    for g in guards:
+        assert not v.is_valid(_load(mp.parent / g)), g
+
+
+def test_safe_reporting_omits_instance() -> None:
+    v = _validator((CONTRACTS / "events/v0/event.schema.json"))
+    errs = list(v.iter_errors({"v": 0, "secret-value-123": "x"}))
+    assert errs
+    assert "secret-value-123" not in " ".join(_safe(errs))
