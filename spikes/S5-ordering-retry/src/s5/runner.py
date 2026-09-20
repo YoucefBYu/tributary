@@ -77,9 +77,14 @@ class Worker:
         point: the group must notice through the session timeout, exactly as it
         would when a pod is OOM-killed.
         """
-        self.killed_wall = time.time()
         self.proc.kill()
         self.proc.wait(timeout=30)
+        # Timestamped *after* the process is confirmed dead. TerminateProcess is
+        # not instantaneous, so a timestamp taken before it lets the victim's
+        # own last few deliveries land "after the kill" and be counted as
+        # recovery -- which is how the first re-run measured a 3 ms recovery
+        # from a 2 s outage.
+        self.killed_wall = time.time()
         log.info("killed worker %s", self.name)
         return self.killed_wall
 
@@ -88,6 +93,40 @@ class Worker:
         if not self.stats_path.exists():
             return None
         return json.loads(self.stats_path.read_text(encoding="utf-8"))
+
+    def deliveries(self) -> int:
+        if not self.log_path.exists():
+            return 0
+        with self.log_path.open("rb") as fh:
+            return sum(1 for _ in fh)
+
+    def wait_mid_commit_window(
+        self, commit_every: int, *, minimum: int, timeout_s: float = 180.0
+    ) -> int:
+        """Block until this worker has an uncommitted window open, then return.
+
+        Killing on a pool-wide delivery count is not good enough. The first
+        re-run of the `kill` scenario killed worker-a at exactly its 260th
+        delivery -- 13 x 20 -- so it had just committed, nothing was replayed
+        and the scenario proved nothing. The kill has to land *between* commits,
+        so wait for this worker's own delivery count to sit mid-window.
+
+        Aims for the middle of the window to leave slack: the count keeps moving
+        between the check and the kill, and deliveries here take single-digit
+        milliseconds.
+        """
+        if commit_every <= 1:
+            raise ValueError("a commit window of 1 has no inside to kill in")
+        target = commit_every // 2
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            n = self.deliveries()
+            if n >= minimum and n % commit_every == target:
+                return n
+            if self.proc.poll() is not None:
+                return n  # it exited on its own; caller will notice the verdict
+            time.sleep(0.002)
+        return self.deliveries()
 
 
 class WorkerPool:
@@ -491,6 +530,27 @@ def rebalance_evidence(run_dir: Path, since_wall: float) -> dict[str, Any]:
     }
 
 
+def owned_at(run_dir: Path, worker: str, wall: float) -> set[int]:
+    """Partitions ``worker`` owned at wall-clock time ``wall``, per the journal.
+
+    Necessary because "partitions this worker ever delivered on" is not the same
+    set: a worker that starts alone owns everything, then gives most of it away
+    when the second member joins. Measuring a recovery gap against a partition
+    somebody else has owned for the last ten seconds yields ~0 ms and means
+    nothing, which is exactly what the first `static_restart` re-run reported.
+    """
+    owned: set[int] = set()
+    for entry in read_journal(run_dir):
+        if float(entry["ts"]) > wall:
+            break
+        if entry["worker"] != worker:
+            continue
+        parts = set(entry["partitions"])
+        owned |= parts if entry["kind"] == "assign" else set()
+        owned -= set() if entry["kind"] == "assign" else parts
+    return owned
+
+
 def takeover_gap_s(
     run_dir: Path, dead: str, killed_wall: float, *, by_others_only: bool = True
 ) -> float | None:
@@ -503,7 +563,9 @@ def takeover_gap_s(
     with the same ``group.instance.id`` is supposed to shorten.
     """
     records = read_delivery_log(run_dir / "deliveries-*.jsonl")
-    owned = {
+    # The journal is authoritative about ownership; fall back to the delivery
+    # log only if a run predates it.
+    owned = owned_at(run_dir, dead, killed_wall) or {
         int(r["partition"])
         for r in records
         if r["worker"] == dead and float(r["ts"]) < killed_wall
@@ -715,12 +777,16 @@ def scenario_kill(opts: Options) -> RunResult:
         a = pool.start("worker-a", extra=extra)
         pool.start("worker-b", extra=extra)
         pool.wait_for_deliveries(max(50, opts.count // 4))
+        at_kill = a.wait_mid_commit_window(
+            opts.replay_commit_every, minimum=max(20, opts.count // 20)
+        )
         killed = a.kill()
         pool.start("worker-c", extra=extra)
         pool.wait_all()
     result = analyse("kill", layout, group, run_dir, plan, pool, wall_s=time.monotonic() - t0)
     result.require_duplicates = True
     result.notes["killed"] = "worker-a"
+    result.notes["deliveries_by_victim_at_kill"] = at_kill
     result.notes["commit_every"] = opts.replay_commit_every
     result.notes["takeover_gap_s"] = takeover_gap_s(run_dir, "worker-a", killed)
     result.notes["session_timeout_ms"] = opts.session_timeout_ms
@@ -772,6 +838,9 @@ def scenario_static_restart(opts: Options) -> RunResult:
     a = pool.start("worker-a", extra=extra)
     b = pool.start("worker-b", extra=extra)
     pool.wait_for_deliveries(max(50, opts.count // 4))
+    at_kill = a.wait_mid_commit_window(
+        opts.replay_commit_every, minimum=max(20, opts.count // 20)
+    )
     killed = a.kill()
     time.sleep(2.0)  # well inside session.timeout.ms
     pool.start("worker-a", extra=extra)  # same instance id
@@ -782,6 +851,7 @@ def scenario_static_restart(opts: Options) -> RunResult:
     result.require_duplicates = True
     result.notes["restarted"] = "worker-a"
     result.notes["commit_every"] = opts.replay_commit_every
+    result.notes["deliveries_by_victim_at_kill"] = at_kill
     result.notes["downtime_s"] = 2.0
     # Not takeover: the same member comes back and resumes its own partitions.
     result.notes["recovery_gap_s"] = takeover_gap_s(
