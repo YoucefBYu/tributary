@@ -42,3 +42,34 @@ def test_destination_is_flagged_not_silently_dropped() -> None:
     r = import_channel(xml)
     assert not r["fullyAutomatic"]
     assert any("d1" in t for t in r["needsAttention"])
+
+
+def test_lifecycle_script_flagged() -> None:
+    xml = PASSTHROUGH.replace("<destinationConnectors/>",
+                              "<preprocessingScript>doStuff();</preprocessingScript><destinationConnectors/>")
+    r = import_channel(xml)
+    assert not r["fullyAutomatic"]
+    assert any("preprocessingScript" in t for t in r["needsAttention"])
+
+
+def test_trivial_lifecycle_stub_is_ok() -> None:
+    xml = PASSTHROUGH.replace("<destinationConnectors/>",
+                              "<postprocessingScript>// x
+return;</postprocessingScript><destinationConnectors/>")
+    assert import_channel(xml)["fullyAutomatic"]
+
+
+def test_templated_port_does_not_abort() -> None:
+    r = import_channel(PASSTHROUGH.replace("<port>6670</port>", "<port>${port}</port>"))
+    assert not r["fullyAutomatic"]
+
+
+def test_analyzer_counts_and_skips(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    from analyze import analyze
+    (tmp_path / "a.xml").write_text(PASSTHROUGH)
+    (tmp_path / "b.xml").write_text(WITH_JS)
+    (tmp_path / "bad.xml").write_text("<channel")
+    (tmp_path / "other.xml").write_text("<x/>")
+    r = analyze(tmp_path)
+    assert r["channels"] == 2 and r["no_manual_work"] == 1
+    assert r["skipped_unparseable"] == 1 and r["skipped_non_channel"] == 1

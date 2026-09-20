@@ -52,14 +52,17 @@ def analyze(root: Path) -> dict[str, object]:
     feats: Counter[str] = Counter()
     locs: list[int] = []
     clean = 0
+    skipped: Counter[str] = Counter()
     n = 0
     for p in sorted(root.rglob("*.xml")):
         try:
             tree = ET.parse(p)
         except ET.ParseError:
+            skipped["skipped_unparseable"] += 1
             continue
         chan = tree.getroot()
         if chan.tag != "channel":
+            skipped["skipped_non_channel"] += 1
             continue
         n += 1
         src = chan.find("sourceConnector/properties")
@@ -74,7 +77,8 @@ def analyze(root: Path) -> dict[str, object]:
         seen = {name for name, rx in FEATURES.items() for b in bodies if rx.search(b)}
         feats.update(seen)
         # "no manual work" = no non-trivial script body and only connector types the importer supports
-        supported = {"TcpReceiverProperties", "TcpDispatcherProperties"}
+        # aligned with importer.py: only the TCP receiver is supported, any destination needs work
+        supported = {"TcpReceiverProperties"}
         kinds = set(conn_src_of(chan)) | set(conn_dst_of(chan))
         if total == 0 and kinds <= supported:
             clean += 1
@@ -88,6 +92,8 @@ def analyze(root: Path) -> dict[str, object]:
                        "total": sum(locs)},
         "feature_channels": dict(feats),
         "no_manual_work": clean,
+        "skipped_unparseable": skipped["skipped_unparseable"],
+        "skipped_non_channel": skipped["skipped_non_channel"],
     }
 
 
