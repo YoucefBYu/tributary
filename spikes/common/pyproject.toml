@@ -3,19 +3,33 @@ name = "tb-spike-common"
 version = "0.0.0"
 description = "Throwaway shared helpers for Tributary Phase 0 spikes. Not importable from packages/."
 requires-python = ">=3.12"
+# Licences per the Phase 0 gate report section 5.1 (approved by architect,
+# pending human confirmation). CLAUDE.md invariant 10 allows MPL-2.0 only as an
+# unmodified dependency approved by the architect; all three MPL entries below
+# are unmodified and none is vendored or patched.
 dependencies = [
     "confluent-kafka>=2.6.0",   # Apache-2.0
-    "orjson>=3.10.0",           # Apache-2.0 / MIT
+    # NOT "Apache-2.0 / MIT": orjson is dual-licensed Apache-2.0 OR MIT for its
+    # own code AND carries MPL-2.0 for vendored components, so the effective
+    # expression is `MPL-2.0 AND (Apache-2.0 OR MIT)`. It ships in the runtime
+    # path, so this is the one MPL obligation that is not test-only.
+    "orjson>=3.10.0",           # MPL-2.0 AND (Apache-2.0 OR MIT)
 ]
 
 [dependency-groups]
 dev = [
     "pytest>=8.3",              # MIT
-    "hypothesis>=6.112",        # MPL-2.0, unmodified test-only dependency (CLAUDE.md stack table)
+    "hypothesis>=6.112",        # MPL-2.0, unmodified test-only dependency
     "pytest-timeout>=2.3",      # MIT
 ]
 
 [build-system]
+# hatchling pulls in `pathspec` (MPL-2.0) at build time. It is not in uv.lock,
+# because build-backend requirements resolve separately from the runtime and dev
+# groups -- which is exactly why a licence inventory taken from the lockfile
+# alone misses it. Build-time only: it never reaches a distributed artefact.
+# Approved as an unmodified dependency, pending human confirmation (gate report
+# section 5.1 / docs/agent-team/gates/phase-0-spikes.md).
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 

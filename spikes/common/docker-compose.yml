@@ -13,6 +13,17 @@
 #   * `docker compose down`                       -> clean cluster, new state.
 # Avoiding named volumes also avoids the root-owned-empty-volume permission
 # trap on Windows/WSL2, where the broker runs as uid 1000.
+#
+# SECURITY: development only. Every listener is PLAINTEXT with no authentication
+# and no authorizer, so anything that can reach a port has full read/write access
+# to every topic and can administer the cluster. Every published port is
+# therefore bound to `127.0.0.1` explicitly: Docker's default is 0.0.0.0, which
+# would expose an unauthenticated Kafka cluster to the whole local network (and,
+# because Docker publishes past the host firewall via NAT, often further than
+# people expect). Do not remove the `127.0.0.1:` prefixes, do not add SASL/TLS
+# here to make it "safe enough" to expose, and never put real patient data on
+# this cluster (CLAUDE.md: synthetic data only). Production topology is an ADR
+# decision, not a tweak to this file.
 
 name: tributary-spikes
 
@@ -64,7 +75,7 @@ services:
     container_name: tb-kafka1
     hostname: kafka1
     ports:
-      - "19092:19092"
+      - "127.0.0.1:19092:19092"
     environment:
       <<: *kafka-env
       KAFKA_NODE_ID: 1
@@ -76,7 +87,7 @@ services:
     container_name: tb-kafka2
     hostname: kafka2
     ports:
-      - "29092:29092"
+      - "127.0.0.1:29092:29092"
     environment:
       <<: *kafka-env
       KAFKA_NODE_ID: 2
@@ -88,16 +99,22 @@ services:
     container_name: tb-kafka3
     hostname: kafka3
     ports:
-      - "39092:39092"
+      - "127.0.0.1:39092:39092"
     environment:
       <<: *kafka-env
       KAFKA_NODE_ID: 3
       KAFKA_LISTENERS: INTERNAL://:9092,CONTROLLER://:9093,EXTERNAL://:39092
       KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka3:9092,EXTERNAL://localhost:39092
 
-  # Optional. `docker compose --profile tools up -d` -> http://localhost:8080
+  # Optional. `docker compose --profile tools up -d` -> http://127.0.0.1:8080
   # kafbat/kafka-ui is Apache-2.0. It is a developer convenience only and is
   # not part of any shipped distribution.
+  #
+  # It has NO login, and it administers the cluster it is pointed at, so it is
+  # bound to loopback like the brokers. `DYNAMIC_CONFIG_ENABLED` is deliberately
+  # absent: with it on, anyone reaching the UI can add clusters and rewrite its
+  # configuration at runtime, which turns an unauthenticated viewer into an
+  # unauthenticated admin console. The read-only view is all the spikes need.
   kafka-ui:
     image: kafbat/kafka-ui:v1.1.0
     container_name: tb-kafka-ui
@@ -106,8 +123,7 @@ services:
       kafka1:
         condition: service_healthy
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     environment:
-      DYNAMIC_CONFIG_ENABLED: "true"
       KAFKA_CLUSTERS_0_NAME: tributary-spikes
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka1:9092,kafka2:9092,kafka3:9092

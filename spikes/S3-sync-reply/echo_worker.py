@@ -24,6 +24,28 @@ from confluent_kafka import Consumer, KafkaError, Producer, TopicPartition
 from mllp import build_ack, control_id
 
 
+def reply_partition(h: dict[str, bytes]) -> int:
+    """Target partition from the optional `tb-x-reply-partition` header, or -1.
+
+    Guarded because the header is attacker-controlled in the sense that matters
+    here: it arrives over the wire and `int()` on arbitrary bytes raises
+    ValueError, which is uncaught in the poll loop and would take the whole
+    worker process down. One malformed header would therefore stall every
+    in-flight request until the receiver's timeout. -1 means "let the
+    partitioner choose", which is also the right fallback for a value that is
+    negative or out of range.
+    """
+    raw = h.get("tb-x-reply-partition")
+    if raw is None:
+        return -1
+    try:
+        part = int(raw)
+    except (TypeError, ValueError):
+        print('{"event": "bad-reply-partition-header"}', flush=True)
+        return -1
+    return part if part >= 0 else -1
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--bootstrap", default="kafka1:9092,kafka2:9092,kafka3:9092")
@@ -74,7 +96,7 @@ def main() -> None:
                 continue
             if a.delay_ms:
                 time.sleep(a.delay_ms / 1000)
-            part = int(h["tb-x-reply-partition"]) if "tb-x-reply-partition" in h else -1
+            part = reply_partition(h)
             ack = build_ack("AA", control_id(m.value()))
             pending += 1
             pr.produce(a.reply, ack[1:-2], key=corr, headers=[("tb-correlation-id", corr)],

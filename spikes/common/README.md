@@ -6,6 +6,33 @@ Owner: `platform-engineer`. Consumers: every Phase 0 spike.
 coordination note). If you need different broker settings, message
 `platform-engineer` instead of forking this file.
 
+## Security: development only
+
+This cluster is **not** a model of a production deployment and must never be
+treated as one.
+
+- **Every listener is PLAINTEXT.** No TLS, no SASL, no authentication of any
+  kind, and no authorizer is configured. Anything that can open a TCP connection
+  to a broker port has full read and write access to every topic and can
+  administer the cluster.
+- **Every published port is bound to `127.0.0.1`** — the three brokers and
+  `kafka-ui`. This is deliberate and load-bearing, not cosmetic. Docker's default
+  is to publish on `0.0.0.0`, and because it publishes via NAT it typically
+  bypasses the host firewall, so dropping the prefix would expose an
+  unauthenticated Kafka cluster to the local network. Do not remove the
+  `127.0.0.1:` prefixes in `docker-compose.yml`.
+- **`kafka-ui` has no login** and administers whatever cluster it points at.
+  `DYNAMIC_CONFIG_ENABLED` is deliberately *not* set: with it on, anyone who
+  reaches the UI can add clusters and rewrite its configuration at runtime,
+  turning an unauthenticated viewer into an unauthenticated admin console.
+- **Synthetic data only** (CLAUDE.md invariant: no real patient data anywhere).
+  HL7 fixtures set MSH-3 to `TRIBUTARY-SYNTH`. Given the above, putting real PHI
+  on this cluster would be a reportable breach, not merely a policy slip.
+
+If a spike needs to be reachable from another host, that is a design question
+for the `architect`, not a port-binding change here. Production listener
+topology, authentication and authorization are ADR decisions.
+
 ## The cluster
 
 3 brokers, Apache Kafka 4.0 in KRaft mode, combined `broker,controller` roles,
@@ -39,7 +66,8 @@ docker compose -f spikes/common/docker-compose.yml ps          # all three "heal
 uv run --directory spikes/common python -m tbcommon.smoke      # prints {"ok": true, ...}
 ```
 
-Optional Kafka UI on <http://localhost:8080>:
+Optional Kafka UI on <http://127.0.0.1:8080> (loopback only, no login — see
+"Security: development only" above):
 
 ```bash
 docker compose -f spikes/common/docker-compose.yml --profile tools up -d
