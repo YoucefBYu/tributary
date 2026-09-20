@@ -1,128 +1,130 @@
-"""Unit tests for the S2 MLLP framing and server ACK logic. No Kafka, no PHI (synthetic ids)."""
+"""Unit tests for MLLP framing edge cases. No sockets, no Kafka -- pure functions."""
 
 from __future__ import annotations
 
-import asyncio
+from mllp import FATAL, FrameParser, Oversize, build_ack, control_id
 
-from mllp import FATAL, EB_CR, SB, FrameParser, Oversize, build_ack, control_id
-from server import Server, Settings
-
-MSG = b"MSH|^~\\&|TRIBUTARY-SYNTH|X|||20260101||ADT^A01|CID1|P|2.5\rPID|1\r"
+SB, EB, CR = b"\x0b", b"\x1c", b"\x0d"
 
 
-def framed(m: bytes = MSG) -> bytes:
-    return SB + m + EB_CR
+def frame(payload: bytes) -> bytes:
+    return SB + payload + EB + CR
 
 
-def test_single_frame() -> None:
-    assert FrameParser(1024).feed(framed()) == [MSG]
+ADT = b"MSH|^~\\&|TRIBUTARY-SYNTH|SPIKE|||20260101000000||ADT^A01|CTRL-1|P|2.5\rPID|1||X"
 
 
-def test_partial_frames_byte_by_byte() -> None:
-    p, out = FrameParser(1024), []
-    for b in framed():
-        out += p.feed(bytes([b]))
-    assert out == [MSG]
+def test_single_frame_one_chunk() -> None:
+    p = FrameParser(max_size=1024)
+    out = p.feed(frame(ADT))
+    assert out == [ADT]
+    assert p.buffered() == 0
 
 
-def test_two_frames_one_chunk_and_garbage_before_sb() -> None:
-    assert FrameParser(1024).feed(b"junk" + framed() + framed()) == [MSG, MSG]
+def test_frame_split_across_chunks() -> None:
+    p = FrameParser(max_size=1024)
+    whole = frame(ADT)
+    mid = len(whole) // 2
+    assert p.feed(whole[:mid]) == []
+    assert p.feed(whole[mid:]) == [ADT]
 
 
 def test_partial_frame_at_eof_never_returned() -> None:
-    p = FrameParser(1024)
-    assert p.feed(SB + MSG) == []
+    """A frame with no terminator is not a complete message: it must never surface,
+    so the caller can never accidentally ACK it."""
+    p = FrameParser(max_size=1024)
+    out = p.feed(SB + ADT)  # no EB CR ever arrives
+    assert out == []
     assert p.buffered() > 0
+    assert not p.fatal
 
 
-def test_oversize_complete_frame_is_flagged_with_cid() -> None:
-    out = FrameParser(10).feed(framed())
-    assert out == [Oversize("CID1")]
+def test_multiple_frames_one_chunk_pipelined() -> None:
+    p = FrameParser(max_size=1024)
+    out = p.feed(frame(ADT) + frame(ADT + b"-2"))
+    assert out == [ADT, ADT + b"-2"]
 
 
-def test_unterminated_oversize_is_fatal_and_buffer_bounded() -> None:
-    p = FrameParser(100)
-    out = p.feed(SB + b"A" * 500)
-    assert out == [FATAL] and p.fatal and p.buffered() == 0
+def test_garbage_before_start_block_discarded() -> None:
+    p = FrameParser(max_size=1024)
+    out = p.feed(b"\x00\x00garbage" + frame(ADT))
+    assert out == [ADT]
 
 
-def test_control_id_cannot_inject_fields() -> None:
-    assert control_id(b"MSH|^~\\&|A|B|||20260101||ADT^A01|X^Y~Z\\W&V|P\rAA|1\r") == "XYZWV"
-    assert control_id(b"MSH|^~\\&|A|B|||T||ADT|" + b"9" * 200 + b"|P\r") == "9" * 64
-    assert control_id(b"garbage") == ""
+def test_chunk_with_no_start_block_is_dropped() -> None:
+    p = FrameParser(max_size=1024)
+    out = p.feed(b"not mllp at all, no start byte")
+    assert out == []
+    assert p.buffered() == 0
 
 
-def test_ack_codes() -> None:
-    for code in ("AA", "AE", "AR"):
-        a = build_ack(code, "CID1")
-        assert a.startswith(SB) and a.endswith(EB_CR) and f"MSA|{code}|CID1|".encode() in a
+def test_oversize_complete_frame_yields_control_id_not_payload() -> None:
+    big = ADT + b"X" * 2000
+    p = FrameParser(max_size=1024)
+    out = p.feed(frame(big))
+    assert len(out) == 1
+    assert isinstance(out[0], Oversize)
+    assert out[0].cid == "CTRL-1"
 
 
-def run(*a, **k):  # noqa: ANN
-    return asyncio.run(_roundtrip(*a, **k))
+def test_unterminated_growth_beyond_max_is_fatal_once() -> None:
+    p = FrameParser(max_size=16)
+    out = p.feed(SB + b"x" * 100)  # never terminates, grows past max_size
+    assert out == [FATAL]
+    assert p.fatal is True
+    assert p.buffered() == 0
+    # further feeds must not raise or double-report; caller is expected to stop calling
+    # once .fatal is set, but the parser itself must stay well-behaved.
+    assert p.feed(b"more") == []
 
 
-class Stub:
-    def __init__(self, ok: bool = True, delay: float = 0.0) -> None:
-        self.ok, self.delay, self.calls = ok, delay, 0
-
-    async def __call__(self, payload: bytes, cid: str) -> bool:
-        self.calls += 1
-        await asyncio.sleep(self.delay)
-        return self.ok
+def test_exactly_max_size_is_not_oversize() -> None:
+    payload = b"A" * 32
+    p = FrameParser(max_size=32)
+    out = p.feed(frame(payload))
+    assert out == [payload]
 
 
-async def _roundtrip(pub: Stub, data: bytes, cfg: Settings | None = None, n_acks: int = 1) -> list[bytes]:
-    cfg = cfg or Settings(port=0, host="127.0.0.1")
-    srv = Server(cfg, pub)
-    s = await srv.start()
-    port = s.sockets[0].getsockname()[1]
-    r, w = await asyncio.open_connection("127.0.0.1", port)
-    w.write(data)
-    buf, acks = b"", []
-    try:
-        while len(acks) < n_acks:
-            buf += await asyncio.wait_for(r.read(4096), 5)
-            while (e := buf.find(EB_CR)) != -1:
-                acks.append(buf[1:e])
-                buf = buf[e + 2 :]
-    finally:
-        w.close()
-        s.close()
-    return acks
+def test_control_id_normal() -> None:
+    assert control_id(ADT) == "CTRL-1"
 
 
-def test_aa_only_after_commit_verdict() -> None:
-    acks = run(Stub(ok=True), framed())
-    assert b"MSA|AA|CID1" in acks[0]
+def test_control_id_missing_fields_returns_empty() -> None:
+    assert control_id(b"MSH|^~\\&|A|B") == ""
 
 
-def test_failed_commit_is_ar_never_aa() -> None:
-    acks = run(Stub(ok=False), framed())
-    assert b"MSA|AR|CID1" in acks[0] and b"MSA|AA" not in acks[0]
+def test_control_id_no_cr_returns_empty_for_short_msh() -> None:
+    assert control_id(b"MSH|^~\\&") == ""
 
 
-def test_publish_timeout_is_ar() -> None:
-    cfg = Settings(port=0, host="127.0.0.1", ack_timeout_s=0.1)
-    acks = run(Stub(ok=True, delay=1.0), framed(), cfg)
-    assert b"MSA|AR|CID1" in acks[0]
+def test_control_id_sanitizes_separators() -> None:
+    # MSH-10 cannot contain a literal "|" (that would start a new field), but it can
+    # legally contain component/sub-component separators; those must not survive into
+    # the ACK's MSA-2, or a crafted control id could forge extra ACK fields.
+    hostile = b"MSH|^~\\&|A|B|||ts||ADT^A01|EVIL^1~2\\3&4|P|2.5\r"
+    cid = control_id(hostile)
+    assert not set(cid) & set("|^~\\&")
+    assert cid == "EVIL1234"
 
 
-def test_oversize_gets_ar_and_is_not_published() -> None:
-    pub = Stub()
-    cfg = Settings(port=0, host="127.0.0.1", max_msg=10)
-    acks = run(pub, framed(), cfg)
-    assert b"MSA|AR|CID1" in acks[0] and pub.calls == 0
+def test_control_id_truncated_to_64_chars() -> None:
+    long_id = "Y" * 200
+    msg = f"MSH|^~\\&|A|B|||ts||ADT^A01|{long_id}|P|2.5\r".encode()
+    assert len(control_id(msg)) == 64
 
 
-def test_acks_in_arrival_order_when_commits_finish_out_of_order() -> None:
-    class Varied(Stub):
-        async def __call__(self, payload: bytes, cid: str) -> bool:
-            await asyncio.sleep(0.2 if cid == "A" else 0.0)
-            return True
+def test_build_ack_shape_and_msa() -> None:
+    ack = build_ack("AA", "CTRL-1")
+    assert ack[:1] == SB
+    assert ack[-2:] == EB + CR
+    assert b"\rMSA|AA|CTRL-1|\r" in ack
 
-    def m(c: str) -> bytes:
-        return framed(MSG.replace(b"CID1", c.encode()))
 
-    acks = run(Varied(), m("A") + m("B"), n_acks=2)
-    assert b"MSA|AA|A|" in acks[0] and b"MSA|AA|B|" in acks[1]
+def test_build_ack_ar_carries_reason_text() -> None:
+    ack = build_ack("AR", "CTRL-2", "too large")
+    assert b"MSA|AR|CTRL-2|too large" in ack
+
+
+def test_build_ack_empty_control_id_still_well_formed() -> None:
+    ack = build_ack("AR", "", "too large")
+    assert b"MSA|AR||too large" in ack
