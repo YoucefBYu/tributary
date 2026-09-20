@@ -11,7 +11,7 @@ where a kill replayed 12 messages and where four partitions changed hands mid-fl
 
 `code-reviewer` rated most S5 claims WEAKLY SUPPORTED on the first run set, because several
 scenarios could pass without exercising the fault they are named after. That was correct. The
-tables below therefore distinguish two run sets under `spikes/S5-ordering-retry/runs/`:
+tables below therefore distinguish three run sets under `spikes/S5-ordering-retry/runs/`:
 
 | Run set | What it is | Status |
 |---|---|---|
@@ -150,8 +150,25 @@ stop (committed 39/95/171 against high watermarks 213/227/308).
 ### Ordering under fault injection, in detail
 
 - **Model layer:** 500 hypothesis examples per property x 4 properties = **2,000 randomised
-  fault schedules**, 0 counterexamples, 245 s. At the default 60 examples the same suite is 36
-  tests in 33 s and runs on every commit.
+  fault schedules**, 0 counterexamples, 250 s. At the default 60 examples the same suite runs in
+  31 s on every commit.
+
+  What those 2,000 examples actually exercised, measured rather than assumed (printed by the
+  suite; a floor of 25% is asserted so the harness cannot silently regress to vacuity):
+
+  | Coverage over 2,000 examples | Value |
+  |---|---|
+  | Scheduled faults that actually fired | **1,339 / 1,396 (95.9%)** |
+  | Examples requesting a fault where at least one fired | **904 / 904 (100%)** |
+  | Examples that paused a partition | 956 |
+  | Examples that dead-lettered | 753 |
+  | Examples where a crash caused a **replay** (duplicates) | **209** |
+
+  The last row matters most and was 0 before this was measured. The property suite hard-coded
+  `commit_interval_s=0.0`, which made the time-based rule commit after every single delivery and
+  collapsed every commit window to one message, so no crash ever replayed anything and the
+  ordering property was never tested against a replay. The commit window is now drawn by the
+  strategy (1, 3 or 8); 209 examples replay, and order held in all of them.
 - **Real cluster:** 12 scenarios above plus 9 integration tests (310 s) plus 4 semantics tests.
   Zero reordered keys anywhere.
 - **Number of order violations measured: 0.** Nothing to escalate against invariant 5.
@@ -198,30 +215,52 @@ floor. That is a fixable implementation detail, not a property of the approach (
 
 ### Cooperative rebalance (re-run, `rebalance-200152`)
 
-A third member joined a tenth of the way through a 2,000-message run. Evidence that partitions
-actually moved, from the timestamped journal rather than from end-of-run revoke counts:
+**What this run actually shows: a cooperative revoke and resume mid-run is safe.** It does *not*
+show a third member joining a stable pair, and the first version of this section claimed that it
+did. The journal is unambiguous:
+
+```
+313.789  worker-a  assign  [0,1,2,3,4,5]
+316.898  worker-b  assign  []              <- worker-b's own join
+316.907  worker-a  revoke  [0,1,2,3]       <- caused by b joining, not c
+320.010  worker-c  assign  [0,2]
+```
+
+worker-b's join at 316.898 is what triggered worker-a's revoke nine milliseconds later; worker-c
+was not assigned anything until 320.010, three seconds later. So worker-a and worker-b were still
+settling when worker-c was started, the four partitions were given up in a single revoke, and
+`revokes_while_running_after` cannot attribute that revoke to worker-c rather than worker-b. The
+200 deliveries that triggered the join threshold were all worker-a's, for the same reason.
+
+What is supported, and is still the point of the scenario:
 
 | Evidence | Value |
 |---|---|
-| Partitions moved after the join | **4** (0, 1, 2, 3) |
-| Revokes by a worker that was *still running* | worker-a: 4; worker-b: 0; worker-c: 0 |
-| Partitions assigned to the joining member | 0 and 2 |
-| Records delivered by the joining member | **628** |
-| Duplicates / losses / reorderings | 0 / 0 / 0 |
+| Partitions given up by a **still-running** worker mid-delivery | **4** (0, 1, 2, 3) |
+| Revokes while running | worker-a: 4; worker-b: 0; worker-c: 0 |
+| Partitions ultimately assigned to worker-c | 0 and 2 |
+| Records delivered by worker-c after taking them | **628** |
+| Duplicates / losses / reorderings across the handover | 0 / 0 / 0 |
+
+So partitions did move from an actively-delivering worker to new owners, and 628 records were
+delivered by a member that owned nothing when the run started, with nothing lost or reordered.
+What is not established is which joiner caused it.
 
 **Zero duplicates here is the correct result, not a weak one.** A cooperative revoke is a planned
 handover: `_on_revoke` commits before the partitions are given up, so the new owner starts exactly
 where the old one stopped and nothing is replayed. That is the contrast with `kill`, where the
-dying worker commits nothing and 12 messages are replayed. Both behaviours are the design working,
-and the distinction only became visible once shutdown revokes were separated from rebalance
-revokes.
+dying worker commits nothing and 12 messages are replayed. Both are the design working.
+
+`s5.runner` now waits for every founding member to own partitions before starting the joiner
+(`wait_for_stable_assignment`, recorded as `founders_stable_before_join`), so a future run can
+make the stronger claim. This run predates that fix and is reported as what it is.
 
 ### Transactions
 
 `txn`: 2,000 consumed, 2,000 produced, 40 transactions of 50, 0 aborts, 0 abortable and 0
 retriable errors, transaction commit p50 <1 ms and p99 78 ms.
 
-`txn_crash` (re-run, `txn_crash-200243`): the stage was killed mid-flight and restarted with the
+`txn_crash` (re-run, `txn_crash-200240`): the stage was killed mid-flight and restarted with the
 same `transactional.id`. Measured **between the kill and the restart**, which is the only window
 in which an open transaction is observable:
 
@@ -278,8 +317,12 @@ and every worker revokes its partitions on clean shutdown. So High 2 applies to 
 test, not to the cluster scenario, but the evidence for both was worthless either way. Workers
 now write a timestamped assign/revoke/lost journal and count `revokes_while_running`, so a
 rebalance revoke is distinguishable from a shutdown revoke, and the joining member starts at a
-tenth of the run. **Resolved by the re-run**: 4 partitions moved from a still-running worker and
-the joining member delivered 628 records (`rebalance-200152`).
+tenth of the run. **Partly resolved by the re-run**: 4 partitions were given up by a
+still-running worker and worker-c delivered 628 records (`rebalance-200152`), so revoke-and-resume
+mid-run is now demonstrated. But the journal shows worker-b's own join caused that revoke three
+seconds before worker-c was assigned anything, so the run does not show a third member joining a
+*stable* pair. `s5.runner` now waits for the founders to be stable first; making the stronger
+claim needs one more run.
 
 **4. Commit-after-delivery on the cluster was a final-state check.** It compared the last
 committed offset against the whole delivery log, which cannot catch a commit that ran ahead of
@@ -291,16 +334,31 @@ window: 144 samples in `kill`, zero violations.
 stage between transactions and still passed. The re-run reads `out` with `read_uncommitted` and
 `read_committed` between the kill and the restart; the difference is the open transaction, and
 the run now fails if there was none. **Resolved by the re-run**: 50 records were inside an open
-transaction at the kill (`txn_crash-200243`).
+transaction at the kill (`txn_crash-200240`).
 
 **6. Property tests never asserted a fault fired.** A fault scheduled for poll 30 never runs if
 the loader finishes at poll 12, so small examples could be vacuous. Firing is now counted,
 surfaced through `hypothesis.event()`, and asserted in a dedicated test.
 
-**7. There was no mutation control.** Added: two deliberately broken loaders (one resuming
-without seeking back, one committing before delivering) and a test asserting the checks **catch**
-them. Both are caught. A suite that cannot go red is decoration, and this is the only evidence
-offered here that the checks have teeth.
+**7. There was no mutation control.** Added: three deliberately broken loaders and a test
+asserting the checks **catch** each one. A suite that cannot go red is decoration, and this is
+the only evidence offered here that the checks have teeth.
+
+| Mutant | Bug it reintroduces | Check that must fail |
+|---|---|---|
+| `_SkippingLoader` | Resumes without seeking back to the failed offset | no-loss |
+| `_CommitBeforeDeliveryLoader` | Stores and commits before the downstream write | commit-after-delivery |
+| `_ReorderingLoader` | Delivers each adjacent pair of offsets in the wrong order | **per-key ordering** |
+
+The third was added after review: the first two produce loss and a premature commit, neither of
+which is a reordering, so nothing previously demonstrated that the *ordering* check -- the
+headline claim of this spike -- is capable of failing. All three are caught.
+
+**8. The property runs never replayed anything.** Covered in the coverage table above: a
+hard-coded `commit_interval_s=0.0` collapsed every commit window to one message, so no crash in
+2,000 examples ever caused a redelivery. Fixed by drawing the commit window from the strategy;
+209 of 2,000 examples now replay, with order preserved in all of them. This is the model-layer
+twin of High 1 and was found by measuring fault coverage rather than by the review.
 
 **Two limits that remain, by design:**
 
@@ -336,7 +394,7 @@ Reported because the first version of each *passed*:
 | Duplicate rate reported | 0.60% (`kill` and `static_restart`, `commit_every=20`), 0.10% (`broker_kill`), 0% without a fault; bounded by `commit_every` | **PASS** (reported) |
 | Commit-after-delivery verified | 0 violations; online in the model (commit hook) and sampled every 250 ms through the kill window on the cluster (144 samples) | **PASS** |
 | Blocking retry with partition pause and resume | 598 real cycles, 0 loss, 0 skips; seek-before-resume proven necessary by measurement, and a mutant that omits it is caught | **PASS** |
-| Cooperative-sticky and static membership | Static cost quantified in both directions and corroborated by S4. Cooperative movement: 4 partitions moved from a still-running worker to the joining member, which then delivered 628 records, with 0 duplicates and 0 losses | **PASS** |
+| Cooperative-sticky and static membership | Static cost quantified in both directions and corroborated by S4. Cooperative movement: 4 partitions given up by a still-running worker mid-delivery and picked up by a member that started with none, which delivered 628 records, with 0 duplicates and 0 losses. Which of the two joiners triggered it is **not** established (see the rebalance section) | **PASS** for revoke-and-resume safety; attribution to a specific joiner NOT established |
 | Transactional Kafka-to-Kafka stage | Exactly-once held across a kill, with 50 records proven to be inside an open transaction at the moment of the kill | **PASS** |
 | Poison message to DLQ | Exactly the 8 poison messages dead-lettered, partition kept moving; `halt-partition` verified as the order-preserving alternative | **PASS** |
 

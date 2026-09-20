@@ -26,6 +26,7 @@ from __future__ import annotations
 import itertools
 import os
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -139,7 +140,12 @@ def _loader(
         on_exhaust=on_exhaust,
         backoff=FAST_BACKOFF,
         commit_every=commit_every,
-        commit_interval_s=0.0,
+        # 0.0 would make the time-based rule fire on every delivery and quietly
+        # reduce every commit window to 1, which is how the whole property suite
+        # ran 240 examples with a crash in them and produced zero duplicates:
+        # the model never replayed anything either. Only `commit_every=1` is
+        # allowed to commit per message.
+        commit_interval_s=0.0 if commit_every == 1 else 3600.0,
         poll_timeout_s=0.0,
         idle_exit_s=0.02,
     )
@@ -181,6 +187,7 @@ def run_scenario(
     poison_every: int | None,
     faults: list[tuple[int, str]],
     seed: int,
+    commit_every: int = 1,
 ) -> Outcome:
     """Publish, then drain under a fault schedule, then drain clean.
 
@@ -188,6 +195,11 @@ def run_scenario(
     loader's consumer. The final clean drain (no injected faults, no transient
     failures) is what makes "no loss" a meaningful assertion: it guarantees the
     run reached quiescence rather than simply stopping early.
+
+    ``commit_every`` is drawn by the strategy rather than fixed at 1, because a
+    one-message commit window means a crash replays at most one message -- and
+    in practice replayed none, so the ordering property was never tested against
+    a replay. Larger windows are where "replay preserves order" is decided.
     """
     cluster = FakeCluster(default_partitions=partitions)
     cluster.create_topic(RAW, partitions)
@@ -206,7 +218,10 @@ def run_scenario(
     )
     clean = FailurePlan(poison=plan_out.poison, transient_rate=0.0, seed=seed)
 
-    first = _loader(cluster, tracker, log_path, plan=failing, instance_id="worker-a")
+    first = _loader(
+        cluster, tracker, log_path, plan=failing, instance_id="worker-a",
+        commit_every=commit_every,
+    )
     consumer = cluster.consumers[-1]
     fired: list[str] = []
 
@@ -262,6 +277,9 @@ def scenarios(draw: st.DrawFn) -> dict[str, Any]:
         "keys": draw(st.integers(min_value=1, max_value=6)),
         "transient_rate": draw(st.sampled_from([0.0, 0.1, 0.35])),
         "poison_every": draw(st.one_of(st.none(), st.integers(min_value=5, max_value=15))),
+        # 1 is the strictest setting and replays nothing on a crash; the larger
+        # windows are the ones that make replay-preserves-order a real claim.
+        "commit_every": draw(st.sampled_from([1, 3, 8])),
         "faults": draw(
             st.lists(
                 st.tuples(st.integers(min_value=1, max_value=30), fault_kinds),
@@ -285,6 +303,18 @@ PROPERTY_SETTINGS = settings(
 
 
 # ------------------------------------------------------------------ properties
+#: Aggregated across every property example in the module, so the report can
+#: quote a measured fault-firing ratio instead of asserting that injection works
+#: on one hand-picked schedule. Checked in `teardown_module`.
+COVERAGE: Counter[str] = Counter()
+
+#: Below this, a green property run is not strong evidence: it means most
+#: examples never reached their scheduled fault. Chosen as a floor to detect
+#: regression in the harness, not as a target -- the measured value is what the
+#: report quotes.
+MIN_FIRED_RATIO = 0.25
+
+
 def _note_coverage(outcome: Outcome) -> None:
     """Record what each example actually exercised.
 
@@ -297,6 +327,51 @@ def _note_coverage(outcome: Outcome) -> None:
     event(f"paused={bool(outcome.stats['pauses'])}")
     event(f"dead_lettered={bool(outcome.dlq_ids)}")
     event(f"duplicates={bool(outcome.report.duplicates)}")
+
+    COVERAGE["examples"] += 1
+    COVERAGE["faults_requested"] += outcome.faults_requested
+    COVERAGE["faults_fired"] += outcome.faults_fired
+    if outcome.faults_requested:
+        COVERAGE["examples_with_faults"] += 1
+        if outcome.faults_fired:
+            COVERAGE["examples_with_a_fired_fault"] += 1
+    COVERAGE["examples_that_paused"] += int(bool(outcome.stats["pauses"]))
+    COVERAGE["examples_that_dead_lettered"] += int(bool(outcome.dlq_ids))
+    COVERAGE["examples_with_duplicates"] += int(bool(outcome.report.duplicates))
+
+
+def fired_ratio() -> float:
+    requested = COVERAGE["faults_requested"]
+    return COVERAGE["faults_fired"] / requested if requested else 0.0
+
+
+def teardown_module(module: object) -> None:
+    """Fail the module if the property runs were largely vacuous.
+
+    Asserting injection works on one chosen schedule says nothing about the
+    other few thousand examples. This measures the ratio actually achieved and
+    prints it, so the report quotes a number rather than a hope.
+
+    Skipped when too little was collected, so running a single test with `-k`
+    does not fail on a sample of three.
+    """
+    with_faults = COVERAGE["examples_with_faults"]
+    if with_faults < 50:
+        return
+    ratio = fired_ratio()
+    print(
+        f"\nfault-injection coverage over {COVERAGE['examples']} examples: "
+        f"{COVERAGE['faults_fired']}/{COVERAGE['faults_requested']} scheduled faults fired "
+        f"({ratio:.1%}); {COVERAGE['examples_with_a_fired_fault']}/{with_faults} examples with "
+        f"a fault had at least one fire; paused={COVERAGE['examples_that_paused']}, "
+        f"dlq={COVERAGE['examples_that_dead_lettered']}, "
+        f"duplicates={COVERAGE['examples_with_duplicates']}"
+    )
+    assert ratio >= MIN_FIRED_RATIO, (
+        f"only {ratio:.1%} of scheduled faults ever fired, below the {MIN_FIRED_RATIO:.0%} "
+        "floor: most property examples finished before reaching their fault, so a green "
+        "run would not be evidence of much"
+    )
 
 
 @given(scenario=scenarios())
@@ -319,6 +394,7 @@ def test_nothing_is_lost_every_message_reaches_the_sink_or_the_dlq(
 ) -> None:
     """Invariant 4. Loss is the one outcome at-least-once does not excuse."""
     outcome = run_scenario(tmp_path, **scenario)
+    _note_coverage(outcome)
     accounted = outcome.delivered_ids | outcome.dlq_ids
     missing = [i for i in outcome.report.lost if i not in accounted]
     assert not missing, f"{len(missing)} message(s) in neither sink nor DLQ (scenario={scenario})"
@@ -331,6 +407,7 @@ def test_no_offset_is_committed_before_the_work_below_it_is_durable(
 ) -> None:
     """Commit-after-delivery, asserted online by the commit hook."""
     outcome = run_scenario(tmp_path, **scenario)
+    _note_coverage(outcome)
     assert not outcome.tracker.violations, "\n".join(outcome.tracker.violations[:5])
     assert outcome.tracker.commits > 0, "a run that never committed proves nothing"
 
@@ -343,6 +420,7 @@ def test_poison_messages_end_up_in_the_dlq_and_only_poison_does(
     """Invariant 5's escape hatch: the DLQ is how an ordered partition unblocks."""
     cluster_poison = scenario["poison_every"]
     outcome = run_scenario(tmp_path, **scenario)
+    _note_coverage(outcome)
     if cluster_poison is None:
         assert not outcome.dlq_ids, "nothing was poison, so the DLQ must be empty"
     # A poison message must never be reported as delivered to the sink.
@@ -550,14 +628,15 @@ class _SkippingLoader(BlockingLoader):
 
     def _resume_due(self) -> None:
         now = time.monotonic()
-        for (topic, partition), st in self.states.items():
-            if not st.paused or st.halted or now < st.resume_at:
+        # `state`, not `st`: `st` is hypothesis.strategies at module scope.
+        for (topic, partition), state in self.states.items():
+            if not state.paused or state.halted or now < state.resume_at:
                 continue
             self._consumer.resume([TopicPartition(topic, partition)])
-            st.paused = False
+            state.paused = False
             # No seek(): librdkafka refetches from last-consumed + 1, so the
             # message that failed is skipped forever.
-            st.next_offset = -1
+            state.next_offset = -1
             self.stats.resumes += 1
 
 
@@ -571,11 +650,43 @@ class _CommitBeforeDeliveryLoader(BlockingLoader):
         super()._handle(msg)
 
 
+class _ReorderingLoader(BlockingLoader):
+    """Mutant: delivers each adjacent pair of offsets in the wrong order.
+
+    The other two mutants produce *loss* and a *premature commit*. Neither
+    produces a reordering, so neither shows that the ordering check -- the
+    headline claim of this spike -- can fail. This one holds each message back
+    until the next one on its partition arrives, then delivers the later offset
+    first.
+
+    It has to clear ``next_offset`` before replaying the held message, because
+    the real loader's stale-offset guard would otherwise drop it and turn the
+    reordering back into loss, which is the thing already covered.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._held: dict[tuple[str, int], MessageLike] = {}
+
+    def _handle(self, msg: MessageLike) -> None:
+        key = (msg.topic(), msg.partition())
+        held = self._held.pop(key, None)
+        if held is None:
+            self._held[key] = msg  # wait for a partner to swap with
+            return
+        super()._handle(msg)  # the later offset goes downstream first
+        state = self.states.get(key)
+        if state is not None:
+            state.next_offset = -1  # defeat the guard that would drop the earlier one
+        super()._handle(held)
+
+
 @pytest.mark.parametrize(
     ("mutant", "what_must_break"),
     [
         (_SkippingLoader, "loss"),
         (_CommitBeforeDeliveryLoader, "commit-after-delivery"),
+        (_ReorderingLoader, "order"),
     ],
 )
 def test_a_broken_loader_is_caught_by_these_checks(
@@ -625,6 +736,11 @@ def test_a_broken_loader_is_caught_by_these_checks(
         assert not report.no_loss, (
             "a loader that resumes without seeking back skipped nothing -- the no-loss "
             "check cannot detect the bug it exists for"
+        )
+    elif what_must_break == "order":
+        assert not report.order_preserved, (
+            "a loader that delivers offsets out of order was reported as ordered -- the "
+            "ordering check, which is this spike's headline claim, has no teeth"
         )
     else:
         assert tracker.violations, (

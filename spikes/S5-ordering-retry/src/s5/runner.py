@@ -551,6 +551,25 @@ def owned_at(run_dir: Path, worker: str, wall: float) -> set[int]:
     return owned
 
 
+def wait_for_stable_assignment(
+    run_dir: Path, workers: Sequence[str], timeout_s: float = 90.0
+) -> bool:
+    """Block until every named worker owns at least one partition.
+
+    Needed before introducing a *further* member. Without it the existing
+    members may still be settling, and their revokes get attributed to the new
+    joiner: in `rebalance-200152` worker-b's own join at 316.898 caused the
+    revoke at 316.907, three seconds before worker-c was assigned anything, yet
+    the analysis credited that revoke to worker-c.
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if all(owned_at(run_dir, w, time.time()) for w in workers):
+            return True
+        time.sleep(0.05)
+    return False
+
+
 def takeover_gap_s(
     run_dir: Path, dead: str, killed_wall: float, *, by_others_only: bool = True
 ) -> float | None:
@@ -889,11 +908,15 @@ def scenario_rebalance(opts: Options) -> RunResult:
     t0 = time.monotonic()
     pool.start("worker-a", extra=_common(opts, idle_exit_s=15.0))
     pool.start("worker-b", extra=_common(opts, idle_exit_s=15.0))
+    # Both founders must own partitions before c joins, or c gets blamed for the
+    # revoke that b's own join caused.
+    stable = wait_for_stable_assignment(run_dir, ["worker-a", "worker-b"])
     pool.wait_for_deliveries(max(20, opts.count // 10))
     joined_at = time.time()
     pool.start("worker-c", extra=_common(opts, idle_exit_s=15.0))
     pool.wait_all()
     result = analyse("rebalance", layout, group, run_dir, plan, pool, wall_s=time.monotonic() - t0)
+    result.notes["founders_stable_before_join"] = stable
     result.notes["joined_at_deliveries"] = max(20, opts.count // 10)
     result.notes["worker_c_delivered"] = (
         (result.worker_stats.get("worker-c") or {}).get("stats", {}).get("delivered", 0)
