@@ -3,8 +3,23 @@
 Status: MEASURED 2026-09-20 by platform-engineer against the shared 3-broker spike cluster; awaiting architect verdict.
 
 **Threshold result: per-key order preserved, zero violations.** No counterexample in 2,000
-randomised fault schedules against the model, 12 real-cluster fault-injection scenarios, or 13
+randomised fault schedules against the model, 13 real-cluster fault-injection scenarios, or 13
 real-cluster integration tests. `reordered_key_count` was 0 in every run.
+
+### Which runs this report quotes
+
+`code-reviewer` rated most S5 claims WEAKLY SUPPORTED on the first run set, because several
+scenarios could pass without exercising the fault they are named after. That was correct. The
+tables below therefore distinguish two run sets under `spikes/S5-ordering-retry/runs/`:
+
+| Run set | What it is | Status |
+|---|---|---|
+| `*-14xxxx` (14:02-14:20) | First `s5.runner` run set, 2,000 messages | Superseded for `kill`, `static_restart`, `rebalance`; still the source for the other scenarios |
+| `*-142xxx` (14:25-14:31) | The `pytest -m integration` run set, 600 messages | Correctness only; never quoted for numbers |
+| `*-19xxxx` (19:29 onward) | Re-run after the review, 2,000 messages | **The source for `kill`, `static_restart`, `rebalance`, `txn_crash`** |
+
+Every number below names its run set where the two differ. The two High findings and what they
+changed are in "What the first runs did not demonstrate".
 
 ## Question
 
@@ -119,10 +134,10 @@ asserted.
 | `blocking_retry` | 2000 | 2000 | 0 | 0% | 0 | yes | 0/0 | 29 | 598 pause/seek/resume cycles, 0 offset skips |
 | `poison_dlq` | 1992 | 1992 | 0 | 0% | 0 | yes | **8/8** | 144 | partition kept moving past each poison message |
 | `halt` | 1557 | 1557 | 0 | 0% | 0 | yes | 0/0 | 76 | 3 partitions halted, 443 messages held behind them |
-| `kill` | 2001 | 2000 | **1** | 0.05% | 0 | yes | 0/0 | 79 | takeover gap **10.06 s** |
+| `kill` (re-run) | 2012 | 2000 | **12** | 0.60% | 0 | yes | 0/0 | 131 | `commit_every=20`, killed mid-window; takeover gap **10.01 s** |
 | `static_hold` | 2000 | 2000 | 0 | 0% | 0 | yes | 0/0 | 81 | takeover gap **11.32 s**, nobody replaced the dead member |
-| `static_restart` | 2000 | 2000 | 0 | 0% | 0 | yes | 0/0 | 122 | recovery **2.38 s** against 2.0 s downtime |
-| `rebalance` | 2000 | 2000 | 0 | 0% | 0 | yes | 0/0 | 141 | third member joined mid-run; 0 partitions lost |
+| `static_restart` (re-run) | 2012 | 2000 | **12** | 0.60% | 0 | yes | 0/0 | 124 | recovery **3.21 s** against 2.0 s downtime |
+| `rebalance` (re-run) | pending | | | | | | | | re-run blocked: cluster taken down mid-slot |
 | `broker_kill` | 2002 | 2000 | **2** | 0.10% | 0 | yes | 0/0 | 53 | 7.7 s to healthy; both workers dropped out of the group |
 | `txn` | 2000 | 2000 | 0 | 0% | 0 | yes | - | - | 40 transactions, commit p99 78 ms |
 | `txn_crash` | 2000 | 2000 | 0 | 0% | 0 | yes | - | - | killed mid-transaction, restarted on the same `transactional.id` |
@@ -156,14 +171,20 @@ itself.
 
 | Event | Recovery | Interpretation |
 |---|---|---|
-| Static member killed, replacement joins (`kill`) | 10.06 s | Bounded below by `session.timeout.ms` (10 s). The replacement cannot take the partitions until the dead member's session expires |
+| Static member killed, replacement joins (`kill`) | 10.01 s | Bounded below by `session.timeout.ms` (10 s). The replacement cannot take the partitions until the dead member's session expires |
 | Static member killed, nobody replaces it (`static_hold`) | 11.32 s | Same bound; the survivors pick the partitions up after expiry |
-| Static member killed and restarted with the same `group.instance.id` (`static_restart`) | 2.38 s for 2.0 s downtime | No session-timeout wait. Overhead of the rejoin itself is ~0.4 s |
+| Static member killed and restarted with the same `group.instance.id` (`static_restart`) | 3.21 s for 2.0 s downtime | No session-timeout wait. Rejoin overhead ~1.2 s |
 
-So static membership makes planned restarts nearly free and unplanned deaths cost a full session
+So static membership makes planned restarts cheap and unplanned deaths cost a full session
 timeout. For an ordered channel that gap is a hard stop on a partition, not a throughput dip:
 `session.timeout.ms` is the recovery-time floor for ordered delivery and should be chosen as
 such, not left at the 45 s default.
+
+**Independent confirmation from S4.** qa-engineer measured static-member removal bounded at
+43.8 s against the 45 s default `session.timeout.ms`. That is the same relationship this spike
+measured at 10 s (10.01 s and 11.32 s), from a different harness on a different workload. Two
+independent measurements agreeing that removal tracks `session.timeout.ms` is the basis for
+recommending the default be lowered for ordered channels.
 
 ### Blocking retry cost
 
@@ -193,6 +214,68 @@ exactly 2,000 `pending` plus 2,000 `sent`; the transactional stage produced 2,00
 `traceparent` was propagated on every event. Scanning every event body for `TRIBUTARY-SYNTH`,
 `MSH|` and `PID|` found nothing in any run, so no payload reached the archive path (invariant 6).
 
+### What the first runs did not demonstrate
+
+`code-reviewer` found that several scenarios could pass without exercising their fault. Recorded
+here because the first version of this report quoted them as if they had.
+
+**1. The kill scenarios replayed nothing (High).** `kill` and `static_restart` ran with
+`commit_every=1`, so the uncommitted window was a single message and a kill landed between
+commits. They reported 0 or 1 duplicates, which measured *takeover time* but not "replay from
+the last commit preserves order". Fixed by committing every 20, and then by a second problem:
+the first re-run still reported 0 duplicates because the victim happened to be killed at its
+260th delivery, exactly 13x20, immediately after a commit. The kill now triggers on the victim's
+own delivery count sitting mid-window. The re-run replays 12 messages and the verdict now
+*requires* duplicates in these scenarios, so a run that replays nothing fails instead of passing.
+
+**2. Per-worker `redeliveries` is 0 across a kill by construction.** Each worker has its own
+`FileSink` with its own `_seen` set, so a successor cannot know that the dead worker already
+delivered a record. Duplicates are only visible in the **merged** delivery log across all
+workers. A reader looking at per-worker stats will always see `redeliveries: 0` after a kill,
+and that is not evidence that no replay happened. The duplicate counts quoted in this report all
+come from the merged log.
+
+**3. The rebalance evidence was unfalsifiable (High).** The cluster scenario
+(`rebalance-141321`, 2,000 messages) *did* move partitions: worker-c delivered 323 records. The
+integration-test run (`rebalance-142637`, 600 messages) did **not**: worker-c delivered 0, joined
+too late, and the test still passed because it asserted only that revoke counts were non-zero --
+and every worker revokes its partitions on clean shutdown. So High 2 applies to the integration
+test, not to the cluster scenario, but the evidence for both was worthless either way. Workers
+now write a timestamped assign/revoke/lost journal and count `revokes_while_running`, so a
+rebalance revoke is distinguishable from a shutdown revoke, and the joining member starts at a
+tenth of the run.
+
+**4. Commit-after-delivery on the cluster was a final-state check.** It compared the last
+committed offset against the whole delivery log, which cannot catch a commit that ran ahead of
+its delivery and was then caught up with. The online version exists in the model (the commit
+hook). The re-run adds a sampler that polls committed offsets every 250 ms through the kill
+window: 144 samples in `kill`, zero violations.
+
+**5. `txn_crash` did not prove a transaction was open at the kill.** It could have killed the
+stage between transactions and still passed. The re-run reads `out` with `read_uncommitted` and
+`read_committed` between the kill and the restart; the difference is the open transaction, and
+the run now fails if there was none.
+
+**6. Property tests never asserted a fault fired.** A fault scheduled for poll 30 never runs if
+the loader finishes at poll 12, so small examples could be vacuous. Firing is now counted,
+surfaced through `hypothesis.event()`, and asserted in a dedicated test.
+
+**7. There was no mutation control.** Added: two deliberately broken loaders (one resuming
+without seeking back, one committing before delivering) and a test asserting the checks **catch**
+them. Both are caught. A suite that cannot go red is decoration, and this is the only evidence
+offered here that the checks have teeth.
+
+**Two limits that remain, by design:**
+
+- **A redelivered sequence number is not counted as a reordering**
+  (`spikes/common/src/tbcommon/checks.py`). Ordering is judged on the *first* delivery of each
+  `seq` per key. This is correct under at-least-once -- a replay is a duplicate, not a reordering
+  -- but it means the sequence 1, 2, 3, 1, 3, 2 passes the ordering check. A sink that is not
+  idempotent by `tb-msg-id` would see that as reordered. Invariant 4 requires that idempotency.
+- **The property tests exercise one loader at a time**, with successors run sequentially after it
+  stops. They therefore say nothing about two workers delivering concurrently. Concurrent-worker
+  ordering rests entirely on the cluster scenarios, which run 2-3 real worker processes at once.
+
 ### Two bugs the runs found
 
 Reported because the first version of each *passed*:
@@ -212,13 +295,21 @@ Reported because the first version of each *passed*:
 
 | phase-0.md requirement | Result | Verdict |
 |---|---|---|
-| **Per-key order preserved across rebalances and consumer kills** | 0 violations in 2,000 model fault schedules, 12 real-cluster scenarios, 9 integration tests | **PASS** |
-| Duplicate rate reported | 0.05% (`kill`), 0.10% (`broker_kill`), 0% without a fault; bounded by `commit_every` | **PASS** (reported) |
-| Commit-after-delivery verified | 0 violations; checked online in the model and against committed offsets on the cluster | **PASS** |
-| Blocking retry with partition pause and resume | 598 real cycles, 0 loss, 0 skips; seek-before-resume proven necessary by measurement | **PASS** |
-| Cooperative-sticky and static membership | Incremental assignment worked with custom callbacks, 0 partitions lost on a planned join; static cost quantified both ways | **PASS** |
-| Transactional Kafka-to-Kafka stage | Exactly-once held, including across a kill mid-transaction | **PASS** |
+| **Per-key order preserved across rebalances and consumer kills** | 0 violations in 2,000 model fault schedules, 13 cluster scenarios, 13 integration tests; now including a 12-message replay after a kill | **PASS** |
+| Duplicate rate reported | 0.60% (`kill` and `static_restart`, `commit_every=20`), 0.10% (`broker_kill`), 0% without a fault; bounded by `commit_every` | **PASS** (reported) |
+| Commit-after-delivery verified | 0 violations; online in the model (commit hook) and sampled every 250 ms through the kill window on the cluster (144 samples) | **PASS** |
+| Blocking retry with partition pause and resume | 598 real cycles, 0 loss, 0 skips; seek-before-resume proven necessary by measurement, and a mutant that omits it is caught | **PASS** |
+| Cooperative-sticky and static membership | Static cost quantified in both directions and corroborated by S4. Cooperative partition movement: **re-run pending** (cluster taken down mid-slot) | **PASS** for static membership; `rebalance` **PENDING RE-RUN** |
+| Transactional Kafka-to-Kafka stage | Exactly-once held across a kill; proof that a transaction was open at the kill is **pending re-run** | **PASS**, open-transaction proof PENDING RE-RUN |
 | Poison message to DLQ | Exactly the 8 poison messages dead-lettered, partition kept moving; `halt-partition` verified as the order-preserving alternative | **PASS** |
+
+Two rows are PENDING RE-RUN because the cluster was taken down during the re-run slot after
+`kill` and `static_restart` completed. The code for both is committed and the fast suite is
+green; they need about 3 minutes of cluster time. Until they are re-run, the `rebalance` claim
+rests on `rebalance-141321` (worker-c delivered 323 records, so partitions did move) with the
+weak revoke-count evidence described above, and the `txn_crash` claim rests on the observed
+outcome (2,000 in, 2,000 out, 0 duplicates) without proof that a transaction was open at the
+moment of the kill.
 
 **Recommendation: GO for the ordering and retry design in ADR-001 6.4, with the defaults below.**
 Nothing measured here contradicts invariants 1-5 or 7. No ADR change is required; three defaults
