@@ -4,6 +4,11 @@ Scenario leader-kill (x N trials): load runs against a fresh topic; at t=KILL_AT
 a rotating partition is hard-killed (docker kill); it is restarted DOWN_S later. Checks per trial:
   * zero acknowledged-message loss (every AA'd control id is in the topic; verify_loss.py)
   * ACK/AR counts and worst ACK latency around the failover (availability cost, reported)
+  NOTE: with RF=3 and min.insync.replicas=2 one dead broker does NOT make Kafka unavailable once
+  the new leader is elected, so "AA while unavailable" is not defined for this scenario (the old
+  aa_while_unavailable field in runs/leader-kill.jsonl was a misdefinition: it flagged legitimate
+  ACKs that landed after election but before the victim restarted). Use analyze_leader_kill.py
+  (ack_gap_s) for the failover cost; the no-ACK-while-unavailable test is the outage scenario.
 Scenario outage (x M trials): two of three brokers are killed so ISR < min.insync.replicas=2 and
 acks=all cannot succeed. Checks: no message SENT after the kill completed is ACKed (AA) until the
 brokers are restarted, and loss is still zero. Host<->container clock skew is measured and
@@ -90,6 +95,10 @@ def trial(kind: str, i: int, rate: int, conns: int, seconds: int, kill_at: float
     ev = run["events"]
     # AA'd messages sent after the kill finished and acked before the restart began
     bad = [e[0] for e in ev if e[3] == "AA" and e[1] - skew > t_kill + GRACE_S and e[2] - skew < t_up0]
+    # strict window metric: any AA whose ACK landed inside the outage window, whatever its send time
+    in_window = [e for e in ev if e[3] == "AA" and t_kill + GRACE_S < e[2] - skew < t_up0]
+    post_kill_aa = sorted(e[2] - skew - t_kill for e in ev if e[3] == "AA" and e[2] - skew > t_kill)
+    t_first = min(e[1] for e in ev) - skew
     lat_max = max((e[2] - e[1] for e in ev if e[3] == "AA"), default=0) * 1000
     v = sh(sys.executable, str(HERE / "verify_loss.py"), "--bootstrap", HOST_BOOT, "--topic", topic,
            str(HERE / "runs" / f"{run_id}.json"), check=False)
@@ -97,7 +106,10 @@ def trial(kind: str, i: int, rate: int, conns: int, seconds: int, kill_at: float
     return {"kind": kind, "trial": i, "run_id": run_id, "victims": victims, "sent": summ["sent"],
             "acked": summ["acked"], "nack": summ["nack"], "unanswered": summ["unanswered"],
             "max_ack_latency_ms": round(lat_max, 1), "kill_wall_s": round(t_kill - t_kill0, 2),
-            "aa_while_unavailable": len(bad), "clock_skew_s": round(skew, 4), "verify": verify}
+            "aa_while_unavailable": len(bad), "aa_acked_in_outage_window": len(in_window),
+            "aa_in_window_sent_before_kill": sum(1 for e in in_window if e[1] - skew <= t_kill),
+            "first_aa_after_kill_s": round(post_kill_aa[0], 2) if post_kill_aa else None,
+            "kill_rel_load_start_s": round(t_kill - t_first, 2), "down_s": round(t_up0 - t_kill, 2), "clock_skew_s": round(skew, 4), "verify": verify}
 
 
 def main() -> None:
