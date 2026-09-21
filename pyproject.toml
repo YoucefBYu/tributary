@@ -1,0 +1,71 @@
+[project]
+name = "tributary"
+version = "0.0.0"
+description = "Tributary workspace root (not published)."
+license = "Apache-2.0"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.uv.sources]
+tributary-sdk = { workspace = true }
+tributary-runtime = { workspace = true }
+tributary-receivers = { workspace = true }
+tributary-loaders = { workspace = true }
+
+[dependency-groups]
+dev = [
+    "tributary-sdk",
+    "tributary-runtime",
+    "tributary-receivers",
+    "tributary-loaders",
+    "pytest>=8.3",
+    "hypothesis>=6.112",   # MPL-2.0, human-approved 2026-09-22, unmodified
+    "jsonschema>=4.23",    # conformance suite (tests/conformance)
+    "ruff>=0.8",
+    "mypy>=1.13",
+    "pre-commit>=4.0",
+    "pip-licenses>=5.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["packages", "tests"]
+addopts = "-ra --import-mode=importlib"
+pythonpath = ["."]
+markers = [
+    "integration: needs Kafka, ClickHouse or PostgreSQL (testcontainers or the compose stack)",
+    "chaos: injects broker, consumer or dependency faults",
+    "bench: measurement run, not a pass/fail test",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+extend-exclude = ["spikes", "samples", ".claude", "docs"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "C4", "SIM", "RUF"]
+ignore = ["E501"]  # the formatter owns line length
+
+[tool.ruff.lint.per-file-ignores]
+"**/tests/**" = ["S101"]
+"tests/**" = ["S101"]
+"benchmarks/**" = ["S311", "RUF046"]  # seeded synthetic-data RNG, not cryptographic
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+namespace_packages = true
+explicit_package_bases = true
+mypy_path = [
+    "packages/tributary-sdk/src",
+    "packages/tributary-runtime/src",
+    "packages/tributary-receivers/src",
+    "packages/tributary-loaders/src",
+]
+exclude = ['/tests/', '^spikes/']
