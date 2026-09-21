@@ -29,3 +29,15 @@ secrets/
 # Benchmark and spike outputs
 benchmarks/results/
 spikes/**/out/
+.claude/agent-memory/architect/contracts-v0-open-confirmations.md
+.claude/agent-memory/architect/MEMORY.md
+.claude/agent-memory/architect/no-shell-for-agents.md
+.claude/agent-memory/architect/phase-0-evidence-lessons.md
+.claude/agent-memory/architect/review-findings-must-be-written-down.md
+.claude/agent-memory/platform-engineer/fault-injection-harness-lessons.md
+.claude/agent-memory/platform-engineer/kafka-topicpartition-repr-windows.md
+.claude/agent-memory/platform-engineer/MEMORY.md
+.claude/agent-memory/platform-engineer/spike-cluster-kafka-facts.md
+.claude/agent-memory/qa-engineer/env-gotchas.md
+.claude/agent-memory/qa-engineer/MEMORY.md
+spikes/S5-ordering-retry/src/s5/model.py
