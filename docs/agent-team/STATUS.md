@@ -5,30 +5,20 @@ wave's exit criteria here.
 
 ## Current
 
-- **Phase / wave:** Phase 0 complete. **P0-3 synthesis filed 2026-09-20; awaiting human sign-off at the gate.**
+- **Phase / wave:** **Phase 0 complete and SIGNED.** The human signed the gate on 2026-09-22 as
+  **GO WITH CONDITIONS**. **This does not start Phase 1 — Phase 1 needs the human's separate go-ahead.**
 - **Branch:** `wave/0`
-- **Blocking the gate — four items, three of which need the human.** Full list and evidence in the gate
-  report section 7. (a) the damaged `.gitignore`, below; (b) **the spike Kafka cluster and MLLP listener
-  are unauthenticated on all interfaces** (`security-reviewer` High 2: `PLAINTEXT` on `0.0.0.0`, no
-  authorizer, `kafka-ui` with dynamic config and no login) — any LAN host has read/write/admin while it
-  runs, and could forge S3 replies; the fix is localhost binding by `platform-engineer` and
-  `connector-engineer`, and the lead is asking whether to stop the cluster now; (c) **human confirmation
-  of three MPL-2.0 dependencies** — `orjson` (shipping runtime; its metadata declares
-  `MPL-2.0 AND (Apache-2.0 OR MIT)`, which corrects an earlier assessment of mine), `hypothesis`
-  (test-only) and `pathspec` (build-time), each architect-approved as unmodified but escalated because
-  CLAUDE.md sends licensing to a human; (d) human sign-off on the nine decisions.
-- **The `.gitignore` item in full:** the root `.gitignore` was damaged by
-  commit `3fb0049` (31 lines cut to 2) and no longer ignores `samples/mirth/*`, `.env`, `.env.*`,
-  `secrets/`, `benchmarks/results/` or `.claude/settings.local.json`. Nothing has leaked and no secret
-  is or ever was tracked, but the control is gone on paths CLAUDE.md calls sensitive — and decision #9
-  invites real anonymized Mirth exports into `samples/mirth/`. Restoring it was permission-denied for
-  agents: `git checkout 2c25448 -- .gitignore && rm Dockerfile` (the root `Dockerfile` is of unknown
-  origin). `security-reviewer` verified the current behaviour: `.env`, `secrets/x`,
-  `samples/mirth/foo.xml` and `benchmarks/results/*` are not ignored at HEAD, and the content hook does
-  not run on commits.
+- **All four blocking gate conditions are met:** (a) the root `.gitignore` restored and the stray root
+  `Dockerfile` removed — human commit `325cef1`, 31 lines back, lead-verified that `samples/mirth/*`,
+  `.env`, `secrets/` and `benchmarks/results/` are ignored again; (b) the spike data plane bound to
+  localhost — `e553fd7` (MLLP default `127.0.0.1`) and `71364c7` (all four published ports on
+  `127.0.0.1`, `DYNAMIC_CONFIG_ENABLED` removed), after the lead stopped the cluster on 2026-09-21;
+  (c) the three MPL-2.0 dependencies approved by the human on 2026-09-22; (d) the sign-off itself.
+  **What remains are the Phase 1 requirements** in the gate report section 7.1 and three non-blocking
+  open items: audit retention, the Mirth corpus, and the keyed-hash mechanism.
 - **Last gate report:** [`docs/agent-team/gates/phase-0-spikes.md`](gates/phase-0-spikes.md) — the
-  exit-criteria check, the invariant 1-10 audit and the reviewer findings. Its recommendation is
-  **GO WITH CONDITIONS**; the conditions are listed there.
+  exit-criteria check (**5 of 5 PASS**), the invariant 1-10 audit and both reviewers' findings
+  (no Critical; both Highs now fixed). **GO WITH CONDITIONS, signed 2026-09-22.**
   The technical decision memo behind it is `docs/spikes/PHASE-0-DECISION.md` — **GO WITH CHANGES**, no
   invariant changes. Two planning values were disproved and corrected: the 12-partition default (now 3)
   and the 200-500 msg/s/core estimate (measured 2,446 with `python-hl7`). Two thresholds were not met
@@ -44,9 +34,11 @@ wave's exit criteria here.
   disputed.** Finding 6 (the `_hmac` mechanism) is answered as UNRESOLVED-by-design and escalated to
   ADR-004 plus a human; finding 12 (audit retention) is in the open questions below. The other seven
   are fixed in place — per-finding record in `contracts/CHANGELOG.md`, status table in
-  `docs/security/contracts-v0-review.md`. **Conformance: 74 passed at HEAD** (envelope 7 valid / 18
-  invalid, events 8 / 16, topic names 10 / 12, 3 guard tests), run by the lead at the Phase 0 gate.
-  No schema bugs. The architect has no shell and did not run it.
+  `docs/security/contracts-v0-review.md`. **Conformance: 76 passed at `83a1fd2`** (was 74, then 70 at
+  `ae4d3bd`, 62 on the first run). The jump to 76 is `qa-engineer`'s expected-failure assertions: every
+  invalid example must now fail at the `expected_json_path` and `expected_validator` recorded in its
+  manifest, so an example failing for the wrong reason goes red — `code-reviewer` Medium 2 from the gate.
+  No schema bugs at any point. Run by the lead and `qa-engineer`; the architect has no shell.
 
 ### Spike reports filed
 
@@ -67,7 +59,7 @@ All six filed and synthesised. Full threshold table with evidence ratings quoted
 
 | Checkpoint | Decision | Date | Notes |
 |---|---|---|---|
-| Phase 0 go/no-go | **NOT signed** | | The human decided the **nine memo items** on 2026-09-21 ("proceed with the recommendations of the decisions"): 7 adopted or approved, audit retention still open, Mirth corpus not decided — decisions log above, gate report section 8. **The gate sign-off itself is outstanding**, and three conditions remain: restore the root `.gitignore`, confirm the MPL dependencies (`orjson`, `hypothesis`, `pathspec`), and bind the spike infra to localhost. Gate report: `gates/phase-0-spikes.md` |
+| Phase 0 go/no-go | **GO WITH CONDITIONS (signed by the human)** | 2026-09-22 | Instruction: *"Approve orjson, hypothesis and pathspec; record Phase 0 GO WITH CONDITIONS signed"*. All four blocking conditions were met first. **The conditions still standing are the non-blocking open items only:** audit retention (open, blocks the `_tb.<env>.audit` contract), the Mirth corpus (not decided), the keyed-hash mechanism (unresolved until before the archiver is built), and the Phase 1 requirements table in `gates/phase-0-spikes.md` 7.1. **Signing does NOT start Phase 1 — Phase 1 needs the human's separate go-ahead.** |
 | Phase 1 wave 1 exit | pending | | |
 | Phase 1 wave 2 exit | pending | | |
 | Phase 1 wave 3 exit | pending | | |
@@ -105,25 +97,20 @@ All six filed and synthesised. Full threshold table with evidence ratings quoted
 | 2026-09-21 | **Human:** Linux re-run of S1 and S2 **APPROVED** as the first Phase 1 CI task, before the receiver is built | `PHASE-0-DECISION.md` section 7 item 7 |
 | 2026-09-21 | **Human:** revised Phase 1 scope (`PHASE-0-DECISION.md` section 8) **APPROVED** | `PHASE-0-DECISION.md` section 8 |
 | 2026-09-21 | Lead stopped the running spike cluster (`docker compose down`) because of the all-interfaces exposure (`security-reviewer` High 2). Nothing lost; storage was ephemeral | gate report 1.1 |
+| 2026-09-22 | **Human, "Approve orjson, hypothesis and pathspec":** the three MPL-2.0 dependencies are **APPROVED** as unmodified — `orjson` (shipping runtime, `MPL-2.0 AND (Apache-2.0 OR MIT)`), `hypothesis` (test-only), `pathspec` (build-time). The approval covers these three packages unmodified; **any new or modified MPL dependency needs fresh approval**, and the inventory is known to be incomplete because `[build-system] requires` resolves outside the lockfiles | gate report 5.1, ADR-001 2.3 |
+| 2026-09-22 | **Human: Phase 0 gate signed as GO WITH CONDITIONS.** Does not start Phase 1 | gate report, sign-offs table |
+| 2026-09-22 | Both gate High findings closed: root `.gitignore` restored (human `325cef1`) and the spike data plane bound to localhost (`e553fd7`, `71364c7`). Conformance suite now asserts *why* each invalid example fails (`83a1fd2`, 76 passed), and the AA-withheld-until-publish-resolves unit test exists (`a5df2c7`) | gate report 1.1 |
 
 ## Open questions for the human
 
-**Seven of the nine Phase 0 gate items were decided on 2026-09-21** — see the decisions log above. What
-remains open is listed here. Items struck through were decided and are kept for one revision so the
-change is visible.
+**Seven of the nine Phase 0 gate items were decided on 2026-09-21, and the MPL approval plus the gate
+sign-off followed on 2026-09-22** — see the decisions log above. What remains open is listed here. Items
+struck through were decided and are kept for one revision so the change is visible.
 
-**Open and blocking the Phase 0 gate:**
+**Nothing blocks the Phase 0 gate any more — it is signed.** The next human decision is whether to start
+Phase 1, which the sign-off deliberately does not do.
 
-- **Restore the root `.gitignore` and remove the stray `Dockerfile`** — the first bullet of "Current"
-  above. Human action; permission-denied for agents.
-- **Confirm the MPL-2.0 dependencies**: `orjson` (shipping runtime; metadata declares
-  `MPL-2.0 AND (Apache-2.0 OR MIT)`), `hypothesis` (test-only), `pathspec` (build-time). Each is
-  architect-approved as unmodified and escalated because CLAUDE.md sends licensing and non-permissive
-  dependencies to a human. If the posture is rejected, `orjson` is the costly one — it is on the hot
-  path.
-- **Sign the Phase 0 gate** (exit criterion 5), once the above and the spike-infra binding are done.
-
-**Open, not blocking the gate:**
+**Open:**
 
 - **Audit retention — still open, and it blocks the `_tb.<env>.audit` contract.** What retention duty
   applies to the control-plane and access audit trail? HIPAA §164.316(b)(2)(i) requires six-year
@@ -134,9 +121,9 @@ change is visible.
   puts `_tb.<env>.events` (3 d) and `raw` (7 d, the replay source) in scope.
 - **Mirth corpus — not decided.** Supply anonymized exports in `samples/mirth/`, or accept that the
   migration estimate stays a guess. S6 is INCONCLUSIVE without them, and migration cost is the
-  highest-likelihood, highest-impact risk in ADR-001 section 13. **Note the ordering risk:** that
-  directory is currently not git-ignored (first bullet of "Current"), so restore the `.gitignore` before
-  any export lands on disk.
+  highest-likelihood, highest-impact risk in ADR-001 section 13. The ordering risk that used to attach to
+  this — `samples/mirth/` not being git-ignored — is **closed**: the `.gitignore` was restored in
+  `325cef1`, so exports can safely land on disk now.
 - Project name and trademark check (codename Tributary).
 - License and governance model (ADR-006).
 - Whether to engage the Open Integration Engine community, and how.

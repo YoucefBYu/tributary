@@ -46,16 +46,23 @@ One parameterised test per contract walks the manifest: every `valid` file must 
 `invalid` file must fail. `qa-engineer` owns the suite in `tests/conformance/`. The topics contract
 uses inline string lists instead of files, since a topic name is one string.
 
-**Status: re-run pending, expected 74 tests.** History, newest first:
+**Status: 76 passed at `83a1fd2`.** History, newest first:
 
 | Run | Result | Covers |
 |---|---|---|
-| after security round 2 | **not yet run** — expected **74**: envelope 7 valid / 18 invalid, events 8 / 16, topic names 10 / 12, plus 3 guard tests | Four invalid examples added for findings 7, 9 and 13 |
+| `83a1fd2` (2026-09-22) | **76 / 0 / 0** | Expected-failure assertions: every `invalid` example must now fail at the `expected_json_path` and `expected_validator` recorded in its manifest, so an example that fails for the *wrong* reason goes red. Closes `code-reviewer` Medium 2 from the Phase 0 gate |
+| after security round 2 | 74 / 0 / 0 | Four invalid examples added for findings 7, 9 and 13 |
 | commit `ae4d3bd` | 70 / 0 / 0 | The five HIGH security fixes of round 1 |
 | 2026-09-20, first run | 62 / 0 / 0, no schema bugs | The contracts as first published; **superseded** |
 
+**Why the expectations matter:** until `83a1fd2` the suite asserted only that an invalid example fails,
+not *why*. A guard could have stopped guarding — the `attrs-clear-text-mrn` example, for instance, would
+still fail if the identifier deny-list were removed, because the key would trip a different rule. The
+manifests now pin the reason, and the expected values were measured against a real validator run rather
+than read off the schema.
+
 No schema changed at P0-3 (the partition-default change is in `topic-defaults.json`, which the suite
-does not validate), so the expected count is unchanged by it.
+does not validate).
 
 Two fixture changes the suite must absorb: the envelope projection replaces `key` with `key_present`
 plus `key_size`, and a `ValidationError` from either schema must not be logged or printed verbatim.

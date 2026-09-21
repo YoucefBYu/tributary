@@ -96,11 +96,17 @@ Sources to re-check: openintegrationengine.org and the OIE GitHub repository (li
   original wording listed MPL alongside the permissive licences, which is looser than CLAUDE.md's
   invariant 10 and contradicted the sentence immediately below. CLAUDE.md governs.
 - Clean-room implementation: do not copy Mirth/OIE source. MPL 2.0 is file-level copyleft and would complicate an Apache-2.0 core — which is exactly why it is approval-gated rather than allowed.
-- **MPL items currently in the tree**, each architect-approved as unmodified and **pending human
-  confirmation** (`docs/agent-team/gates/phase-0-spikes.md` section 5, invariant 10): `orjson` (metadata
-  declares `MPL-2.0 AND (Apache-2.0 OR MIT)`; a **shipping runtime** dependency), `hypothesis`
-  (MPL-2.0, test-only, named in CLAUDE.md's stack table), `pathspec` (MPL-2.0, build-time via
-  hatchling).
+- **MPL items in the tree, HUMAN-APPROVED 2026-09-22** as unmodified dependencies
+  (`docs/agent-team/gates/phase-0-spikes.md` section 5.1): `orjson` (metadata declares
+  `MPL-2.0 AND (Apache-2.0 OR MIT)`; a **shipping runtime** dependency), `hypothesis` (MPL-2.0,
+  test-only, named in CLAUDE.md's stack table), `pathspec` (MPL-2.0, build-time via hatchling).
+  **The approval covers these three packages unmodified; any new or modified MPL dependency needs fresh
+  approval.**
+- **The MPL inventory is known to be incomplete.** `pathspec` is in none of the spike lockfiles, because
+  `[build-system] requires` resolves separately from the runtime and dev groups — so a licence inventory
+  taken from lockfiles alone misses every build-backend dependency, and `pathspec` may not be the only
+  one. The Phase 1 CI licence/SBOM check must cover build-system requirements as well as the locked
+  runtime and dev groups.
 - Python 3.12+; type hints required in the SDK.
 
 ---
