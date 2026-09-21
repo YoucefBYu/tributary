@@ -57,7 +57,15 @@ def time_each(name: str, fn: Callable[[bytes], object], corpus: Sequence[bytes],
         lat.append((pc() - s) / 1000)
     total = (pc() - t0) / 1e9
     lat.sort()
-    return Result(name, len(corpus), total, len(corpus) / total, percentile(lat, 0.5), percentile(lat, 0.99), statistics.fmean(lat))
+    return Result(
+        name,
+        len(corpus),
+        total,
+        len(corpus) / total,
+        percentile(lat, 0.5),
+        percentile(lat, 0.99),
+        statistics.fmean(lat),
+    )
 
 
 def write_results(path: Path, results: Sequence[Result], meta: dict[str, object] | None = None) -> None:

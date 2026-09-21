@@ -43,9 +43,7 @@ def _ts(dt: datetime) -> str:
 
 
 def _msh(mtype: str, ctrl: str, now: datetime) -> str:
-    return (
-        f"MSH|^~\\&|{SENDING_APP}|SYNTH-FAC|TRIBUTARY-DST|DST-FAC|{_ts(now)}||{mtype}|{ctrl}|P|2.5.1"
-    )
+    return f"MSH|^~\\&|{SENDING_APP}|SYNTH-FAC|TRIBUTARY-DST|DST-FAC|{_ts(now)}||{mtype}|{ctrl}|P|2.5.1"
 
 
 def _patient(rng: random.Random, n: int) -> dict[str, str]:
@@ -95,7 +93,9 @@ def generate_message(rng: random.Random, index: int, mtype: str) -> str:
             for i in range(1, rng.randrange(1, 4)):
                 code, text = rng.choice(_DX)
                 segs.append(f"DG1|{i}||{code}^{text}^I10||{_ts(now)}|F")
-            segs.append(f"NK1|1|{rng.choice(_FAMILY)}^{rng.choice(_GIVEN)}|SPO|{p['street']}^^{p['city']}^{p['state']}^{p['zip']}|555-0199")
+            segs.append(
+                f"NK1|1|{rng.choice(_FAMILY)}^{rng.choice(_GIVEN)}|SPO|{p['street']}^^{p['city']}^{p['state']}^{p['zip']}|555-0199"
+            )
     elif mtype == "ORU^R01":
         segs.append(_pid(p))
         segs.append(_pv1(rng, visit, now, False))

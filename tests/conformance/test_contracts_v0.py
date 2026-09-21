@@ -78,10 +78,7 @@ def _file_cases() -> list[Any]:
         base = manifest_path.parent
         schema = (base / m["schema"]).resolve()
         cases += [
-            pytest.param(
-                schema, base / e["file"], True, None, id=f"{name}:valid:{e['file']}"
-            )
-            for e in m["valid"]
+            pytest.param(schema, base / e["file"], True, None, id=f"{name}:valid:{e['file']}") for e in m["valid"]
         ]
         cases += [
             pytest.param(
@@ -96,12 +93,8 @@ def _file_cases() -> list[Any]:
     return cases
 
 
-@pytest.mark.parametrize(
-    ("schema", "example", "should_pass", "expected"), _file_cases()
-)
-def test_example(
-    schema: Path, example: Path, should_pass: bool, expected: Failure | None
-) -> None:
+@pytest.mark.parametrize(("schema", "example", "should_pass", "expected"), _file_cases())
+def test_example(schema: Path, example: Path, should_pass: bool, expected: Failure | None) -> None:
     validator = _validator(schema)
     if should_pass:
         errors = list(validator.iter_errors(_load(example)))
@@ -117,9 +110,7 @@ def test_example(
 def _topic_cases() -> list[Any]:
     m = _load(CONTRACTS / "topics/v0/examples/topic-names.json")
     schema = (CONTRACTS / "topics/v0/examples" / m["schema"]).resolve()
-    return [
-        pytest.param(schema, n, True, None, id=f"topic:valid:{n}") for n in m["valid"]
-    ] + [
+    return [pytest.param(schema, n, True, None, id=f"topic:valid:{n}") for n in m["valid"]] + [
         pytest.param(
             schema,
             e["name"],
@@ -132,9 +123,7 @@ def _topic_cases() -> list[Any]:
 
 
 @pytest.mark.parametrize(("schema", "name", "should_pass", "expected"), _topic_cases())
-def test_topic_name(
-    schema: Path, name: str, should_pass: bool, expected: Failure | None
-) -> None:
+def test_topic_name(schema: Path, name: str, should_pass: bool, expected: Failure | None) -> None:
     validator = _validator(schema)
     if should_pass:
         assert validator.is_valid(name)
