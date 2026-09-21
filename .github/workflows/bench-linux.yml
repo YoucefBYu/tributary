@@ -1,0 +1,50 @@
+# Linux re-run of the Phase 0 S1/S2 benchmarks (human decision #7, first Phase 1 CI task).
+# STUB: records the environment and dependency versions so the numbers are like-for-like
+# (Phase 0 requirement 9: S1 ran via `uv run --with`, so its versions were never recorded).
+# The measurement steps are wired by qa-engineer once benchmarks/ has a lock-file-backed entry
+# point. Manual trigger only: it never runs on push, and only runs once a human pushes the branch.
+name: bench-linux
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UV_FROZEN: "1"
+
+jobs:
+  s1-s2:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+        with:
+          python-version: "3.12"
+      - run: uv sync
+      - name: record environment
+        run: |
+          mkdir -p benchmarks/results
+          {
+            echo "date_utc: $(date -u +%FT%TZ)"
+            echo "git_sha: $GITHUB_SHA"
+            echo "runner_image: ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+            uname -a
+            lscpu | grep -E 'Model name|^CPU\(s\)|Thread|MHz' || true
+            free -m
+            python3 --version
+            uv --version
+            docker --version
+          } | tee benchmarks/results/environment.txt
+          uv export --frozen --all-groups --no-emit-workspace --no-hashes > benchmarks/results/locked-versions.txt
+      - name: run S1 and S2
+        run: |
+          echo "not wired yet: qa-engineer to add the S1 (parser) and S2 (MLLP to Kafka) entry points" >&2
+          echo "the environment and locked versions above are already recorded." >&2
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        if: always()
+        with:
+          name: bench-linux-${{ github.run_id }}
+          path: benchmarks/results/

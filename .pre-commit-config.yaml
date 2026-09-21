@@ -1,0 +1,26 @@
+# Local hooks only: no remote hook repos to fetch, so versions come from uv.lock and the
+# hooks behave the same in CI. Install with: uv run pre-commit install
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff check
+        entry: uv run ruff check
+        language: system
+        types_or: [python, pyi]
+      - id: ruff-format
+        name: ruff format
+        entry: uv run ruff format --check
+        language: system
+        types_or: [python, pyi]
+      - id: gitignore-guard
+        name: root .gitignore still protects samples/mirth, .env, secrets/
+        entry: uv run python .github/scripts/gitignore_guard.py
+        language: system
+        pass_filenames: false
+        files: ^\.gitignore$
+      - id: secret-scan
+        name: secret scan (values never printed)
+        entry: uv run python .github/scripts/secret_scan.py
+        language: system
+        pass_filenames: false

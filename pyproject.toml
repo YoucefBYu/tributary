@@ -30,11 +30,10 @@ dev = [
     "ruff>=0.8",
     "mypy>=1.13",
     "pre-commit>=4.0",
-    "pip-licenses>=5.0",
 ]
 
 [tool.pytest.ini_options]
-testpaths = ["packages", "tests"]
+testpaths = ["packages", "tests", ".github/scripts"]
 addopts = "-ra --import-mode=importlib"
 pythonpath = ["."]
 markers = [
@@ -50,11 +49,16 @@ extend-exclude = ["spikes", "samples", ".claude", "docs"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "S", "C4", "SIM", "RUF"]
-ignore = ["E501"]  # the formatter owns line length
+ignore = [
+    "E501",  # the formatter owns line length
+    "SIM108",  # ternary is not always clearer
+]
 
 [tool.ruff.lint.per-file-ignores]
 "**/tests/**" = ["S101"]
 "tests/**" = ["S101"]
+"**/test_*.py" = ["S101"]
+".github/scripts/**" = ["S404", "S603", "S607", "E402"]  # CI tooling shells out to git and uv
 "benchmarks/**" = ["S311", "RUF046"]  # seeded synthetic-data RNG, not cryptographic
 
 [tool.mypy]

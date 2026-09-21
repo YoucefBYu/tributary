@@ -1,0 +1,86 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main, "wave/**"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_FROZEN: "1"   # fail if uv.lock is out of date, never re-resolve in CI
+
+jobs:
+  python:
+    name: lint, types, unit tests, conformance
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync
+      - run: uv run ruff check . && uv run ruff format --check .
+      - run: uv run mypy packages
+      - run: uv run pytest -m "not integration and not chaos and not bench"
+      # Explicit so a contracts/** change can never skip it, even if testpaths change.
+      - name: contract conformance
+        run: uv run pytest tests/conformance -q
+
+  integration:
+    name: integration (testcontainers)
+    runs-on: ubuntu-24.04
+    needs: python
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync
+      # Exit code 5 means "no tests collected": allowed until the first integration test lands.
+      - run: uv run pytest -m integration || [ $? -eq 5 ]
+
+  supply-chain:
+    name: licence and SBOM, secret scan, gitignore guard
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+        with:
+          python-version: "3.12"
+      - run: uv sync
+      - name: gitignore still protects sensitive paths
+        run: uv run python .github/scripts/gitignore_guard.py
+      - name: secret scan
+        run: uv run python .github/scripts/secret_scan.py
+      - name: licence check (runtime, dev and build-system requires) and SBOM
+        run: uv run python .github/scripts/licence_check.py --sbom sbom.cdx.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        if: always()
+        with:
+          name: sbom
+          path: sbom.cdx.json
+
+  ui:
+    name: ui lint, typecheck, test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: skip until ui/ exists
+        id: has_ui
+        run: echo "present=$([ -f ui/package.json ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+      - uses: pnpm/action-setup@d9184bf108216479bc5a137cc391f4d7b14c870b  # v6.1.0
+        if: steps.has_ui.outputs.present == 'true'
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        if: steps.has_ui.outputs.present == 'true'
+        with:
+          node-version: "22"
+      - if: steps.has_ui.outputs.present == 'true'
+        run: pnpm --dir ui install --frozen-lockfile && pnpm --dir ui lint && pnpm --dir ui typecheck && pnpm --dir ui test --run
