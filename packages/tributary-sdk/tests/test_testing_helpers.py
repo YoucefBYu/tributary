@@ -7,6 +7,7 @@ imported (invariant 7, and the Phase 0 ground rule that spike code stays out of 
 
 from __future__ import annotations
 
+import subprocess
 import sys
 from datetime import UTC, datetime
 
@@ -138,10 +139,30 @@ def test_fixture_loader_reads_bytes_and_refuses_to_escape_its_directory(tmp_path
 
 
 def test_a_step_runs_with_no_kafka_client_and_no_spike_code_imported() -> None:
-    """The W1-3 verify line, as an assertion: no confluent_kafka, no tbcommon, nothing from spikes/."""
-    run_pipeline([annotate], make_message())
-    forbidden = [name for name in sys.modules if name.split(".")[0] in {"confluent_kafka", "tbcommon", "spikes"}]
-    assert forbidden == []
+    """The W1-3 verify line, as an assertion: no confluent_kafka, no tbcommon, nothing from spikes/.
+
+    In a subprocess, because `sys.modules` is process-global: when the whole repo suite runs, the
+    runtime's own tests have already imported `confluent_kafka`, and an in-process check would report
+    on them rather than on the SDK. A fresh interpreter is the only honest way to ask this.
+    """
+    program = (
+        "import sys\n"
+        "from tributary.sdk import step\n"
+        "from tributary.sdk.testing import make_message, run_step\n"
+        "@step\n"
+        "def passthrough(msg):\n"
+        "    return None\n"
+        "run_step(passthrough, make_message())\n"
+        "forbidden = [n for n in sys.modules if n.split('.')[0] in {'confluent_kafka', 'tbcommon', 'spikes'}]\n"
+        "assert not forbidden, forbidden\n"
+    )
+    result = subprocess.run(  # noqa: S603 - same interpreter, literal program, no shell
+        [sys.executable, "-c", program],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_the_sdk_declares_no_third_party_dependencies() -> None:
