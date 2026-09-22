@@ -356,3 +356,90 @@ def test_garbage_forwarded_when_parse_error_not_declared() -> None:
     pub = FakePublisher()
     asyncio.run(_run(settings(nack_on=frozenset()), pub, client))
     assert len(pub.calls) == 1
+
+
+class StalledWriter:
+    """A `StreamWriter`-shaped fake whose `drain()` never resolves until `gate` is set: models a
+    peer that stopped reading, without depending on filling a real OS socket buffer."""
+
+    def __init__(self) -> None:
+        self.written: list[bytes] = []
+        self.gate = asyncio.Event()
+
+    def write(self, data: bytes) -> None:
+        self.written.append(data)
+
+    async def drain(self) -> None:
+        await self.gate.wait()
+
+    def get_extra_info(self, name: str) -> None:
+        return None
+
+    def close(self) -> None:
+        pass
+
+
+async def _resolved(value: bool) -> bool:
+    return value
+
+
+def test_budget_is_not_released_until_the_ack_write_completes() -> None:
+    """Regression for the code-review High: releasing the byte budget as soon as the publish
+    outcome resolves — rather than once the ACK has actually been written to the peer — lets a
+    stalled connection's reader keep admitting and publishing new frames while a backlog of
+    already-decided ACKs queues up behind one write stuck in `drain()`: an unbounded-item-count
+    bypass of a byte-count budget."""
+
+    async def go() -> None:
+        cfg = settings(queue_max_bytes=100, max_message_bytes=100, write_timeout_s=1.0)
+        srv = MllpServer(cfg, FakePublisher())
+        await srv.budget.reserve(50, timeout=1.0)  # simulates what handle() does before queueing
+        assert srv.budget.used_bytes == 50
+
+        writer = StalledWriter()
+        q: asyncio.Queue = asyncio.Queue()
+        writer_task = asyncio.ensure_future(srv._ack_writer(q, writer))
+        await q.put(("C1", asyncio.ensure_future(_resolved(True)), 50))
+
+        await asyncio.sleep(0.05)  # the writer has written and is now blocked in drain()
+        assert writer.written  # the AA bytes were handed to write() already
+        assert srv.budget.used_bytes == 50  # but the reservation is NOT released yet
+
+        writer.gate.set()  # let drain() finish
+        await asyncio.sleep(0.05)
+        assert srv.budget.used_bytes == 0  # released only now
+
+        await q.put(None)
+        await asyncio.wait_for(writer_task, 2)
+
+    asyncio.run(go())
+
+
+def test_conn_pipeline_bounds_the_ack_queue_independently_of_the_byte_budget() -> None:
+    """`conn_pipeline` (code-review Medium: defined, documented, never read) backpressures the
+    reader on its own, on top of whatever `ByteBudget` does — defense in depth against a future
+    change to the release-timing fix above."""
+
+    async def go() -> None:
+        cfg = settings(conn_pipeline=1, queue_max_bytes=10_000_000, write_timeout_s=5.0)
+        srv = MllpServer(cfg, FakePublisher())
+        writer = StalledWriter()
+        q: asyncio.Queue = asyncio.Queue(cfg.conn_pipeline)
+        writer_task = asyncio.ensure_future(srv._ack_writer(q, writer))
+
+        # C1 is dequeued by the writer almost immediately and then blocks in drain(), freeing a
+        # queue slot even though C1 itself is not done; C2 then fills that one slot (conn_pipeline
+        # = 1), so only the THIRD item has nowhere to go and blocks on put().
+        await q.put(("C1", asyncio.ensure_future(_resolved(True)), None))
+        await asyncio.sleep(0.05)
+        await q.put(("C2", asyncio.ensure_future(_resolved(True)), None))
+        put_third = asyncio.ensure_future(q.put(("C3", asyncio.ensure_future(_resolved(True)), None)))
+        await asyncio.sleep(0.05)
+        assert not put_third.done()  # the queue is full: a third put blocks
+
+        writer.gate.set()
+        await asyncio.wait_for(put_third, 2)
+        await q.put(None)
+        await asyncio.wait_for(writer_task, 2)
+
+    asyncio.run(go())

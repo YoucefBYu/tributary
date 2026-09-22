@@ -10,6 +10,16 @@ in arrival order, matching what a pipelining MLLP sender expects. The receiver-w
 (`backpressure.py`) is the real backpressure: a full budget delays reading the next frame on every
 connection until room frees up, and a wait that outlives `ack.timeoutMs` becomes a `queue-full` NACK
 rather than an unbounded buffer (gate requirement 5).
+
+A reservation is held for a frame's whole lifetime in this process, including the time spent
+writing its ACK to the peer: `_ack_writer` releases it only after that write attempt finishes
+(success or a detected-dead connection), never as soon as the publish outcome is known. Releasing
+early would let a stalled peer's connection keep admitting and publishing new frames — each one
+freeing its own budget the instant Kafka acks it — while a backlog of already-decided ACKs queues
+up behind the one write that is blocked in `w.drain()`, an unbounded-item-count bypass of a
+byte-count budget (code review, W1-5 second round). `conn_pipeline` bounds `q` itself for the same
+reason, defense in depth: even if a future change reordered the release again, a full `q` still
+backpressures the reader independently of `ByteBudget`.
 """
 
 from __future__ import annotations
@@ -92,15 +102,19 @@ class MllpServer:
                     out = build_ack("AR", cid, "unavailable")
                     self.metrics.publish_failures += 1
                     self.metrics.nacked_unavailable += 1
-            if reserved is not None:
-                await self.budget.release(reserved)
-            if dead:
-                continue  # keep draining so the reader never blocks on a dead peer
             try:
-                w.write(out)
-                await asyncio.wait_for(w.drain(), self.cfg.write_timeout_s)
+                if not dead:  # keep draining so the reader never blocks on a dead peer
+                    w.write(out)
+                    await asyncio.wait_for(w.drain(), self.cfg.write_timeout_s)
             except (ConnectionError, OSError, TimeoutError):
                 dead = True
+            finally:
+                # Released only now, once the write attempt (or the decision to skip it for a
+                # dead peer) is over: while a stalled peer's drain() is pending, this frame's
+                # bytes stay charged, so the budget cannot be bypassed by piling up written-but-
+                # unflushed ACKs (code review, W1-5 second round).
+                if reserved is not None:
+                    await self.budget.release(reserved)
 
     async def handle(self, r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         peer = w.get_extra_info("peername")
@@ -112,7 +126,10 @@ class MllpServer:
         self.metrics.connections_total += 1
         self.metrics.connections_open += 1
         parser = FrameParser(self.cfg.max_message_bytes)
-        q: asyncio.Queue[_QueueItem | None] = asyncio.Queue()  # unbounded: the byte budget is the backpressure
+        # Bounded independently of ByteBudget (defense in depth: see the module docstring). A full
+        # q means the ack_writer has fallen behind flushing ACKs to this peer; q.put then
+        # backpressures the reader directly, on top of whatever ByteBudget itself is doing.
+        q: asyncio.Queue[_QueueItem | None] = asyncio.Queue(self.cfg.conn_pipeline)
         writer_task = asyncio.create_task(self._ack_writer(q, w))
         try:
             while not parser.fatal:
@@ -176,7 +193,6 @@ async def serve_from_channel_spec(
         cfg.bootstrap_servers,
         topic,
         linger_ms=cfg.linger_ms,
-        delivery_timeout_ms=cfg.delivery_timeout_ms,
         queue_max_messages=cfg.max_inflight * 2,
     )
     publisher.start(asyncio.get_running_loop())
