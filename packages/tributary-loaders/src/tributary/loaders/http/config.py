@@ -1,10 +1,12 @@
 """Turning one `contracts/channel-spec/v0` destination (`spec.destinations[]`, `type: http`) into
 `HttpDestinationConfig`.
 
-Same split as `tributary-receivers`' `mllp/config.py`: the schema already constrains field shapes
-(a producer validated it before publishing, invariant 3's "runtime must ignore unknown fields" is
-the other half of that split), so this module trusts those and only refuses what is legal per the
-schema but unsupported by this wave's loader — never silently drops a declared behaviour.
+Parsing and validating the shared parts of a channel spec — `idempotency`, `retry` (including the
+`retry-topic` refusal, ADR-003 D1/D2) and destination-name uniqueness — is `tributary.runtime.spec`'s
+job now that `tributary-runtime` exists: this module builds on `ChannelSpec`/`Destination` rather than
+re-parsing the document, so there is one parser for the contract, not two that can drift (platform-
+engineer, W1-6 second round). What is left here is genuinely HTTP-specific: which `auth.type` values
+this wave's loader can authenticate with, and the `circuitBreaker` mapping.
 """
 
 from __future__ import annotations
@@ -13,6 +15,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from tributary.runtime.errors import ChannelSpecError
+from tributary.runtime.spec import ChannelSpec, Destination
+
 from ..errors import ConfigError
 
 #: `auth.type` values this wave's loader can actually authenticate with. `oauth2-client-credentials`
@@ -20,10 +25,6 @@ from ..errors import ConfigError
 #: secretRef-to-files plumbing `tributary-receivers.tls` has for the *server* side, built here for a
 #: *client* — both real work, neither done yet. A destination declaring one is refused at startup.
 SUPPORTED_AUTH_TYPES = frozenset({"basic", "bearer"})
-
-#: `retry.policy` values: the channel-spec schema itself only allows `blocking` (`retry-topic` fails
-#: validation, ADR-003 D1/D2), so this is a second, defensive check for a hand-built config.
-SUPPORTED_RETRY_POLICIES = frozenset({"blocking"})
 
 Method = Literal["POST", "PUT", "PATCH"]
 
@@ -58,10 +59,6 @@ class HttpDestinationConfig:
     max_attempts: int
     on_exhaust: str  # "halt-partition" | "dlq-and-continue"
 
-    def __post_init__(self) -> None:
-        if self.idempotency_technique == "idempotency-key-header" and not self.idempotency_header:
-            raise ConfigError("idempotency.technique is idempotency-key-header but idempotency.header is not set")
-
 
 def _require(mapping: Mapping[str, Any], key: str, where: str) -> Any:
     try:
@@ -70,61 +67,53 @@ def _require(mapping: Mapping[str, Any], key: str, where: str) -> Any:
         raise ConfigError(f"{where}: missing required field {key!r}") from None
 
 
-def find_destination(spec: Mapping[str, Any], name: str) -> Mapping[str, Any]:
-    destinations: list[Mapping[str, Any]] = spec.get("spec", {}).get("destinations", [])
-    for entry in destinations:
-        if entry.get("name") == name:
-            return entry
-    raise ConfigError(f"no destination named {name!r} in this channel spec")
+def http_destination_config_from_destination(channel: str, destination: Destination) -> HttpDestinationConfig:
+    """Build `HttpDestinationConfig` from an already-parsed `tributary.runtime.spec.Destination`.
+    Raises `ConfigError` for anything this wave's loader cannot honour."""
+    if destination.type != "http":
+        raise ConfigError(f"destination {destination.name!r}: type is {destination.type!r}, not 'http'")
 
-
-def http_destination_config_from_channel_spec(spec: Mapping[str, Any], destination_name: str) -> HttpDestinationConfig:
-    """Build `HttpDestinationConfig` for one `spec.destinations[]` entry. Raises `ConfigError` for
-    anything this wave's loader cannot honour."""
-    channel = _require(_require(spec, "metadata", "channel spec"), "name", "metadata")
-    dest = find_destination(spec, destination_name)
-    if dest.get("type") != "http":
-        raise ConfigError(f"destination {destination_name!r}: type is {dest.get('type')!r}, not 'http'")
-
-    with_ = _require(dest, "with", "destination")
-    auth_obj = with_.get("auth")
+    params = destination.params
+    auth_obj = params.get("auth")
     auth = None
     if auth_obj:
         if auth_obj["type"] not in SUPPORTED_AUTH_TYPES:
             raise ConfigError(
-                f"destination {destination_name!r}: auth.type {auth_obj['type']!r} is not supported by this "
+                f"destination {destination.name!r}: auth.type {auth_obj['type']!r} is not supported by this "
                 f"wave's loader (supported: {sorted(SUPPORTED_AUTH_TYPES)})"
             )
         auth = AuthSpec(auth_obj["type"], auth_obj["secretRef"])
 
-    breaker_obj = with_.get("circuitBreaker")
+    breaker_obj = params.get("circuitBreaker")
     breaker = (
         CircuitBreakerSpec(breaker_obj["failureThreshold"], float(breaker_obj["openSeconds"])) if breaker_obj else None
     )
 
-    idem = _require(dest, "idempotency", "destination")
-    technique = _require(idem, "technique", "idempotency")
-
-    retry = _require(dest, "retry", "destination")
-    policy = _require(retry, "policy", "retry")
-    if policy not in SUPPORTED_RETRY_POLICIES:
-        raise ConfigError(f"destination {destination_name!r}: retry.policy {policy!r} is not supported")
-    on_exhaust = _require(retry, "onExhaust", "retry")
-
+    retry = destination.retry
     return HttpDestinationConfig(
         channel=channel,
-        destination=destination_name,
-        url=_require(with_, "url", "with"),
-        method=_require(with_, "method", "with"),
-        timeout_s=_require(with_, "timeoutMs", "with") / 1000,
-        headers=dict(with_.get("headers", {})),
+        destination=destination.name,
+        url=_require(params, "url", "with"),
+        method=_require(params, "method", "with"),
+        timeout_s=_require(params, "timeoutMs", "with") / 1000,
+        headers=dict(params.get("headers", {})),
         auth=auth,
         circuit_breaker=breaker,
-        idempotency_technique=technique,
-        idempotency_header=idem.get("header"),
-        backoff=retry.get("backoff", "exponential"),
-        initial_delay_ms=retry.get("initialDelayMs", 250),
-        max_delay_ms=retry.get("maxDelayMs", 60_000),
-        max_attempts=_require(retry, "maxAttempts", "retry"),
-        on_exhaust=on_exhaust,
+        idempotency_technique=destination.idempotency.technique,
+        idempotency_header=destination.idempotency.header,
+        backoff=retry.backoff,
+        initial_delay_ms=retry.initial_delay_ms,
+        max_delay_ms=retry.max_delay_ms,
+        max_attempts=retry.max_attempts,
+        on_exhaust=retry.on_exhaust,
     )
+
+
+def http_destination_config_from_channel_spec(spec: Mapping[str, Any], destination_name: str) -> HttpDestinationConfig:
+    """Parse the whole document with `ChannelSpec.from_document` and build the one destination."""
+    try:
+        channel_spec = ChannelSpec.from_document(spec)
+        destination = channel_spec.destination(destination_name)
+    except ChannelSpecError as exc:
+        raise ConfigError(str(exc)) from exc
+    return http_destination_config_from_destination(channel_spec.name, destination)

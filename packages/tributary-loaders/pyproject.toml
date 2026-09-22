@@ -6,6 +6,7 @@ license = "Apache-2.0"
 requires-python = ">=3.12"
 dependencies = [
     "tributary-sdk",
+    "tributary-runtime",       # ConsumerLoop, clients/topics/config: contracts/topics/v0, not a literal here
     "confluent-kafka>=2.6.0",   # Apache-2.0
 ]
 
@@ -18,3 +19,4 @@ packages = ["src/tributary"]
 
 [tool.uv.sources]
 tributary-sdk = { workspace = true }
+tributary-runtime = { workspace = true }
