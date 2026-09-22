@@ -2,7 +2,7 @@
   "contract": "tributary.channel-spec/v0",
   "schema": "../channel.schema.json",
   "note": "Examples are JSON because a channel spec is authored in YAML and validated after parsing; the schema sees the parsed document either way. All names, hosts and digests are synthetic. No example carries a payload, a record key or a credential value.",
-  "expectation_note": "UNMEASURED. Unlike the envelope, events and topics manifests, every expected_json_path/expected_validator pair below is the ARCHITECT'S PREDICTION of what jsonschema Draft 2020-12 reports, not a value read off a real run: this session has no shell. qa-engineer (or the lead) MUST run `python contracts/validate.py --emit-expectations` and replace this block with the measured pairs before the wave-1 gate, and MUST report any pair that differs rather than relaxing the assertion. Until that has happened, a red conformance run here is evidence about my predictions, not necessarily about the schema. Paths and keywords only, never instance values, so this file is PHI-safe either way.",
+  "expectation_note": "MEASURED 2026-09-22 by qa-engineer with `contracts/validate.py --emit-expectations` against jsonschema Draft 2020-12, and independently by the lead (94 checks, 0 failed, first run). Every expected_json_path/expected_validator pair below is the failing location and keyword that example MUST produce, so an example that fails for the WRONG reason goes red instead of passing (code-reviewer Medium 2, Phase 0 gate). These 19 pairs were first written as architect predictions - this session has no shell - and all 19 matched the measured run exactly, including the three flagged as least certain; no correction was needed. Paths and keywords only, never instance values, so this file is PHI-safe. An example may fail on more than one pair; the test asserts the pinned pair is among the failures.",
   "valid": [
     {
       "file": "valid/walking-skeleton-loopback.json",
@@ -100,7 +100,7 @@
       "violates": "step.with rejects property names that denote a credential ('token'); secrets go through auth.secretRef and never into a spec",
       "expected_json_path": "$.spec.pipeline.steps[0].with",
       "expected_validator": "not",
-      "expectation_note": "propertyNames reports at the containing object with the inner keyword, matching the events attrs deny-list precedent ($.attrs / not). If this ever reports 'pattern' instead, the example is failing on the name charset and the credential deny-list has stopped being tested"
+      "expectation_note": "Measured. propertyNames reports at the containing object with the inner keyword, matching the events attrs deny-list precedent ($.attrs / not). If this ever reports 'pattern' instead, the example is failing on the name charset and the credential deny-list has stopped being tested"
     },
     {
       "file": "invalid/destination-http-plaintext-remote.json",

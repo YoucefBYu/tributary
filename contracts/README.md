@@ -77,16 +77,19 @@ uv run --no-project --python 3.12 --with jsonschema python contracts/validate.py
 
 `--emit-expectations` prints the **measured** `(json_path, validator)` pair for every invalid
 example, paste-ready. It exists because the architect session has no shell: pairs written without
-it are predictions. Neither tool ever prints an instance or part of one — a contract example is
-record-shaped, so that is a PHI rule (invariant 6), not a style one.
+it are predictions, and the point of the mode is that nobody has to accept a prediction. Neither
+tool ever prints an instance or part of one — a contract example is record-shaped, so that is a PHI
+rule (invariant 6), not a style one.
 
-**Status: 76 passed at `83a1fd2`** for the three contracts that existed then. The wave-1 additions —
-the whole channel-spec contract (23) and two envelope examples for requirement 13 — are **not in
-that run**, and their pinned failure pairs are **architect predictions, not measurements**. Expected
-total after the re-run: 101. History, newest first:
+**Status: `validate.py` 96 / 0 and `pytest tests/conformance` 99 passed, 2026-09-22.** The two runs
+differ by the two envelope examples added for requirement 13, which postdate the pytest run;
+expected pytest total next run is 101. All 21 wave-1 pairs were written as architect predictions and
+**all 21 matched the measured run**, so none of the manifests needed correcting. History, newest
+first:
 
 | Run | Result | Covers |
 |---|---|---|
+| W1-1 (2026-09-22) | **`validate.py` 96 / 0; pytest 99** | Contract set 1.0: the new `channel-spec` contract (23 examples) and two envelope examples for requirement 13. `validate.py` is new and covers all four contracts standalone; the pytest run at `5eb3949` predates the envelope pair |
 | `83a1fd2` (2026-09-22) | **76 / 0 / 0** | Expected-failure assertions: every `invalid` example must now fail at the `expected_json_path` and `expected_validator` recorded in its manifest, so an example that fails for the *wrong* reason goes red. Closes `code-reviewer` Medium 2 from the Phase 0 gate |
 | after security round 2 | 74 / 0 / 0 | Four invalid examples added for findings 7, 9 and 13 |
 | commit `ae4d3bd` | 70 / 0 / 0 | The five HIGH security fixes of round 1 |

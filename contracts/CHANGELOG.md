@@ -65,13 +65,21 @@ worker's only source of truth, so it needed a contract and had none.
 W1-3 to W1-8 needs a new field, and the `_hmac` question is human-reserved. Phase 1 requirement 10
 (validate the real emitters against this schema) is a test obligation, not a contract change.
 
-### Not verified
+### Verified
 
-`contracts/validate.py` is new and **has never been run** — this session has no shell. The 19
-channel-spec expected-failure pairs and the 2 new envelope pairs are the architect's **predictions**,
-not measurements, and are labelled as such in the manifests. `qa-engineer` runs
-`--emit-expectations` and the pairs are corrected from the measured output before the wave-1 gate.
-Every other contract's pairs were measured at `83a1fd2` and are unaffected.
+Three independent first-run-green checks on 2026-09-22, all after the artifacts were written and
+none by the architect, who has no shell:
+
+| Check | By | Result |
+|---|---|---|
+| `contracts/validate.py` | lead | 94 / 0, then **96 / 0** with the two envelope examples |
+| `contracts/validate.py --emit-expectations` | `qa-engineer` | **All 21 predicted `(json_path, validator)` pairs matched the measured ones.** No manifest correction needed |
+| `pytest tests/conformance` | `qa-engineer` | **99 passed** at `5eb3949` (76 + 23). Expected 101 once the envelope pair is in a pytest run |
+| CI wiring | `devops-engineer` | `f649665` — a standalone `contracts` job running `validate.py` before `uv sync`, separate from the pytest conformance job |
+
+The 21 pairs were written as predictions and labelled UNMEASURED everywhere they appeared, because
+the other three contracts' pairs were measured and these would otherwise have borrowed that
+authority. They are now measured; the labels are gone.
 
 ## 2026-09-20 (P0-3) — `tributary.topics/v0`: partition defaults and consumer timeouts, from measurements
 

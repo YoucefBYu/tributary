@@ -9,8 +9,8 @@
 Realises invariant 7 (channels are declarative, steps are unit-testable functions) and carries the
 declarative half of invariants 1, 4 and 5.
 
-**Unexecuted.** This session has no shell. The schema has never been through a validator and the
-manifest's expected-failure pairs are predictions, not measurements — see section 8.
+**Verified 2026-09-22.** `check_schema` passes, all 23 examples behave as the manifest says, and
+every invalid example fails at the pinned location and keyword — see section 8.
 
 ---
 
@@ -262,23 +262,21 @@ uv run --no-project --python 3.12 --with jsonschema python contracts/validate.py
 assert that each invalid example fails at the `expected_json_path` and `expected_validator` it pins,
 not merely that it fails.
 
-**The pinned pairs in this manifest are UNMEASURED predictions.** Every other contract's pairs were
-measured by `qa-engineer` against a real validator run; this session has no shell, so mine are
-reasoned from the schema. Before the wave-1 gate:
+**Status: passing.** Three independent runs on 2026-09-22, all first-run green:
 
-1. `python contracts/validate.py --emit-expectations` prints the measured pairs for every invalid
-   example across all four contracts, paste-ready and PHI-safe (paths and keywords only).
-2. Replace the pairs in this manifest with the measured ones, and **report any that differed** to
-   the architect rather than relaxing the assertion — a difference usually means the example fails
-   for a reason other than the one it is named after, which is the defect this mechanism exists to
-   catch.
+| Run | By | Result |
+|---|---|---|
+| `contracts/validate.py` | lead | **94 / 0** across all four contracts, then **96 / 0** with the two envelope examples added for requirement 13 |
+| `contracts/validate.py --emit-expectations` | `qa-engineer` | All **19 predicted pairs matched the measured ones exactly.** No correction needed |
+| `pytest tests/conformance` | `qa-engineer` | **99 passed** at `5eb3949` (76 + 23); expected 101 once the two new envelope examples are in a pytest run |
 
-Until step 2 has happened, a red run here is evidence about the predictions, not necessarily about
-the schema.
+The pinned pairs were written as architect predictions, because this session has no shell, and were
+labelled as such until they were measured. The three flagged as least certain — the `propertyNames`
+deny-list path, the shared `oneOf` pair, and the if/then/else `else` branch — all matched.
 
-`qa-engineer` adds `channel-spec` to the `FILE_CONTRACTS` tuple in
-`tests/conformance/test_contracts_v0.py`; the manifest shape is identical to the envelope and events
-manifests, so nothing else in the suite changes.
+`qa-engineer` added `channel-spec` to the `FILE_CONTRACTS` constant in
+`tests/conformance/test_contracts_v0.py` (`5eb3949`); the manifest shape is identical to the
+envelope and events manifests, so nothing else in the suite changed.
 
 ---
 

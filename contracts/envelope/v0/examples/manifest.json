@@ -148,14 +148,14 @@
       "violates": "tb-attempt is decimal ASCII only. A malformed integer header must be a REJECT (dlq with HEADER_PARSE_ERROR), never an unhandled exception in a consumer loop (README 2.3, Phase 1 requirement 13, SR-10)",
       "expected_json_path": "$.headers['tb-attempt']",
       "expected_validator": "pattern",
-      "expectation_note": "ADDED 2026-09-22 with the channel-spec contract. This pair is the architect's PREDICTION, not a measured value - it is not in the 76-test run at 83a1fd2. qa-engineer to confirm with contracts/validate.py --emit-expectations"
+      "expectation_note": "ADDED 2026-09-22 with the channel-spec contract, so it is not in the 76-test pytest run at 83a1fd2. MEASURED by the lead with contracts/validate.py (96 checks, 0 failed)"
     },
     {
       "file": "invalid/channel-version-not-an-integer.json",
       "violates": "tb-channel-version is decimal ASCII only; 'v7' is the plausible mistake, and int('v7') raising inside a consumer loop is a crash loop on one poison record (README 2.3)",
       "expected_json_path": "$.headers['tb-channel-version']",
       "expected_validator": "pattern",
-      "expectation_note": "ADDED 2026-09-22. Predicted, not measured - see the entry above"
+      "expectation_note": "ADDED 2026-09-22. Measured in the same 96-check run as the entry above"
     }
   ]
 }

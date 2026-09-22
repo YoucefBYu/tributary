@@ -63,11 +63,13 @@ explicitly so the two schemas stay independent.
 even when a size is `0`. An omitted field would pass the claim-check and size rules by accident, which
 is the opposite of what a conformance test is for. `topic` is optional.
 
-**Conformance.** 27 examples: 7 valid, 20 invalid. The suite passed 76 / 0 / 0 across all three
-contracts at `83a1fd2` (2026-09-22), where every invalid example is asserted to fail at the
-`expected_json_path` and `expected_validator` its manifest pins. The two examples added for
-section 2.3 (`attempt-not-an-integer`, `channel-version-not-an-integer`) are **not in that run**;
-they arrive with the wave-1 channel-spec contract and are covered by the same re-run.
+**Conformance.** 27 examples: 7 valid, 20 invalid. Every invalid example is asserted to fail at the
+`expected_json_path` and `expected_validator` its manifest pins, not merely to fail. The pytest
+suite passed 76 / 0 / 0 across three contracts at `83a1fd2` and 99 / 0 / 0 once `channel-spec` was
+added at `5eb3949`; the two examples added for section 2.3 (`attempt-not-an-integer`,
+`channel-version-not-an-integer`) postdate that run and are **measured green by
+`contracts/validate.py`** (96 checks, 0 failed, 2026-09-22). Expected pytest total on the next run:
+101.
 
 ### 1.2 Strict producers, lenient consumers
 

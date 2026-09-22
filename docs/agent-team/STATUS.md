@@ -9,7 +9,7 @@ wave's exit criteria here.
   `platform-engineer`, `connector-engineer`, `devops-engineer`, `qa-engineer`. Phase 0 is complete and
   signed (**GO WITH CONDITIONS**, 2026-09-22).
 - **Branch:** `wave/1-1`
-- **W1-1 contracts (architect): artifacts complete, verification outstanding.**
+- **W1-1 contracts (architect): DONE and verified.**
   `tributary.channel-spec/v0` is published — schema, README, 23 examples (4 valid, 19 invalid) — plus
   `contracts/validate.py`, a standalone checker for all four contracts. Envelope gained section 2.3
   (every header parsed defensively: reject, never crash — Phase 1 requirement 13 generalised beyond
@@ -17,15 +17,20 @@ wave's exit criteria here.
   (`topic-defaults.json` is read, never restated as a literal) and 3.8 (the lite RF=1 startup warning
   is mandatory and testable). `events/v0` needed no change, recorded with the reason. Decisions in
   [ADR-007](../adr/ADR-007-channel-spec-shape-and-refusals.md).
-  **Not verified: this session has no shell.** The schema has never been through a validator, and the
-  21 new expected-failure pairs (19 channel-spec, 2 envelope) are architect **predictions**, not
-  measurements — labelled as such in the manifests. `qa-engineer` runs
-  `contracts/validate.py --emit-expectations` and the pairs are corrected from the measured output
-  before the gate. Expected conformance total afterwards: **101** (was 76).
-- **"Contracts v1" is contract set 1.0**, not a directory rename: `envelope/v0` + `topics/v0` +
-  `events/v0` + `channel-spec/v0`, frozen together at the wave-1 gate. Mapping table and the rejected
-  alternative are in `contracts/README.md`. **Overrulable by the lead or the human, and far cheaper to
-  overrule now than after wave-1 code references land.**
+  **Verified by three first-run-green checks, none of them by the architect, who has no shell:**
+  `contracts/validate.py` **96 / 0** (lead); `--emit-expectations` showed **all 21 new
+  `(json_path, validator)` pairs matched** the measured run, so no manifest needed correcting
+  (`qa-engineer`); `pytest tests/conformance` **99 passed** at `5eb3949` (`qa-engineer`), which
+  becomes 101 once the two envelope examples added after it are in a pytest run. `devops-engineer`
+  wired a standalone `contracts` CI job at `f649665`, running before `uv sync` and separate from the
+  pytest conformance job. The 21 pairs were written as predictions and labelled UNMEASURED
+  everywhere until they were measured.
+- **"Contracts v1" is contract set 1.0 — APPROVED by the lead 2026-09-22**, not escalated to the
+  human: a documentation and versioning convention, not a licensing or invariant question. Set 1.0 is
+  `envelope/v0` + `topics/v0` + `events/v0` + `channel-spec/v0`, frozen together at the wave-1 gate;
+  there are deliberately **no `contracts/*/v1/` directories**. Mapping table and the rejected
+  alternative are in `contracts/README.md`. The lead will name the choice in the wave summary so the
+  human is not surprised by the absent directories.
 - **Phase 0 branch:** `wave/0`
 - **All four blocking gate conditions are met:** (a) the root `.gitignore` restored and the stray root
   `Dockerfile` removed — human commit `325cef1`, 31 lines back, lead-verified that `samples/mirth/*`,
@@ -123,7 +128,7 @@ All six filed and synthesised. Full threshold table with evidence ratings quoted
 | 2026-09-22 | **Security rules that a schema can hold are held by the schema**: TLS unless loopback, `tls.clientAuth` stated explicitly, plaintext HTTP only to loopback, no query string in a destination URL, credential-shaped property names rejected, `queue.maxBytes` required. Phase 1 requirements 5 and 8 become validation failures rather than review findings | ADR-007 D7 |
 | 2026-09-22 | **`idempotency` is required on every destination**, with a written justification when `none`. Invariant 4 becomes declarative and per-channel reviewable instead of a sentence in a loader docstring. The key is always `tb-msg-id` and is not configurable | ADR-007 D4 |
 | 2026-09-22 | **The `_tb.<env>.channels` record shape is specified for the first time**: key, value, tombstone, and the rule that the runtime rejects a published record without `metadata.version`. Invariant 3 made that topic load-bearing and nothing had defined it | `contracts/channel-spec/v0/README.md` 6 |
-| 2026-09-22 | **"Contracts v1" = contract set 1.0**, not `v1/` directories. Rejected: copying three contracts into new major directories — ~60 files moved, every path in `tests/conformance`, ADR-002, ADR-003 and this file broken, no schema changed. A new major directory is created by a breaking change *after* a freeze, not by the freeze | `contracts/README.md`, `contracts/CHANGELOG.md` |
+| 2026-09-22 | **"Contracts v1" = contract set 1.0**, not `v1/` directories — **lead-approved**, deliberately not escalated to the human as a versioning convention rather than a licensing or invariant question. Rejected: copying three contracts into new major directories — ~60 files moved, every path in `tests/conformance`, ADR-002, ADR-003 and this file broken, no schema changed. A new major directory is created by a breaking change *after* a freeze, not by the freeze | `contracts/README.md`, `contracts/CHANGELOG.md` |
 | 2026-09-22 | **Phase 1 requirement 13 generalised**: every integer, timestamp and UUID header is parse-or-reject, with `reject` defined (dlq + `HEADER_PARSE_ERROR` + event + commit) and the failing value kept out of the error string. A missing required header is the same class of failure | `contracts/envelope/v0` 2.3 |
 | 2026-09-22 | **`topic-defaults.json` is read, never restated as a literal**, in runtime, control plane, topic creation, Compose and Helm. Reason: `min.insync.replicas` is topic-level, so a copied-and-forgotten literal makes invariant 1 silently false — the HIGH finding's original mechanism | `contracts/topics/v0` 3.7 |
 | 2026-09-22 | Both gate High findings closed: root `.gitignore` restored (human `325cef1`) and the spike data plane bound to localhost (`e553fd7`, `71364c7`). Conformance suite now asserts *why* each invalid example fails (`83a1fd2`, 76 passed), and the AA-withheld-until-publish-resolves unit test exists (`a5df2c7`) | gate report 1.1 |
