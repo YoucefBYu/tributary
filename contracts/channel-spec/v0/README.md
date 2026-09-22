@@ -285,9 +285,9 @@ not merely that it fails.
 
 | Run | By | Result |
 |---|---|---|
-| `contracts/validate.py` | lead | **94 / 0** across all four contracts, then **96 / 0** with the two envelope examples added for requirement 13 |
+| `contracts/validate.py` | lead | **94 / 0** across all four contracts at publication, **100 / 0** at `f5bc92d` once the requirement-13 and quarantine examples landed |
 | `contracts/validate.py --emit-expectations` | `qa-engineer` | All **19 predicted pairs matched the measured ones exactly.** No correction needed |
-| `pytest tests/conformance` | `qa-engineer` | **99 passed** at `5eb3949` (76 + 23), then **101** with the two envelope examples added for requirement 13 |
+| `pytest tests/conformance` | `qa-engineer` | **99 passed** at `5eb3949` (76 + 23), **105** at `f5bc92d` |
 
 The pinned pairs were written as architect predictions, because this session has no shell, and were
 labelled as such until they were measured. The three flagged as least certain — the `propertyNames`

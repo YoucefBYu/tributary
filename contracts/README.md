@@ -81,14 +81,15 @@ it are predictions, and the point of the mode is that nobody has to accept a pre
 tool ever prints an instance or part of one — a contract example is record-shaped, so that is a PHI
 rule (invariant 6), not a style one.
 
-**Status: `validate.py` 96 / 0 and `pytest tests/conformance` 101 passed, 2026-09-22.** The two
+**Status: `validate.py` 100 / 0 and `pytest tests/conformance` 105 passed, 2026-09-22.** The two
 counts differ because `validate.py` counts examples across all four contracts while pytest counts
-test cases including its own meta-tests. All 21 wave-1 pairs were written as architect predictions
-and **all 21 matched the measured run**, so none of the manifests needed correcting. History, newest
+test cases including its own meta-tests. All 23 wave-1 pairs were written as architect predictions
+and **all 23 matched the measured run**, so no manifest has needed correcting. History, newest
 first:
 
 | Run | Result | Covers |
 |---|---|---|
+| W1-4 questions (2026-09-22) | **`validate.py` 100 / 0; pytest 105** (`f5bc92d`) | The quarantine shape for unidentifiable records: `kind: record` plus four examples. `record-with-attrs.json` joins `EVENT_PHI_GUARDS`, now 8 |
 | W1-1 (2026-09-22) | **`validate.py` 96 / 0; pytest 101** | Contract set 1.0: the new `channel-spec` contract (23 examples) and two envelope examples for requirement 13. `validate.py` is new and covers all four contracts standalone, run by the lead; pytest run by `qa-engineer` (99 at `5eb3949`, 101 once the envelope pair landed) |
 | `83a1fd2` (2026-09-22) | **76 / 0 / 0** | Expected-failure assertions: every `invalid` example must now fail at the `expected_json_path` and `expected_validator` recorded in its manifest, so an example that fails for the *wrong* reason goes red. Closes `code-reviewer` Medium 2 from the Phase 0 gate |
 | after security round 2 | 74 / 0 / 0 | Four invalid examples added for findings 7, 9 and 13 |

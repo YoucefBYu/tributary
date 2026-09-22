@@ -20,8 +20,9 @@ wave's exit criteria here.
   **Verified by three first-run-green checks, none of them by the architect, who has no shell:**
   `contracts/validate.py` **96 / 0** (lead); `--emit-expectations` showed **all 21 new
   `(json_path, validator)` pairs matched** the measured run, so no manifest needed correcting
-  (`qa-engineer`); `pytest tests/conformance` **99 passed** at `5eb3949` and **101** with the two
-  envelope examples for requirement 13 (`qa-engineer`). `devops-engineer`
+  (`qa-engineer`); `pytest tests/conformance` **105 passed** and `validate.py` **100 / 0** at
+  `f5bc92d`, the latest run, covering the requirement-13 and quarantine additions (`qa-engineer`).
+  `devops-engineer`
   wired a standalone `contracts` CI job at `f649665`, running before `uv sync` and separate from the
   pytest conformance job. The 21 pairs were written as predictions and labelled UNMEASURED
   everywhere until they were measured.

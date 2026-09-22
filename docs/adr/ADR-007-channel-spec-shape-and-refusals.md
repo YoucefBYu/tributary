@@ -107,8 +107,8 @@ reworded. Contracts: `channel-spec/v0` is new; `envelope/v0` gains sections 2.3 
 
 1. ~~**Measure the expected-failure pairs.**~~ **DONE 2026-09-22.** `contracts/validate.py` 96 / 0
    (lead) and `--emit-expectations` (`qa-engineer`): all 21 predicted `(json_path, validator)` pairs
-   matched the measured run, so no manifest needed correcting. `pytest tests/conformance` 99 passed
-   at `5eb3949` and **101** with the two envelope examples. CI job wired at `f649665`.
+   matched the measured run, so no manifest needed correcting. Latest run `f5bc92d`:
+   `validate.py` **100 / 0**, `pytest tests/conformance` **105 passed**. CI job wired at `f649665`.
 2. **`queue.maxBytes` default** is `TODO(connector-engineer)` — the contract fixes the unit, not the
    number, and the number should come from a measurement.
 3. **`retry-topic` spike** (ADR-003 D2, gate 7.2 item 18) removes the `not` in D5.

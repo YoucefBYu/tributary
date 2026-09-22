@@ -56,11 +56,17 @@ and it disappears silently if claim-check work raises the inline limit. Raised b
 `connector-engineer` as defence-in-depth; written down because the reason it is unreachable is
 fragile.
 
-### Not verified
+### Verified
 
-The four new examples and the two new `(json_path, validator)` pairs are **architect predictions**;
-no shell here. `contracts/validate.py` and `--emit-expectations` measure them. The `default`
-annotation and the 3.2.1 rules change no validation outcome, so no example was added for them.
+`contracts/validate.py` **100 checks, 0 failed** (lead) and `pytest tests/conformance` **105 passed**
+(`qa-engineer`, `f5bc92d`), both first-run green. The two new `(json_path, validator)` pairs were
+written as architect predictions and **both matched the measured run**, including
+`record-with-attrs.json` at `$` / `not`, which I had flagged as the one with no precedent in this
+repo — a branch-level `not` inside a `then` rather than a `not` on a property. No manifest needed
+correcting. `record-with-attrs.json` is now in `EVENT_PHI_GUARDS` (8 guards).
+
+The `queue.maxBytes` `default` annotation and the 3.2.1 rules change no validation outcome, so no
+example was added for them and they do not move the counts.
 
 ## 2026-09-22 (W1-1) — contract set 1.0: new `tributary.channel-spec/v0`, plus envelope and topics additions
 

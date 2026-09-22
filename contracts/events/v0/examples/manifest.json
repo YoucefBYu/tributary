@@ -1,7 +1,7 @@
 {
   "contract": "tributary.events/v0",
   "schema": "../event.schema.json",
-  "note": "All identifiers are synthetic. The invalid set deliberately includes the PHI-shaped mistakes (payload-in-event, attrs-clear-text-mrn, attrs-hmac-not-fixed-length-hex, attrs-free-text-value, claim-check-presigned-url) so a regression cannot reintroduce them quietly. Keep these asserted, never skipped.",
+  "note": "All identifiers are synthetic. The invalid set deliberately includes the PHI-shaped mistakes (payload-in-event, attrs-clear-text-mrn, attrs-hmac-not-fixed-length-hex, attrs-free-text-value, attrs-too-many-entries, attrs-hl7-delimiters, claim-check-presigned-url, record-with-attrs) so a regression cannot reintroduce them quietly. These eight are EVENT_PHI_GUARDS in tests/conformance: asserted by name, never skipped.",
   "expectation_note": "Each 'invalid' entry carries expected_json_path and expected_validator: the failing location and JSON Schema keyword that example MUST produce, so an example that fails for the wrong reason goes red instead of passing (code-reviewer Medium 2, Phase 0 gate). This matters most for the five PHI guards: before it, a guard could pass while no longer guarding anything. Values were MEASURED by qa-engineer against jsonschema Draft 2020-12 and hand-checked against each 'violates' line; paths and keywords only, never instance values, so they are PHI-safe.",
   "valid": [
     { "file": "valid/received.json", "note": "Receive, with a hashed searchable attribute. The 64-hex SHAPE is what the schema checks; the hashing mechanism is UNRESOLVED (README 3.1), so do not read this example as a recommendation to emit identifier-derived attrs yet" },
@@ -117,14 +117,14 @@
       "violates": "kind=record requires topic, partition and offset: they are the only identity an unidentifiable record has, and without them the event cannot be joined to the quarantined bytes",
       "expected_json_path": "$",
       "expected_validator": "required",
-      "expectation_note": "PREDICTED by the architect, not yet measured (no shell). Added 2026-09-22 with the quarantine shape"
+      "expectation_note": "Added 2026-09-22 with the quarantine shape. MEASURED by qa-engineer at f5bc92d; same if/then shape as message-without-message-id.json, which reports at $ for the same reason"
     },
     {
       "file": "invalid/record-with-attrs.json",
       "violates": "a quarantine event carries no attrs: every value would be derived from the broken record's own bytes, and attrs become searchable columns in ClickHouse and the browser (invariant 6). 'first_bytes: MSH' is the plausible mistake - an HL7 segment start smuggled into a metadata column",
       "expected_json_path": "$",
       "expected_validator": "not",
-      "expectation_note": "PREDICTED, not yet measured. PHI GUARD - add to EVENT_PHI_GUARDS in tests/conformance so it is asserted by name and never skipped"
+      "expectation_note": "MEASURED by qa-engineer at f5bc92d. PHI GUARD, listed in EVENT_PHI_GUARDS (8 guards) so it is asserted by name and never skipped. The 'not' is at $ because it sits at the branch level inside the kind=record 'then', unlike the attrs deny-list which reports at $.attrs - if this ever reports elsewhere, the no-attrs rule has moved and the guard is no longer guarding it"
     }
   ]
 }
