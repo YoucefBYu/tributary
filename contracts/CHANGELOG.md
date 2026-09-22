@@ -40,10 +40,27 @@ window (up to 50 redeliveries after an unclean death; S5 saw 12 at 20), so a des
 and deliberately out of the channel spec: it is an operational knob, not channel semantics, and
 there is no evidence yet of per-destination variation.
 
+### `tributary.channel-spec/v0`: the `queue.maxBytes` default is filled in
+
+The W1-1 `TODO(connector-engineer)` is closed. When `source.queue` is absent the receiver default is
+**64 MiB (67,108,864)**, now carried as a JSON Schema `default` annotation on the `queue` object and
+in README 3.2.1. **Labelled a judgement, not a measurement**, and it stays labelled: no Phase 0 spike
+pinned steady-state buffered bytes at a receiver — S2 measured ACK latency and loss, not memory — so
+there is no number to cite. The Linux S2 re-run (its follow-up 1) is where to measure it.
+
+Also documented rather than assumed: **`maxMessageBytes` must not exceed `queue.maxBytes`**, enforced
+by a receiver startup check because JSON Schema cannot compare two properties. It cannot fire for a
+schema-valid spec today — `maxMessageBytes` tops out at 1,000,000 and `queue.maxBytes` starts at
+1,048,576 — but that overlap is a coincidence of two independently chosen bounds, not a guarantee,
+and it disappears silently if claim-check work raises the inline limit. Raised by
+`connector-engineer` as defence-in-depth; written down because the reason it is unreachable is
+fragile.
+
 ### Not verified
 
 The four new examples and the two new `(json_path, validator)` pairs are **architect predictions**;
-no shell here. `contracts/validate.py` and `--emit-expectations` measure them.
+no shell here. `contracts/validate.py` and `--emit-expectations` measure them. The `default`
+annotation and the 3.2.1 rules change no validation outcome, so no example was added for them.
 
 ## 2026-09-22 (W1-1) — contract set 1.0: new `tributary.channel-spec/v0`, plus envelope and topics additions
 

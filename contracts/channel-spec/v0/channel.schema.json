@@ -191,7 +191,8 @@
       "type": "object",
       "required": ["maxBytes"],
       "additionalProperties": false,
-      "$comment": "Phase 1 requirement 5 (SR-3): a receiver queue is bounded in BYTES. An item count is not a memory bound when an item may be up to 1 MB, which is why maxBytes is required whenever this object is present and maxMessages alone does not conform. The default when the object is absent is the receiver's, and it MUST also be a byte bound - TODO(connector-engineer): set and document it from a measurement, the contract fixes the unit only.",
+      "default": { "maxBytes": 67108864 },
+      "$comment": "Phase 1 requirement 5 (SR-3): a receiver queue is bounded in BYTES. An item count is not a memory bound when an item may be up to 1 MB, which is why maxBytes is required whenever this object is present and maxMessages alone does not conform. When the object is absent the receiver default applies: 64 MiB (67,108,864), set by connector-engineer in tributary-receivers. That number is a JUDGEMENT, not a measurement - 64 messages at the 1 MB inline ceiling, or many thousands of typical few-hundred-byte HL7 messages - because no Phase 0 spike pinned steady-state buffered bytes at a receiver (S2 measured latency and loss, not memory). Measure it in the Linux S2 re-run before anyone treats it as sized rather than picked.",
       "properties": {
         "maxBytes": { "type": "integer", "minimum": 1048576, "maximum": 4294967296 },
         "maxMessages": { "type": "integer", "minimum": 1, "maximum": 1000000 }

@@ -114,7 +114,26 @@ schema is expressed there.
 | `tls` | C | **Required whenever `bind` is not loopback**, wildcard included. `secretRef` and `clientAuth` are both required inside it; `clientAuth: required` is mTLS. |
 | `ack` | R | `mode` is `after-commit` and nothing else. `nackOn` lists the conditions that NACK instead. A NACK carries a code and `tb-msg-id` only — never the record key, never exception text. |
 | `maxMessageBytes` | O | ≤ 1,000,000, the envelope's inline limit. Claim-check for larger payloads is **untested** (gate 7.2 item 18); do not design a channel that depends on it yet. |
-| `queue` | O | When present, `maxBytes` is required. When absent, the receiver's default applies and **that default must also be a byte bound** — `TODO(connector-engineer)`: set and document it from a measurement. The contract fixes the unit, not the number. |
+| `queue` | O | When present, `maxBytes` is required; `maxMessages` alone does not conform. When absent the receiver default applies: **64 MiB (67,108,864)**. See 3.2.1. |
+
+#### 3.2.1 The 64 MiB queue default is picked, not sized
+
+64 MiB is roughly 64 messages at the 1 MB inline ceiling, or many thousands of typical
+few-hundred-byte HL7 messages. **It is a judgement and not a measurement.** No Phase 0 spike pinned
+steady-state buffered bytes at a receiver — S2 measured ACK latency and loss, not memory — so there
+is no number to cite, and the label stays until there is. The Linux S2 re-run (its follow-up 1) is
+the natural place to measure it. Set by `connector-engineer`, whose module docstring says the same.
+
+**`maxMessageBytes` must not exceed the queue's `maxBytes`.** A single maximum-size message that can
+never fit its own queue budget is a configuration error, not a runtime condition, and the receiver
+refuses to start on it. JSON Schema cannot express a comparison between two properties, so this is a
+code rule with a startup check, like the other rules in section 6.
+
+Today it cannot fire for a schema-valid spec, because `maxMessageBytes` tops out at 1,000,000 and
+`queue.maxBytes` starts at 1,048,576 — **but that is a coincidence of two independently chosen
+bounds, not a guarantee.** Raise the inline limit for claim-check work, or lower the queue minimum,
+and the overlap disappears silently. That is exactly why the check is worth keeping and worth
+writing down rather than treating as unreachable code.
 
 ### 3.3 `spec.pipeline`
 
