@@ -26,6 +26,7 @@ EVENT_PHI_GUARDS = {
     "invalid/attrs-too-many-entries.json",
     "invalid/attrs-hl7-delimiters.json",
     "invalid/claim-check-presigned-url.json",
+    "invalid/record-with-attrs.json",
 }
 ENVELOPE_PHI_GUARDS = {
     "invalid/claim-check-presigned-url.json",
