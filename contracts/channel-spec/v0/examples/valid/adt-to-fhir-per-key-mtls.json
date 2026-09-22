@@ -1,0 +1,53 @@
+{
+  "apiVersion": "tributary.dev/v1",
+  "kind": "Channel",
+  "metadata": {
+    "name": "adt-to-fhir",
+    "labels": { "domain": "adt", "owner": "integration-team" }
+  },
+  "spec": {
+    "ordering": "per-key",
+    "partitionKey": "hl7:PID.3.1",
+    "source": {
+      "type": "mllp",
+      "bind": "0.0.0.0",
+      "port": 6661,
+      "tls": { "secretRef": "mllp-tls", "clientAuth": "required", "minVersion": "1.3" },
+      "ack": { "mode": "after-commit", "nackOn": ["parse-error"], "timeoutMs": 10000 },
+      "maxMessageBytes": 1000000,
+      "queue": { "maxBytes": 67108864, "maxMessages": 2048 }
+    },
+    "pipeline": {
+      "bundle": "ghcr.io/tributary-synth/adt-integration@sha256:3f7a1c9e2b5d48a06e1f8c3d7b2a95e04c6d8f1a3b5c7d9e0f2a4b6c8d0e2f46",
+      "stepRetries": 3,
+      "steps": [
+        { "name": "parse", "uses": "tributary.hl7v2.parse", "with": { "version": "2.5.1" } },
+        { "name": "filter", "ref": "adt_flow.filters.only_admit_transfer_discharge" },
+        { "name": "to-fhir", "ref": "adt_flow.mapping.to_fhir_bundle" }
+      ]
+    },
+    "destinations": [
+      {
+        "name": "fhir-server",
+        "type": "http",
+        "with": {
+          "url": "https://fhir.example.org/fhir",
+          "method": "POST",
+          "timeoutMs": 8000,
+          "headers": { "Accept": "application/fhir+json" },
+          "auth": { "type": "oauth2-client-credentials", "secretRef": "fhir-oauth" },
+          "circuitBreaker": { "failureThreshold": 10, "openSeconds": 30 }
+        },
+        "idempotency": { "technique": "idempotency-key-header", "header": "Idempotency-Key" },
+        "retry": {
+          "policy": "blocking",
+          "backoff": "exponential",
+          "initialDelayMs": 250,
+          "maxDelayMs": 60000,
+          "maxAttempts": 10,
+          "onExhaust": "halt-partition"
+        }
+      }
+    ]
+  }
+}

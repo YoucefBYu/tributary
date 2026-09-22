@@ -1,0 +1,35 @@
+{
+  "apiVersion": "tributary.dev/v1",
+  "kind": "Channel",
+  "metadata": { "name": "adt-fanout" },
+  "spec": {
+    "ordering": "none",
+    "source": {
+      "type": "mllp",
+      "bind": "localhost",
+      "port": 6663,
+      "ack": { "mode": "after-commit", "nackOn": ["parse-error", "spec-invalid", "queue-full"] }
+    },
+    "pipeline": {
+      "bundle": "ghcr.io/tributary-synth/adt-integration@sha256:3f7a1c9e2b5d48a06e1f8c3d7b2a95e04c6d8f1a3b5c7d9e0f2a4b6c8d0e2f46",
+      "stepRetries": 0,
+      "steps": [{ "name": "to-json", "uses": "tributary.hl7v2.to_json" }]
+    },
+    "destinations": [
+      {
+        "name": "primary",
+        "type": "http",
+        "with": { "url": "https://primary.example.org/ingest", "method": "PUT", "timeoutMs": 5000 },
+        "idempotency": { "technique": "conditional-update" },
+        "retry": { "policy": "blocking", "backoff": "fixed", "initialDelayMs": 1000, "maxAttempts": 3, "onExhaust": "halt-partition" }
+      },
+      {
+        "name": "analytics",
+        "type": "http",
+        "with": { "url": "https://analytics.example.org/events", "method": "POST", "timeoutMs": 3000 },
+        "idempotency": { "technique": "idempotency-key-header", "header": "X-Idempotency-Key" },
+        "retry": { "policy": "blocking", "maxAttempts": 3, "onExhaust": "dlq-and-continue" }
+      }
+    ]
+  }
+}

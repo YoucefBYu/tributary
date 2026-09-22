@@ -1,0 +1,41 @@
+{
+  "apiVersion": "tributary.dev/v1",
+  "kind": "Channel",
+  "metadata": {
+    "name": "lab-results-to-dwh",
+    "version": 7,
+    "labels": { "domain": "oru", "tier": "gold" },
+    "description": "The published form: metadata.version is set by the control plane and becomes tb-channel-version."
+  },
+  "spec": {
+    "ordering": "per-key",
+    "partitionKey": "hl7:PID.3.1",
+    "partitions": 6,
+    "retention": { "raw": "14d", "dlq": "30d" },
+    "source": {
+      "type": "mllp",
+      "bind": "::",
+      "port": 6662,
+      "tls": { "secretRef": "lab-mllp-tls", "clientAuth": "required" },
+      "ack": { "mode": "after-commit" },
+      "queue": { "maxBytes": 134217728 }
+    },
+    "pipeline": {
+      "bundle": "ghcr.io/tributary-synth/lab-integration@sha256:a1b2c3d4e5f60718293a4b5c6d7e8f900a1b2c3d4e5f60718293a4b5c6d7e8f9",
+      "transactional": true,
+      "steps": [
+        { "name": "parse", "uses": "tributary.hl7v2.parse" },
+        { "name": "normalise", "ref": "lab_flow.mapping.normalise_observations", "with": { "unitSystem": "ucum", "strict": true } }
+      ]
+    },
+    "destinations": [
+      {
+        "name": "dwh",
+        "type": "http",
+        "with": { "url": "https://dwh.example.org/v1/observations", "method": "POST", "timeoutMs": 15000 },
+        "idempotency": { "technique": "sink-native", "note": "ReplacingMergeTree on (tb_msg_id)" },
+        "retry": { "policy": "blocking", "maxAttempts": 20, "onExhaust": "halt-partition" }
+      }
+    ]
+  }
+}
