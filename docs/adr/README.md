@@ -9,6 +9,10 @@ approves it.
 | [001](ADR-001-kafka-centric-python-integration-engine.md) | Kafka-centric, Python-native open-source integration engine | Proposed | — |
 | [002](ADR-002-topic-topology-and-envelope.md) | Topic topology and envelope specification | Proposed (skeleton, TODOs pending spikes) | `envelope/v0`, `topics/v0` |
 | [003](ADR-003-ordering-retry-and-dlq.md) | Ordering, retry and DLQ policy | Proposed (skeleton, TODOs pending spikes) | `envelope/v0`, `events/v0` |
+| [007](ADR-007-channel-spec-shape-and-refusals.md) | Channel spec shape and what it refuses | Proposed (W1-1, no invariant changes) | `channel-spec/v0`, `envelope/v0`, `topics/v0` |
+
+Numbers 004 to 006 stay reserved for the planned ADRs below, so the channel-spec decision took 007
+rather than renumbering them. ADR numbers are identifiers, not an ordering.
 
 ## Planned
 

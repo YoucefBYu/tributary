@@ -5,9 +5,28 @@ wave's exit criteria here.
 
 ## Current
 
-- **Phase / wave:** **Phase 0 complete and SIGNED.** The human signed the gate on 2026-09-22 as
-  **GO WITH CONDITIONS**. **This does not start Phase 1 — Phase 1 needs the human's separate go-ahead.**
-- **Branch:** `wave/0`
+- **Phase / wave:** **Phase 1, wave 1 — walking skeleton. IN PROGRESS.** Team of five: `architect`,
+  `platform-engineer`, `connector-engineer`, `devops-engineer`, `qa-engineer`. Phase 0 is complete and
+  signed (**GO WITH CONDITIONS**, 2026-09-22).
+- **Branch:** `wave/1-1`
+- **W1-1 contracts (architect): artifacts complete, verification outstanding.**
+  `tributary.channel-spec/v0` is published — schema, README, 23 examples (4 valid, 19 invalid) — plus
+  `contracts/validate.py`, a standalone checker for all four contracts. Envelope gained section 2.3
+  (every header parsed defensively: reject, never crash — Phase 1 requirement 13 generalised beyond
+  the single header SR-10 hit) and 2.4 (Phase 0 spike drift not to reproduce). Topics gained 3.7
+  (`topic-defaults.json` is read, never restated as a literal) and 3.8 (the lite RF=1 startup warning
+  is mandatory and testable). `events/v0` needed no change, recorded with the reason. Decisions in
+  [ADR-007](../adr/ADR-007-channel-spec-shape-and-refusals.md).
+  **Not verified: this session has no shell.** The schema has never been through a validator, and the
+  21 new expected-failure pairs (19 channel-spec, 2 envelope) are architect **predictions**, not
+  measurements — labelled as such in the manifests. `qa-engineer` runs
+  `contracts/validate.py --emit-expectations` and the pairs are corrected from the measured output
+  before the gate. Expected conformance total afterwards: **101** (was 76).
+- **"Contracts v1" is contract set 1.0**, not a directory rename: `envelope/v0` + `topics/v0` +
+  `events/v0` + `channel-spec/v0`, frozen together at the wave-1 gate. Mapping table and the rejected
+  alternative are in `contracts/README.md`. **Overrulable by the lead or the human, and far cheaper to
+  overrule now than after wave-1 code references land.**
+- **Phase 0 branch:** `wave/0`
 - **All four blocking gate conditions are met:** (a) the root `.gitignore` restored and the stray root
   `Dockerfile` removed — human commit `325cef1`, 31 lines back, lead-verified that `samples/mirth/*`,
   `.env`, `secrets/` and `benchmarks/results/` are ignored again; (b) the spike data plane bound to
@@ -99,6 +118,14 @@ All six filed and synthesised. Full threshold table with evidence ratings quoted
 | 2026-09-21 | Lead stopped the running spike cluster (`docker compose down`) because of the all-interfaces exposure (`security-reviewer` High 2). Nothing lost; storage was ephemeral | gate report 1.1 |
 | 2026-09-22 | **Human, "Approve orjson, hypothesis and pathspec":** the three MPL-2.0 dependencies are **APPROVED** as unmodified — `orjson` (shipping runtime, `MPL-2.0 AND (Apache-2.0 OR MIT)`), `hypothesis` (test-only), `pathspec` (build-time). The approval covers these three packages unmodified; **any new or modified MPL dependency needs fresh approval**, and the inventory is known to be incomplete because `[build-system] requires` resolves outside the lockfiles | gate report 5.1, ADR-001 2.3 |
 | 2026-09-22 | **Human: Phase 0 gate signed as GO WITH CONDITIONS.** Does not start Phase 1 | gate report, sign-offs table |
+| 2026-09-22 | **Channel spec v0 published** (W1-1): declarative spec referencing code in a digest-pinned bundle. Rejected: a Mirth-parity spec with inline source (breaks invariant 7 and puts arbitrary code on `_tb.channels`, which is RCE across the data plane) and a code-first channel with no document (the UI and control plane could not reason about a channel without executing tenant code) | ADR-007, `contracts/channel-spec/v0` |
+| 2026-09-22 | **`retry-topic` is in the policy enum and rejected by the validator.** Vocabulary stays shared across specs, docs and code; selection is a validation failure until the spike. Chosen over a prose-only ban because both Phase 0 High findings were controls that were specified and then not applied | ADR-007 D5, ADR-003 D1/D2 |
+| 2026-09-22 | **Security rules that a schema can hold are held by the schema**: TLS unless loopback, `tls.clientAuth` stated explicitly, plaintext HTTP only to loopback, no query string in a destination URL, credential-shaped property names rejected, `queue.maxBytes` required. Phase 1 requirements 5 and 8 become validation failures rather than review findings | ADR-007 D7 |
+| 2026-09-22 | **`idempotency` is required on every destination**, with a written justification when `none`. Invariant 4 becomes declarative and per-channel reviewable instead of a sentence in a loader docstring. The key is always `tb-msg-id` and is not configurable | ADR-007 D4 |
+| 2026-09-22 | **The `_tb.<env>.channels` record shape is specified for the first time**: key, value, tombstone, and the rule that the runtime rejects a published record without `metadata.version`. Invariant 3 made that topic load-bearing and nothing had defined it | `contracts/channel-spec/v0/README.md` 6 |
+| 2026-09-22 | **"Contracts v1" = contract set 1.0**, not `v1/` directories. Rejected: copying three contracts into new major directories — ~60 files moved, every path in `tests/conformance`, ADR-002, ADR-003 and this file broken, no schema changed. A new major directory is created by a breaking change *after* a freeze, not by the freeze | `contracts/README.md`, `contracts/CHANGELOG.md` |
+| 2026-09-22 | **Phase 1 requirement 13 generalised**: every integer, timestamp and UUID header is parse-or-reject, with `reject` defined (dlq + `HEADER_PARSE_ERROR` + event + commit) and the failing value kept out of the error string. A missing required header is the same class of failure | `contracts/envelope/v0` 2.3 |
+| 2026-09-22 | **`topic-defaults.json` is read, never restated as a literal**, in runtime, control plane, topic creation, Compose and Helm. Reason: `min.insync.replicas` is topic-level, so a copied-and-forgotten literal makes invariant 1 silently false — the HIGH finding's original mechanism | `contracts/topics/v0` 3.7 |
 | 2026-09-22 | Both gate High findings closed: root `.gitignore` restored (human `325cef1`) and the spike data plane bound to localhost (`e553fd7`, `71364c7`). Conformance suite now asserts *why* each invalid example fails (`83a1fd2`, 76 passed), and the AA-withheld-until-publish-resolves unit test exists (`a5df2c7`) | gate report 1.1 |
 
 ## Open questions for the human

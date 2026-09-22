@@ -21,8 +21,9 @@ the human, and much cheaper to reverse now than after wave-1 code references lan
 ### New: `tributary.channel-spec/v0` (Draft)
 
 `channel-spec/v0/channel.schema.json` plus 23 examples (4 valid, 19 invalid). Consumers: runtime,
-control plane, CLI, UI, migration. Decisions recorded in ADR-005, with the options and what each
-gives up. The schema-enforced rules and the rule each serves are tabulated in
+control plane, CLI, UI, migration. Decisions recorded in
+[ADR-007](../docs/adr/ADR-007-channel-spec-shape-and-refusals.md), with the options and what each
+gives up (ADR-004 to ADR-006 are reserved for the topics already named in `docs/adr/README.md`). The schema-enforced rules and the rule each serves are tabulated in
 `channel-spec/v0/README.md` section 2; the load-bearing ones:
 
 | Rule | Basis |

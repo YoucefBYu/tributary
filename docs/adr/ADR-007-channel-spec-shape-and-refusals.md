@@ -1,0 +1,117 @@
+# ADR-007: Channel Spec Shape and What It Refuses
+
+**Status:** Proposed — decided by the architect at W1-1. No invariant changes; every rule here realises an existing invariant or a Phase 0 gate requirement.
+**Date:** 2026-09-22
+**Deciders:** architect, with the lead and human able to overrule before the wave-1 gate
+**Relates to:** ADR-001 sections 6.1, 6.2, 6.4 · ADR-003 D1-D6 · invariants 1, 3, 4, 5, 6, 7 · gate `phase-0-spikes.md` 7.1 requirements 5, 7, 8, 13
+**Contracts:** `contracts/channel-spec/v0` (new), `contracts/envelope/v0` 2.3-2.4, `contracts/topics/v0` 3.7-3.8
+**Evidence:** none of these is a measurement. The numeric defaults referenced (3 partitions, `session.timeout.ms` 15000, `commit_every`) come from S4 and S5 via ADR-002; the channel spec only points at them.
+
+---
+
+## 1. Context
+
+Wave 1 needs one document that the runtime, the control plane, the CLI, the UI and the Mirth
+importer all agree on, published before those five things are written. ADR-001 6.1 sketches it as an
+illustration; an illustration cannot be validated, so three teams were about to invent details
+independently.
+
+Two constraints shape it more than convenience does:
+
+- **Invariant 3** makes `_tb.<env>.channels` the worker's only source of truth. A spec is therefore a
+  document that a tenant can supply and the data plane then trusts completely.
+- **Phase 0's two High findings were both controls that were specified and then quietly not applied.**
+  The gate report says so explicitly. That is an argument for putting rules in a validator rather
+  than in prose, wherever a validator can hold them.
+
+## 2. Options considered
+
+### Option A — Mirth-parity spec: inline source in the document
+
+Filter and transformer bodies live in the spec as strings, as Mirth does with JavaScript.
+
+| | |
+|---|---|
+| Pros | Shortest path for a migrating Mirth user; a one-line filter costs one line; the importer maps almost directly; no bundle build needed for a trivial channel |
+| Cons | Breaks invariant 7: inline source cannot be imported by pytest, reviewed in a diff, type-checked by `mypy`, or pinned by a digest. It puts arbitrary code on the `_tb.channels` topic, which is the one artefact write access to means remote code execution across the data plane (`topics/v0` 3.4). Every "run this string" path needs a sandbox we have not designed |
+| Complexity | Low to write, high to secure |
+| Cost | The trust model becomes load-bearing immediately, before ADR-005 exists |
+| Scalability | Fine |
+| Team familiarity | High — it is the incumbent's model |
+
+### Option B — Declarative spec referencing code in a digest-pinned bundle (**selected**)
+
+Steps name a registered step (`uses`) or a dotted path inside an OCI bundle (`ref`). The spec
+carries configuration; the bundle carries code.
+
+| | |
+|---|---|
+| Pros | Every step is an ordinary Python function, so invariant 7's "unit-testable without Kafka" is true by construction; code is reviewed, typed and tested in its own repo; the digest makes "what code ran" answerable from a record's `tb-channel-version`; the spec stays small enough to validate strictly |
+| Cons | A one-line filter needs a bundle, a module and a test. That is a real adoption cost and the first thing a Mirth user will complain about |
+| Complexity | Moderate: needs a bundle build, which wave 1 does not have yet |
+| Cost | Migration friction, mitigated by `packages/tributary-mirth-import` |
+| Scalability | Good — the spec is config-sized regardless of pipeline size |
+| Team familiarity | Normal Python |
+
+### Option C — Code-first: the channel *is* Python, no document
+
+A decorated pipeline object defines source, steps and destinations.
+
+| | |
+|---|---|
+| Pros | No schema to maintain; full expressiveness; testable |
+| Cons | The UI cannot render or edit a channel without executing it; the control plane cannot validate a deploy without running tenant code; diffing two versions means diffing arbitrary code; invariant 3 would put a Python interpreter on the spec-load path in every worker |
+| Complexity | Low at first, high once the UI and control plane need to reason about a channel |
+| Cost | Rules out the visual channel view and safe server-side validation |
+| Scalability | Fine |
+| Team familiarity | High |
+
+## 3. Decision
+
+**Option B.** Configuration is declarative and validated; code lives in a digest-pinned bundle. Nine
+sub-decisions follow, each expressed in the schema rather than in prose wherever possible.
+
+| # | Decision | What it gives up |
+|---|---|---|
+| D1 | **No field anywhere carries inline code.** No `script`, no `code`, no `transformer` body, in this major version | A one-line filter costs a bundle, a module and a test. The conversion path is the importer's job, which is where that cost belongs |
+| D2 | **`ordering` is required with no default**; `partitionKey` required iff `per-key`, forbidden otherwise | A spec author must decide ordering before writing anything else. Intended: invariant 5 says ordering is explicit, and a default would be the thing nobody reads |
+| D3 | **`ack.mode` is a one-member enum.** `after-commit` is the only representable value | The field looks redundant. It is not: a reader sees the guarantee instead of assuming it, and there is no syntax for the invariant-1 violation |
+| D4 | **`idempotency` is required per destination**, with a justification note when `none` | Extra ceremony on every destination. It makes invariant 4 reviewable per channel and gives each loader's duplicate-delivery test something to assert against |
+| D5 | **`retry-topic` is in the enum and rejected by the validator** | A channel with an order-insensitive sink waits for the spike. Keeping the name shared across specs, docs and code while refusing selection is the honest position: ADR-003 D1 already forbids it and D2 leaves its mechanism undecided. Removing the `not` later is a one-line relaxation |
+| D6 | **Connector `type` enums list only what has been built** (`mllp`, `http`) | Every new connector costs one contract change and one approval round. Intended: the alternative is publishing invented config for unwritten code, and an enum relaxation is additive anyway |
+| D7 | **Security rules are validator rules, not review notes**: TLS unless loopback, `clientAuth` stated explicitly, plaintext HTTP only to loopback, no query string in a destination URL, credential-shaped property names rejected, `queue.maxBytes` required | Some legitimate configurations are refused — notably a FHIR destination that needs `?identifier=`, which becomes an explicit wave-2 contract change with a no-log rule rather than a default |
+| D8 | **`metadata.version` is set by the control plane and optional in the schema**; the runtime rejects a published record without it | The schema does not enforce it. Alternatives were a second schema file (cross-file `$ref` needs a resolver the conformance harness does not have) or a placeholder version in authored files (invites drift). Same arrangement as the envelope's per-class key identity rules |
+| D9 | **Retention is the only per-channel topic override** | A channel cannot tune its own durability. Correct: invariant 1 is not per-channel |
+
+## 4. Consequences
+
+- Three teams can start against a fixed surface: `platform-engineer` (runtime spec load, W1-4),
+  `connector-engineer` (MLLP and HTTP config, W1-5/W1-6), `devops-engineer` (topic creation).
+- `_tb.<env>.channels` has a contract for the first time: key, value, tombstone, and the
+  `metadata.version` rule (`channel-spec/v0/README.md` 6). Invariant 3 made that topic load-bearing
+  and nothing had specified it.
+- Phase 1 requirements 5 and 8 become validation failures instead of review findings. Requirement 7's
+  digest pinning extends from base images to bundles.
+- The Mirth importer now has a target it cannot fully hit: a channel using inline JavaScript cannot be
+  translated mechanically. S6 is already INCONCLUSIVE on import feasibility; this makes the lower
+  bound of that estimate worse, not better, and it should be said out loud rather than discovered.
+- The UI can render a channel diagram from the document without executing anything.
+
+## 5. Impact on invariants and contracts
+
+**No invariant changes.** Invariants 1, 3, 4, 5, 6 and 7 gain declarative enforcement; none is
+reworded. Contracts: `channel-spec/v0` is new; `envelope/v0` gains sections 2.3 and 2.4;
+`topics/v0` gains 3.7 and 3.8. All additive, all recorded in `contracts/CHANGELOG.md`.
+
+## 6. Follow-ups
+
+1. **Measure the expected-failure pairs.** All 19 channel-spec pairs and 2 new envelope pairs are
+   architect predictions; this session had no shell. `qa-engineer` runs
+   `contracts/validate.py --emit-expectations` and the manifests are corrected from the output.
+   Until then the schema is **unexecuted**.
+2. **`queue.maxBytes` default** is `TODO(connector-engineer)` — the contract fixes the unit, not the
+   number, and the number should come from a measurement.
+3. **`retry-topic` spike** (ADR-003 D2, gate 7.2 item 18) removes the `not` in D5.
+4. **Claim-check spike** decides whether a channel-level knob is needed at all.
+5. **Sync-reply fields** arrive with W2-8; **`partitionKey` expression semantics** with W2-4.
+6. **Destination-level filters** were deliberately omitted; revisit if a real channel needs one.
