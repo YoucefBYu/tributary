@@ -1,0 +1,188 @@
+# Tributary lite stack (Phase 1, W1-7): single-node Kafka (KRaft), ClickHouse, PostgreSQL, the MLLP
+# receiver, and a one-shot job that creates the walking-skeleton topics. `worker` and `loader` are
+# not wired in yet -- see the note at the bottom of this file.
+#
+# Start:   docker compose -f deploy/compose/docker-compose.yml up -d
+# Stop:    docker compose -f deploy/compose/docker-compose.yml down
+# Verify:  docker compose -f deploy/compose/docker-compose.yml ps   (every service "healthy")
+# See deploy/compose/README.md for what each service is for and how to talk to the receiver.
+#
+# *** LITE PROFILE, DEVELOPMENT ONLY ***
+# One Kafka broker, replication factor 1, min.insync.replicas 1 (topic-defaults.json `profiles.lite`,
+# ADR-002 D14, human-approved 2026-09-21). This is an explicit, documented exception to invariant 1's
+# durability promise, not a relaxation of it: an acknowledged message can still be lost if this one
+# broker dies before it is replicated, because there is nothing to replicate it to. The topic-bootstrap
+# job logs the mandatory startup warning every run (`bootstrap_topics.py::emit_lite_warning`); each
+# data-plane component must also emit it once W1-4/5/6 land (topic-defaults.json README 3.8).
+# BARRED FROM PRODUCTION. Never point this stack at anything but synthetic data (CLAUDE.md).
+#
+# Every published port is bound to 127.0.0.1 explicitly. Docker's default is 0.0.0.0, which would
+# expose an unauthenticated, unencrypted dev cluster to the whole local network (Phase 0 gate finding
+# High 2 / SR-8, and Phase 1 requirement 8). Do not remove the `127.0.0.1:` prefixes and do not add
+# credentials here to make wider exposure "safe enough" -- production topology is Helm, not this file.
+# PLAINTEXT and no-auth throughout are fine ONLY because nothing here is reachable off-loopback and
+# nothing here ever carries real patient data.
+#
+# Storage is intentionally ephemeral (no named volumes), matching spikes/common/docker-compose.yml:
+# `stop`/`start` keeps a container's data, `down` starts clean. Avoids the root-owned volume
+# permission trap on Windows/WSL2 too. Add named volumes yourself for a longer-lived local sandbox.
+
+name: tributary-lite
+
+services:
+  kafka:
+    # Apache Software Foundation image (Apache-2.0). Do not swap in confluentinc/cp-* -- Confluent
+    # Community License is not on CLAUDE.md's allowed list (Apache-2.0/MIT/BSD/ISC/PSF, MPL only as
+    # an approved unmodified dependency).
+    image: apache/kafka:4.0.0@sha256:3f7b939115cd4872e9cee9369d80bd69712fde55f9902f46d793f64848dedc75
+    container_name: tb-kafka
+    hostname: kafka
+    # "no", deliberately, matching the spike cluster: `docker kill` (what a future chaos test uses)
+    # DOES trigger a restart policy, and any restart policy would silently resurrect the broker
+    # inside a fault-injection window and make the result a lie.
+    restart: "no"
+    ports:
+      - "127.0.0.1:19092:19092"
+    environment:
+      CLUSTER_ID: ZEBnsPTsTmysrIwkF8yYDw
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:19092
+      # EXTERNAL advertises the loopback address on purpose: it is the only address a host-side tool
+      # (a local kcat, the future e2e test) can actually reach through the port mapping above.
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://127.0.0.1:19092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      # RF=1 / min.insync.replicas=1: the lite-profile exception (see the file header). Not in
+      # topic-defaults.json `must_not_hardcode` -- that list covers per-topic-class configs (created
+      # by topic-bootstrap, which reads them from the file at every run) and worker/producer client
+      # settings, not these two broker-wide defaults, which are fixed by "one broker" rather than
+      # measured. `auto.create.topics.enable` stays false so nothing but topic-bootstrap creates a
+      # topic, and so an under-configured auto-created topic can never be how invariant 1 goes quiet.
+      KAFKA_DEFAULT_REPLICATION_FACTOR: "1"
+      KAFKA_MIN_INSYNC_REPLICAS: "1"
+      KAFKA_UNCLEAN_LEADER_ELECTION_ENABLE: "false"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_HEAP_OPTS: ${TB_KAFKA_HEAP:--Xmx512M -Xms512M}
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 15s
+
+  clickhouse:
+    # Apache-2.0.
+    image: clickhouse/clickhouse-server:24.8-alpine@sha256:b002e56ed5c16e224c312527f6fcba7e77216fec5d7a88a7828f59efc614feb5
+    container_name: tb-clickhouse
+    restart: "no"
+    ports:
+      - "127.0.0.1:8123:8123"  # HTTP interface
+      - "127.0.0.1:9000:9000"  # native protocol
+    environment:
+      CLICKHOUSE_DB: tributary
+      # Deliberately no CLICKHOUSE_USER/CLICKHOUSE_PASSWORD: setting a username without a password
+      # makes the entrypoint disable network access for it entirely (tested against 24.8-alpine), so
+      # the fix is to leave both unset and keep the image's own default -- `default` user, no
+      # password, network access on. Acceptable only because this port is loopback-bound and never
+      # carries real data (see the file header); set a password before binding this wider.
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    healthcheck:
+      # 127.0.0.1, not localhost: this image's /etc/hosts resolves localhost to ::1 first, and
+      # ClickHouse listens on the IPv4 interface, so a name-based check hangs until the whole
+      # `retries` budget is spent (confirmed empirically, 24.8-alpine).
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8123/ping | grep -q Ok || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 10s
+
+  postgres:
+    # PostgreSQL License (permissive).
+    image: postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+    container_name: tb-postgres
+    restart: "no"
+    ports:
+      - "127.0.0.1:5432:5432"
+    environment:
+      POSTGRES_DB: tributary
+      POSTGRES_USER: tributary
+      # `trust` (no password) instead of a committed default password: CLAUDE.md forbids secrets in
+      # the repo, and a dev-only default password is still a password someone will forget to change.
+      # Safe here only because the port is loopback-bound and this stack never holds real data.
+      POSTGRES_HOST_AUTH_METHOD: trust
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tributary -d tributary"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 5s
+
+  topic-bootstrap:
+    build:
+      context: ./topic-bootstrap
+    container_name: tb-topic-bootstrap
+    restart: "no"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    volumes:
+      # Read the contract, don't copy it: `topic-defaults.json` `must_not_hardcode` (architect,
+      # 2026-09-22) -- every partition count and per-class config comes from this file at container
+      # start, every run, so a contract change or a re-measurement reaches the lite stack without a
+      # rebuild.
+      - ../../contracts/topics/v0/topic-defaults.json:/contracts/topics/v0/topic-defaults.json:ro
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+      TB_ENV: dev
+      TB_PROFILE: lite
+      TB_CHANNEL: adt-passthrough
+      TB_TOPIC_DEFAULTS: /contracts/topics/v0/topic-defaults.json
+    read_only: true
+
+  mllp-receiver:
+    build:
+      context: ../..  # repo root: the image needs the full uv workspace to resolve tributary-sdk
+      dockerfile: deploy/compose/images/python-app.Dockerfile
+      args:
+        TB_PACKAGE: tributary-receivers
+    container_name: tb-mllp-receiver
+    restart: "no"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      topic-bootstrap:
+        condition: service_completed_successfully
+    command:
+      - tributary.receivers.mllp
+      - --channel-spec=/contracts/channel-spec/v0/examples/valid/walking-skeleton-loopback.json
+      - --env=dev
+      - --bootstrap=kafka:9092
+    volumes:
+      - ../../contracts/channel-spec/v0/examples/valid/walking-skeleton-loopback.json:/contracts/channel-spec/v0/examples/valid/walking-skeleton-loopback.json:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+    # No port is published. The walking-skeleton channel spec binds the MLLP listener to 127.0.0.1
+    # (contracts/channel-spec/v0 `source.bind`), which `require_safe_bind` (tributary-receivers)
+    # accepts without TLS -- but a container's own loopback is not reachable through Docker's port
+    # publishing, only from inside that same network namespace. A healthcheck runs via `docker exec`,
+    # i.e. inside the container, so it can still prove the listener is up; a real MLLP client (the
+    # future W1-8 e2e test) must join this network namespace explicitly:
+    #   network_mode: "service:mllp-receiver"
+    # rather than get a published host port. See deploy/compose/README.md.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 6661), timeout=2).close()"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 5s
+
+# worker and loader are not defined yet: tributary-runtime has no consumer entry point (W1-4) and
+# tributary-loaders has no HTTP loader (W1-6) as of this file. Once both exist, add them here the same
+# way as mllp-receiver (python-app.Dockerfile, TB_PACKAGE=tributary-runtime / tributary-loaders),
+# wire worker's out.http-stub consumption to the loader, and update the "under two minutes" verify
+# note in README.md to include them.
