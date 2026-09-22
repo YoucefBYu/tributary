@@ -294,6 +294,58 @@ tb.<env>.<channel>.<role>[.<destination>]     role = pipeline | loader | replier
 For example `tb.prod.adt-to-fhir.loader.fhir-server`. A shadow deployment appends
 `.shadow-<label>`, which is what makes shadow deploys free: a second group on the same `raw` topic.
 
+### 3.7 These values are read from the contract, not copied into code
+
+**Normative.** [`topic-defaults.json`](topic-defaults.json) is the single source for the values
+below. The runtime, the control plane, the topic-creation job, Compose and Helm MUST obtain them
+from this file — loaded at startup, or generated into a constants module by the build — and MUST
+NOT restate them as literals.
+
+| Value | Where it must not be duplicated |
+|---|---|
+| Partition counts per class, and the partition budget | runtime, topic creation, Helm |
+| `retention.ms`, `cleanup.policy` per class | topic creation, Helm |
+| `min.insync.replicas`, `unclean.leader.election.enable` | topic creation, Compose, Helm |
+| `session.timeout.ms` (15000), `heartbeat.interval.ms` (5000) | worker and loader consumers |
+| `commit_every` | worker and loader consumers |
+| `acks`, `enable.idempotence`, `delivery.timeout.ms` | receiver producer |
+
+**Why a literal is a defect and not a style preference.** `min.insync.replicas` is a topic-level
+config: a topic created without it inherits the broker default of 1, `acks=all` is then satisfied by
+a single replica, the receiver still ACKs the sender, and the next broker loss drops an acknowledged
+message — invariant 1 violated with every setting apparently correct. That was a HIGH finding
+against contracts v0 (section 3.1), and a copied literal in one of five places is exactly how it
+returns. The same argument applies to `session.timeout.ms`: it is the recovery-time floor for an
+ordered channel (ADR-002 D5.1), so a component that quietly keeps Kafka's 45 s default stops an
+ordered partition for 45 s after an OOM kill, and nothing in the code says so.
+
+Two specific values were **measured in Phase 0 and will be re-measured on Linux** (`session.timeout.ms`,
+the partition defaults). A duplicated literal is a place the next measurement silently fails to
+reach.
+
+Acceptance: `devops-engineer` and `platform-engineer` each keep a test asserting that the component's
+effective configuration equals the value in `topic-defaults.json`. A grep-based check in CI for the
+numbers above is a reasonable second line, and is `devops-engineer`'s call.
+
+### 3.8 The lite profile's startup warning is mandatory
+
+The `lite` profile (RF=1, `min.insync.replicas=1`) is a **human-approved profile exception to
+invariant 1's durability promise**, recorded in ADR-002 D14 and adopted on 2026-09-21. The invariant
+itself is unchanged. Three rules follow, and none of them is advisory:
+
+1. Any component started against a cluster in the `lite` profile MUST emit the warning in
+   `topic-defaults.json` `profiles.lite.warning` **at startup**, at WARN level, in the structured
+   log. The distribution ships this on by default and there is no flag to suppress it.
+2. `lite` is **barred from production use.** It cannot guarantee RPO=0 for acknowledged messages,
+   which is the one promise invariant 1 makes.
+3. `lite` is the only place the durability floor may be lowered, and it is lowered explicitly in
+   `profiles.lite.class_config_overrides` rather than inherited. A tool that applies the class
+   configs and forgets the profile overrides fails **safe**, at the production floor.
+
+Acceptance: a test asserts the warning is emitted when the profile is `lite` and not emitted
+otherwise. A warning nobody can prove fires is the same as no warning — the lesson Phase 0 recorded
+as "a green test whose fault never fired is indistinguishable from a passing system".
+
 ---
 
 ## 4. Conformance

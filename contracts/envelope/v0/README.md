@@ -63,9 +63,11 @@ explicitly so the two schemas stay independent.
 even when a size is `0`. An omitted field would pass the claim-check and size rules by accident, which
 is the opposite of what a conformance test is for. `topic` is optional.
 
-**Conformance.** 25 examples: 7 valid, 18 invalid. The suite passed at commit `ae4d3bd` (70 tests
-across all three contracts) after the first round of security fixes; the second round added two
-invalid envelope examples, so the expected count is now 74. That re-run has not happened yet.
+**Conformance.** 27 examples: 7 valid, 20 invalid. The suite passed 76 / 0 / 0 across all three
+contracts at `83a1fd2` (2026-09-22), where every invalid example is asserted to fail at the
+`expected_json_path` and `expected_validator` its manifest pins. The two examples added for
+section 2.3 (`attempt-not-an-integer`, `channel-version-not-an-integer`) are **not in that run**;
+they arrive with the wave-1 channel-spec contract and are covered by the same re-run.
 
 ### 1.2 Strict producers, lenient consumers
 
@@ -143,6 +145,57 @@ in a list view — only in the record detail, which reads the record itself.
 Revisit in v1 if a real channel needs it, with an explicit per-channel allow-list of which
 `tb-usr-*` headers project into `attrs` and under which names. That is policy, which section 8
 already assigns to ADR-004.
+
+### 2.3 Every header is parsed defensively: reject, never crash
+
+**Normative, and it applies to every component that reads a record.** A Kafka header is bytes
+written by another process. Any of them may be missing, truncated, non-UTF-8, or syntactically
+wrong, including on a record this engine wrote itself — a partial produce, a downgraded producer, or
+a deliberately malformed record from a compromised writer all look the same at the consumer.
+
+| Class of header | Rule |
+|---|---|
+| Integer (`tb-attempt`, `tb-channel-version`) | Parse with an explicit conversion that cannot raise past the call site. A value that is not decimal ASCII, is signed, is padded, or overflows the documented range is a **reject**. |
+| Timestamp (`tb-received-at`, `tb-retry-not-before`) | Same, against the RFC 3339 form in section 2. A parse failure is a reject, not a silent `now()`. |
+| UUID (`tb-msg-id`, `tb-correlation-id`, `tb-parent-id`) | Same, against the canonical form. |
+| Enumerated (`tb-stage`, `tb-content-type`, `tb-error-code`) | An unknown value is not a parse failure — see "lenient consumers" in 1.2. Do not reject a record for a `tb-stage` value from a newer producer. |
+
+**Reject** means: do not process the record, route it to `dlq` with `tb-stage` set to the stage that
+read it and `tb-error-code: HEADER_PARSE_ERROR`, emit an `error` event, and commit the offset. It
+does **not** mean an unhandled exception, and it does not mean skipping the record silently.
+
+Three consequences that are easy to get wrong:
+
+1. **The error must not quote the value.** `int(v)` raises `ValueError: invalid literal for int()
+   with base 10: '<value>'`, and that string reaches logs and the exception surface. A header value
+   can be attacker-supplied or PHI-adjacent, so catch the error and raise a typed one carrying the
+   header *name* and `tb-msg-id` only (invariant 6, and section 4).
+2. **A missing required header is the same class of failure as a malformed one.** `headers["tb-attempt"]`
+   raising `KeyError` inside a consumer loop is a crash loop on one poison record, which stalls a
+   partition — the same operational outcome as the bug this rule exists to prevent.
+3. **This is total for the whole registry, not for the one header a spike happened to hit.**
+   Phase 0's finding (SR-10) was against a single experimental header. Generalising it is Phase 1
+   requirement 13, owned jointly by `platform-engineer` and `connector-engineer`.
+
+Reserved error codes the contracts themselves rely on: `HEADER_PARSE_ERROR` (this section),
+`TRANSFORM_ERROR` (ADR-001 6.4). Others are chosen by the component that raises them, within
+`^[A-Z][A-Z0-9_]{0,63}$`; there is deliberately no central registry to keep in sync.
+
+### 2.4 Known envelope drift in Phase 0 code — do not reproduce
+
+Spike code diverged from this contract in three ways. All three are recorded here because the spike
+directories stay in the tree as reference material, and the fastest way to write a Phase 1 emitter
+is to copy one.
+
+| Drift | Correct form |
+|---|---|
+| `tb-x-stage` used as a load-bearing header | `tb-stage`. `tb-x-*` is experimental, never load-bearing, and must not survive into a released package (section 2.1). |
+| Non-canonical ids: uppercase hex, unhyphenated, or a UUIDv4 in `tb-msg-id` | Canonical lowercase hyphenated form, and `tb-msg-id` is **UUIDv7** specifically — the schema's `uuid7` pattern pins the version nibble. |
+| Timestamps as epoch floats | RFC 3339, UTC, 3 to 9 fractional digits (section 2). The events contract has an `invalid/ts-epoch-float.json` example for the same mistake. |
+
+Phase 1 requirement 10 is the check that catches a recurrence: every emitter validates its output
+against this contract's schema in its own tests, using the SDK's projection helper rather than a
+hand-built dict.
 
 ---
 

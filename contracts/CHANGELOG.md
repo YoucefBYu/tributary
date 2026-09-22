@@ -3,6 +3,75 @@
 Newest first. Each entry names the contract, the version, whether the change is additive or
 breaking, and the reason. Breaking changes reference an ADR.
 
+## 2026-09-22 (W1-1) — contract set 1.0: new `tributary.channel-spec/v0`, plus envelope and topics additions
+
+Phase 1 wave 1. Everything here is **additive** to Draft contracts, so no version bump; had v0 been
+frozen, none of it would be breaking either — the envelope and topics changes add rules and examples,
+they do not narrow what an existing conforming producer may send.
+
+**Decision: "contracts v1" is a contract-set milestone, not a directory rename.** Set 1.0 is
+`envelope/v0` + `topics/v0` + `events/v0` + `channel-spec/v0`, frozen together at the wave-1 gate.
+Rejected alternative: copy the three existing contracts into `v1/` directories. That moves about
+sixty files, breaks every path in `tests/conformance`, ADR-002, ADR-003 and `STATUS.md`, and changes
+no schema. This README's own rule is that a new major directory is created by a breaking change
+*after* a freeze, not by the freeze. **Give up:** the deliverable name and the directory names no
+longer match, so the mapping table in `README.md` has to stay accurate. Reversible by the lead or
+the human, and much cheaper to reverse now than after wave-1 code references land.
+
+### New: `tributary.channel-spec/v0` (Draft)
+
+`channel-spec/v0/channel.schema.json` plus 23 examples (4 valid, 19 invalid). Consumers: runtime,
+control plane, CLI, UI, migration. Decisions recorded in ADR-005, with the options and what each
+gives up. The schema-enforced rules and the rule each serves are tabulated in
+`channel-spec/v0/README.md` section 2; the load-bearing ones:
+
+| Rule | Basis |
+|---|---|
+| `ordering` required with no default; `partitionKey` required iff `per-key` | Invariant 5 |
+| `source.ack.mode` is a one-member enum (`after-commit`) | Invariant 1 — no representable way to express ACK-before-commit |
+| `destinations[].idempotency` required; `none` requires a justification note | Invariant 4 |
+| `retry.policy: retry-topic` is in the enum and **rejected by the validator** | ADR-003 D1/D2 — defined vocabulary, never implemented or measured |
+| No field anywhere carries inline code | Invariant 7 |
+| `pipeline.bundle` must be digest-pinned | Supply chain; browser attribution |
+| TLS required on a non-loopback `bind`; plaintext HTTP only to loopback; `tls.clientAuth` must be stated | Phase 1 requirement 8 (SR-8, CR-10) |
+| `queue.maxBytes` required when `queue` is present | Phase 1 requirement 5 (SR-3) |
+| Destination URL carries no query string or fragment | Envelope section 4 — PHI in URLs |
+| `with` rejects credential-shaped property names | No secrets in a spec |
+
+Also fixed by this contract: the `_tb.<env>.channels` record shape (key, value, tombstone, the
+`metadata.version` rule) — `channel-spec/v0/README.md` section 6. Invariant 3 makes that topic the
+worker's only source of truth, so it needed a contract and had none.
+
+### `tributary.envelope/v0`
+
+| Change | Reason |
+|---|---|
+| New section 2.3, **every header is parsed defensively: reject, never crash** | Phase 1 requirement 13 (SR-10), generalised from the one experimental header a spike hit to every integer, timestamp and UUID header. Defines `reject` (dlq + `HEADER_PARSE_ERROR` + event + commit), forbids quoting the value in the error, and names the missing-header case as the same class of failure |
+| New section 2.4, **known envelope drift in Phase 0 code** | `tb-x-stage` as a load-bearing header, non-canonical ids, epoch-float timestamps. The spike directories stay in the tree and are the fastest thing to copy |
+| Two invalid examples: `attempt-not-an-integer`, `channel-version-not-an-integer` | Give section 2.3 a conformance guard |
+| Conformance paragraph corrected | It still claimed 74 expected and "that re-run has not happened yet"; it was 76 at `83a1fd2` |
+
+### `tributary.topics/v0`
+
+| Change | Reason |
+|---|---|
+| New section 3.7 and a `must_not_hardcode` block in `topic-defaults.json` | The runtime, control plane, topic creation, Compose and Helm read these values, never restate them. `min.insync.replicas` is topic-level: a topic created without it inherits the broker default of 1, `acks=all` is satisfied by one replica, and a broker loss drops an acknowledged message with every setting apparently correct. That was a HIGH finding, and a copied literal in one of five places is how it returns |
+| New section 3.8 and `profiles.lite` fields `production_use`, `startup_warning_required`, `warning_acceptance` | The lite RF=1 warning is mandatory and testable, not advisory, and `lite` is barred from production. Human-approved profile exception to invariant 1, ADR-002 D14, 2026-09-21 |
+
+### `tributary.events/v0`
+
+**No change, deliberately.** Wave 1 emits lifecycle events through the existing schema; nothing in
+W1-3 to W1-8 needs a new field, and the `_hmac` question is human-reserved. Phase 1 requirement 10
+(validate the real emitters against this schema) is a test obligation, not a contract change.
+
+### Not verified
+
+`contracts/validate.py` is new and **has never been run** — this session has no shell. The 19
+channel-spec expected-failure pairs and the 2 new envelope pairs are the architect's **predictions**,
+not measurements, and are labelled as such in the manifests. `qa-engineer` runs
+`--emit-expectations` and the pairs are corrected from the measured output before the wave-1 gate.
+Every other contract's pairs were measured at `83a1fd2` and are unaffected.
+
 ## 2026-09-20 (P0-3) — `tributary.topics/v0`: partition defaults and consumer timeouts, from measurements
 
 Still Draft, so these land in place without a version bump. Had v0 been frozen this would be

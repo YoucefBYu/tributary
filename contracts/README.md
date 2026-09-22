@@ -11,13 +11,33 @@ for approval before implementing.
 | Message envelope (`tb-*` headers, key, payload) | v0 | Draft | [`envelope/v0/README.md`](envelope/v0/README.md) | `envelope/v0/envelope.schema.json` |
 | Topic naming, defaults, required config | v0 | Draft | [`topics/v0/README.md`](topics/v0/README.md) | `topics/v0/topic-name.schema.json`, `topics/v0/topic-defaults.json` |
 | Lifecycle events (`_tb.<env>.events`) | v0 | Draft | [`events/v0/README.md`](events/v0/README.md) | `events/v0/event.schema.json` |
+| Channel spec (source, steps, destinations, ordering, retry) | v0 | Draft | [`channel-spec/v0/README.md`](channel-spec/v0/README.md) | `channel-spec/v0/channel.schema.json` |
+
+### Contract set 1.0 — what "contracts v1" means
+
+The Phase 1 wave 1 plan calls for "contracts v1". That is the **contract set** milestone, not a
+directory rename: set 1.0 is the four contracts above, frozen together at the wave-1 gate.
+
+| Set version | Members | Frozen |
+|---|---|---|
+| 1.0 | `envelope/v0`, `topics/v0`, `events/v0`, `channel-spec/v0` | at the Phase 1 wave 1 gate |
+
+**Why not `envelope/v1/` and so on.** The rule below says a new major *directory* is created by a
+breaking change **after** a freeze, not by the freeze itself. Copying the three contracts into `v1/`
+directories would move about sixty files, break every path in `tests/conformance`, ADR-002, ADR-003
+and `STATUS.md`, and change no schema — a rename presented as a version. The contracts are still
+Draft, so wave-1 changes go into the existing directories and are recorded in
+[`CHANGELOG.md`](CHANGELOG.md), which is what Draft status is for.
+
+**Give up:** the deliverable's name and the directory names no longer match, so this table is the
+mapping and has to stay accurate. Architect decision, 2026-09-22; the lead and the human can
+overrule it, and it is much cheaper to overrule now than after wave 1 references land.
 
 ## Planned
 
 | Contract | Format | Target | Consumers |
 |---|---|---|---|
-| Channel spec | JSON Schema plus examples | Phase 1 wave 1 | control plane, runtime, CLI, UI, migration |
-| Control-plane API | OpenAPI 3.1 | Phase 1 wave 1 | API, UI client generation, CLI, tests |
+| Control-plane API | OpenAPI 3.1 | Phase 1 wave 3 (W3-1) | API, UI client generation, CLI, tests |
 | Audit events (`_tb.<env>.audit`) | JSON Schema | Phase 1, with RBAC — **blocked on the retention decision** (`topics/v0/README.md` 2.1): whether Kafka, ClickHouse or object storage is the system of record changes the contract, so settle that first | control plane, archive |
 
 ## Rules
@@ -46,7 +66,24 @@ One parameterised test per contract walks the manifest: every `valid` file must 
 `invalid` file must fail. `qa-engineer` owns the suite in `tests/conformance/`. The topics contract
 uses inline string lists instead of files, since a topic name is one string.
 
-**Status: 76 passed at `83a1fd2`.** History, newest first:
+Two ways to run it. [`validate.py`](validate.py) is the architect-owned checker: standalone,
+`jsonschema` plus the standard library only, so it runs on a clean clone before the uv workspace
+exists, and it is what a contract author runs while editing a schema.
+
+```
+uv run --no-project --python 3.12 --with jsonschema python contracts/validate.py
+uv run --no-project --python 3.12 --with jsonschema python contracts/validate.py --emit-expectations
+```
+
+`--emit-expectations` prints the **measured** `(json_path, validator)` pair for every invalid
+example, paste-ready. It exists because the architect session has no shell: pairs written without
+it are predictions. Neither tool ever prints an instance or part of one — a contract example is
+record-shaped, so that is a PHI rule (invariant 6), not a style one.
+
+**Status: 76 passed at `83a1fd2`** for the three contracts that existed then. The wave-1 additions —
+the whole channel-spec contract (23) and two envelope examples for requirement 13 — are **not in
+that run**, and their pinned failure pairs are **architect predictions, not measurements**. Expected
+total after the re-run: 101. History, newest first:
 
 | Run | Result | Covers |
 |---|---|---|

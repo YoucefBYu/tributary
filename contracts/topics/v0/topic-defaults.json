@@ -7,6 +7,24 @@
     "per-channel spec overrides (retention only)"
   ],
   "apply_order_note": "A topic-creation tool MUST apply the class configs and THEN the profile overrides. Applying only the class configs is safe by default because they carry the production durability values.",
+  "must_not_hardcode": {
+    "$comment": "NORMATIVE, see README.md 3.7. Every value below is read from this file - loaded at startup or generated into constants by the build - and never restated as a literal in packages/ or deploy/. min.insync.replicas is the reason: it is a TOPIC-level config, so a topic created without it inherits the broker default of 1, acks=all is satisfied by one replica, the receiver still ACKs, and the next broker loss drops an acknowledged message. Invariant 1 false with every setting apparently correct. A copied literal in one of five places is how that HIGH finding returns.",
+    "values": [
+      "classes[*].partitions",
+      "classes[*].configs.retention.ms",
+      "classes[*].configs.cleanup.policy",
+      "classes[*].configs.min.insync.replicas",
+      "classes[*].configs.unclean.leader.election.enable",
+      "clients.worker_consumer.session.timeout.ms",
+      "clients.worker_consumer.heartbeat.interval.ms",
+      "clients.worker_consumer.commit_every",
+      "clients.receiver_producer.acks",
+      "clients.receiver_producer.enable.idempotence",
+      "clients.receiver_producer.delivery.timeout.ms",
+      "partition_budget.*"
+    ],
+    "acceptance": "devops-engineer and platform-engineer each keep a test asserting the component's effective configuration equals the value here. session.timeout.ms and the partition defaults will be re-measured on Linux; a duplicated literal is a place that re-measurement silently fails to reach."
+  },
   "profiles": {
     "production": {
       "replication_factor": 3,
@@ -16,10 +34,14 @@
     "lite": {
       "replication_factor": 1,
       "rpo_zero": false,
+      "production_use": "barred",
+      "startup_warning_required": true,
+      "approval": "Human-approved profile exception to invariant 1's durability promise, 2026-09-21 (ADR-002 D14). The invariant itself is NOT edited. See README.md 3.8.",
       "class_config_overrides": {
         "min.insync.replicas": 1
       },
-      "warning": "RF=1 with min.insync.replicas=1 cannot guarantee RPO=0 for acknowledged messages. Development and accepted-risk small sites only; the runtime must log this at startup. This is the ONLY place the durability floor may be lowered, and it is deliberately explicit rather than inherited."
+      "warning": "RF=1 with min.insync.replicas=1 cannot guarantee RPO=0 for acknowledged messages. Development and accepted-risk small sites only; the runtime must log this at startup. This is the ONLY place the durability floor may be lowered, and it is deliberately explicit rather than inherited.",
+      "warning_acceptance": "MANDATORY and testable: emitted at WARN level in the structured log by any component started against a lite-profile cluster, on by default, with no flag to suppress it. A test asserts it is emitted under lite and not otherwise - a warning nobody can prove fires is the same as no warning."
     }
   },
   "durability_floor": {

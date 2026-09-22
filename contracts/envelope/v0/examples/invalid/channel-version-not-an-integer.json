@@ -1,0 +1,18 @@
+{
+  "class": "raw",
+  "topic": "prod.adt-to-fhir.raw",
+  "key_present": true,
+  "key_size": 26,
+  "payload_present": true,
+  "payload_size": 1180,
+  "headers": {
+    "tb-msg-id": "018f3a5c-7d21-7b3e-9f01-2c4a6e8b0d13",
+    "tb-channel": "adt-to-fhir",
+    "tb-channel-version": "v7",
+    "tb-source": "mllp-receiver:recv-7f3a@10.0.2.15:41522",
+    "tb-received-at": "2026-09-20T11:22:33.123Z",
+    "tb-content-type": "application/hl7-v2+er7; charset=UTF-8",
+    "tb-attempt": "0",
+    "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+  }
+}
