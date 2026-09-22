@@ -85,6 +85,22 @@ def test_usr_header_named_after_an_identifier_is_refused() -> None:
         make_message().with_usr("patient-id", "12345")
 
 
+def test_experimental_headers_are_tolerated_inbound_and_strippable() -> None:
+    """Envelope contract 1.2 against 2.1: accept `tb-x-*` on the way in, never hand one on."""
+    inbound = Message(headers={**make_message().headers, "tb-x-seq": "17", "tb-usr-batch-id": "b-4471"})
+    assert inbound.get("tb-x-seq") == "17", "a consumer must not reject a record for an unknown header"
+
+    outgoing = inbound.without_experimental()
+    assert outgoing.get("tb-x-seq") is None
+    assert outgoing.headers["tb-usr-batch-id"] == "b-4471", "the channel-defined space is propagated"
+    assert outgoing.msg_id == inbound.msg_id
+
+
+def test_stripping_nothing_returns_the_same_object() -> None:
+    message = make_message()
+    assert message.without_experimental() is message
+
+
 def test_text_refuses_to_guess_the_hl7_charset() -> None:
     """HL7 v2 in the field is frequently ISO-8859-1; guessing UTF-8 corrupts names (envelope 3.1)."""
     message = make_message(b"MSH|^~\\&|", content_type="application/hl7-v2+er7")
