@@ -7,6 +7,14 @@ requires-python = ">=3.12"
 dependencies = [
 ]
 
+# Stdlib only, on purpose: a channel bundle must be able to import the SDK, write steps and test them
+# without a Kafka client, a JSON Schema validator or anything else the data plane happens to use.
+
+[project.entry-points.pytest11]
+# Gives a bundle the `run_step`, `run_pipeline`, `make_message` and `fake_ctx` fixtures of
+# ADR-001 6.2 with no conftest. Fixtures only: the plugin adds no hooks and changes no collection.
+tributary_sdk = "tributary.sdk.pytest_plugin"
+
 [build-system]
 requires = ["hatchling==1.27.0"]
 build-backend = "hatchling.build"

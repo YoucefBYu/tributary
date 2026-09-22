@@ -98,6 +98,16 @@ class LogFieldError(TributaryError):
     """A structured-log field is not a scalar, is too long, or uses a name that denotes an identifier."""
 
 
+class KeyValueConflictError(TributaryError):
+    """A versioned `ctx.kv` write lost a race: the stored version is not the expected one."""
+
+    def __init__(self, key: str, *, expected: int, actual: int) -> None:
+        super().__init__(f"kv key {safe_token(key)}: expected version {expected}, found {actual}")
+        self.key = key
+        self.expected = expected
+        self.actual = actual
+
+
 class SecretNotFoundError(TributaryError):
     """No secret is bound to the given `secretRef`."""
 
