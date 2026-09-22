@@ -30,6 +30,7 @@ dev = [
     "ruff>=0.8",
     "mypy>=1.13",
     "pre-commit>=4.0",
+    "testcontainers[kafka]>=4.8",  # Apache-2.0; W1-4/W1-5 integration tests (Kafka via testcontainers)
 ]
 
 [tool.pytest.ini_options]
