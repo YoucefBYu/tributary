@@ -1,0 +1,75 @@
+"""Identifier and trace-context minting: UUIDv7 message ids and W3C `traceparent`.
+
+Python 3.12 has no `uuid.uuid7`, so the layout of RFC 9562 section 5.7 is built here. The version and
+variant nibbles are what the envelope schema checks (`^...-7[0-9a-f]{3}-[89ab]...`), and a v4 id or a
+hex-without-hyphens id is the exact non-conformance the Phase 0 gate found in S3 (section 6, G1).
+
+Nothing here derives an identifier from payload content. A correlation id in particular must not be a
+hash of a patient identifier, because that makes it a stable pseudonym for that patient in every reply
+record and archive row (envelope contract 3.2).
+"""
+
+from __future__ import annotations
+
+import secrets
+import time
+import uuid
+
+_UNIX_TS_MS_BITS = 48
+_RAND_A_BITS = 12
+_RAND_B_BITS = 62
+
+
+def uuid7(*, unix_ts_ms: int | None = None) -> str:
+    """A time-ordered UUIDv7 in canonical lowercase form.
+
+    Ordering is at millisecond granularity: two ids minted in the same millisecond sort arbitrarily.
+    That is sufficient here — `tb-msg-id` is an identity and an idempotency key, never a sequence
+    number, and per-key ordering comes from the partition, not from the id.
+    """
+    stamp = time.time_ns() // 1_000_000 if unix_ts_ms is None else unix_ts_ms
+    if not 0 <= stamp < (1 << _UNIX_TS_MS_BITS):
+        raise ValueError("unix_ts_ms does not fit in 48 bits")
+    value = stamp << 80
+    value |= 0x7 << 76
+    value |= secrets.randbits(_RAND_A_BITS) << 64
+    value |= 0b10 << 62
+    value |= secrets.randbits(_RAND_B_BITS)
+    return str(uuid.UUID(int=value))
+
+
+def new_correlation_id() -> str:
+    """A fresh engine-minted correlation id (UUIDv4, never derived from the payload; envelope 3.2)."""
+    return str(uuid.uuid4())
+
+
+def _nonzero_hex(byte_count: int) -> str:
+    """Random lowercase hex that is not all zeros, which the `traceparent` grammar forbids."""
+    while True:
+        candidate = secrets.token_bytes(byte_count)
+        if any(candidate):
+            return candidate.hex()
+
+
+def new_traceparent(*, sampled: bool = True) -> str:
+    """A fresh W3C `traceparent` with a new trace id and span id."""
+    return f"00-{_nonzero_hex(16)}-{_nonzero_hex(8)}-{'01' if sampled else '00'}"
+
+
+def child_traceparent(parent: str) -> str:
+    """The same trace id and flags with a new span id: one span per hop (envelope contract 6, rule 2).
+
+    An unparseable parent yields a fresh `traceparent` rather than an error. Trace context is
+    observability: a malformed inbound value must not fail a message that is otherwise deliverable.
+    """
+    parts = parent.split("-")
+    if len(parts) != 4 or parts[0] != "00" or len(parts[1]) != 32 or len(parts[3]) != 2:
+        return new_traceparent()
+    try:
+        int(parts[1], 16)
+        int(parts[3], 16)
+    except ValueError:
+        return new_traceparent()
+    if parts[1] == "0" * 32:
+        return new_traceparent()
+    return f"00-{parts[1]}-{_nonzero_hex(8)}-{parts[3]}"
