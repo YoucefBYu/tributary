@@ -15,6 +15,9 @@ from jsonschema import Draft202012Validator, FormatChecker
 from jsonschema.validators import validator_for
 
 CONTRACTS = Path(__file__).resolve().parents[2] / "contracts"
+# Contracts with a manifest.json of {schema, valid[], invalid[]} under v0/examples/. Add a new
+# contract here (one line) rather than in each function below.
+FILE_CONTRACTS = ("envelope", "events", "channel-spec")
 EVENT_PHI_GUARDS = {
     "invalid/payload-in-event.json",
     "invalid/attrs-clear-text-mrn.json",
@@ -72,7 +75,7 @@ def _validator(schema_path: Path) -> Draft202012Validator:
 
 def _file_cases() -> list[Any]:
     cases: list[Any] = []
-    for name in ("envelope", "events"):
+    for name in FILE_CONTRACTS:
         manifest_path = CONTRACTS / name / "v0" / "examples" / "manifest.json"
         m = _load(manifest_path)
         base = manifest_path.parent
@@ -135,7 +138,7 @@ def test_topic_name(schema: Path, name: str, should_pass: bool, expected: Failur
 
 def test_every_invalid_entry_has_an_expectation() -> None:
     """A new invalid example without an expected failure must fail the suite, not slide in as 'any error'."""
-    for name in ("envelope", "events"):
+    for name in FILE_CONTRACTS:
         m = _load(CONTRACTS / name / "v0/examples/manifest.json")
         for e in m["invalid"]:
             _expected(f"{name}:{e['file']}", e)
