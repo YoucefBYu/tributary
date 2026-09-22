@@ -8,11 +8,16 @@ silently drift from what `bootstrap_topics.py` actually creates.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
 
-from .bootstrap_topics import data_topic_name, derive_topics, load_defaults, platform_topic_name
+# `topic-bootstrap` has a hyphen, so it cannot be a Python package (mypy: "not a valid Python package
+# name"); a bare `sys.path` entry makes `bootstrap_topics` importable as a top-level module instead,
+# matching the pattern already used for `.github/scripts`.
+sys.path.insert(0, str(Path(__file__).parent))
+from bootstrap_topics import data_topic_name, derive_topics, load_defaults, platform_topic_name
 
 CONTRACT_PATH = Path(__file__).resolve().parents[3] / "contracts" / "topics" / "v0" / "topic-defaults.json"
 
@@ -61,21 +66,36 @@ def test_replication_factor_and_min_insync_replicas_come_from_the_contract(defau
 
 
 def test_out_and_retry_partitions_match_raw_per_the_contract_constraint(defaults: dict) -> None:  # type: ignore[type-arg]
-    topics = {t.name: t for t in derive_topics(defaults, env="dev", profile="lite", channel="adt-passthrough", destinations=("http-stub",))}
+    topics = {
+        t.name: t
+        for t in derive_topics(
+            defaults, env="dev", profile="lite", channel="adt-passthrough", destinations=("http-stub",)
+        )
+    }
     raw_partitions = topics["dev.adt-passthrough.raw"].partitions
     assert topics["dev.adt-passthrough.out.http-stub"].partitions == raw_partitions
     assert topics["dev.adt-passthrough.retry"].partitions == raw_partitions
 
 
 def test_dlq_and_platform_topic_partitions_match_the_contract_exactly(defaults: dict) -> None:  # type: ignore[type-arg]
-    topics = {t.name: t for t in derive_topics(defaults, env="dev", profile="lite", channel="adt-passthrough", destinations=("http-stub",))}
+    topics = {
+        t.name: t
+        for t in derive_topics(
+            defaults, env="dev", profile="lite", channel="adt-passthrough", destinations=("http-stub",)
+        )
+    }
     assert topics["dev.adt-passthrough.dlq"].partitions == defaults["classes"]["dlq"]["partitions"]
     assert topics["_tb.dev.channels"].partitions == defaults["classes"]["channels"]["partitions"]
     assert topics["_tb.dev.events"].partitions == defaults["classes"]["events"]["partitions"]
 
 
 def test_every_class_config_value_matches_the_contract_after_the_profile_override(defaults: dict) -> None:  # type: ignore[type-arg]
-    topics = {t.name: t for t in derive_topics(defaults, env="dev", profile="lite", channel="adt-passthrough", destinations=("http-stub",))}
+    topics = {
+        t.name: t
+        for t in derive_topics(
+            defaults, env="dev", profile="lite", channel="adt-passthrough", destinations=("http-stub",)
+        )
+    }
     raw = topics["dev.adt-passthrough.raw"].configs
     contract_raw = defaults["classes"]["raw"]["configs"]
     overrides = defaults["profiles"]["lite"]["class_config_overrides"]

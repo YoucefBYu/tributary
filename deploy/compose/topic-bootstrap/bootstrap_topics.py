@@ -52,7 +52,7 @@ def _class_configs(defaults: dict[str, Any], class_name: str, profile: str) -> d
 
 
 def _replication_factor(defaults: dict[str, Any], profile: str) -> int:
-    return int(defaults["profiles"][profile]["replication_factor"])  # type: ignore[no-any-return]
+    return int(defaults["profiles"][profile]["replication_factor"])
 
 
 def data_topic_name(env: str, channel: str, kind: str, destination: str | None = None) -> str:
@@ -135,12 +135,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = p.parse_args(argv)
 
-    from confluent_kafka.admin import AdminClient, NewTopic  # deferred: keeps derive_topics testable without it
+    from confluent_kafka.admin import AdminClient, NewTopic  # type: ignore[attr-defined]  # deferred import
 
     defaults = load_defaults(args.defaults)
     emit_lite_warning(defaults, args.profile)
     destinations = tuple(args.destination or ["http-stub"])
-    topics = derive_topics(defaults, env=args.env, profile=args.profile, channel=args.channel, destinations=destinations)
+    topics = derive_topics(
+        defaults, env=args.env, profile=args.profile, channel=args.channel, destinations=destinations
+    )
 
     admin = AdminClient({"bootstrap.servers": args.bootstrap})
     new_topics = [
@@ -153,7 +155,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             future.result()
             log.info(json.dumps({"topic": name, "status": "created"}))
-        except Exception as exc:  # noqa: BLE001 - TopicExistsError has no stable public import path
+        except Exception as exc:  # TopicExistsError has no stable public import path across versions
             if "already exists" in str(exc).lower():
                 log.info(json.dumps({"topic": name, "status": "already-exists"}))
             else:
