@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 from types import MappingProxyType
 
 from .errors import KeyValueConflictError, SecretNotFoundError
-from .guards import validate_attr, validate_attrs, validate_log_fields, validate_usr
+from .guards import validate_attr, validate_attrs, validate_log_event, validate_log_fields, validate_usr
 
 #: A fixed instant, so a step that stamps a time produces the same output on every run.
 DEFAULT_NOW = datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC)
@@ -36,6 +36,7 @@ class RecordingLogger:
         self.records: list[LogRecord] = []
 
     def _record(self, level: str, event: str, fields: Mapping[str, object]) -> None:
+        validate_log_event(event)
         validate_log_fields(fields)
         self.records.append(LogRecord(level=level, event=event, fields=MappingProxyType(dict(fields))))
 

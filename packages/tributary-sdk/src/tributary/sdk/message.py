@@ -219,15 +219,24 @@ class Message:
         return message
 
     def with_header(self, name: str, value: str) -> Message:
-        """A copy with one header set. Rejects an empty value: omit the header to mean absent."""
+        """A copy with one header set. Rejects an empty value: omit the header to mean absent.
+
+        A `tb-usr-*` name is routed through the same guard `with_usr` uses. Without that, the deny-list
+        is only enforced on the convenience method and `with_header("tb-usr-mrn", ...)` walks straight
+        past it — a guard with a documented bypass is not a guard.
+        """
         if not isinstance(name, str) or not name:
             raise HeaderValueError("<non-text-name>", "header name must be non-empty text")
         if not isinstance(value, str):
             raise HeaderValueError(name, "header value must be text")
         if not value:
             raise HeaderValueError(name, "empty value; omit the header to mean absent (envelope contract 2)")
-        if "\r" in value or "\n" in value:
+        if any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
             raise HeaderValueError(name, "control characters are not allowed in a header value")
+        if name.startswith(h.USR_PREFIX):
+            from .guards import validate_usr  # local import: guards imports nothing from message
+
+            validate_usr(name[len(h.USR_PREFIX) :], value)
         return Message(headers={**self._headers, name: value}, payload=self._payload, key=self._key)
 
     def with_headers(self, values: Mapping[str, str]) -> Message:
@@ -258,9 +267,6 @@ class Message:
 
     def with_usr(self, name: str, value: str) -> Message:
         """A copy with a channel-defined `tb-usr-*` header set, validated against the envelope rules."""
-        from .guards import validate_usr  # local import: guards imports nothing from message
-
-        validate_usr(name, value)
         return self.with_header(h.usr_name(name), value)
 
     # -- dunder ----------------------------------------------------------------------------------

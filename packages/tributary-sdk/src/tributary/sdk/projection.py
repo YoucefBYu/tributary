@@ -24,7 +24,8 @@ from __future__ import annotations
 from typing import Literal
 
 from . import headers as h
-from .errors import EnvelopeError, safe_token
+from .errors import EnvelopeError, UsrHeaderError, safe_token
+from .guards import validate_usr
 from .message import Message
 
 TopicClass = Literal["raw", "out", "retry", "dlq", "reply"]
@@ -135,10 +136,13 @@ def validate_for_produce(
                 "package (envelope contract 2.1)"
             )
         if name.startswith(h.USR_PREFIX):
-            if value_bytes > h.MAX_PREFIXED_VALUE_BYTES:
-                raise EnvelopeError(
-                    f"header {safe_token(name)} is {value_bytes} bytes, at most {h.MAX_PREFIXED_VALUE_BYTES} allowed"
-                )
+            # The full tb-usr-* rule, not just the byte budget. This is the layer every produce path
+            # goes through, so a header set with `with_header` directly — bypassing `with_usr` and
+            # `ctx.set_usr` — is caught here rather than reaching a topic (code-reviewer High, wave 1).
+            try:
+                validate_usr(name[len(h.USR_PREFIX) :], value)
+            except UsrHeaderError as exc:
+                raise EnvelopeError(str(exc)) from exc
         elif name.startswith("tb-") and name not in h.REGISTERED:
             raise EnvelopeError(f"header {safe_token(name)} is not registered; tb- is reserved (envelope contract 3)")
         elif value_bytes > h.MAX_REGISTERED_VALUE_BYTES:

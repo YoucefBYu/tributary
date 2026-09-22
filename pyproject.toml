@@ -33,7 +33,7 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
-testpaths = ["packages", "tests", ".github/scripts"]
+testpaths = ["packages", "tests", ".github/scripts", "deploy/compose/topic-bootstrap"]
 addopts = "-ra --import-mode=importlib"
 pythonpath = ["."]
 markers = [

@@ -25,7 +25,7 @@ import pytest
 from jsonschema import Draft202012Validator
 from tributary.sdk import Message
 from tributary.sdk import headers as h
-from tributary.sdk.errors import EnvelopeError
+from tributary.sdk.errors import EnvelopeError, UsrHeaderError
 from tributary.sdk.ids import new_correlation_id, new_traceparent, uuid7
 from tributary.sdk.projection import FORBIDDEN, REQUIRED, TopicClass, record_projection, validate_for_produce
 from tributary.sdk.testing import make_message
@@ -237,7 +237,8 @@ def test_header_byte_budgets_are_enforced() -> None:
     with pytest.raises(EnvelopeError):
         validate_for_produce(over_value, topic_class="raw")
 
-    over_usr = make_message(key=b"K").with_header("tb-usr-batch", "b" * 257)
+    # Built through the constructor, not with_header: the produce-time check is the layer under test.
+    over_usr = Message(headers={**make_message(key=b"K").headers, "tb-usr-batch": "b" * 257}, key=b"K")
     with pytest.raises(EnvelopeError):
         validate_for_produce(over_usr, topic_class="raw")
 
@@ -246,6 +247,30 @@ def test_header_byte_budgets_are_enforced() -> None:
         crowded = crowded.with_header(f"tb-usr-f{index}", "v")
     with pytest.raises(EnvelopeError):
         validate_for_produce(crowded, topic_class="raw")
+
+
+@pytest.mark.parametrize("name", ["tb-usr-mrn", "tb-usr-patient-id", "tb-usr-dob"])
+def test_an_identifier_named_usr_header_cannot_reach_the_producer_by_any_route(name: str) -> None:
+    """Regression, code-reviewer High (wave 1).
+
+    The deny-list used to be enforced only by `with_usr`/`ctx.set_usr`, so
+    `with_header("tb-usr-mrn", ...)` walked past it and `validate_for_produce` checked only the byte
+    size. Both routes are closed now: the copy-on-write setter refuses it, and the produce-time check —
+    the layer every producer goes through — refuses it even when the message was built by hand.
+    """
+    base = make_message(key=b"SYNTH-KEY-0001")
+    with pytest.raises(UsrHeaderError):
+        base.with_header(name, "999-88-7777")
+
+    smuggled = Message(headers={**base.headers, name: "999-88-7777"}, payload=base.payload, key=base.key)
+    with pytest.raises(EnvelopeError):
+        validate_for_produce(smuggled, topic_class="raw")
+
+
+def test_a_well_formed_usr_header_still_passes() -> None:
+    """The guard has to let the legitimate case through, or channels route around it."""
+    message = make_message(key=b"SYNTH-KEY-0001").with_header("tb-usr-batch-id", "b-4471")
+    validate_for_produce(message, topic_class="raw")
 
 
 def test_the_schema_check_itself_can_go_red(validator: Draft202012Validator) -> None:

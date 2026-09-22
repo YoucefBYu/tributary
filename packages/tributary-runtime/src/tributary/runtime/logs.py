@@ -18,7 +18,7 @@ from datetime import UTC, datetime
 from typing import IO, Any, Final
 
 import orjson
-from tributary.sdk.guards import validate_log_fields
+from tributary.sdk.guards import validate_log_event, validate_log_fields
 
 LEVELS: Final[dict[str, int]] = {"debug": 10, "info": 20, "warning": 30, "error": 40}
 DEFAULT_LEVEL = "info"
@@ -61,6 +61,7 @@ class JsonLogger:
     def _emit(self, level: str, event: str, fields: Mapping[str, object]) -> None:
         if LEVELS[level] < self._threshold:
             return
+        validate_log_event(event)
         validate_log_fields(fields)
         record: dict[str, Any] = {
             "ts": datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z"),

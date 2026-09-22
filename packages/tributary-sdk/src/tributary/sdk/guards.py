@@ -25,6 +25,7 @@ ATTR_VALUE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+-]{0,63}$")
 HMAC_VALUE = re.compile(r"^[0-9a-f]{64}$")
 USR_NAME = re.compile(r"^[a-z0-9-]{1,48}$")
 LOG_FIELD_NAME = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+LOG_EVENT_NAME = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
 MAX_ATTRS = 16
 MAX_ATTRS_BYTES = 1024
@@ -169,6 +170,16 @@ def validate_log_field(name: str, value: object) -> None:
             raise LogFieldError(f"log field {safe_token(name)}: {len(value)} characters, at most {MAX_LOG_VALUE_CHARS}")
         if "\r" in value or "\n" in value:
             raise LogFieldError(f"log field {safe_token(name)}: CR/LF would forge a second log line")
+
+
+def validate_log_event(event: str) -> None:
+    """Check a log call's event name.
+
+    The event name is the one string a caller could build with an f-string, so it is constrained to a
+    short snake_case code for the same reason `attrs` values are: free text is where PHI arrives.
+    """
+    if not isinstance(event, str) or not LOG_EVENT_NAME.match(event):
+        raise LogFieldError(f"log event {safe_token(event)} must match ^[a-z][a-z0-9_]{{0,63}}$")
 
 
 def validate_log_fields(fields: Mapping[str, object]) -> None:
