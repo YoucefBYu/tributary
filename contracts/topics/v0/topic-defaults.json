@@ -216,8 +216,10 @@
       "session.timeout.ms": 15000,
       "heartbeat.interval.ms": 5000,
       "session.timeout.ms_source": "MEASURED (S5 and S4, ADR-002 D5.1). This is the recovery-time floor for an ordered channel: a killed worker's partitions cannot move until its session expires. S5 measured 10.01 s and 11.32 s takeover at a 10 s setting; S4 measured 43.8 s static-member removal at the 45 s Kafka default, from a different harness. 10-15 s is the recommended band; shorter raises the risk of spurious rebalances on a loaded or GC-pausing worker.",
-      "commit_every": "tunable per destination, default well above 1",
-      "commit_every_source": "MEASURED (S5): committing every 50 records instead of every 1 gave 4.9x throughput (151 -> 733 msg/s) for a replay window of 50 instead of 1. Invariant 4 requires loader idempotency on tb-msg-id anyway, so a window of 1 buys little."
+      "commit_every": 50,
+      "commit_every_source": "MEASURED (S5): committing every 50 records instead of every 1 gave 4.9x throughput (151 -> 733 msg/s) for a replay window of 50 instead of 1. Invariant 4 requires loader idempotency on tb-msg-id anyway, so a window of 1 buys little. 50 is the value that was measured; the surrounding curve was not, so it is a measured point rather than an optimum.",
+      "commit_every_note": "This is the REPLAY WINDOW: after an unclean worker death, up to this many records are redelivered (S5 measured 12 replayed at commit_every=20). At-least-once permits that and an idempotent loader absorbs it. A destination declaring idempotency.technique 'none' in its channel spec has no such absorber, so up to 50 visible duplicates at that destination is the consequence - lower it per destination, or accept it in the justification note the channel spec already requires.",
+      "commit_every_scope": "Deployment-level in v0. Deliberately NOT a channel-spec field: it is an operational tuning knob rather than channel semantics, and there is no evidence yet about per-destination variation. Revisit when there is."
     }
   },
   "partition_budget": {

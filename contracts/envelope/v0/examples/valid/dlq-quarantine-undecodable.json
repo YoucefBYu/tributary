@@ -1,0 +1,20 @@
+{
+  "class": "dlq",
+  "topic": "prod.adt-to-fhir.dlq",
+  "key_present": true,
+  "key_size": 36,
+  "payload_present": true,
+  "payload_size": 2048,
+  "headers": {
+    "tb-msg-id": "018f6b2d-1c40-7a55-8e77-5b9d0e3f7a21",
+    "tb-channel": "adt-to-fhir",
+    "tb-channel-version": "7",
+    "tb-source": "worker:pipeline-2@worker-4",
+    "tb-received-at": "2026-09-22T09:14:02.004Z",
+    "tb-content-type": "application/octet-stream",
+    "tb-attempt": "0",
+    "tb-stage": "queued",
+    "tb-error-code": "HEADER_PARSE_ERROR",
+    "traceparent": "00-7c1a2b3c4d5e6f708192a3b4c5d6e7f8-1122334455667788-01"
+  }
+}

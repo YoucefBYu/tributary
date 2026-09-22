@@ -3,6 +3,48 @@
 Newest first. Each entry names the contract, the version, whether the change is additive or
 breaking, and the reason. Breaking changes reference an ADR.
 
+## 2026-09-22 (W1-4 questions) — quarantine shape for unidentifiable records; `commit_every` becomes a number
+
+Two questions from `platform-engineer` during runtime v0. Both **additive** to Draft contracts. Both
+were holes in my own W1-1 increment, not in the questions.
+
+### `tributary.events/v0` + `tributary.envelope/v0`: a record whose headers cannot be decoded
+
+**The gap was a contradiction between two of my own contracts.** `envelope/v0` 2.3 requires a
+malformed header to be rejected to `dlq` with an event emitted. But a `dlq` record requires the whole
+core header set — the exact bytes that could not be read — and an event with `kind: message` requires
+`message_id`, which cannot be trusted from a broken record. So the mandated behaviour was
+unimplementable, and the honest workaround (log it and move on) put unvalidated bytes on the one
+surface invariant 6 most restricts. Deferring to Phase 2 was offered and **rejected**: a deferral
+would still have required editing 2.3 to stop mandating an event, and the PHI risk is live in code
+being written this wave.
+
+| Change | Detail |
+|---|---|
+| `events/v0`: new `kind: "record"` | Identifies a record by `topic`/`partition`/`offset` — the only identity an unidentifiable record has. Requires all three; pins `stage: quarantined`, `status: error`, `content_type: application/octet-stream`; **forbids `attrs`**, since every value would derive from the broken record's own bytes and `attrs` are searchable columns in ClickHouse and the browser |
+| `events/v0`: new stage `quarantined` | |
+| `envelope/v0`: new section 5.2 | A quarantined record is a **new record the engine constructs**, not the original moved: freshly minted `tb-msg-id` (never one recovered from untrusted input, which would collide with a real message in every loader's idempotency check), channel and version from the subscription, `tb-received-at` = quarantine time (a deliberate, named deviation from "set once at receive" — the original is unknowable, so end-to-end latency for it is meaningless), `application/octet-stream`, and the **original bytes as the payload** |
+| `envelope/v0` 5.2: the logging table | May log topic, partition, offset, the minted id, the error code and byte counts. **Never any byte of the original record, header names included** — a name is attacker-supplied too, and under mis-framing it is payload. No `repr()` of the record or any slice of it |
+| Examples | `events valid/record-quarantined`, `invalid/record-without-offset`, `invalid/record-with-attrs` (**a PHI guard** — to be listed in `EVENT_PHI_GUARDS`); `envelope valid/dlq-quarantine-undecodable` |
+
+### `tributary.topics/v0`: `commit_every` is now `50`, not prose
+
+It was the string `"tunable per destination, default well above 1"`. W1-1 then added `commit_every`
+to the `must_not_hardcode` list — **so the contract required reading a value that was not
+machine-readable, which made conformance impossible.** That is my defect from the same increment.
+
+Now `50`, the S5-measured point, with two things stated that the prose lost: it **is** the replay
+window (up to 50 redeliveries after an unclean death; S5 saw 12 at 20), so a destination declaring
+`idempotency.technique: none` has no absorber and should lower it or justify it; and 50 is a measured
+*point*, not a measured optimum — the surrounding curve was never run. Scope stays deployment-level
+and deliberately out of the channel spec: it is an operational knob, not channel semantics, and
+there is no evidence yet of per-destination variation.
+
+### Not verified
+
+The four new examples and the two new `(json_path, validator)` pairs are **architect predictions**;
+no shell here. `contracts/validate.py` and `--emit-expectations` measure them.
+
 ## 2026-09-22 (W1-1) — contract set 1.0: new `tributary.channel-spec/v0`, plus envelope and topics additions
 
 Phase 1 wave 1. Everything here is **additive** to Draft contracts, so no version bump; had v0 been

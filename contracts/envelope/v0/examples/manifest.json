@@ -31,6 +31,10 @@
     {
       "file": "valid/raw-reprocessed-with-parent.json",
       "note": "Reprocess: new tb-msg-id, tb-parent-id set, channel-defined tb-usr-* header"
+    },
+    {
+      "file": "valid/dlq-quarantine-undecodable.json",
+      "note": "Quarantine wrapper (README 5.2): a record whose headers could not be decoded, rewritten as a new engine-constructed dlq record with a freshly minted tb-msg-id, octet-stream content type and the original bytes as the payload. Every header value here comes from the engine, none from the broken record"
     }
   ],
   "invalid": [

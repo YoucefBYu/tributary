@@ -8,7 +8,10 @@
   "additionalProperties": false,
   "properties": {
     "v": { "const": 0 },
-    "kind": { "enum": ["message", "partition"] },
+    "kind": {
+      "enum": ["message", "partition", "record"],
+      "$comment": "'record' identifies a Kafka record that could not be identified as a Tributary message at all - undecodable or unparseable headers - so it is described by its topic/partition/offset coordinates instead of by tb-msg-id. Without it, the one record class most likely to mean an attack or a broken producer would be visible only in logs, which is the surface invariant 6 most restricts."
+    },
     "ts": { "$ref": "#/$defs/rfc3339UtcMillis" },
     "channel": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,63}$" },
     "channel_version": { "type": "integer", "minimum": 0 },
@@ -27,7 +30,8 @@
         "dlq",
         "partition_paused",
         "partition_resumed",
-        "partition_halted"
+        "partition_halted",
+        "quarantined"
       ]
     },
     "status": { "enum": ["ok", "error", "timeout", "dropped"] },
@@ -160,6 +164,25 @@
         "properties": {
           "stage": {
             "enum": ["partition_paused", "partition_resumed", "partition_halted"]
+          }
+        }
+      }
+    },
+    {
+      "$comment": "Record events describe an UNIDENTIFIABLE record by its Kafka coordinates. message_id, when present, is the id the engine minted for the quarantine wrapper it wrote to the DLQ - never a value read out of the broken record, which is untrusted input. channel is the channel whose topic it was read from, which is known from the subscription rather than from the record.",
+      "if": { "properties": { "kind": { "const": "record" } }, "required": ["kind"] },
+      "then": {
+        "required": ["topic", "partition", "offset"],
+        "not": {
+          "required": ["attrs"],
+          "$comment": "No attrs on a quarantine event. Every attrs value would have to be derived from the broken record's own bytes, and attrs become searchable columns in ClickHouse and the browser - the one place the contract cannot let unvalidated input land."
+        },
+        "properties": {
+          "stage": { "enum": ["quarantined"] },
+          "status": { "enum": ["error"] },
+          "content_type": {
+            "const": "application/octet-stream",
+            "$comment": "Unknown by definition. Naming it octet-stream keeps the field honest rather than guessing from a header that could not be read."
           }
         }
       }

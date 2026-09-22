@@ -1,0 +1,16 @@
+{
+  "v": 0,
+  "kind": "record",
+  "ts": "2026-09-22T09:14:02.004Z",
+  "channel": "adt-to-fhir",
+  "channel_version": 7,
+  "stage": "quarantined",
+  "status": "error",
+  "instance": "worker:pipeline-2@worker-4",
+  "content_type": "application/octet-stream",
+  "size_bytes": 2048,
+  "topic": "prod.adt-to-fhir.raw",
+  "partition": 1,
+  "error_code": "HEADER_PARSE_ERROR",
+  "traceparent": "00-7c1a2b3c4d5e6f708192a3b4c5d6e7f8-1122334455667788-01"
+}

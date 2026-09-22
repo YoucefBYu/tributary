@@ -11,7 +11,8 @@
     { "file": "valid/dlq.json", "note": "Step failure routed to the DLQ" },
     { "file": "valid/claim-checked-received.json", "note": "Claim-check: size_bytes 0 plus a URI" },
     { "file": "valid/partition-paused.json", "note": "Blocking retry paused a partition; triggering message id included" },
-    { "file": "valid/partition-resumed.json", "note": "Partition resumed; duration_ms is the outage length" }
+    { "file": "valid/partition-resumed.json", "note": "Partition resumed; duration_ms is the outage length" },
+    { "file": "valid/record-quarantined.json", "note": "kind=record: a record whose headers could not be decoded, identified by topic/partition/offset. message_id is the id minted for the DLQ quarantine wrapper, never a value read out of the broken record" }
   ],
   "invalid": [
     {
@@ -110,6 +111,20 @@
       "violates": "stage enum: 'enriched' is a pipeline step name, not a lifecycle stage",
       "expected_json_path": "$.stage",
       "expected_validator": "enum"
+    },
+    {
+      "file": "invalid/record-without-offset.json",
+      "violates": "kind=record requires topic, partition and offset: they are the only identity an unidentifiable record has, and without them the event cannot be joined to the quarantined bytes",
+      "expected_json_path": "$",
+      "expected_validator": "required",
+      "expectation_note": "PREDICTED by the architect, not yet measured (no shell). Added 2026-09-22 with the quarantine shape"
+    },
+    {
+      "file": "invalid/record-with-attrs.json",
+      "violates": "a quarantine event carries no attrs: every value would be derived from the broken record's own bytes, and attrs become searchable columns in ClickHouse and the browser (invariant 6). 'first_bytes: MSH' is the plausible mistake - an HL7 segment start smuggled into a metadata column",
+      "expected_json_path": "$",
+      "expected_validator": "not",
+      "expectation_note": "PREDICTED, not yet measured. PHI GUARD - add to EVENT_PHI_GUARDS in tests/conformance so it is asserted by name and never skipped"
     }
   ]
 }

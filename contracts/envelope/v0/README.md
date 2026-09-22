@@ -340,6 +340,42 @@ inside the `raw` retention window breaks replay: treat the object store TTL as `
 dlq retention)` until ADR-004 says otherwise. **Assumption, unverified:** no spike measured
 claim-check behaviour in Phase 0.
 
+### 5.2 Quarantine records: when the headers cannot be read at all
+
+Section 2.3 says a malformed header is a reject to `dlq`. That is impossible to do literally when
+the headers cannot be decoded at all, because a `dlq` record requires the whole core header set and
+those are exactly the bytes that could not be read. **A quarantined record is therefore a new record
+the engine constructs, not the original record moved.**
+
+| Part | Value |
+|---|---|
+| `tb-msg-id` | A **fresh** UUIDv7 minted by the quarantining component. Never a value recovered from the broken record: that is untrusted input, and a forged id would collide with a real message in the browser and in every loader's idempotency check. |
+| `tb-channel`, `tb-channel-version` | Known from the subscription and the applied spec, not from the record. |
+| `tb-source` | The quarantining component and instance, not the original peer, which is unknown. |
+| `tb-received-at` | The quarantine time. **This is a deliberate deviation** from "set once at receive, never rewritten" (section 6 rule 1): the original receive time is unknowable. End-to-end latency for this record is meaningless and must not be computed. |
+| `tb-content-type` | `application/octet-stream`. Unknown by definition. |
+| `tb-stage`, `tb-error-code` | The stage that read it, and `HEADER_PARSE_ERROR`. |
+| Key | `tb-msg-id`, as for every `dlq` record. |
+| **Value** | The original record's bytes — headers and payload — as an opaque blob. |
+
+The original bytes go in the **payload**, which is the one part of the envelope that is opaque and
+already treated as PHI-bearing, on a topic whose ACLs and 30-day retention already assume that. They
+do not go into headers, `attrs`, or an event.
+
+**The logging rule is the part most likely to go wrong, and it is a Critical finding if it does.**
+A developer diagnosing "why can this not be decoded" will reach for `repr(record)` or log the raw
+header bytes. Those bytes are unvalidated input of unknown provenance: a mis-framed message puts
+payload content — an HL7 segment, a patient name — in a header slot. So, from a quarantine path:
+
+| May be logged | Must never be logged |
+|---|---|
+| `topic`, `partition`, `offset` | Any byte of the original record, in any encoding or escaping |
+| The minted quarantine `tb-msg-id` | Header **names** as well as values — a name is also attacker-supplied, and under mis-framing it is payload |
+| `tb-error-code`, byte counts | `repr()`/`str()` of the record, the header list, or any slice or prefix of either |
+
+The matching event is `kind: "record"`, `stage: "quarantined"`, carrying the Kafka coordinates and
+the minted id ([events contract](../../events/v0/README.md)). It deliberately has no `attrs`.
+
 ---
 
 ## 6. Propagation rules
