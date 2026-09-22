@@ -24,12 +24,6 @@ from .errors import ConfigError, safe_token
 
 CONTRACT_RELATIVE = Path("topics") / "v0" / "topic-defaults.json"
 
-#: `topic-defaults.json` states `commit_every` as prose ("tunable per destination, default well above
-#: 1") with the measurement in a sibling `_source` field, so there is no number to read. 50 is the
-#: value S5 measured at 4.9x the throughput of 1 (151 -> 733 msg/s) for a replay window of 50.
-#: TODO(architect): add a numeric `commit_every_default` to the contract so this constant can go.
-FALLBACK_COMMIT_EVERY = 50
-
 #: Likewise `out`/`retry` partitions are stated as "match the raw topic of the same channel".
 MATCH_RAW = "match-raw"
 
@@ -43,7 +37,6 @@ class ConsumerDefaults:
     partition_assignment_strategy: str
     enable_auto_commit: bool
     commit_every: int
-    commit_every_is_measured: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,8 +113,10 @@ def load_topic_defaults(contracts_dir: str | Path | None = None) -> TopicDefault
     if not isinstance(consumer_block, dict):
         raise ConfigError("clients.worker_consumer is missing from the topics contract")
 
-    raw_commit_every = consumer_block.get("commit_every")
-    commit_every = raw_commit_every if isinstance(raw_commit_every, int) else FALLBACK_COMMIT_EVERY
+    # No fallback: an absent or prose-valued commit_every is a refusal to start, not an invented
+    # number. commit_every is the replay window after an unclean death, so guessing it here would
+    # quietly change how many duplicates a destination sees.
+    commit_every = _require_int(consumer_block, "commit_every", path)
 
     session_timeout = _require_int(consumer_block, "session.timeout.ms", path)
     heartbeat = _require_int(consumer_block, "heartbeat.interval.ms", path)
@@ -145,7 +140,6 @@ def load_topic_defaults(contracts_dir: str | Path | None = None) -> TopicDefault
             partition_assignment_strategy=str(consumer_block.get("partition.assignment.strategy", "")),
             enable_auto_commit=bool(consumer_block.get("enable.auto.commit", False)),
             commit_every=commit_every,
-            commit_every_is_measured=isinstance(raw_commit_every, int),
         ),
         producer={
             "acks": producer_block.get("acks", "all"),

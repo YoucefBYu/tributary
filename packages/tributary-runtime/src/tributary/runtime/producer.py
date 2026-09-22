@@ -81,6 +81,27 @@ class RecordProducer:
             raise DeliveryError("PRODUCE_REFUSED", retryable=True, detail=type(exc).__name__) from exc
         self._producer.poll(0)
 
+    def produce_raw(
+        self,
+        topic: str,
+        *,
+        key: bytes | None,
+        value: bytes | None,
+        headers: list[tuple[str, bytes]] | None = None,
+    ) -> None:
+        """Queue bytes verbatim, with **no envelope validation**.
+
+        The one caller is the quarantine path for a record that could not be decoded. Making such a
+        record conformant would mean minting a `tb-msg-id`, and a new identity breaks the browser's
+        parent/child tree and the loader idempotency key. This is not a general escape hatch: every
+        record the engine itself produces goes through `produce`.
+        """
+        try:
+            self._producer.produce(topic, value=value, key=key, headers=headers, on_delivery=self._on_delivery)
+        except BufferError as exc:
+            raise DeliveryError("PRODUCER_QUEUE_FULL", retryable=True) from exc
+        self._producer.poll(0)
+
     def _on_delivery(self, err: Any, msg: Any) -> None:
         if err is not None:
             # str(err) is a librdkafka error string: a code and a topic, no record content.

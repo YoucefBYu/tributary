@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 from tributary.runtime import topics
-from tributary.runtime.config import FALLBACK_COMMIT_EVERY, find_contracts_dir, load_topic_defaults
+from tributary.runtime.config import find_contracts_dir, load_topic_defaults
 from tributary.runtime.errors import ConfigError, TopicNameError
 
 CONTRACTS = Path(__file__).resolve().parents[3] / "contracts"
@@ -88,22 +88,29 @@ def test_the_loader_reads_the_file_rather_than_hardcoding_the_measured_numbers(t
     document["classes"]["raw"]["partitions"] = 12
     document["clients"]["worker_consumer"]["session.timeout.ms"] = 9000
     document["clients"]["worker_consumer"]["heartbeat.interval.ms"] = 3000
-    document["clients"]["worker_consumer"]["commit_every"] = 50
+    document["clients"]["worker_consumer"]["commit_every"] = 25
     path.write_text(json.dumps(document), encoding="utf-8")
 
     defaults = load_topic_defaults(root)
     assert defaults.partitions_for("raw") == 12
     assert defaults.consumer.session_timeout_ms == 9000
-    assert defaults.consumer.commit_every == 50
-    assert defaults.consumer.commit_every_is_measured is True
+    assert defaults.consumer.commit_every == 25
 
 
-def test_commit_every_falls_back_visibly_while_the_contract_states_it_in_prose() -> None:
-    defaults = load_topic_defaults()
-    assert defaults.consumer.commit_every == FALLBACK_COMMIT_EVERY
-    assert defaults.consumer.commit_every_is_measured is False, (
-        "topic-defaults.json now carries a numeric commit_every: drop FALLBACK_COMMIT_EVERY and use it"
-    )
+def test_commit_every_is_read_from_the_contract_and_has_no_fallback(tmp_path: Path) -> None:
+    """S5 measured 50. A prose or absent value is a refusal to start, not an invented number:
+    commit_every is the replay window after an unclean death, so guessing it changes how many
+    duplicates a destination with `idempotency.technique: none` actually sees."""
+    assert load_topic_defaults().consumer.commit_every == 50
+
+    root = tmp_path / "contracts"
+    shutil.copytree(CONTRACTS / "topics", root / "topics")
+    path = root / "topics" / "v0" / "topic-defaults.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["clients"]["worker_consumer"]["commit_every"] = "tunable per destination"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    with pytest.raises(ConfigError):
+        load_topic_defaults(root)
 
 
 def test_out_partitions_resolve_to_the_raw_count() -> None:
