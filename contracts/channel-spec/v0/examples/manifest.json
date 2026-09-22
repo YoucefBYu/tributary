@@ -1,0 +1,142 @@
+{
+  "contract": "tributary.channel-spec/v0",
+  "schema": "../channel.schema.json",
+  "note": "Examples are JSON because a channel spec is authored in YAML and validated after parsing; the schema sees the parsed document either way. All names, hosts and digests are synthetic. No example carries a payload, a record key or a credential value.",
+  "expectation_note": "UNMEASURED. Unlike the envelope, events and topics manifests, every expected_json_path/expected_validator pair below is the ARCHITECT'S PREDICTION of what jsonschema Draft 2020-12 reports, not a value read off a real run: this session has no shell. qa-engineer (or the lead) MUST run `python contracts/validate.py --emit-expectations` and replace this block with the measured pairs before the wave-1 gate, and MUST report any pair that differs rather than relaxing the assertion. Until that has happened, a red conformance run here is evidence about my predictions, not necessarily about the schema. Paths and keywords only, never instance values, so this file is PHI-safe either way.",
+  "valid": [
+    {
+      "file": "valid/walking-skeleton-loopback.json",
+      "note": "Wave 1 E2E shape: MLLP on loopback with no TLS, ordering none, one pass-through step, HTTP stub on loopback, idempotency 'none' with the required justification"
+    },
+    {
+      "file": "valid/adt-to-fhir-per-key-mtls.json",
+      "note": "Production shape: wildcard bind with mTLS, per-key ordering, byte-bounded queue, three steps, HTTPS destination with blocking retry and halt-partition"
+    },
+    {
+      "file": "valid/published-with-version.json",
+      "note": "The form on _tb.<env>.channels: metadata.version set by the control plane, partitions and retention overrides, transactional pipeline"
+    },
+    {
+      "file": "valid/two-destinations-fanout.json",
+      "note": "Two destinations with different idempotency techniques and different exhaustion behaviour on one unordered channel"
+    }
+  ],
+  "invalid": [
+    {
+      "file": "invalid/missing-ordering.json",
+      "violates": "spec.required: ordering. Invariant 5 - ordering is explicit, so there is no default",
+      "expected_json_path": "$.spec",
+      "expected_validator": "required"
+    },
+    {
+      "file": "invalid/per-key-without-partition-key.json",
+      "violates": "ordering per-key requires partitionKey; without it the runtime would have to invent a key or silently fall back to round-robin",
+      "expected_json_path": "$.spec",
+      "expected_validator": "required"
+    },
+    {
+      "file": "invalid/ordering-none-with-partition-key.json",
+      "violates": "ordering none must not carry partitionKey: a key expression that is silently ignored reads as ordered and is not",
+      "expected_json_path": "$.spec",
+      "expected_validator": "not"
+    },
+    {
+      "file": "invalid/retry-topic-selected.json",
+      "violates": "retry.policy retry-topic is DEFINED but not selectable in v0: never implemented or measured, and its delay mechanism is undecided (ADR-003 D1/D2, gate 7.2 item 18)",
+      "expected_json_path": "$.spec.destinations[0].retry.policy",
+      "expected_validator": "not"
+    },
+    {
+      "file": "invalid/bundle-tag-not-digest.json",
+      "violates": "pipeline.bundle must be digest-pinned; a tag lets the code running in production change with no channel version to explain it",
+      "expected_json_path": "$.spec.pipeline.bundle",
+      "expected_validator": "pattern"
+    },
+    {
+      "file": "invalid/source-non-loopback-without-tls.json",
+      "violates": "a listener on a non-loopback address (here 0.0.0.0) requires tls. Phase 1 requirement 8 (SR-8, CR-10) made enforceable rather than reviewed",
+      "expected_json_path": "$.spec.source",
+      "expected_validator": "required"
+    },
+    {
+      "file": "invalid/tls-without-client-auth.json",
+      "violates": "tls.clientAuth must be stated, with no default: a default is the mTLS setting everyone inherits and nobody reviews",
+      "expected_json_path": "$.spec.source.tls",
+      "expected_validator": "required"
+    },
+    {
+      "file": "invalid/ack-mode-optimistic.json",
+      "violates": "ack.mode is a one-member enum: after-commit. Invariant 1 - ACK timing is not a tuning knob, and 'on-receive' is the exact mistake the invariant exists to prevent",
+      "expected_json_path": "$.spec.source.ack.mode",
+      "expected_validator": "const"
+    },
+    {
+      "file": "invalid/queue-bounded-by-messages-only.json",
+      "violates": "queue.maxBytes is required whenever queue is present; an item count is not a memory bound when an item can be 1 MB (Phase 1 requirement 5, SR-3)",
+      "expected_json_path": "$.spec.source.queue",
+      "expected_validator": "required"
+    },
+    {
+      "file": "invalid/step-inline-script.json",
+      "violates": "a step has no field carrying inline code. Invariant 7 - a step must be a unit-testable function of (message, ctx), and inline source cannot be imported by pytest, reviewed in a diff or type-checked",
+      "expected_json_path": "$.spec.pipeline.steps[0]",
+      "expected_validator": "additionalProperties"
+    },
+    {
+      "file": "invalid/step-uses-and-ref.json",
+      "violates": "exactly one of uses or ref; both means two candidate implementations and an undefined precedence",
+      "expected_json_path": "$.spec.pipeline.steps[0]",
+      "expected_validator": "oneOf",
+      "expectation_note": "Shares its pinned pair with step-neither-uses-nor-ref.json: one oneOf covers both directions. Weak evidence of WHY, accepted for the same reason as the topic-name anyOf - splitting the schema would not distinguish them"
+    },
+    {
+      "file": "invalid/step-neither-uses-nor-ref.json",
+      "violates": "exactly one of uses or ref; neither leaves the step with no implementation to load",
+      "expected_json_path": "$.spec.pipeline.steps[0]",
+      "expected_validator": "oneOf"
+    },
+    {
+      "file": "invalid/step-with-inline-secret.json",
+      "violates": "step.with rejects property names that denote a credential ('token'); secrets go through auth.secretRef and never into a spec",
+      "expected_json_path": "$.spec.pipeline.steps[0].with",
+      "expected_validator": "not",
+      "expectation_note": "propertyNames reports at the containing object with the inner keyword, matching the events attrs deny-list precedent ($.attrs / not). If this ever reports 'pattern' instead, the example is failing on the name charset and the credential deny-list has stopped being tested"
+    },
+    {
+      "file": "invalid/destination-http-plaintext-remote.json",
+      "violates": "plaintext http is permitted only to loopback; PHI in flight to a remote destination is TLS or it is a breach",
+      "expected_json_path": "$.spec.destinations[0].with.url",
+      "expected_validator": "pattern"
+    },
+    {
+      "file": "invalid/destination-url-with-query.json",
+      "violates": "a destination URL carries no query string: the identifier a healthcare API wants there is usually the record key, and a URL is logged by every proxy on the path (contracts/envelope/v0 section 4)",
+      "expected_json_path": "$.spec.destinations[0].with.url",
+      "expected_validator": "pattern"
+    },
+    {
+      "file": "invalid/destination-missing-idempotency.json",
+      "violates": "every destination declares its idempotency technique. Invariant 4 - at-least-once delivery means an undeclared technique is an undetected duplicate",
+      "expected_json_path": "$.spec.destinations[0]",
+      "expected_validator": "required"
+    },
+    {
+      "file": "invalid/idempotency-none-without-note.json",
+      "violates": "technique 'none' requires a written justification a reviewer can read; it is allowed, unexplained it is not",
+      "expected_json_path": "$.spec.destinations[0].idempotency",
+      "expected_validator": "required"
+    },
+    {
+      "file": "invalid/unknown-spec-field.json",
+      "violates": "spec.additionalProperties: an unrecognised key in a tenant-supplied document the data plane trusts completely is a typo or an injection, never a feature",
+      "expected_json_path": "$.spec",
+      "expected_validator": "additionalProperties"
+    },
+    {
+      "file": "invalid/channel-name-not-topic-safe.json",
+      "violates": "metadata.name must match ^[a-z][a-z0-9-]{0,63}$: it becomes a topic segment and the tb-channel header, and Kafka metrics collapse '.' and are case-sensitive",
+      "expected_json_path": "$.metadata.name",
+      "expected_validator": "pattern"
+    }
+  ]
+}
