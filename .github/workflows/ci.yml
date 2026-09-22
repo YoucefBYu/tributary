@@ -16,6 +16,20 @@ env:
   UV_FROZEN: "1"   # fail if uv.lock is out of date, never re-resolve in CI
 
 jobs:
+  contracts:
+    # architect-owned, dependency-free by design: jsonschema plus the standard library only, paths
+    # resolved relative to the script. Runs with --no-project so it proves contracts/ is valid on a
+    # clean clone before uv sync and before the workspace exists at all, ahead of and separate from
+    # qa-engineer's pytest conformance suite below.
+    name: contract validation (contracts/validate.py)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+        with:
+          python-version: "3.12"
+      - run: uv run --no-project --python 3.12 --with jsonschema python contracts/validate.py
+
   python:
     name: lint, types, unit tests, conformance
     runs-on: ubuntu-24.04
