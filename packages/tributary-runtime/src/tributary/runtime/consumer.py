@@ -95,7 +95,7 @@ class DlqWriter(Protocol):
 
     def dead_letter(self, record: ConsumedRecord, *, error_code: str, stage: str) -> None: ...
 
-    def quarantine(self, raw: Any, *, error_code: str, channel: str, channel_version: int, stage: str) -> str:
+    def quarantine(self, raw: Any, *, channel: str, channel_version: int) -> str:
         """Write the quarantine wrapper for an undecodable record and return the id it minted."""
 
 
@@ -170,7 +170,6 @@ class ConsumerLoop:
         instance: str,
         dlq: DlqWriter | None = None,
         destination: str | None = None,
-        read_stage: str = "queued",
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._consumer = consumer
@@ -185,9 +184,6 @@ class ConsumerLoop:
         self._instance = instance
         self._dlq = dlq
         self._destination = destination
-        #: The stage that read the record, stamped on a quarantine wrapper: `queued` for a pipeline
-        #: worker reading `raw`, `pending` for a loader reading `out.<dest>`.
-        self._read_stage = read_stage
         self._clock = clock
         self._retry_state: dict[Key, RetryState] = {}
         self._since_commit = 0
@@ -469,13 +465,7 @@ class ConsumerLoop:
         """
         minted: str | None = None
         if self._dlq is not None:
-            minted = self._dlq.quarantine(
-                raw,
-                error_code=exc.error_code,
-                channel=self._channel,
-                channel_version=self._channel_version,
-                stage=self._read_stage,
-            )
+            minted = self._dlq.quarantine(raw, channel=self._channel, channel_version=self._channel_version)
         self.stats.quarantined += 1
         value = raw.value()
         self._emitter.emit(
@@ -489,7 +479,7 @@ class ConsumerLoop:
                 message_id=minted,
                 size_bytes=len(value) if value is not None else 0,
                 error_code=exc.error_code,
-                error_message="record headers could not be decoded; quarantined verbatim to the DLQ",
+                error_message="record could not be identified as a Tributary message; quarantined to the DLQ",
             )
         )
         self._log.error(
@@ -499,6 +489,7 @@ class ConsumerLoop:
             partition=partition,
             offset=offset,
             error_code=exc.error_code,
+            reason_code=exc.reason_code,
             message_id=minted,
         )
         self._mark((topic, partition), offset)

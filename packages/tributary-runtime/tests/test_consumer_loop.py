@@ -62,13 +62,13 @@ class ScriptedHandler:
 class RecordingDlq:
     def __init__(self) -> None:
         self.dead: list[tuple[str, str]] = []
-        self.quarantined: list[tuple[str, str, int, str]] = []
+        self.quarantined: list[tuple[str, int]] = []
 
     def dead_letter(self, record: ConsumedRecord, *, error_code: str, stage: str) -> None:
         self.dead.append((error_code, stage))
 
-    def quarantine(self, raw: Any, *, error_code: str, channel: str, channel_version: int, stage: str) -> str:
-        self.quarantined.append((error_code, channel, channel_version, stage))
+    def quarantine(self, raw: Any, *, channel: str, channel_version: int) -> str:
+        self.quarantined.append((channel, channel_version))
         return uuid7()
 
 
@@ -333,14 +333,16 @@ def test_an_undecodable_record_is_quarantined_and_the_partition_continues() -> N
 
     loop.run(max_iterations=3)
 
-    assert dlq.quarantined == [("HEADER_NOT_TEXT", "adt-passthrough", 1, "queued")]
+    assert dlq.quarantined == [("adt-passthrough", 1)], (
+        "the wrapper's channel comes from the subscription; its stage and code are fixed by contract"
+    )
     assert handler.seen == [1], "the partition keeps moving past a record nothing can decode"
     assert consumer.committed[-1] == [(TOPIC, 0, 2)]
 
     quarantine = next(event for event in events.events if event.stage == "quarantined")
     assert quarantine.topic == TOPIC and quarantine.offset == 0
     assert quarantine.message_id, "the event carries the id minted for the wrapper, never one from the record"
-    assert quarantine.error_code == "HEADER_NOT_TEXT"
+    assert quarantine.error_code == "RECORD_UNDECODABLE"
 
 
 def test_nothing_from_an_undecodable_record_reaches_the_log() -> None:

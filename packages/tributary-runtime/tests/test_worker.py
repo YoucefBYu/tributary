@@ -219,15 +219,17 @@ def test_the_quarantine_wrapper_is_a_new_conformant_record() -> None:
         channel="adt-passthrough",
         channel_version=3,
         source="worker:pipeline-1@localhost",
-        stage="queued",
     )
 
     assert wrapper.payload == blob, "the original bytes live in the payload, the opaque PHI-bearing part"
     assert wrapper.key == wrapper.msg_id.encode("utf-8"), "keyed by tb-msg-id like every dlq record"
     assert wrapper.msg_id[14] == "7", "a freshly minted UUIDv7, never a value recovered from the record"
     assert wrapper.content_type == "application/octet-stream"
-    assert wrapper.error_code == "HEADER_PARSE_ERROR"
-    assert wrapper.stage == "queued"
+    assert wrapper.error_code == "RECORD_UNDECODABLE", "the schema keys its quarantine rules on this code"
+    assert wrapper.stage == "quarantined", (
+        "never the stage that read it: the record never reached queued or pending, so claiming it did "
+        "would be false rather than merely inconsistent"
+    )
     assert wrapper.source == "worker:pipeline-1@localhost", "this component, not the unknown original peer"
 
     validator = Draft202012Validator(json.loads(ENVELOPE_SCHEMA.read_text(encoding="utf-8")))
@@ -236,8 +238,8 @@ def test_the_quarantine_wrapper_is_a_new_conformant_record() -> None:
 
 def test_two_quarantine_wrappers_never_share_an_identity() -> None:
     """A forged or reused id would collide with a real message in the browser and in loader idempotency."""
-    first = quarantine_message(blob=b"a", channel="c", channel_version=1, source="s", stage="queued")
-    second = quarantine_message(blob=b"a", channel="c", channel_version=1, source="s", stage="queued")
+    first = quarantine_message(blob=b"a", channel="c", channel_version=1, source="s")
+    second = quarantine_message(blob=b"a", channel="c", channel_version=1, source="s")
     assert first.msg_id != second.msg_id
 
 
@@ -260,15 +262,15 @@ def test_the_dlq_writer_quarantines_a_conformant_wrapper_and_returns_its_id() ->
         def headers(self) -> list[tuple[str, bytes]]:
             return [("tb-channel", bytes([0xFF, 0xFE]))]
 
-    minted = writer.quarantine(
-        Broken(), error_code="HEADER_NOT_TEXT", channel="adt-passthrough", channel_version=1, stage="queued"
-    )
+    minted = writer.quarantine(Broken(), channel="adt-passthrough", channel_version=1)
 
     topic, key, value, _headers = producer.produced[0]
     assert topic == "dev.adt-passthrough.dlq"
     assert key == minted.encode("utf-8")
     assert value is not None and value.startswith(b"TBQ1"), "the original bytes are framed into the payload"
     assert b"unreadable" in value
+    assert b"SYNTH-KEY-1" in value, "the original key lives in the blob (envelope 5.2)"
+    assert key != b"SYNTH-KEY-1", "and must not become the wrapper's key, which is the minted id"
     assert producer.flushes == 1, "the DLQ write is confirmed before the loop commits the input offset"
 
 

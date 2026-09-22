@@ -18,12 +18,26 @@ from tributary.sdk.errors import HeaderError, TributaryError
 RawHeaders = Sequence[tuple[str, bytes | None]] | None
 
 
-class RecordDecodeError(TributaryError):
-    """A consumed record is not a usable Tributary message. Carries a stable code for the DLQ."""
+#: The contract code for the quarantine path (envelope 5.2). Deliberately not `HEADER_PARSE_ERROR`:
+#: that one means a single malformed header on a record that could still be identified, which keeps its
+#: own `tb-msg-id` and reading stage. `RECORD_UNDECODABLE` means nothing about the record is
+#: trustworthy. A rise in the first points at one producer's field; a rise in the second at framing,
+#: corruption, or someone else writing to the topic. Collapsing them hides the second behind the first.
+RECORD_UNDECODABLE = "RECORD_UNDECODABLE"
 
-    def __init__(self, error_code: str, reason: str) -> None:
-        super().__init__(f"{error_code}: {reason}")
-        self.error_code = error_code
+
+class RecordDecodeError(TributaryError):
+    """A consumed record is not a usable Tributary message.
+
+    `error_code` is what reaches the wrapper header and the event: always `RECORD_UNDECODABLE`, because
+    the envelope schema keys its quarantine rules on it. `reason_code` is a finer code from this
+    module's own vocabulary, for the log line only - a fixed token, never anything from the record.
+    """
+
+    def __init__(self, reason_code: str, reason: str) -> None:
+        super().__init__(f"{RECORD_UNDECODABLE}/{reason_code}: {reason}")
+        self.error_code = RECORD_UNDECODABLE
+        self.reason_code = reason_code
         self.reason = reason
 
 
@@ -94,10 +108,21 @@ def quarantine_blob(*, key: bytes | None, value: bytes | None, headers: Iterable
 
     `TBQ1 | u32 key_len | key | u32 header_count | (u32 name_len | name | u32 value_len | value)* | payload`
 
-    A null key or header value is `0xFFFFFFFF`. The original **key** is included even though the
-    contract's table names only headers and payload: without it the quarantined record is not the
-    record, and the key is already on a topic whose ACLs and retention assume PHI. Flagged for the
-    architect rather than decided quietly.
+    Lengths are unsigned 32-bit **big-endian** and `0xFFFFFFFF` means null, so a null key or value is
+    distinguishable from a zero-length one. The magic carries the format version: a future framing is
+    `TBQ2` and tells itself apart on sight.
+
+    The original **key** lives in the blob and nowhere else. It must not become the wrapper's key,
+    which is the minted `tb-msg-id`, and must not be lifted into a header, an `attrs` entry or a log
+    line (envelope 5.2).
+
+    Nothing in the message flow parses this. Workers and loaders write it and never read it; the
+    archive, the browser and the CLI parse it on an explicit operator action. A component that parsed
+    it to auto-retry a quarantined record would feed attacker-controlled bytes back into the pipeline.
+
+    **Fidelity limit:** `confluent_kafka` hands header names to Python as `str`, so a name that was not
+    valid UTF-8 on the wire cannot be preserved byte for byte; it is re-encoded with `surrogateescape`,
+    which round-trips whatever the client decoded. Values are untouched bytes.
     """
     import struct
 

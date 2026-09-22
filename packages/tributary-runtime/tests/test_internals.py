@@ -15,6 +15,7 @@ from tributary.runtime.context import EnvSecretStore, UnavailableKeyValueStore, 
 from tributary.runtime.executor import PipelineExecutor, StepFailure
 from tributary.runtime.logs import JsonLogger
 from tributary.runtime.records import (
+    RECORD_UNDECODABLE,
     ConsumedRecord,
     RecordDecodeError,
     apply_usr_headers,
@@ -133,23 +134,30 @@ def test_a_well_formed_record_decodes() -> None:
 
 
 @pytest.mark.parametrize(
-    ("mutate", "code"),
+    ("mutate", "reason"),
     [
         (lambda hs: [(name, value) for name, value in hs if name != h.TB_MSG_ID], "ENVELOPE_INVALID"),
         (lambda hs: [*hs, (h.TB_ATTEMPT, b"1_0")], "ENVELOPE_INVALID"),
         (lambda hs: [*hs, (h.TB_CHANNEL_VERSION, b"one")], "ENVELOPE_INVALID"),
         (lambda hs: [*hs, (h.TB_MSG_ID, b"not-a-uuid7")], "ENVELOPE_INVALID"),
-        (lambda hs: [*hs, (h.TB_CHANNEL, b"\xff\xfe")], "HEADER_NOT_TEXT"),
+        (lambda hs: [*hs, (h.TB_CHANNEL, bytes([0xFF, 0xFE]))], "HEADER_NOT_TEXT"),
     ],
 )
-def test_a_malformed_record_is_a_typed_reject_with_a_dlq_code(mutate: object, code: str) -> None:
+def test_a_malformed_record_is_a_typed_reject_with_a_dlq_code(mutate: object, reason: str) -> None:
+    """One contract code out (`RECORD_UNDECODABLE`), a finer reason code for the log line.
+
+    The envelope schema keys its quarantine rules on `tb-error-code: RECORD_UNDECODABLE`, so that is
+    what reaches the wrapper and the event; the reason distinguishes "a header is not text" from "the
+    envelope is unusable" for whoever reads the log.
+    """
     message = make_message(b"synthetic", key=b"K")
     headers = mutate(raw_headers(message))  # type: ignore[operator]
     with pytest.raises(RecordDecodeError) as caught:
         decode_record(
             topic="dev.adt-passthrough.raw", partition=0, offset=1, key=b"K", value=b"synthetic", headers=headers
         )
-    assert caught.value.error_code == code
+    assert caught.value.error_code == RECORD_UNDECODABLE
+    assert caught.value.reason_code == reason
 
 
 def test_an_unknown_header_does_not_make_a_record_undeliverable() -> None:

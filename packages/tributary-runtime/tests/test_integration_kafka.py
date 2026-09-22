@@ -343,7 +343,7 @@ def test_an_undecodable_record_is_quarantined_to_the_dlq_with_a_record_event(
         json.loads((CONTRACTS / "envelope" / "v0" / "envelope.schema.json").read_text(encoding="utf-8"))
     )
     dead = drain(topics, dlq_topic(ENV, CHANNEL), expected=1)
-    wrappers = [record for record in dead if header_map(record).get(h.TB_ERROR_CODE) == "HEADER_NOT_TEXT"]
+    wrappers = [record for record in dead if header_map(record).get(h.TB_ERROR_CODE) == "RECORD_UNDECODABLE"]
     assert wrappers, "the undecodable record was quarantined to the DLQ"
 
     wrapper = wrappers[-1]
@@ -351,7 +351,11 @@ def test_an_undecodable_record_is_quarantined_to_the_dlq_with_a_record_event(
     assert headers[h.TB_CONTENT_TYPE] == "application/octet-stream"
     assert headers[h.TB_CHANNEL] == CHANNEL, "the channel comes from the subscription, not the record"
     assert wrapper.key() == headers[h.TB_MSG_ID].encode(), "keyed by the minted tb-msg-id"
-    assert wrapper.value() is not None and marker in wrapper.value(), "the original bytes are preserved"
+    assert headers[h.TB_STAGE] == "quarantined", "fixed by contract, not the stage that read it"
+    blob = wrapper.value()
+    assert blob is not None and blob.startswith(b"TBQ1"), "framed per envelope 5.2.1"
+    assert marker in blob, "the original payload bytes are preserved"
+    assert b"SYNTH-KEY-0" in blob, "and so is the original key, in the blob and nowhere else"
     projected = Message(headers=headers, payload=wrapper.value(), key=wrapper.key())
     assert list(envelope.iter_errors(record_projection(projected, topic_class="dlq"))) == []
 
@@ -365,7 +369,7 @@ def test_an_undecodable_record_is_quarantined_to_the_dlq_with_a_record_event(
         assert event["kind"] == "record"
         assert event["status"] == "error"
         assert "attrs" not in event
-        assert event["message_id"] == headers[h.TB_MSG_ID] or event["error_code"] == "HEADER_NOT_TEXT"
+        assert event["error_code"] == "RECORD_UNDECODABLE"
         assert list(events.iter_errors(event)) == []
 
 

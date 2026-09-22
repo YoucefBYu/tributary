@@ -34,7 +34,7 @@ from .events import EventEmitter, MessageEvent, NullEmitter
 from .executor import PipelineExecutor
 from .logs import JsonLogger
 from .producer import KafkaEventEmitter, KafkaProducerLike, RecordProducer
-from .records import ConsumedRecord, quarantine_blob
+from .records import RECORD_UNDECODABLE, ConsumedRecord, quarantine_blob
 from .spec import ChannelSpec, RetryPolicy
 from .steps import load_steps
 from .topics import channels_topic, consumer_group, dlq_topic, events_topic, out_topic, raw_topic
@@ -105,7 +105,7 @@ class KafkaDlqWriter:
             stage=stage,
         )
 
-    def quarantine(self, raw: Any, *, error_code: str, channel: str, channel_version: int, stage: str) -> str:
+    def quarantine(self, raw: Any, *, channel: str, channel_version: int) -> str:
         """Wrap a record that could not be decoded and write it to the DLQ. Returns the minted id.
 
         Envelope contract 5.2: the quarantined record is a **new** record the engine constructs, not
@@ -121,8 +121,6 @@ class KafkaDlqWriter:
             channel=channel,
             channel_version=channel_version,
             source=self._source,
-            stage=stage,
-            error_code=error_code,
         )
         self._producer.produce(self._topic, wrapper, topic_class="dlq", ordering="none")
         self._producer.flush_pending(self._flush_timeout_s)
@@ -135,8 +133,6 @@ def quarantine_message(
     channel: str,
     channel_version: int,
     source: str,
-    stage: str,
-    error_code: str = "HEADER_PARSE_ERROR",
 ) -> Message:
     """The quarantine wrapper for an undecodable record (envelope contract 5.2).
 
@@ -148,6 +144,11 @@ def quarantine_message(
     `tb-received-at` is the quarantine time, a deliberate deviation from "set once at receive" because
     the original receive time is unknowable — so end-to-end latency for this record is meaningless and
     must not be computed.
+
+    `tb-stage` is always `quarantined`, never the stage that read the record: the record never reached
+    `queued` or `pending`, so claiming it did would be false rather than merely inconsistent. Where it
+    was read from is carried precisely by `tb-source` and the event's topic/partition/offset, which is
+    strictly more information than a stage name.
     """
     msg_id = uuid7()
     return Message(
@@ -159,8 +160,8 @@ def quarantine_message(
             h.TB_RECEIVED_AT: h.format_timestamp(datetime.now(UTC)),
             h.TB_CONTENT_TYPE: "application/octet-stream",
             h.TB_ATTEMPT: "0",
-            h.TB_STAGE: stage,
-            h.TB_ERROR_CODE: error_code,
+            h.TB_STAGE: "quarantined",
+            h.TB_ERROR_CODE: RECORD_UNDECODABLE,
             h.TRACEPARENT: new_traceparent(),
         },
         payload=blob,
