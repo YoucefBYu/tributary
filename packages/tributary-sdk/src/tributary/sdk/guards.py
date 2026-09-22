@@ -141,7 +141,10 @@ def validate_usr(name: str, value: str) -> None:
         raise UsrHeaderError(f"tb-usr-{safe_token(name)}: value must be text")
     if not value:
         raise UsrHeaderError(f"tb-usr-{safe_token(name)}: empty value; omit the header instead (envelope contract 2)")
-    if any(ch in value for ch in ("\r", "\n")) or any(ord(ch) < 0x20 for ch in value):
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+        # C0 controls and DEL. The check lives here, not only in `Message.with_header`, because
+        # `validate_for_produce` calls this function directly and is the authoritative layer for a
+        # hand-built message — the same argument that closed the deny-list bypass (code-reviewer, wave 1).
         raise UsrHeaderError(f"tb-usr-{safe_token(name)}: control characters are not allowed in a header value")
     size = len(value.encode("utf-8"))
     if size > MAX_USR_VALUE_BYTES:

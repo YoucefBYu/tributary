@@ -15,7 +15,7 @@ from typing import Any
 import orjson
 import pytest
 from jsonschema import Draft202012Validator
-from tributary.runtime.events import EventError, MessageEvent, PartitionEvent, RecordingEmitter, serialize
+from tributary.runtime.events import EventError, MessageEvent, PartitionEvent, RecordEvent, RecordingEmitter, serialize
 from tributary.sdk.ids import uuid7
 
 SCHEMA_PATH = Path(__file__).resolve().parents[3] / "contracts" / "events" / "v0" / "event.schema.json"
@@ -85,6 +85,61 @@ def test_message_events_validate(validator: Draft202012Validator, stage: str) ->
 def test_failure_events_validate(validator: Draft202012Validator, stage: str) -> None:
     event = message_event(stage=stage, status="error", error_code="HTTP_503", error_message="destination returned 503")
     assert failures(validator, event.to_dict()) == set()
+
+
+def record_event(**overrides: Any) -> RecordEvent:
+    fields: dict[str, Any] = {
+        "channel": "adt-passthrough",
+        "channel_version": 2,
+        "instance": "worker:pipeline-2@worker-4",
+        "topic": "dev.adt-passthrough.raw",
+        "partition": 1,
+        "offset": 90210,
+        "error_code": "HEADER_PARSE_ERROR",
+        "message_id": uuid7(),
+        "size_bytes": 2048,
+        "error_message": "record headers could not be decoded; quarantined verbatim to the DLQ",
+    }
+    fields.update(overrides)
+    return RecordEvent(**fields)
+
+
+def test_a_quarantine_event_validates(validator: Draft202012Validator) -> None:
+    """The events contract's `kind: record`, added for exactly this case (CHANGELOG, ee29c62)."""
+    document = record_event().to_dict()
+    assert failures(validator, document) == set()
+    assert document["kind"] == "record"
+    assert document["stage"] == "quarantined"
+    assert document["content_type"] == "application/octet-stream"
+    assert "attrs" not in document
+
+
+def test_a_quarantine_event_carries_no_attrs_even_if_asked(validator: Draft202012Validator) -> None:
+    """Every attrs value would derive from the broken record's bytes, and attrs are searchable columns."""
+    document = record_event().to_dict()
+    document["attrs"] = {"trigger": "a01"}
+    assert failures(validator, document), "the schema must reject attrs on a record event"
+
+
+@pytest.mark.parametrize("field_name", ["topic", "partition", "offset"])
+def test_a_quarantine_event_without_its_coordinates_fails(validator: Draft202012Validator, field_name: str) -> None:
+    """The coordinates are the only identity an unidentifiable record has."""
+    document = record_event().to_dict()
+    del document[field_name]
+    assert ("$", "required") in failures(validator, document)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{"stage": "dlq"}, {"status": "ok"}, {"content_type": "application/hl7-v2+er7"}],
+)
+def test_a_record_event_refuses_the_wrong_shape_at_construction(overrides: dict[str, Any]) -> None:
+    with pytest.raises(EventError):
+        record_event(**overrides)
+
+
+def test_the_quarantine_event_key_is_the_coordinates() -> None:
+    assert record_event().key == b"dev.adt-passthrough.raw:1"
 
 
 @pytest.mark.parametrize("stage", ["partition_paused", "partition_resumed", "partition_halted"])

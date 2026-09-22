@@ -61,8 +61,10 @@ class MllpSettings:
     max_conns: int = 512
     conn_pipeline: int = 256
     max_inflight: int = 5000
-    linger_ms: int = 2
-    delivery_timeout_ms: int = 5000
+    linger_ms: int = 5  # matches contracts/topics/v0 clients.receiver_producer.linger.ms
+    # No delivery_timeout_ms field: that value is `acks`/`enable.idempotence`'s sibling in the
+    # topics contract's must_not_hardcode list, and RawPublisher reads it from the contract
+    # unconditionally (kafka_publisher.py) rather than accepting it as a parameter here.
 
     def __post_init__(self) -> None:
         # A frame under max_message_bytes must always be able to fit the (empty) byte budget on

@@ -16,12 +16,13 @@ import signal
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any, cast
 
 from tributary.sdk import Message, Step
 from tributary.sdk import headers as h
 from tributary.sdk.context import Logger
-from tributary.sdk.ids import child_traceparent, new_traceparent
+from tributary.sdk.ids import child_traceparent, new_traceparent, uuid7
 
 from .channels import ChannelCache, ChannelsConsumerLike
 from .clients import KafkaSettings, consumer_config, events_producer_config, max_poll_interval_ms, producer_config
@@ -33,7 +34,7 @@ from .events import EventEmitter, MessageEvent, NullEmitter
 from .executor import PipelineExecutor
 from .logs import JsonLogger
 from .producer import KafkaEventEmitter, KafkaProducerLike, RecordProducer
-from .records import ConsumedRecord
+from .records import ConsumedRecord, quarantine_blob
 from .spec import ChannelSpec, RetryPolicy
 from .steps import load_steps
 from .topics import channels_topic, consumer_group, dlq_topic, events_topic, out_topic, raw_topic
@@ -73,12 +74,21 @@ class KafkaDlqWriter:
     still sitting in a producer buffer would be a lost message wearing the costume of a handled one.
     """
 
-    __slots__ = ("_flush_timeout_s", "_log", "_producer", "_topic")
+    __slots__ = ("_flush_timeout_s", "_log", "_producer", "_source", "_topic")
 
-    def __init__(self, producer: RecordProducer, topic: str, *, log: Logger, flush_timeout_s: float = 30.0) -> None:
+    def __init__(
+        self,
+        producer: RecordProducer,
+        topic: str,
+        *,
+        log: Logger,
+        source: str,
+        flush_timeout_s: float = 30.0,
+    ) -> None:
         self._producer = producer
         self._topic = topic
         self._log = log
+        self._source = source
         self._flush_timeout_s = flush_timeout_s
 
     def dead_letter(self, record: ConsumedRecord, *, error_code: str, stage: str) -> None:
@@ -95,20 +105,67 @@ class KafkaDlqWriter:
             stage=stage,
         )
 
-    def quarantine(self, raw: Any, *, error_code: str) -> None:
-        """A record that could not be decoded, copied verbatim.
+    def quarantine(self, raw: Any, *, error_code: str, channel: str, channel_version: int, stage: str) -> str:
+        """Wrap a record that could not be decoded and write it to the DLQ. Returns the minted id.
 
-        It is not made conformant: doing so would mean minting a `tb-msg-id`, and a new identity breaks
-        both the browser's parent/child tree and the loader idempotency key. Quarantine keeps the bytes
-        for a human without pretending the record is ours.
+        Envelope contract 5.2: the quarantined record is a **new** record the engine constructs, not
+        the original moved — a `dlq` record needs the whole core header set, which is exactly the bytes
+        that could not be read. The original bytes go in the payload as an opaque blob.
+
+        **Nothing from the record reaches a log line here or in the caller** — not a value, not a header
+        *name*, not a `repr`. Under mis-framing a header name is payload, so an HL7 segment or a patient
+        name can be sitting in a name slot; the contract calls logging any of it a Critical finding.
         """
-        self._producer.produce_raw(
-            self._topic,
-            key=raw.key(),
-            value=raw.value(),
-            headers=[(name, value) for name, value in (raw.headers() or []) if isinstance(value, bytes)],
+        wrapper = quarantine_message(
+            blob=quarantine_blob(key=raw.key(), value=raw.value(), headers=raw.headers() or []),
+            channel=channel,
+            channel_version=channel_version,
+            source=self._source,
+            stage=stage,
+            error_code=error_code,
         )
+        self._producer.produce(self._topic, wrapper, topic_class="dlq", ordering="none")
         self._producer.flush_pending(self._flush_timeout_s)
+        return wrapper.require(h.TB_MSG_ID)
+
+
+def quarantine_message(
+    *,
+    blob: bytes,
+    channel: str,
+    channel_version: int,
+    source: str,
+    stage: str,
+    error_code: str = "HEADER_PARSE_ERROR",
+) -> Message:
+    """The quarantine wrapper for an undecodable record (envelope contract 5.2).
+
+    Every header comes from what the engine knows — the subscription, the applied spec, this component —
+    and never from the record. `tb-msg-id` is a **fresh** UUIDv7: a value recovered from the broken
+    record is untrusted input, and a forged id would collide with a real message in the browser and in
+    every loader's idempotency check.
+
+    `tb-received-at` is the quarantine time, a deliberate deviation from "set once at receive" because
+    the original receive time is unknowable — so end-to-end latency for this record is meaningless and
+    must not be computed.
+    """
+    msg_id = uuid7()
+    return Message(
+        headers={
+            h.TB_MSG_ID: msg_id,
+            h.TB_CHANNEL: channel,
+            h.TB_CHANNEL_VERSION: str(channel_version),
+            h.TB_SOURCE: source,
+            h.TB_RECEIVED_AT: h.format_timestamp(datetime.now(UTC)),
+            h.TB_CONTENT_TYPE: "application/octet-stream",
+            h.TB_ATTEMPT: "0",
+            h.TB_STAGE: stage,
+            h.TB_ERROR_CODE: error_code,
+            h.TRACEPARENT: new_traceparent(),
+        },
+        payload=blob,
+        key=msg_id.encode("utf-8"),
+    )
 
 
 def dlq_message(message: Message, *, error_code: str, stage: str) -> Message:
@@ -389,6 +446,7 @@ class PipelineWorker:
                 producer,
                 dlq_topic(env, channel),
                 log=self.log,
+                source=self.settings.instance,
                 flush_timeout_s=self.settings.flush_timeout_s,
             ),
         )

@@ -20,6 +20,7 @@ from tributary.runtime.executor import StepFailure
 from tributary.runtime.logs import JsonLogger
 from tributary.runtime.records import ConsumedRecord, to_kafka_headers
 from tributary.runtime.spec import RetryPolicy
+from tributary.sdk.ids import uuid7
 from tributary.sdk.testing import make_message
 
 from .fakes import FakeConsumer, FakeError, FakeRecord
@@ -61,13 +62,14 @@ class ScriptedHandler:
 class RecordingDlq:
     def __init__(self) -> None:
         self.dead: list[tuple[str, str]] = []
-        self.quarantined: list[str] = []
+        self.quarantined: list[tuple[str, str, int, str]] = []
 
     def dead_letter(self, record: ConsumedRecord, *, error_code: str, stage: str) -> None:
         self.dead.append((error_code, stage))
 
-    def quarantine(self, raw: Any, *, error_code: str) -> None:
-        self.quarantined.append(error_code)
+    def quarantine(self, raw: Any, *, error_code: str, channel: str, channel_version: int, stage: str) -> str:
+        self.quarantined.append((error_code, channel, channel_version, stage))
+        return uuid7()
 
 
 def record(offset: int, *, partition: int = 0, headers: list[tuple[str, bytes]] | None = None) -> FakeRecord:
@@ -327,13 +329,61 @@ def test_an_undecodable_record_is_quarantined_and_the_partition_continues() -> N
     consumer.append(record(1))
     dlq = RecordingDlq()
     handler = ScriptedHandler()
-    loop, _ = build(consumer, handler, dlq=dlq)
+    loop, events = build(consumer, handler, dlq=dlq)
 
     loop.run(max_iterations=3)
 
-    assert dlq.quarantined == ["HEADER_NOT_TEXT"]
-    assert handler.seen == [1]
+    assert dlq.quarantined == [("HEADER_NOT_TEXT", "adt-passthrough", 1, "queued")]
+    assert handler.seen == [1], "the partition keeps moving past a record nothing can decode"
     assert consumer.committed[-1] == [(TOPIC, 0, 2)]
+
+    quarantine = next(event for event in events.events if event.stage == "quarantined")
+    assert quarantine.topic == TOPIC and quarantine.offset == 0
+    assert quarantine.message_id, "the event carries the id minted for the wrapper, never one from the record"
+    assert quarantine.error_code == "HEADER_NOT_TEXT"
+
+
+def test_nothing_from_an_undecodable_record_reaches_the_log() -> None:
+    """Envelope contract 5.2: a header NAME is attacker-supplied too, and under mis-framing it is payload.
+
+    So the permitted set is coordinates, the minted id, the code and byte counts — and this test drives
+    a record whose payload, key and header name are all distinctive markers to prove none of them lands
+    in a log line.
+    """
+    marker = "PID|1|SYNTH-MARKER^JANE"
+    consumer = FakeConsumer()
+    consumer.append(
+        FakeRecord(
+            _topic=TOPIC,
+            _partition=0,
+            _offset=0,
+            _key=b"SYNTH-KEY-MARKER",
+            _value=marker.encode(),
+            _headers=[(marker, b"\xff\xfe")],
+        )
+    )
+    stream = io.StringIO()
+    loop = ConsumerLoop(
+        consumer,
+        ScriptedHandler(),
+        topics=[TOPIC],
+        retry=BLOCKING,
+        settings=LoopSettings(commit_every=1, poll_timeout_s=0.0),
+        emitter=RecordingEmitter(),
+        log=JsonLogger("test", stream=stream, level="debug"),
+        channel="adt-passthrough",
+        channel_version=1,
+        instance="worker:test@localhost",
+        dlq=RecordingDlq(),
+        clock=Clock(),
+    )
+    loop.run(max_iterations=2)
+
+    written = stream.getvalue()
+    assert "SYNTH-MARKER" not in written
+    assert "SYNTH-KEY-MARKER" not in written
+    assert "PID|" not in written
+    assert "record_quarantined" in written, "the failure is still reported, by coordinates and code"
 
 
 # -- consumer errors, rebalance and shutdown --------------------------------------------------------

@@ -25,7 +25,7 @@ import pytest
 from jsonschema import Draft202012Validator
 from tributary.sdk import Message
 from tributary.sdk import headers as h
-from tributary.sdk.errors import EnvelopeError, UsrHeaderError
+from tributary.sdk.errors import EnvelopeError, HeaderValueError, UsrHeaderError
 from tributary.sdk.ids import new_correlation_id, new_traceparent, uuid7
 from tributary.sdk.projection import FORBIDDEN, REQUIRED, TopicClass, record_projection, validate_for_produce
 from tributary.sdk.testing import make_message
@@ -263,6 +263,21 @@ def test_an_identifier_named_usr_header_cannot_reach_the_producer_by_any_route(n
         base.with_header(name, "999-88-7777")
 
     smuggled = Message(headers={**base.headers, name: "999-88-7777"}, payload=base.payload, key=base.key)
+    with pytest.raises(EnvelopeError):
+        validate_for_produce(smuggled, topic_class="raw")
+
+
+@pytest.mark.parametrize("bad", [chr(0x7F), "seq" + chr(0x7F), chr(0x00), "a" + chr(0x1B)])
+def test_a_control_character_in_a_usr_header_cannot_reach_the_producer(bad: str) -> None:
+    """Follow-up to the same High: DEL (0x7F) was checked by `with_header` but not by the guard itself,
+    so a hand-built message reached `validate_for_produce` unrejected (code-reviewer, wave 1)."""
+    base = make_message(key=b"SYNTH-KEY-0001")
+    # Either error is a correct refusal: with_header's own control-character check may fire before the
+    # tb-usr guard. What matters is that neither route lets the value through.
+    with pytest.raises((HeaderValueError, UsrHeaderError)):
+        base.with_header("tb-usr-seq", bad)
+
+    smuggled = Message(headers={**base.headers, "tb-usr-seq": bad}, payload=base.payload, key=base.key)
     with pytest.raises(EnvelopeError):
         validate_for_produce(smuggled, topic_class="raw")
 

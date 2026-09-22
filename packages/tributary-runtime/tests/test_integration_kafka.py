@@ -31,9 +31,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-
-pytest.importorskip("testcontainers.core.container", reason="testcontainers is needed for the Kafka integration test")
-
 from confluent_kafka import Consumer, Producer
 from confluent_kafka.admin import AdminClient, NewTopic
 from jsonschema import Draft202012Validator
@@ -316,6 +313,60 @@ def test_an_experimental_header_is_tolerated_inbound_and_stripped_on_produce(
     assert delivered, "the record was delivered despite carrying an experimental header"
     assert all(EXPERIMENTAL_PROBE not in header_map(record) for record in delivered)
     assert all(SEQ_HEADER in header_map(record) for record in delivered)
+
+
+def test_an_undecodable_record_is_quarantined_to_the_dlq_with_a_record_event(
+    deployed_spec: dict[str, Any], topics: str
+) -> None:
+    """The quarantine path end to end, against the contracts (envelope 5.2, events `kind: record`).
+
+    The record carries a non-UTF-8 header value, so the worker cannot identify it as a Tributary
+    message at all. What must happen: a **new** wrapper record on the DLQ whose payload holds the
+    original bytes, a freshly minted UUIDv7 as its id, and a `kind: record` / `stage: quarantined`
+    event. What must not happen: the partition stalling, or any of those bytes reaching a log line.
+    """
+    marker = b"PID|1|SYNTH-QUARANTINE-MARKER^JANE"
+    producer = Producer({"bootstrap.servers": topics, "acks": "all", "enable.idempotence": True})
+    producer.produce(
+        raw_topic(ENV, CHANNEL),
+        key=b"SYNTH-KEY-0",
+        value=marker,
+        headers=[("tb-channel", bytes([0xFF, 0xFE])), ("tb-msg-id", uuid7().encode())],
+    )
+    assert producer.flush(30) == 0
+
+    running = worker(topics, "pipeline-quarantine")
+    running.build()
+    running.run(max_iterations=200)
+
+    envelope = Draft202012Validator(
+        json.loads((CONTRACTS / "envelope" / "v0" / "envelope.schema.json").read_text(encoding="utf-8"))
+    )
+    dead = drain(topics, dlq_topic(ENV, CHANNEL), expected=1)
+    wrappers = [record for record in dead if header_map(record).get(h.TB_ERROR_CODE) == "HEADER_NOT_TEXT"]
+    assert wrappers, "the undecodable record was quarantined to the DLQ"
+
+    wrapper = wrappers[-1]
+    headers = header_map(wrapper)
+    assert headers[h.TB_CONTENT_TYPE] == "application/octet-stream"
+    assert headers[h.TB_CHANNEL] == CHANNEL, "the channel comes from the subscription, not the record"
+    assert wrapper.key() == headers[h.TB_MSG_ID].encode(), "keyed by the minted tb-msg-id"
+    assert wrapper.value() is not None and marker in wrapper.value(), "the original bytes are preserved"
+    projected = Message(headers=headers, payload=wrapper.value(), key=wrapper.key())
+    assert list(envelope.iter_errors(record_projection(projected, topic_class="dlq"))) == []
+
+    events = Draft202012Validator(
+        json.loads((CONTRACTS / "events" / "v0" / "event.schema.json").read_text(encoding="utf-8"))
+    )
+    emitted = [json.loads(record.value()) for record in drain(topics, events_topic(ENV), expected=1)]
+    quarantined = [event for event in emitted if event.get("stage") == "quarantined"]
+    assert quarantined, "a kind: record event was emitted, so the failure is not log-only"
+    for event in quarantined:
+        assert event["kind"] == "record"
+        assert event["status"] == "error"
+        assert "attrs" not in event
+        assert event["message_id"] == headers[h.TB_MSG_ID] or event["error_code"] == "HEADER_NOT_TEXT"
+        assert list(events.iter_errors(event)) == []
 
 
 WORKER_PROGRAM = """

@@ -21,7 +21,14 @@ from tributary.runtime.logs import JsonLogger
 from tributary.runtime.producer import RecordProducer
 from tributary.runtime.records import ConsumedRecord
 from tributary.runtime.spec import ChannelSpec
-from tributary.runtime.worker import PipelineHandler, check_partition_counts, dlq_message, out_message
+from tributary.runtime.worker import (
+    KafkaDlqWriter,
+    PipelineHandler,
+    check_partition_counts,
+    dlq_message,
+    out_message,
+    quarantine_message,
+)
 from tributary.sdk import Drop, Message, step
 from tributary.sdk import headers as h
 from tributary.sdk.projection import record_projection
@@ -202,6 +209,67 @@ def test_the_dlq_record_carries_a_code_and_never_exception_text() -> None:
     rendered = " ".join(f"{name}={value}" for name, value in dead.headers.items())
     assert "SYNTH^JANE" not in rendered
     assert "ValueError" not in rendered
+
+
+def test_the_quarantine_wrapper_is_a_new_conformant_record() -> None:
+    """Envelope contract 5.2: a new record the engine constructs, not the original moved."""
+    blob = b"TBQ1-original-bytes"
+    wrapper = quarantine_message(
+        blob=blob,
+        channel="adt-passthrough",
+        channel_version=3,
+        source="worker:pipeline-1@localhost",
+        stage="queued",
+    )
+
+    assert wrapper.payload == blob, "the original bytes live in the payload, the opaque PHI-bearing part"
+    assert wrapper.key == wrapper.msg_id.encode("utf-8"), "keyed by tb-msg-id like every dlq record"
+    assert wrapper.msg_id[14] == "7", "a freshly minted UUIDv7, never a value recovered from the record"
+    assert wrapper.content_type == "application/octet-stream"
+    assert wrapper.error_code == "HEADER_PARSE_ERROR"
+    assert wrapper.stage == "queued"
+    assert wrapper.source == "worker:pipeline-1@localhost", "this component, not the unknown original peer"
+
+    validator = Draft202012Validator(json.loads(ENVELOPE_SCHEMA.read_text(encoding="utf-8")))
+    assert list(validator.iter_errors(record_projection(wrapper, topic_class="dlq"))) == []
+
+
+def test_two_quarantine_wrappers_never_share_an_identity() -> None:
+    """A forged or reused id would collide with a real message in the browser and in loader idempotency."""
+    first = quarantine_message(blob=b"a", channel="c", channel_version=1, source="s", stage="queued")
+    second = quarantine_message(blob=b"a", channel="c", channel_version=1, source="s", stage="queued")
+    assert first.msg_id != second.msg_id
+
+
+def test_the_dlq_writer_quarantines_a_conformant_wrapper_and_returns_its_id() -> None:
+    producer = FakeProducer()
+    writer = KafkaDlqWriter(
+        RecordProducer(producer, log=JsonLogger("test", stream=io.StringIO())),
+        "dev.adt-passthrough.dlq",
+        log=JsonLogger("test", stream=io.StringIO()),
+        source="worker:pipeline-1@localhost",
+    )
+
+    class Broken:
+        def key(self) -> bytes:
+            return b"SYNTH-KEY-1"
+
+        def value(self) -> bytes:
+            return b"unreadable"
+
+        def headers(self) -> list[tuple[str, bytes]]:
+            return [("tb-channel", bytes([0xFF, 0xFE]))]
+
+    minted = writer.quarantine(
+        Broken(), error_code="HEADER_NOT_TEXT", channel="adt-passthrough", channel_version=1, stage="queued"
+    )
+
+    topic, key, value, _headers = producer.produced[0]
+    assert topic == "dev.adt-passthrough.dlq"
+    assert key == minted.encode("utf-8")
+    assert value is not None and value.startswith(b"TBQ1"), "the original bytes are framed into the payload"
+    assert b"unreadable" in value
+    assert producer.flushes == 1, "the DLQ write is confirmed before the loop commits the input offset"
 
 
 def test_worker_logs_never_contain_the_record_key_or_payload() -> None:

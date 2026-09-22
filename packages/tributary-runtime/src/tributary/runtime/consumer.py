@@ -43,7 +43,7 @@ from confluent_kafka import TopicPartition
 from tributary.sdk.context import Logger
 
 from .errors import DeliveryError
-from .events import EventEmitter, MessageEvent, PartitionEvent
+from .events import EventEmitter, MessageEvent, PartitionEvent, RecordEvent
 from .executor import StepFailure
 from .records import ConsumedRecord, RecordDecodeError, decode_record
 from .spec import RetryPolicy
@@ -95,7 +95,8 @@ class DlqWriter(Protocol):
 
     def dead_letter(self, record: ConsumedRecord, *, error_code: str, stage: str) -> None: ...
 
-    def quarantine(self, raw: Any, *, error_code: str) -> None: ...
+    def quarantine(self, raw: Any, *, error_code: str, channel: str, channel_version: int, stage: str) -> str:
+        """Write the quarantine wrapper for an undecodable record and return the id it minted."""
 
 
 Key = tuple[str, int]
@@ -169,6 +170,7 @@ class ConsumerLoop:
         instance: str,
         dlq: DlqWriter | None = None,
         destination: str | None = None,
+        read_stage: str = "queued",
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._consumer = consumer
@@ -183,6 +185,9 @@ class ConsumerLoop:
         self._instance = instance
         self._dlq = dlq
         self._destination = destination
+        #: The stage that read the record, stamped on a quarantine wrapper: `queued` for a pipeline
+        #: worker reading `raw`, `pending` for a loader reading `out.<dest>`.
+        self._read_stage = read_stage
         self._clock = clock
         self._retry_state: dict[Key, RetryState] = {}
         self._since_commit = 0
@@ -453,15 +458,40 @@ class ConsumerLoop:
     def _quarantine(self, raw: Any, topic: str, partition: int, offset: int, exc: RecordDecodeError) -> None:
         """A record we cannot decode at all.
 
-        It is copied verbatim to the DLQ rather than made conformant, because making it conformant
-        would mean inventing a `tb-msg-id` — a new identity that breaks the browser's parent/child tree
-        and the loader idempotency key. No message event is emitted: `kind: message` requires a
-        `message_id` and there is none. TODO(architect): the events contract has no shape for
-        "unroutable record", so this failure is visible only in logs and metrics.
+        The engine writes a **new** wrapper record to the DLQ carrying the original bytes as an opaque
+        payload, with a freshly minted `tb-msg-id` (envelope contract 5.2), and emits a
+        `kind: "record"`, `stage: "quarantined"` event so the failure is visible in the browser rather
+        than only in a log file — the record class most likely to mean an attack or a broken producer.
+
+        **Nothing from the record is logged**: not a value, not a header name, not a `repr` or a slice.
+        Under mis-framing a header name is payload, so a patient name can be sitting in a name slot.
+        Coordinates, the minted id, the code and byte counts are the whole permitted set.
         """
+        minted: str | None = None
         if self._dlq is not None:
-            self._dlq.quarantine(raw, error_code=exc.error_code)
+            minted = self._dlq.quarantine(
+                raw,
+                error_code=exc.error_code,
+                channel=self._channel,
+                channel_version=self._channel_version,
+                stage=self._read_stage,
+            )
         self.stats.quarantined += 1
+        value = raw.value()
+        self._emitter.emit(
+            RecordEvent(
+                channel=self._channel,
+                channel_version=self._channel_version,
+                instance=self._instance,
+                topic=topic,
+                partition=partition,
+                offset=offset,
+                message_id=minted,
+                size_bytes=len(value) if value is not None else 0,
+                error_code=exc.error_code,
+                error_message="record headers could not be decoded; quarantined verbatim to the DLQ",
+            )
+        )
         self._log.error(
             "record_quarantined",
             channel=self._channel,
@@ -469,6 +499,7 @@ class ConsumerLoop:
             partition=partition,
             offset=offset,
             error_code=exc.error_code,
+            message_id=minted,
         )
         self._mark((topic, partition), offset)
 

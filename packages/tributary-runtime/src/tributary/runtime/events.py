@@ -227,7 +227,75 @@ class PartitionEvent:
         )
 
 
-LifecycleEvent = MessageEvent | PartitionEvent
+@dataclass(frozen=True, slots=True)
+class RecordEvent:
+    """A Kafka record that could not be identified as a Tributary message at all.
+
+    Described by its topic/partition/offset, because there is no trustworthy `tb-msg-id` in it;
+    `message_id` is the id the engine minted for the quarantine wrapper it wrote to the DLQ, never a
+    value read out of the broken record (envelope contract 5.2).
+
+    **No `attrs`, by contract.** Every value would have to derive from the broken record's own bytes,
+    and `attrs` become searchable columns in ClickHouse and the browser — the one place unvalidated
+    input must not land. `content_type` is pinned to `application/octet-stream`: unknown by definition,
+    and naming it keeps the field honest instead of guessing from a header that could not be read.
+    """
+
+    channel: str
+    channel_version: int
+    instance: str
+    topic: str
+    partition: int
+    offset: int
+    error_code: str
+    message_id: str | None = None
+    size_bytes: int | None = None
+    error_message: str | None = None
+    traceparent: str | None = None
+    ts: str = field(default_factory=now_text)
+    stage: str = "quarantined"
+    status: Status = "error"
+    content_type: str = "application/octet-stream"
+
+    def __post_init__(self) -> None:
+        if self.stage != "quarantined":
+            raise EventError("a record event's only stage is quarantined")
+        if self.status != "error":
+            raise EventError("a record event is always an error")
+        if self.content_type != "application/octet-stream":
+            raise EventError("a record event's content type is application/octet-stream by definition")
+        _check_common(self.stage, self.status, self.error_code, self.error_message)
+
+    @property
+    def key(self) -> bytes:
+        """Keyed by the coordinates, like a partition event: there is no trustworthy message id."""
+        return f"{self.topic}:{self.partition}".encode()
+
+    def to_dict(self) -> dict[str, Any]:
+        return _compact(
+            {
+                "v": EVENT_VERSION,
+                "kind": "record",
+                "ts": self.ts,
+                "channel": self.channel,
+                "channel_version": self.channel_version,
+                "stage": self.stage,
+                "status": self.status,
+                "instance": self.instance,
+                "message_id": self.message_id,
+                "content_type": self.content_type,
+                "size_bytes": self.size_bytes,
+                "topic": self.topic,
+                "partition": self.partition,
+                "offset": self.offset,
+                "error_code": self.error_code,
+                "error_message": self.error_message,
+                "traceparent": self.traceparent,
+            }
+        )
+
+
+LifecycleEvent = MessageEvent | PartitionEvent | RecordEvent
 
 
 def _compact(document: Mapping[str, Any]) -> dict[str, Any]:

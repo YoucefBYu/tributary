@@ -80,6 +80,41 @@ def _require_usable(message: Message) -> None:
         raise RecordDecodeError("ENVELOPE_INVALID", str(exc)) from exc
 
 
+QUARANTINE_MAGIC = b"TBQ1"
+
+
+def quarantine_blob(*, key: bytes | None, value: bytes | None, headers: Iterable[tuple[str, bytes | None]]) -> bytes:
+    """Frame an undecodable record's own bytes into one opaque blob.
+
+    Envelope contract 5.2 puts the original headers and payload in the quarantine wrapper's **payload**,
+    because that is the one part of the envelope that is opaque and already treated as PHI-bearing. It
+    does not say how to frame them, so this is a runtime choice, recorded here and reported to the
+    architect: a magic, then length-prefixed slots, so a human with a hex viewer can separate the parts
+    without the runtime ever decoding them.
+
+    `TBQ1 | u32 key_len | key | u32 header_count | (u32 name_len | name | u32 value_len | value)* | payload`
+
+    A null key or header value is `0xFFFFFFFF`. The original **key** is included even though the
+    contract's table names only headers and payload: without it the quarantined record is not the
+    record, and the key is already on a topic whose ACLs and retention assume PHI. Flagged for the
+    architect rather than decided quietly.
+    """
+    import struct
+
+    def slot(raw: bytes | None) -> bytes:
+        if raw is None:
+            return struct.pack(">I", 0xFFFFFFFF)
+        return struct.pack(">I", len(raw)) + raw
+
+    collected = list(headers)
+    parts = [QUARANTINE_MAGIC, slot(key), struct.pack(">I", len(collected))]
+    for name, header_value in collected:
+        parts.append(slot(name.encode("utf-8", errors="surrogateescape") if isinstance(name, str) else bytes(name)))
+        parts.append(slot(header_value))
+    parts.append(value if value is not None else b"")
+    return b"".join(parts)
+
+
 def to_kafka_headers(message: Message) -> list[tuple[str, bytes]]:
     """Encode headers for `confluent_kafka.Producer.produce`."""
     return [(name, value.encode("utf-8")) for name, value in message.headers.items()]
