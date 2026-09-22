@@ -3,6 +3,31 @@
 Newest first. Each entry names the contract, the version, whether the change is additive or
 breaking, and the reason. Breaking changes reference an ADR.
 
+## 2026-09-22 (W1-4 implementation) — quarantine blob framing, the original key, and a stage that stops being a guess
+
+Three items `platform-engineer` raised while implementing quarantine (`a96edb1`). All **additive**;
+the first two ratify what they built, the third changes it. Two were gaps in section 5.2 as I wrote
+it, and the third was another cross-contract inconsistency of mine: `events/v0` already had a
+`quarantined` stage and `envelope/v0`'s `tb-stage` enum did not.
+
+| Item | Decision |
+|---|---|
+| **Blob framing** | **Pinned, not implementation-defined**, adopted as `platform-engineer` specified it: `"TBQ1" \| key \| header_count \| (name, value)* \| payload` with length prefixes and `0xFFFFFFFF` for null, in new section 5.2.1. Implementation-defined was the wrong answer because two components can already write a wrapper — a worker reading `raw` and a loader reading `out.<dest>` — so the archive and browser could not render either reliably. Added on top of their design: **lengths are unsigned 32-bit big-endian** (a contract that omits byte order lets two implementations differ and both believe they conform), nothing in the message flow parses the blob (a component that parsed it to auto-retry would feed attacker-controlled bytes back into the pipeline), and the browser masks the whole blob **including header names** as payload rather than metadata |
+| **The original key belongs in the blob** | **Kept**, and now named in 5.2. Their reasoning is better than my table: without the key the artefact is not the record, and a per-key reprocess would need it. It adds no exposure — it is a DLQ payload whose ACLs and retention already assume PHI, and the key already existed on the source topic. Two rules pinned because this is the field section 4 restricts hardest: it MUST NOT become the wrapper's key, and MUST NOT be lifted into a header, `attrs` or a log line |
+| **`tb-stage` on a wrapper** | **Always `quarantined`**, not the stage that read it. `envelope/v0`'s stage enum gains `quarantined` (it was already in `events/v0` — my inconsistency). Stamping `queued` or `pending` claims a stage the record never reached, and two components guessing differently makes the browser timeline disagree with itself, which is what `platform-engineer` predicted. Where it was read from is carried precisely by `tb-source` and the event's `topic`/`partition`/`offset` — strictly more information than a stage name |
+
+**New error code `RECORD_UNDECODABLE`, separate from `HEADER_PARSE_ERROR`.** Needed as the schema's
+discriminator for the quarantine shape, but justified independently: they are different failures
+needing different alerts. `HEADER_PARSE_ERROR` is one malformed header on a record that could still
+be identified, which keeps its original identity and its reading stage; `RECORD_UNDECODABLE` means
+nothing about the record is trustworthy. A rise in the first points at one producer's field, a rise
+in the second at framing, corruption or someone writing to the topic. Reserved-code table in 2.3.
+
+Enforced, not just documented: a conditional keyed on `tb-error-code: RECORD_UNDECODABLE` requires
+`tb-stage: quarantined` and `tb-content-type: application/octet-stream`, with the new invalid example
+`quarantine-stage-not-quarantined.json`. **`platform-engineer` must change `HEADER_PARSE_ERROR` to
+`RECORD_UNDECODABLE` on the quarantine path** — a one-string change they offered to make either way.
+
 ## 2026-09-22 (W1-4 questions) — quarantine shape for unidentifiable records; `commit_every` becomes a number
 
 Two questions from `platform-engineer` during runtime v0. Both **additive** to Draft contracts. Both

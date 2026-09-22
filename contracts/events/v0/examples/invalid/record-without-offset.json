@@ -11,6 +11,6 @@
   "size_bytes": 2048,
   "topic": "prod.adt-to-fhir.raw",
   "partition": 1,
-  "error_code": "HEADER_PARSE_ERROR",
+  "error_code": "RECORD_UNDECODABLE",
   "traceparent": "00-7c1a2b3c4d5e6f708192a3b4c5d6e7f8-1122334455667788-01"
 }

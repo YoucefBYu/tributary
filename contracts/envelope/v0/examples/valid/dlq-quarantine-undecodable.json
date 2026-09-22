@@ -13,8 +13,8 @@
     "tb-received-at": "2026-09-22T09:14:02.004Z",
     "tb-content-type": "application/octet-stream",
     "tb-attempt": "0",
-    "tb-stage": "queued",
-    "tb-error-code": "HEADER_PARSE_ERROR",
+    "tb-stage": "quarantined",
+    "tb-error-code": "RECORD_UNDECODABLE",
     "traceparent": "00-7c1a2b3c4d5e6f708192a3b4c5d6e7f8-1122334455667788-01"
   }
 }

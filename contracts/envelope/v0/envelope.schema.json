@@ -140,6 +140,28 @@
       }
     },
     {
+      "$comment": "A quarantine wrapper (README 5.2) is discriminated by tb-error-code RECORD_UNDECODABLE and must be stamped consistently by every component that can write one - a pipeline worker reading raw and a loader reading out.<dest> otherwise guess different stages and the browser timeline disagrees with itself. tb-stage is 'quarantined', not the stage that read it: the record never reached queued or pending, and claiming it did is false in a different way. WHERE it was read from is recorded precisely by the event's topic/partition/offset and by tb-source, which is more informative than a stage name.",
+      "if": {
+        "properties": {
+          "headers": {
+            "properties": { "tb-error-code": { "const": "RECORD_UNDECODABLE" } },
+            "required": ["tb-error-code"]
+          }
+        },
+        "required": ["headers"]
+      },
+      "then": {
+        "properties": {
+          "headers": {
+            "properties": {
+              "tb-stage": { "const": "quarantined" },
+              "tb-content-type": { "const": "application/octet-stream" }
+            }
+          }
+        }
+      }
+    },
+    {
       "$comment": "Class reply: correlation id is the whole point; tb-source and tb-attempt are optional.",
       "if": { "properties": { "class": { "const": "reply" } }, "required": ["class"] },
       "then": {
@@ -204,7 +226,8 @@
         "retrying",
         "replied",
         "error",
-        "dlq"
+        "dlq",
+        "quarantined"
       ]
     },
     "headers": {

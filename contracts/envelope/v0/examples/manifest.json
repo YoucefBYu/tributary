@@ -155,6 +155,13 @@
       "expectation_note": "ADDED 2026-09-22 with the channel-spec contract, so it is not in the 76-test pytest run at 83a1fd2. MEASURED by the lead with contracts/validate.py (96 checks, 0 failed)"
     },
     {
+      "file": "invalid/quarantine-stage-not-quarantined.json",
+      "violates": "a RECORD_UNDECODABLE wrapper must carry tb-stage 'quarantined', not the stage that read it (README 5.2). 'queued' is the plausible mistake and it claims the record was queued, which never happened; worse, a worker reading raw and a loader reading out.<dest> would stamp different values and the browser timeline would disagree with itself",
+      "expected_json_path": "$.headers['tb-stage']",
+      "expected_validator": "const",
+      "expectation_note": "PREDICTED by the architect, not yet measured (no shell). Added 2026-09-22 when platform-engineer found the stage ambiguity while implementing quarantine"
+    },
+    {
       "file": "invalid/channel-version-not-an-integer.json",
       "violates": "tb-channel-version is decimal ASCII only; 'v7' is the plausible mistake, and int('v7') raising inside a consumer loop is a crash loop on one poison record (README 2.3)",
       "expected_json_path": "$.headers['tb-channel-version']",

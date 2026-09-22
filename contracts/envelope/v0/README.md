@@ -178,9 +178,19 @@ Three consequences that are easy to get wrong:
    Phase 0's finding (SR-10) was against a single experimental header. Generalising it is Phase 1
    requirement 13, owned jointly by `platform-engineer` and `connector-engineer`.
 
-Reserved error codes the contracts themselves rely on: `HEADER_PARSE_ERROR` (this section),
-`TRANSFORM_ERROR` (ADR-001 6.4). Others are chosen by the component that raises them, within
-`^[A-Z][A-Z0-9_]{0,63}$`; there is deliberately no central registry to keep in sync.
+Reserved error codes the contracts themselves rely on:
+
+| Code | Meaning |
+|---|---|
+| `HEADER_PARSE_ERROR` | One header was malformed on a record that could still be **identified**. The reject keeps the original `tb-msg-id` and the original identity, and `tb-stage` is the stage that read it. Usually a broken producer field. |
+| `RECORD_UNDECODABLE` | The record could not be identified at all, so no original identity is trustworthy. Produces a quarantine wrapper (section 5.2). Framing damage, corruption or an attack. |
+| `TRANSFORM_ERROR` | A pipeline step raised (ADR-001 6.4). |
+
+The first two are deliberately separate codes for one operational reason: they need different alerts.
+A rise in `HEADER_PARSE_ERROR` points at one producer's field; a rise in `RECORD_UNDECODABLE` points
+at framing, corruption or someone writing to the topic. Collapsing them hides the second behind the
+first. Other codes are chosen by the component that raises them, within `^[A-Z][A-Z0-9_]{0,63}$`;
+there is deliberately no central registry to keep in sync.
 
 ### 2.4 Known envelope drift in Phase 0 code — do not reproduce
 
@@ -354,13 +364,62 @@ the engine constructs, not the original record moved.**
 | `tb-source` | The quarantining component and instance, not the original peer, which is unknown. |
 | `tb-received-at` | The quarantine time. **This is a deliberate deviation** from "set once at receive, never rewritten" (section 6 rule 1): the original receive time is unknowable. End-to-end latency for this record is meaningless and must not be computed. |
 | `tb-content-type` | `application/octet-stream`. Unknown by definition. |
-| `tb-stage`, `tb-error-code` | The stage that read it, and `HEADER_PARSE_ERROR`. |
-| Key | `tb-msg-id`, as for every `dlq` record. |
-| **Value** | The original record's bytes — headers and payload — as an opaque blob. |
+| `tb-stage` | **`quarantined`**, always — not the stage that read it. The record never reached `queued` or `pending`, so naming either is false, and every component that can quarantine (a worker reading `raw`, a loader reading `out.<dest>` or `retry`) must stamp the same value or the browser's timeline disagrees with itself. *Where* it was read from is recorded precisely by `tb-source` and by the event's `topic`/`partition`/`offset`. |
+| `tb-error-code` | **`RECORD_UNDECODABLE`**, which is distinct from `HEADER_PARSE_ERROR` (section 2.3). They are different failures and deserve different alerts: `HEADER_PARSE_ERROR` means one header was malformed on an otherwise identifiable record, which is usually a broken producer field and keeps its original identity; `RECORD_UNDECODABLE` means the record could not be identified at all, which is framing damage, corruption or an attack. The schema keys the quarantine shape off this code. |
+| Key | `tb-msg-id` — the minted one — as for every `dlq` record. |
+| **Value** | The original record's **key, headers and payload**, framed per 5.2.1. |
 
 The original bytes go in the **payload**, which is the one part of the envelope that is opaque and
 already treated as PHI-bearing, on a topic whose ACLs and 30-day retention already assume that. They
 do not go into headers, `attrs`, or an event.
+
+**The original key goes in the blob too.** Without it the quarantined artefact is not the record —
+key, headers and payload are what arrived, and the key is what a reprocess would need to reproduce it
+on a per-key channel. It adds no new exposure: it is going into a DLQ payload whose ACLs and
+retention already assume PHI, and it already existed on the topic it came from. Two rules follow,
+because this is the field the contract otherwise restricts hardest (section 4): the original key MUST
+NOT become the wrapper's key, which is the minted `tb-msg-id`, and it MUST NOT be lifted out into a
+header, an `attrs` entry or a log line. It lives in the blob and nowhere else.
+
+### 5.2.1 Blob framing
+
+**Pinned, not implementation-defined.** Two components can already write a quarantine wrapper — a
+pipeline worker reading `raw` and a loader reading `out.<dest>` — so an implementation-defined
+framing means the archive and the message browser cannot render either one reliably.
+
+```
+"TBQ1"                                   4 bytes, magic and format version
+u32 key_len            key               key_len bytes
+u32 header_count
+  ( u32 name_len       name              per header, header_count times
+    u32 value_len      value )
+payload                                  to the end of the record value
+```
+
+- All lengths are **unsigned 32-bit big-endian**. Big-endian so a hex viewer reads them left to
+  right in the order a human expects; the contract has to say which, or two implementations differ
+  by byte order and both believe they conform.
+- `0xFFFFFFFF` means null, distinguishing a null key or value from a zero-length one. Safe as a
+  sentinel because the inline payload limit is 1,000,000 bytes.
+- The magic carries the version. A future framing is `TBQ2` and is distinguishable on sight, which is
+  what makes this safe to pin now.
+- Names and values are **raw bytes, not text.** They are what could not be decoded; re-encoding them
+  would destroy the evidence the blob exists to preserve.
+
+Two consumer rules:
+
+1. **Nothing in the message flow parses this blob.** Receivers, workers and loaders write it and
+   never read it. Only the archive, the message browser and the CLI parse it, and only on an explicit
+   operator action. A component that parsed it automatically — to retry a quarantined record, say —
+   would be feeding attacker-controlled bytes back into the pipeline on a loop.
+2. **When the browser renders it, it is payload, not metadata.** The header names and values inside
+   are normally metadata surfaces, but here they are unvalidated bytes from an unidentifiable record,
+   and under mis-framing a "header name" is payload content. So the whole blob, names included, is
+   masked by default with an audited reveal, exactly like a payload (W4-3), and never rendered in a
+   list view or a tooltip.
+
+Design credit: `platform-engineer` specified this framing while implementing, and it is adopted as
+written apart from pinning the byte order and the two consumer rules.
 
 **The logging rule is the part most likely to go wrong, and it is a Critical finding if it does.**
 A developer diagnosing "why can this not be decoded" will reach for `repr(record)` or log the raw
