@@ -268,7 +268,7 @@ not merely that it fails.
 |---|---|---|
 | `contracts/validate.py` | lead | **94 / 0** across all four contracts, then **96 / 0** with the two envelope examples added for requirement 13 |
 | `contracts/validate.py --emit-expectations` | `qa-engineer` | All **19 predicted pairs matched the measured ones exactly.** No correction needed |
-| `pytest tests/conformance` | `qa-engineer` | **99 passed** at `5eb3949` (76 + 23); expected 101 once the two new envelope examples are in a pytest run |
+| `pytest tests/conformance` | `qa-engineer` | **99 passed** at `5eb3949` (76 + 23), then **101** with the two envelope examples added for requirement 13 |
 
 The pinned pairs were written as architect predictions, because this session has no shell, and were
 labelled as such until they were measured. The three flagged as least certain — the `propertyNames`

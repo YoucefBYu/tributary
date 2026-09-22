@@ -74,7 +74,7 @@ none by the architect, who has no shell:
 |---|---|---|
 | `contracts/validate.py` | lead | 94 / 0, then **96 / 0** with the two envelope examples |
 | `contracts/validate.py --emit-expectations` | `qa-engineer` | **All 21 predicted `(json_path, validator)` pairs matched the measured ones.** No manifest correction needed |
-| `pytest tests/conformance` | `qa-engineer` | **99 passed** at `5eb3949` (76 + 23). Expected 101 once the envelope pair is in a pytest run |
+| `pytest tests/conformance` | `qa-engineer` | **99 passed** at `5eb3949` (76 + 23), then **101** with the envelope pair for requirement 13 |
 | CI wiring | `devops-engineer` | `f649665` — a standalone `contracts` job running `validate.py` before `uv sync`, separate from the pytest conformance job |
 
 The 21 pairs were written as predictions and labelled UNMEASURED everywhere they appeared, because
