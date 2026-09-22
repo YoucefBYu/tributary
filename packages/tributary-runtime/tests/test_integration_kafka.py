@@ -20,6 +20,11 @@ at-least-once means, and why invariant 4 requires loader idempotency on `tb-msg-
 from __future__ import annotations
 
 import json
+import os
+import socket
+import subprocess
+import sys
+import time
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
@@ -27,12 +32,12 @@ from typing import Any
 
 import pytest
 
-pytest.importorskip("testcontainers.kafka", reason="testcontainers is needed for the Kafka integration test")
+pytest.importorskip("testcontainers.core.container", reason="testcontainers is needed for the Kafka integration test")
 
 from confluent_kafka import Consumer, Producer
 from confluent_kafka.admin import AdminClient, NewTopic
 from jsonschema import Draft202012Validator
-from testcontainers.kafka import KafkaContainer
+from testcontainers.core.container import DockerContainer
 from tributary.runtime.clients import KafkaSettings
 from tributary.runtime.config import load_topic_defaults
 from tributary.runtime.topics import channels_topic, dlq_topic, events_topic, out_topic, raw_topic
@@ -53,10 +58,12 @@ PARTITIONS = 3
 KEYS = [f"SYNTH-KEY-{index}" for index in range(4)]
 PER_KEY = 8
 
-#: A tb-x-* header is legal on a spike topic and must never survive into a released package
-#: (envelope contract 2.1, gate section 6). It is used here only as a measurement affordance for the
-#: ordering check — and the test below asserts it does NOT reach `out`.
-SEQ_HEADER = "tb-x-seq"
+#: The ordering affordance travels in the contract's channel-defined space, which is propagated and
+#: never interpreted by the engine (envelope contract 2.1). S5 used `tb-x-seq`; that space is
+#: spike-local and the runtime now strips it on produce, so a test that relied on it would be testing
+#: a header the engine is required to drop.
+SEQ_HEADER = "tb-usr-seq"
+EXPERIMENTAL_PROBE = "tb-x-seq"
 
 
 @step
@@ -65,10 +72,71 @@ def passthrough(message: Message) -> None:
     return None
 
 
+def _free_port() -> int:
+    """A port the broker can advertise.
+
+    KRaft needs `advertised.listeners` to name the address clients will actually use, and that has to
+    be known *before* the container starts — hence a port chosen here and published explicitly rather
+    than a Docker-assigned one read back afterwards.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
+
+
 @pytest.fixture(scope="module")
 def kafka() -> Iterator[str]:
-    with KafkaContainer() as container:
-        yield container.get_bootstrap_server()
+    """A single-node Apache Kafka 4.x in KRaft mode, managed by testcontainers.
+
+    `DockerContainer` with `apache/kafka:4.0.0` rather than testcontainers' `KafkaContainer`, whose
+    start script is written for `confluentinc/cp-kafka` and its `/etc/confluent/docker/run` entry
+    point. CLAUDE.md's stack is Apache Kafka 4.x (KRaft) and Phase 0 measured against 4.0.0, so the
+    broker under test is the broker the design was measured on.
+
+    RF=1 and `min.insync.replicas=1` here are the lite profile: a single-node test cluster cannot
+    satisfy the production durability floor, and pretending otherwise would make this test evidence
+    for something it does not check.
+    """
+    port = _free_port()
+    container = (
+        DockerContainer("apache/kafka:4.0.0")
+        .with_env("KAFKA_NODE_ID", "1")
+        .with_env("KAFKA_PROCESS_ROLES", "broker,controller")
+        .with_env("KAFKA_LISTENERS", "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093")
+        .with_env("KAFKA_ADVERTISED_LISTENERS", f"PLAINTEXT://127.0.0.1:{port}")
+        .with_env("KAFKA_LISTENER_SECURITY_PROTOCOL_MAP", "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT")
+        .with_env("KAFKA_CONTROLLER_LISTENER_NAMES", "CONTROLLER")
+        .with_env("KAFKA_CONTROLLER_QUORUM_VOTERS", "1@localhost:9093")
+        .with_env("KAFKA_INTER_BROKER_LISTENER_NAME", "PLAINTEXT")
+        .with_env("KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR", "1")
+        .with_env("KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR", "1")
+        .with_env("KAFKA_TRANSACTION_STATE_LOG_MIN_ISR", "1")
+        .with_env("KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS", "0")
+        .with_env("KAFKA_AUTO_CREATE_TOPICS_ENABLE", "false")
+        .with_env("CLUSTER_ID", "MkU3OEVBNTcwNTJENDM2Qk")
+        .with_bind_ports(9092, port)
+    )
+    container.start()
+    bootstrap = f"127.0.0.1:{port}"
+    try:
+        _await_broker(bootstrap)
+        yield bootstrap
+    finally:
+        container.stop()
+
+
+def _await_broker(bootstrap: str, *, timeout_s: float = 90.0) -> None:
+    """Wait for metadata rather than for a log line: a started process is not a reachable broker."""
+    deadline = time.monotonic() + timeout_s
+    last: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            AdminClient({"bootstrap.servers": bootstrap}).list_topics(timeout=5)
+            return
+        except Exception as exc:  # any failure here means the broker is not ready yet
+            last = exc
+            time.sleep(1.0)
+    raise RuntimeError(f"Kafka did not become reachable: {type(last).__name__ if last else 'timeout'}")
 
 
 @pytest.fixture(scope="module")
@@ -117,7 +185,9 @@ def publish(bootstrap: str, count_per_key: int, *, start: int = 0) -> list[str]:
                 channel=CHANNEL,
                 msg_id=uuid7(),
                 traceparent=new_traceparent(),
-                headers={SEQ_HEADER: str(sequence)},
+                # The probe rides along on every record: the engine must tolerate it inbound and
+                # must not hand it on (envelope contract 2.1 against 1.2).
+                headers={SEQ_HEADER: str(sequence), EXPERIMENTAL_PROBE: "spike-local"},
             )
             ids.append(message.msg_id)
             producer.produce(
@@ -136,8 +206,6 @@ def drain(bootstrap: str, topic: str, *, expected: int, timeout_s: float = 30.0)
     EOF, not the high watermark: the watermark counts transaction control records that are never handed
     to the application, so a watermark loop can fail to terminate.
     """
-    import time
-
     consumer = Consumer(
         {
             "bootstrap.servers": bootstrap,
@@ -229,48 +297,115 @@ def test_a_message_flows_from_raw_to_out_with_events(deployed_spec: dict[str, An
         assert list(events.iter_errors(event)) == []
 
 
-def test_the_experimental_header_does_not_survive_the_hop(deployed_spec: dict[str, Any], topics: str) -> None:
-    """Control on the control: the ordering affordance must not become a load-bearing header.
+def test_an_experimental_header_is_tolerated_inbound_and_stripped_on_produce(
+    deployed_spec: dict[str, Any], topics: str
+) -> None:
+    """Envelope contract 2.1 against 1.2, end to end.
 
-    `tb-x-seq` is produced onto `raw` by this test, and the contract allows it there. It reaches `out`
-    only because the runtime propagates headers it does not understand, which is correct — what must
-    never happen is the runtime *producing* one itself.
+    A `tb-x-*` header on `raw` must not make the record undeliverable — rejecting it would let any
+    producer poison a channel with a header the contract calls "never load-bearing" — and it must not
+    survive the hop either, because it must never reach a released package. Tolerated inbound,
+    stripped on produce. `tb-usr-*`, the channel-defined space, is propagated.
     """
+    inbound = drain(topics, raw_topic(ENV, CHANNEL), expected=1)
+    assert any(EXPERIMENTAL_PROBE in header_map(record) for record in inbound), (
+        "the probe must really be on raw, or this test asserts nothing"
+    )
+
     delivered = drain(topics, out_topic(ENV, CHANNEL, DESTINATION), expected=1)
-    assert delivered, "the previous test should have left records here"
-    produced_by_runtime = {
-        name for raw in delivered for name in header_map(raw) if name.startswith("tb-x-") and name != SEQ_HEADER
+    assert delivered, "the record was delivered despite carrying an experimental header"
+    assert all(EXPERIMENTAL_PROBE not in header_map(record) for record in delivered)
+    assert all(SEQ_HEADER in header_map(record) for record in delivered)
+
+
+WORKER_PROGRAM = """
+import os
+from tributary.runtime.clients import KafkaSettings
+from tributary.runtime.config import load_topic_defaults
+from tributary.runtime.worker import PipelineWorker, WorkerSettings
+from tributary.sdk import step
+
+@step
+def passthrough(message):
+    return None
+
+worker = PipelineWorker(
+    settings=WorkerSettings(
+        env=os.environ["TB_ENV"],
+        channel=os.environ["TB_CHANNEL"],
+        kafka=KafkaSettings(bootstrap_servers=os.environ["TB_BOOTSTRAP_SERVERS"]),
+        instance_id=os.environ["TB_INSTANCE_ID"],
+        poll_timeout_s=0.1,
+    ),
+    steps_override=(passthrough,),
+    defaults=load_topic_defaults(),
+)
+worker.build()
+worker.run()
+"""
+
+
+def spawn_worker(bootstrap: str, instance_id: str) -> subprocess.Popen[bytes]:
+    """A worker in its own process, so it can be killed rather than asked politely to stop."""
+    environment = {
+        **os.environ,
+        "TB_ENV": ENV,
+        "TB_CHANNEL": CHANNEL,
+        "TB_BOOTSTRAP_SERVERS": bootstrap,
+        "TB_INSTANCE_ID": instance_id,
+        "TB_LOG_LEVEL": "warning",
     }
-    assert produced_by_runtime == set()
+    return subprocess.Popen([sys.executable, "-c", WORKER_PROGRAM], env=environment)  # noqa: S603
+
+
+def wait_for_at_least(bootstrap: str, topic: str, *, count: int, timeout_s: float = 60.0) -> int:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        delivered = len(drain(bootstrap, topic, expected=count, timeout_s=5.0))
+        if delivered >= count:
+            return delivered
+        time.sleep(0.5)
+    raise AssertionError(f"{topic} did not reach {count} records in {timeout_s}s")
 
 
 def test_kill_and_restart_preserves_per_key_order_and_loses_nothing(deployed_spec: dict[str, Any], topics: str) -> None:
-    """Invariant 5 under a kill, with the fault asserted rather than assumed."""
-    before = drain(topics, out_topic(ENV, CHANNEL, DESTINATION), expected=0, timeout_s=10.0)
-    baseline = len(before)
+    """Invariant 5 under a real `kill`, with the fault asserted rather than assumed.
 
+    The worker runs in its own process and is killed with no chance to commit or drain. That is the
+    difference between this and a graceful stop, and it is the whole test: a scenario that stops the
+    loop politely measures shutdown, not replay, while appearing to prove ordering under failure
+    (PHASE-0-DECISION section 4). `commit_every` is 50 and fewer than 50 records are in flight, so a
+    kill before the first commit replays everything it had already delivered — which is why the
+    duplicate count is asserted to be non-zero: no duplicates would mean the kill landed somewhere
+    harmless and the test proved nothing.
+    """
+    out = out_topic(ENV, CHANNEL, DESTINATION)
+    baseline = len(drain(topics, out, expected=0, timeout_s=10.0))
     published = publish(topics, PER_KEY, start=100)
 
-    killed = worker(topics, "pipeline-kill")
-    killed.build()
-    killed.run(max_iterations=30)  # stop mid-stream, inside an uncommitted window
-    killed.stop()
+    killed = spawn_worker(topics, "pipeline-kill")
+    try:
+        wait_for_at_least(topics, out, count=baseline + 4)
+    finally:
+        killed.kill()
+        killed.wait(timeout=30)
+    assert killed.returncode != 0, "the worker must have been killed, not have exited cleanly"
 
-    restarted = worker(topics, "pipeline-kill")  # same group.instance.id: static membership
+    # Same group.instance.id: static membership, so the successor fences the dead member instead of
+    # waiting out session.timeout.ms (S5 measured 3.21 s for a 2.0 s planned restart).
+    restarted = worker(topics, "pipeline-kill")
     restarted.build()
-    restarted.run(max_iterations=400)
+    restarted.run(max_iterations=800)
 
-    delivered = drain(topics, out_topic(ENV, CHANNEL, DESTINATION), expected=baseline + len(published))
+    delivered = drain(topics, out, expected=baseline + len(published))
     replayed = [raw for raw in delivered if int(header_map(raw).get(SEQ_HEADER, -1)) >= 100]
-
     delivered_ids = [header_map(raw)[h.TB_MSG_ID] for raw in replayed]
+
     assert set(published) <= set(delivered_ids), "no acknowledged message was lost across the kill"
 
     duplicates = len(delivered_ids) - len(set(delivered_ids))
-    assert duplicates >= 0
-    # Not asserted as a threshold: duplicates are permitted by at-least-once and their count depends on
-    # where the kill landed in the commit window. Reported so the number is visible in the run log.
-    print(f"duplicates across the kill: {duplicates}")
+    print(f"duplicates across the kill: {duplicates} of {len(published)} published")
+    assert duplicates > 0, "the kill did not interrupt an uncommitted window, so this run tested recovery from nothing"
 
     for _key, sequences in first_delivery_order(replayed).items():
         assert sequences == sorted(sequences), f"per-key order broken for a key ({len(sequences)} records)"

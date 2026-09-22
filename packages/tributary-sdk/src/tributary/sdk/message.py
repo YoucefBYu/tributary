@@ -255,6 +255,20 @@ class Message:
         remaining = {key: value for key, value in self._headers.items() if key != name}
         return Message(headers=remaining, payload=self._payload, key=self._key)
 
+    def without_experimental(self) -> Message:
+        """A copy with every `tb-x-*` header removed.
+
+        Two contract rules meet here. A consumer must not reject a record for an unknown header
+        (envelope contract 1.2), so an inbound `tb-x-*` is tolerated; but `tb-x-*` must not survive
+        into a released package (2.1), so the engine must not hand one on either. Stripping at the
+        produce boundary satisfies both, where rejecting the record would let any producer poison a
+        channel with a header the contract calls "never load-bearing".
+        """
+        remaining = {name: value for name, value in self._headers.items() if not name.startswith(h.EXPERIMENTAL_PREFIX)}
+        if len(remaining) == len(self._headers):
+            return self
+        return Message(headers=remaining, payload=self._payload, key=self._key)
+
     def with_key(self, key: _Bytes | None) -> Message:
         """A copy with a different ordering key. Changing it changes the partition, so it changes order."""
         return Message(headers=self._headers, payload=self._payload, key=key)

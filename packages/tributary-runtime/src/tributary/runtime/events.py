@@ -246,11 +246,17 @@ class EventEmitter(Protocol):
 
     def emit(self, event: LifecycleEvent) -> None: ...
 
+    def close(self) -> None:
+        """Best-effort flush at shutdown, bounded so a slow events topic cannot delay a drain."""
+
 
 class NullEmitter:
     """Drops every event. For a worker running with events disabled, and for unit tests that ignore them."""
 
     def emit(self, event: LifecycleEvent) -> None:
+        return None
+
+    def close(self) -> None:
         return None
 
 
@@ -262,6 +268,9 @@ class RecordingEmitter:
 
     def emit(self, event: LifecycleEvent) -> None:
         self.events.append(event)
+
+    def close(self) -> None:
+        return None
 
     def stages(self) -> list[str]:
         return [event.stage for event in self.events]

@@ -160,3 +160,15 @@ class KafkaEventEmitter:
         except Exception as exc:
             self._dropped += 1
             self._log.warning("event_emit_failed", stage=event.stage, error_type=type(exc).__name__)
+
+    def close(self, timeout_s: float = 2.0) -> None:
+        """Flush what is in the queue at shutdown, with a short bound.
+
+        Still fire-and-forget: the wait is capped so a slow or unreachable events topic cannot hold up
+        a worker drain (invariant 9). Without it, a clean shutdown truncates the tail of every
+        message timeline, which is the part an operator looks at after an incident.
+        """
+        remaining = self._producer.flush(timeout_s)
+        if remaining:
+            self._dropped += remaining
+            self._log.warning("events_dropped_at_shutdown", dropped=remaining, dropped_total=self._dropped)

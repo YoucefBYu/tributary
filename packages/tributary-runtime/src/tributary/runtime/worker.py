@@ -120,7 +120,8 @@ def dlq_message(message: Message, *, error_code: str, stage: str) -> Message:
     """
     msg_id = message.require(h.TB_MSG_ID)
     return (
-        message.with_header(h.TB_STAGE, stage)
+        message.without_experimental()
+        .with_header(h.TB_STAGE, stage)
         .with_header(h.TB_ERROR_CODE, error_code)
         .without_header(h.TB_RETRY_NOT_BEFORE)
         .with_key(msg_id.encode("utf-8"))
@@ -135,7 +136,10 @@ def out_message(message: Message, destination: str, *, usr: dict[str, str]) -> M
     keeps one patient's messages on one partition (invariant 5).
     """
     result = (
-        message.with_header(h.TB_DESTINATION, destination)
+        # tb-x-* is tolerated inbound and never handed on: the engine must not produce one
+        # (envelope contract 2.1 against 1.2).
+        message.without_experimental()
+        .with_header(h.TB_DESTINATION, destination)
         .with_header(h.TB_STAGE, "routed")
         .with_attempt(0)
         .with_header(h.TRACEPARENT, child_traceparent(message.traceparent or new_traceparent()))
@@ -408,7 +412,13 @@ class PipelineWorker:
 
     def run(self, *, max_iterations: int | None = None) -> LoopStats:
         loop = self.loop or self.build()
-        return loop.run(max_iterations=max_iterations)
+        try:
+            return loop.run(max_iterations=max_iterations)
+        finally:
+            # The loop has already committed; this only flushes the event tail, briefly.
+            self.emitter.close()
+            if self.cache is not None:
+                self.cache.close()
 
     def stop(self) -> None:
         if self.loop is not None:
