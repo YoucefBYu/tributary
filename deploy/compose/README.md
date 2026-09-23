@@ -30,16 +30,30 @@ healthcheck (see the table below for why) but show "Up" with `RestartCount: 0`.
 | `worker` | built from `images/python-app.Dockerfile` | n/a (no listener) | `packages/tributary-runtime`, `python -m tributary.runtime.worker`; consumes `_tb.dev.channels` and `dev.adt-passthrough.raw` |
 | `loader` | built from `images/python-app.Dockerfile` | n/a (no listener) | `packages/tributary-loaders`, `python -m tributary.loaders.http --channel=adt-passthrough`, destination `http-stub`; reads its channel spec live from `_tb.dev.channels` (`--channel`, not a file — see below), so it depends on `channel-publish` the same way `worker` does; see further below for why delivery never succeeds in this stack |
 
-### The loader never successfully delivers here, and that's expected
+### This stack proves `raw` -> `out.<dest>`, not `out.<dest>` -> the destination
 
-The demo channel's `http-stub` destination is `http://127.0.0.1:8080/ingest` — loopback, same
-reasoning as the receiver's bind below — and there is no HTTP server listening there in this stack
-(W1-8, `qa-engineer`'s e2e test brings its own). Every delivery attempt gets "connection refused";
-`loader` retries per the destination's policy (blocking, `maxAttempts: 5`) and then halts the
-partition. That is the retry-then-halt behaviour invariant 5 depends on, observable and correct, not a
-bug in this file — it is why `loader` has no healthcheck ("running but paused, waiting for a
-destination" has no single up/down signal to probe). Point it at a real stub, or let a future e2e test
-bring its own, before treating a successful delivery as demonstrated.
+Verified end to end against a real send (not a test double): one MLLP message gets `MSA|AA`, the
+worker logs `transformed` then `routed` to `_tb.dev.events`, and the record lands on
+`dev.adt-passthrough.out.http-stub` with `tb-destination: http-stub`, `tb-attempt: 0`, `tb-stage:
+routed` and an unchanged payload. That is the whole W1-4 delivery path this stack can demonstrate.
+
+What it cannot demonstrate: the demo channel's `http-stub` destination is `http://127.0.0.1:8080/ingest`
+— loopback, same reasoning as the receiver's bind below — and there is no HTTP server listening there
+in this stack (W1-8, `qa-engineer`'s e2e test brings its own). Every delivery attempt gets "connection
+refused"; `loader` retries per the destination's policy (`blocking`, `maxAttempts: 5`) — four
+`partition_paused`/`partition_resumed` pairs, then `partition_halted` on the fifth, exactly that
+arithmetic, observed in `_tb.dev.events` — and halts the partition rather than reordering or dropping
+the message (ADR-003 D3: `halt-partition` never delivers out of order and never abandons a message, at
+the cost of needing an operator; the alternative the spec could have chosen, `dlq-and-continue`, keeps
+moving and leaves a gap in that key's order instead). That is correct, observable behaviour, not a bug
+in this file — it is why `loader` has no healthcheck ("running but paused, waiting for a destination"
+has no single up/down signal to probe). Point it at a real stub, or let a future e2e test bring its
+own, before treating a successful delivery to the destination as demonstrated.
+
+**A halted partition does not clear itself**, and there is no resume tooling yet (control plane or CLI,
+not wave 1) — so running the demo twice against the same Kafka data reuses a still-halted partition.
+`docker compose down -v` between runs avoids this; it is why every verification in this file's history
+uses it.
 
 ## Reaching the MLLP receiver
 
