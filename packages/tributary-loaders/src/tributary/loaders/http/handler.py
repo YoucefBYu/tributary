@@ -14,16 +14,28 @@ machinery a second time now that it exists.
 of its own. `handle` drives one persistent event loop with `run_until_complete` per record rather than
 spinning one up per call — a fresh `asyncio.run` per record would also mean a fresh `HttpLoader`
 executor per record (`loader.py`'s dedicated bounded thread pool), defeating the point of it being a
-bound at all.
+bound at all. `ConsumerLoop` calls `handle` from exactly one thread, one record at a time (confirmed
+with platform-engineer), so the one event loop and the one `HttpLoader` are never touched
+concurrently — **this class is not thread-safe, and must not become one by adding a thread pool
+around `handle`**; key-level parallelism within one partition is a different, unbuilt design
+(ADR-001 7.2), not a thing to approximate here.
+
+`spec_source.current()` is called once per record (the same rule `PipelineHandler` follows) to pick
+up a republished channel spec without a restart: only `HttpLoader.config` (URL, method, headers,
+auth, idempotency) is refreshed this way. `retry` (attempts, backoff, `onExhaust`) is fixed for the
+life of the `ConsumerLoop`, because `ConsumerLoop.__init__` takes one `RetryPolicy` at construction —
+a destination that changes its retry policy needs a restart until the runtime hot-reloads that too.
 """
 
 from __future__ import annotations
 
 import asyncio
 
+from tributary.runtime.channels import LiveSpecSource
 from tributary.runtime.errors import DeliveryError
 from tributary.runtime.records import ConsumedRecord
 
+from .config import http_destination_config_from_destination
 from .loader import HttpLoader, Reason
 
 ERROR_CODES: dict[Reason, str] = {
@@ -37,11 +49,16 @@ ERROR_CODES: dict[Reason, str] = {
 
 
 class HttpRecordHandler:
-    def __init__(self, http_loader: HttpLoader) -> None:
+    def __init__(self, http_loader: HttpLoader, *, spec_source: LiveSpecSource, destination: str) -> None:
         self._http_loader = http_loader
+        self._spec_source = spec_source
+        self._destination = destination
         self._loop = asyncio.new_event_loop()
 
     def handle(self, record: ConsumedRecord) -> None:
+        spec = self._spec_source.current()
+        destination = spec.destination(self._destination)
+        self._http_loader.config = http_destination_config_from_destination(spec.name, destination)
         outcome = self._loop.run_until_complete(self._http_loader.deliver(record.message))
         if outcome.success:
             return
@@ -52,4 +69,5 @@ class HttpRecordHandler:
 
     def close(self) -> None:
         self._http_loader.close()
+        self._spec_source.close()
         self._loop.close()

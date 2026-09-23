@@ -1,14 +1,15 @@
-"""`python -m tributary.loaders.http --channel-spec <path> --destination <name> --env <env>
+"""`python -m tributary.loaders.http --channel <name> --destination <name> --env <env>
 --bootstrap <hosts>`.
 
 Wires `HttpRecordHandler` into `tributary.runtime`'s `ConsumerLoop`, mirroring
 `tributary.runtime.worker.PipelineWorker.build()`: the same `clients.consumer_config`/
-`producer_config`, the same `topics.consumer_group`/`out_topic`/`dlq_topic`, the same
-`KafkaDlqWriter`. One simplification versus the pipeline worker: the channel spec is read once from
-a file rather than kept hot from a live `_tb.<env>.channels` cache — this loader does not yet reload
-on a republished spec. That is a real gap (a channel change needs a restart to take effect here),
-not a design choice; tracked as a follow-up once this loader needs the same hot-reload the pipeline
-worker already has.
+`producer_config`, the same `topics.consumer_group`/`out_topic`/`dlq_topic`/`events_topic`, the same
+`KafkaDlqWriter` and `KafkaEventEmitter`. The channel spec itself is read live from `_tb.<env>.channels`
+via `tributary.runtime.channels.open_spec_source` (platform-engineer, W1-6 third round) — the same
+hot-reload path the pipeline worker uses, not a second cache: `HttpRecordHandler` calls
+`source.current()` once per record, so a republished spec's URL, headers, auth or idempotency settings
+take effect on the next record with no restart. `retry` is fixed at loop construction (see
+`handler.py`'s docstring) until `ConsumerLoop` itself grows a way to hot-reload that too.
 """
 
 from __future__ import annotations
@@ -20,15 +21,21 @@ import signal
 import time
 from typing import cast
 
-from tributary.runtime.clients import KafkaSettings, consumer_config, max_poll_interval_ms, producer_config
-from tributary.runtime.config import load_topic_defaults
+from tributary.runtime.channels import open_spec_source
+from tributary.runtime.clients import (
+    KafkaSettings,
+    consumer_config,
+    events_producer_config,
+    max_poll_interval_ms,
+    producer_config,
+)
+from tributary.runtime.config import TopicDefaults, load_topic_defaults
 from tributary.runtime.consumer import ConsumerLoop, KafkaConsumerLike, LoopSettings
-from tributary.runtime.events import NullEmitter
 from tributary.runtime.logs import JsonLogger
-from tributary.runtime.producer import KafkaProducerLike, RecordProducer
-from tributary.runtime.spec import ChannelSpec
-from tributary.runtime.topics import consumer_group, dlq_topic, out_topic
+from tributary.runtime.producer import KafkaEventEmitter, KafkaProducerLike, RecordProducer
+from tributary.runtime.topics import channels_topic, consumer_group, dlq_topic, events_topic, out_topic
 from tributary.runtime.worker import KafkaDlqWriter
+from tributary.sdk.context import Logger
 
 from ..secrets import DirSecretResolver
 from .config import http_destination_config_from_destination
@@ -36,31 +43,67 @@ from .handler import HttpRecordHandler
 from .loader import HttpLoader
 
 
+#: `contracts/topics/v0` README 3.8 / topic-defaults.json `profiles.lite`: RF=1 (`min.insync.replicas:
+#: 1`) cannot guarantee RPO=0 for an acknowledged message. Every data-plane component must emit this,
+#: unsuppressed, at startup when running against a lite deployment — devops-engineer's
+#: `deploy/compose/topic-bootstrap/bootstrap_topics.py` emits its own copy for the topic-creation job;
+#: this is the receiver-side (well, loader-side) copy the same acceptance criterion asks for.
+def emit_lite_profile_warning(log: Logger, *, profile: str) -> None:
+    if profile != "lite":
+        return
+    log.warning(
+        "lite_profile_active",
+        detail="RF=1, min.insync.replicas=1: no RPO=0 guarantee for an acknowledged message "
+        "(contracts/topics/v0/topic-defaults.json profiles.lite)",
+    )
+
+
 def build_loop(a: argparse.Namespace) -> tuple[ConsumerLoop, HttpRecordHandler]:
     from confluent_kafka import Consumer, Producer
 
-    with open(a.channel_spec, encoding="utf-8") as f:
-        channel_spec = ChannelSpec.from_document(json.load(f))
-    destination = channel_spec.destination(a.destination)
-    config = http_destination_config_from_destination(channel_spec.name, destination)
-
-    log = JsonLogger(f"loader-{a.destination}", base={"channel": channel_spec.name, "destination": a.destination})
-    resolver = DirSecretResolver(a.secrets_dir) if a.secrets_dir else DirSecretResolver()
-    handler = HttpRecordHandler(HttpLoader(config, secret_resolver=resolver, log=log))
-
     kafka_settings = KafkaSettings(bootstrap_servers=a.bootstrap)
-    defaults = load_topic_defaults(a.contracts_dir)
+    defaults: TopicDefaults = load_topic_defaults(a.contracts_dir)
     instance = a.instance_id or f"loader-{a.destination}-{os.getpid()}"
+    log = JsonLogger(f"loader-{a.destination}", base={"channel": a.channel, "destination": a.destination})
+    emit_lite_profile_warning(log, profile=a.profile)
+
+    spec_source = open_spec_source(
+        channel=a.channel,
+        consumer=Consumer(
+            consumer_config(
+                kafka_settings,
+                defaults,
+                group_id=f"tb.{a.env}.{a.channel}.channels.{instance}",
+                enable_partition_eof=True,
+            )
+        ),
+        topic=channels_topic(a.env),
+        log=log,
+    )
+    spec = spec_source.current()  # raises if the channel is not deployed; fail closed at startup
+    destination = spec.destination(a.destination)
+    config = http_destination_config_from_destination(spec.name, destination)
+
+    resolver = DirSecretResolver(a.secrets_dir) if a.secrets_dir else DirSecretResolver()
+    http_loader = HttpLoader(config, secret_resolver=resolver, log=log)
+    handler = HttpRecordHandler(http_loader, spec_source=spec_source, destination=a.destination)
 
     data_producer = Producer(
-        producer_config(
-            kafka_settings, defaults, client_id=f"tb-{a.env}-{channel_spec.name}-{a.destination}-{instance}"
-        )
+        producer_config(kafka_settings, defaults, client_id=f"tb-{a.env}-{a.channel}-{a.destination}-{instance}")
     )
     producer = RecordProducer(cast("KafkaProducerLike", data_producer), log=log)
     dlq = None
     if destination.retry.on_exhaust == "dlq-and-continue":
-        dlq = KafkaDlqWriter(producer, dlq_topic(a.env, channel_spec.name), log=log, source=instance)
+        dlq = KafkaDlqWriter(producer, dlq_topic(a.env, a.channel), log=log, source=instance)
+
+    emitter = KafkaEventEmitter(
+        cast(
+            "KafkaProducerLike",
+            Producer(events_producer_config(kafka_settings, client_id=f"tb-events-loader-{a.destination}-{instance}")),
+        ),
+        events_topic(a.env),
+        log=log,
+    )
 
     consumer = cast(
         "KafkaConsumerLike",
@@ -68,45 +111,46 @@ def build_loop(a: argparse.Namespace) -> tuple[ConsumerLoop, HttpRecordHandler]:
             consumer_config(
                 kafka_settings,
                 defaults,
-                group_id=consumer_group(a.env, channel_spec.name, "loader", a.destination),
+                group_id=consumer_group(a.env, a.channel, "loader", a.destination),
                 group_instance_id=instance,
-                max_poll_interval=max_poll_interval_ms(channel_spec),
+                max_poll_interval=max_poll_interval_ms(spec),
             )
         ),
     )
     loop = ConsumerLoop(
         consumer,
         handler,
-        topics=[out_topic(a.env, channel_spec.name, a.destination)],
+        topics=[out_topic(a.env, a.channel, a.destination)],
         retry=destination.retry,
         settings=LoopSettings(commit_every=defaults.consumer.commit_every),
-        emitter=NullEmitter(),  # TODO(W2): lifecycle events for the loader stage, once it needs them
+        emitter=emitter,
         log=log,
-        channel=channel_spec.name,
-        channel_version=channel_spec.version,
+        channel=a.channel,
+        channel_version=spec.version,
         instance=instance,
         dlq=dlq,
         destination=a.destination,
     )
     loop.start()
-    log.info(
-        "loader_started",
-        channel=channel_spec.name,
-        destination=a.destination,
-        channel_version=channel_spec.version,
-    )
+    log.info("loader_started", channel=a.channel, destination=a.destination, channel_version=spec.version)
     return loop, handler
 
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--channel-spec", required=True, help="path to a contracts/channel-spec/v0 JSON document")
+    p.add_argument("--channel", required=True, help="the deployed channel name (spec.metadata.name)")
     p.add_argument("--destination", required=True, help="the spec.destinations[].name to load")
     p.add_argument("--env", required=True, help="the topic-name env segment, e.g. 'dev' or 'prod'")
     p.add_argument("--bootstrap", required=True, help="Kafka bootstrap.servers")
     p.add_argument("--instance-id", help="defaults to loader-<destination>-<pid>")
     p.add_argument("--secrets-dir", help="overrides TB_SECRETS_DIR / the default secrets mount")
     p.add_argument("--contracts-dir", help="overrides TB_CONTRACTS_DIR / the default contracts/ search")
+    p.add_argument(
+        "--profile",
+        default=os.environ.get("TB_PROFILE", "lite"),
+        choices=["lite", "production"],
+        help="topic-defaults.json profile in use; 'lite' emits the mandatory RF=1 startup warning",
+    )
     a = p.parse_args()
     loop, handler = build_loop(a)
 

@@ -12,8 +12,46 @@ from tributary.loaders.http.handler import HttpRecordHandler
 from tributary.loaders.http.loader import HttpLoader
 from tributary.runtime.errors import DeliveryError
 from tributary.runtime.records import ConsumedRecord
+from tributary.runtime.spec import Destination, Idempotency, RetryPolicy
 from tributary.sdk import Message, ids
 from tributary.sdk import headers as h
+
+
+class FakeSpecSource:
+    """Stands in for `tributary.runtime.channels.LiveSpecSource`: `current()` returns an object
+    with `.name` and `.destination(name)`, which is all `HttpRecordHandler` reads."""
+
+    def __init__(self, channel: str, destination: Destination) -> None:
+        self.name = channel
+        self._destination = destination
+        self.closed = False
+
+    def current(self) -> FakeSpecSource:
+        return self
+
+    def destination(self, name: str) -> Destination:
+        assert name == self._destination.name
+        return self._destination
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def make_destination(**overrides: object) -> Destination:
+    base: dict[str, object] = {
+        "name": "dest",
+        "type": "http",
+        "params": {"url": "https://example.org/ingest", "method": "POST", "timeoutMs": 2000},
+        "idempotency": Idempotency(technique="none", note="test"),
+        "retry": RetryPolicy(policy="blocking", max_attempts=3, on_exhaust="halt-partition"),
+    }
+    base.update(overrides)
+    return Destination(**base)  # type: ignore[arg-type]
+
+
+def make_handler(loader: HttpLoader, *, destination: Destination | None = None) -> HttpRecordHandler:
+    dest = destination if destination is not None else make_destination()
+    return HttpRecordHandler(loader, spec_source=FakeSpecSource("c", dest), destination=dest.name)
 
 
 def make_record() -> ConsumedRecord:
@@ -58,7 +96,7 @@ def make_config(**overrides: object) -> HttpDestinationConfig:
 
 def test_handle_returns_normally_on_success() -> None:
     loader = HttpLoader(make_config(), send=lambda req: Response(200))
-    handler = HttpRecordHandler(loader)
+    handler = make_handler(loader)
     try:
         handler.handle(make_record())  # must not raise
     finally:
@@ -67,7 +105,7 @@ def test_handle_returns_normally_on_success() -> None:
 
 def test_handle_raises_retryable_delivery_error_on_5xx() -> None:
     loader = HttpLoader(make_config(), send=lambda req: Response(503))
-    handler = HttpRecordHandler(loader)
+    handler = make_handler(loader)
     try:
         with pytest.raises(DeliveryError) as exc_info:
             handler.handle(make_record())
@@ -79,7 +117,7 @@ def test_handle_raises_retryable_delivery_error_on_5xx() -> None:
 
 def test_handle_raises_non_retryable_delivery_error_on_4xx() -> None:
     loader = HttpLoader(make_config(), send=lambda req: Response(422))
-    handler = HttpRecordHandler(loader)
+    handler = make_handler(loader)
     try:
         with pytest.raises(DeliveryError) as exc_info:
             handler.handle(make_record())
@@ -98,10 +136,40 @@ def test_handle_can_be_called_more_than_once_on_the_same_handler() -> None:
         return Response(200)
 
     loader = HttpLoader(make_config(), send=fake_send)
-    handler = HttpRecordHandler(loader)
+    handler = make_handler(loader)
     try:
         handler.handle(make_record())
         handler.handle(make_record())
     finally:
         handler.close()
     assert len(calls) == 2
+
+
+def test_handle_refreshes_config_from_the_spec_source_each_call() -> None:
+    """A republished spec's URL takes effect on the next record, with no restart."""
+    seen_urls: list[str] = []
+
+    def fake_send(req: Request) -> Response:
+        seen_urls.append(req.url)
+        return Response(200)
+
+    loader = HttpLoader(make_config(), send=fake_send)
+    source = FakeSpecSource("c", make_destination())
+    handler = HttpRecordHandler(loader, spec_source=source, destination="dest")
+    try:
+        handler.handle(make_record())
+        source._destination = make_destination(
+            params={"url": "https://new.example.org/ingest", "method": "POST", "timeoutMs": 2000}
+        )
+        handler.handle(make_record())
+    finally:
+        handler.close()
+    assert seen_urls == ["https://example.org/ingest", "https://new.example.org/ingest"]
+
+
+def test_close_closes_the_spec_source_too() -> None:
+    loader = HttpLoader(make_config(), send=lambda req: Response(200))
+    source = FakeSpecSource("c", make_destination())
+    handler = HttpRecordHandler(loader, spec_source=source, destination="dest")
+    handler.close()
+    assert source.closed is True
