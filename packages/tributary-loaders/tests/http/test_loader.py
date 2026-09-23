@@ -68,10 +68,29 @@ class FakeSecretResolver:
 
 @pytest.mark.parametrize(
     ("status", "expected"),
-    [(200, "success"), (201, "success"), (429, "http-429"), (500, "http-5xx"), (404, "http-4xx")],
+    [
+        (200, "success"),
+        (201, "success"),
+        (301, "http-3xx"),
+        (302, "http-3xx"),
+        (429, "http-429"),
+        (500, "http-5xx"),
+        (404, "http-4xx"),
+    ],
 )
 def test_classify_status(status: int, expected: str) -> None:
     assert classify_status(status) == expected
+
+
+def test_3xx_is_not_retryable() -> None:
+    """A redirect is a config problem (the destination moved), not a transient failure; the client
+    (`_NoRedirectHandler`) never follows one, so retrying it would just repeat the same declined
+    exchange forever (security review, gate finding)."""
+    loader = HttpLoader(make_config(), send=lambda req: Response(302, {"Location": "https://elsewhere.example/"}))
+    outcome = asyncio.run(loader.deliver(make_message()))
+    assert outcome.success is False
+    assert outcome.reason == "http-3xx"
+    assert outcome.retryable is False
 
 
 def test_deliver_success_sends_no_idempotency_header_by_default() -> None:

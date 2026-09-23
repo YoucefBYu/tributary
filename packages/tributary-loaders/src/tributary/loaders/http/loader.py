@@ -68,7 +68,9 @@ from .client import Request, Response, TransportError, stdlib_send
 from .config import AuthSpec, HttpDestinationConfig
 from .metrics import LoaderMetrics
 
-Reason = Literal["success", "circuit-open", "timeout", "transport-error", "http-5xx", "http-429", "http-4xx"]
+Reason = Literal[
+    "success", "circuit-open", "timeout", "transport-error", "http-5xx", "http-429", "http-4xx", "http-3xx"
+]
 
 DEFAULT_MAX_CONCURRENT_REQUESTS = 8
 
@@ -98,12 +100,18 @@ class DeliveryOutcome:
 
     @property
     def retryable(self) -> bool:
-        return not self.success and self.reason != "http-4xx"
+        return not self.success and self.reason not in ("http-4xx", "http-3xx")
 
 
 def classify_status(status_code: int) -> Reason:
+    """`client._NoRedirectHandler` means a 3xx reaches here as an ordinary response, never a
+    followed hop: it is a config problem (the destination moved and the spec's `url` was not
+    updated), not a transient one, so — like a 4xx — it is not retryable. Retrying an unretryable
+    redirect would just repeat the same declined-redirect exchange forever."""
     if 200 <= status_code < 300:
         return "success"
+    if 300 <= status_code < 400:
+        return "http-3xx"
     if status_code == 429:
         return "http-429"
     if 500 <= status_code < 600:

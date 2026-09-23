@@ -6,12 +6,17 @@ from __future__ import annotations
 import threading
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import ClassVar
 
 import pytest
 from tributary.loaders.http.client import Request, TransportError, stdlib_send
 
 
 class Handler(BaseHTTPRequestHandler):
+    #: (method, headers) for every request `/redirect-target` ever received, class-level because
+    #: `ThreadingHTTPServer` builds a fresh `Handler` per request; the `server` fixture clears it.
+    redirect_target_hits: ClassVar[list[tuple[str, dict[str, str]]]] = []
+
     def log_message(self, *_args: object) -> None:  # silence test output
         pass
 
@@ -34,6 +39,18 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b"bad request")
             return
+        if self.path == "/redirect":
+            self.send_response(302)
+            self.send_header("Location", "/redirect-target")
+            self.end_headers()
+            return
+        if self.path == "/redirect-target":
+            # if this is ever hit, stdlib_send followed the redirect it must refuse to follow
+            type(self).redirect_target_hits.append((self.command, dict(self.headers)))
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"followed")
+            return
         if self.path == "/slow":
             import time
 
@@ -53,6 +70,7 @@ class Handler(BaseHTTPRequestHandler):
 
 @pytest.fixture
 def server() -> Iterator[str]:
+    Handler.redirect_target_hits = []
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
@@ -95,3 +113,23 @@ def test_timeout_raises_transport_error(server: str) -> None:
 def test_connection_refused_raises_transport_error() -> None:
     with pytest.raises(TransportError):
         stdlib_send(Request("POST", "http://127.0.0.1:1", headers={}, body=b"", timeout_s=1))
+
+
+@pytest.mark.parametrize("method", ["POST", "PUT", "PATCH"])
+def test_redirect_is_refused_not_followed(server: str, method: str) -> None:
+    """Security review, gate finding, High: a 3xx must never turn into a second request — not a
+    bodyless GET at the target (invariant 4: the record would be committed as delivered without its
+    payload ever arriving anywhere), and not a second request carrying `Authorization` to wherever
+    `Location` points. Checked for every method this loader can use
+    (`contracts/channel-spec/v0` httpParams.method)."""
+    resp = stdlib_send(
+        Request(
+            method,
+            f"{server}/redirect",
+            headers={"Authorization": "Bearer secret-token"},
+            body=b"payload",
+            timeout_s=2,
+        )
+    )
+    assert resp.status_code == 302
+    assert Handler.redirect_target_hits == []  # the redirect target was never contacted at all

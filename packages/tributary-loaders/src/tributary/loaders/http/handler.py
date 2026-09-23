@@ -45,6 +45,7 @@ ERROR_CODES: dict[Reason, str] = {
     "http-5xx": "HTTP_5XX",
     "http-429": "HTTP_429",
     "http-4xx": "HTTP_4XX",
+    "http-3xx": "HTTP_3XX",
 }
 
 
