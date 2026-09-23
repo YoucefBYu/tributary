@@ -148,6 +148,41 @@ writing down rather than treating as unreachable code.
 configuration turns into a program the runtime has to interpret. Property names that denote a
 credential (`password`, `token`, `apiKey`, …) are rejected outright.
 
+#### 3.3.1 `ref` needs bundle-fetch, which does not exist in wave 1
+
+The two step forms resolve by different mechanisms, and only one of them is implemented:
+
+| Form | Resolves by | Wave 1 |
+|---|---|---|
+| `uses` | A Python entry point in the `tributary.steps` group, already present in the running image (ADR-001 6.2) | **Works.** |
+| `ref` | A dotted path inside the OCI bundle named by `pipeline.bundle`, which something has to fetch and put on the worker's import path | **Not implemented.** No bundle-fetch exists; the runtime calls `importlib.import_module` and assumes the code is already importable. |
+
+So **a spec that must run today uses `uses` only.** A `ref` step raises at first execution — not at
+deploy, because step resolution is lazy, so `channel_spec_applied` succeeds and the failure arrives
+with the first real message. Found by `qa-engineer-2` against the Compose stack, where
+`valid/walking-skeleton-loopback.json` referenced `adt_flow.steps.passthrough` and nothing in the repo
+publishes, vendors or installs an `adt_flow` package. That example now uses
+`uses: tributary.core.passthrough`.
+
+**Why `ref` is documented-as-unimplemented rather than rejected by the schema, unlike `retry-topic`
+(section 4.1).** The two failure modes are not comparable. Selecting `retry-topic` would *silently*
+reorder messages, which is a patient-safety failure that looks like success; an unresolvable `ref`
+raises loudly and delivers nothing. And `ref` is the primary authoring mechanism for real channels —
+ADR-001 6.1's own example uses it for two of three steps — so rejecting it would block wave 2 channel
+authoring on bundle-fetch landing first. Loud-and-unimplemented gets a doc; silent-and-unmeasured gets
+a validator rule.
+
+**`bundle` stays required even for a `uses`-only pipeline.** The digest then names the image whose
+entry points provide those steps, which is the worker or runtime image itself. That keeps the property
+digest-pinning exists for: "what code ran" is answerable from `tb-channel-version` alone, regardless of
+which step form a channel used.
+
+**Every other valid example in this contract is illustrative, not runnable.** They reference
+`tributary.hl7v2.parse` (W2-1) and bundle-local modules such as `adt_flow` and `lab_flow` that are
+deliberately fictional, because their job is to show the document's shape. Only
+`walking-skeleton-loopback.json` claims to be the wave-1 runnable shape, and it is the one that has to
+resolve.
+
 ### 3.4 `spec.destinations` (v0 defines `http` only)
 
 | Field | Required | Notes |

@@ -6,7 +6,7 @@
   "valid": [
     {
       "file": "valid/walking-skeleton-loopback.json",
-      "note": "Wave 1 E2E shape: MLLP on loopback with no TLS, ordering none, one pass-through step, HTTP stub on loopback, idempotency 'none' with the required justification"
+      "note": "Wave 1 E2E shape and the ONLY example that must actually run: MLLP on loopback with no TLS, ordering none, HTTP stub on loopback, idempotency 'none' with the required justification. Its step uses `uses: tributary.core.passthrough`, an entry point in the running image, because `ref` needs bundle-fetch and that does not exist in wave 1 (README 3.3.1). Every other example here is illustrative and references code that is deliberately fictional"
     },
     {
       "file": "valid/adt-to-fhir-per-key-mtls.json",

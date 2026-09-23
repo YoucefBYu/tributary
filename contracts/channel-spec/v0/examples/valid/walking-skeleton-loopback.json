@@ -15,7 +15,7 @@
     },
     "pipeline": {
       "bundle": "ghcr.io/tributary-synth/adt-integration@sha256:3f7a1c9e2b5d48a06e1f8c3d7b2a95e04c6d8f1a3b5c7d9e0f2a4b6c8d0e2f46",
-      "steps": [{ "name": "passthrough", "ref": "adt_flow.steps.passthrough" }]
+      "steps": [{ "name": "passthrough", "uses": "tributary.core.passthrough" }]
     },
     "destinations": [
       {

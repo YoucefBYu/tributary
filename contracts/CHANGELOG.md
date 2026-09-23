@@ -3,6 +3,47 @@
 Newest first. Each entry names the contract, the version, whether the change is additive or
 breaking, and the reason. Breaking changes reference an ADR.
 
+## 2026-09-23 (W1-8) — the walking-skeleton example is made runnable; `ref` is documented as unimplemented
+
+`qa-engineer-2` found that `valid/walking-skeleton-loopback.json` pointed `steps[0].ref` at
+`adt_flow.steps.passthrough` inside an OCI bundle, and **nothing in the repo publishes, vendors or
+installs `adt_flow`, nor is there any bundle-fetch implementation.** Confirmed empirically against the
+Compose stack (`ModuleNotFoundError`). The example was schema-valid and unrunnable, and its file name
+claims to be the wave-1 runnable shape, so anyone using it as a reference hit a wall. My defect.
+
+Worse than a broken example: the failure is **late**. Step resolution is lazy, so `channel_spec_applied`
+succeeds at deploy and the error arrives with the first real message.
+
+**Decision: the example uses `uses: tributary.core.passthrough`** — an entry point in the
+`tributary.steps` group (ADR-001 6.2), resolved from the running image with no bundle-fetch involved.
+
+Rejected alternative: bake a demo `adt_flow` package into the worker image for the lite stack. It would
+exercise the `ref` path *fake*, via `PYTHONPATH` rather than bundle-fetch, so it proves nothing about
+the real path while looking as though it does — the "a green test whose fault never fired" pattern this
+project has already been bitten by twice. It also has to be maintained forever or the example breaks
+again. **Give up:** no example demonstrates `ref` end to end until bundle-fetch exists, which is honest
+about what wave 1 has.
+
+New README section 3.3.1 states the rest:
+
+- `uses` resolves by entry point and works; `ref` needs bundle-fetch and **does not exist in wave 1**.
+  A spec that must run today uses `uses` only.
+- **Why `ref` is documented-as-unimplemented rather than schema-rejected, unlike `retry-topic`.** The
+  failure modes are not comparable: `retry-topic` would *silently* reorder messages, a patient-safety
+  failure that looks like success, while an unresolvable `ref` raises loudly and delivers nothing. And
+  `ref` is the primary authoring mechanism for real channels, so rejecting it would block wave 2
+  authoring on bundle-fetch. Loud-and-unimplemented gets a doc; silent-and-unmeasured gets a validator
+  rule.
+- `bundle` stays required for a `uses`-only pipeline: the digest then names the image whose entry points
+  provide the steps, which keeps "what code ran" answerable from `tb-channel-version` alone.
+- **Every other valid example is illustrative, not runnable**, and now says so. They reference
+  `tributary.hl7v2.parse` (W2-1) and deliberately fictional bundle modules. Only the walking-skeleton
+  example claims to run, and it is the one that has to resolve.
+
+**Depends on `platform-engineer` registering `tributary.core.passthrough`** in `tributary-runtime`'s
+`tributary.steps` entry points. Until that lands the example is schema-valid and still unrunnable, which
+is the same state it was in — the contract change alone does not fix the Compose stack.
+
 ## 2026-09-23 (W1-4 follow-up) — the ordinary reject shape, so records stop being over-quarantined
 
 `platform-engineer` reported that section 2.3's ordinary reject path is unimplemented: every decode
