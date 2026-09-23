@@ -102,6 +102,20 @@ Sources to re-check: openintegrationengine.org and the OIE GitHub repository (li
   test-only, named in CLAUDE.md's stack table), `pathspec` (MPL-2.0, build-time via hatchling).
   **The approval covers these three packages unmodified; any new or modified MPL dependency needs fresh
   approval.**
+- **`certifi` (MPL-2.0), HUMAN-APPROVED 2026-09-23** as a separate decision, **not** an extension of the
+  approval above (`docs/agent-team/gates/phase-1-wave-1.md` 5.3 finding 1). Unmodified, **dev group
+  only, never shipped**, and scoped specifically to its current transitive path:
+  `testcontainers[kafka]` → `docker` → `requests` → `certifi`. Arriving by a different path, or into the
+  runtime groups, is a different dependency and needs a fresh decision.
+  **Why a separate approval rather than adding a fourth name to the list above:** that approval was
+  recorded as covering *those three packages*, and a transitive arrival is exactly the case the scope
+  note was written for. Extending it silently would have made the scope note decorative.
+- **How this one nearly passed unnoticed, which is the reusable part.** The root manifest annotates
+  `"testcontainers[kafka]>=4.8",  # Apache-2.0`. That comment is *correct about testcontainers itself*
+  and says nothing about its transitive closure, so it reads as a clearance while clearing nothing —
+  the same shape as the `pathspec` miss below. **A licence claim is only as good as the resolution it
+  came from, and a hand-written comment is not a resolution.** It was `licence_check.py` exiting 1 in
+  CI, not review, that caught it.
 - **The MPL inventory is known to be incomplete.** `pathspec` is in none of the spike lockfiles, because
   `[build-system] requires` resolves separately from the runtime and dev groups — so a licence inventory
   taken from lockfiles alone misses every build-backend dependency, and `pathspec` may not be the only

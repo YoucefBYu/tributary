@@ -277,24 +277,32 @@ commits.
 
 ### Invariant 10 — clean-room and licensing
 
-**AT RISK — one open High, and it is a human decision.** The scan that condition 4 asked for has now
-been run, and it found something.
+**UPHELD, with a fourth MPL approval recorded.** The scan that condition 4 asked for was run, it found
+something, and the human decided it.
 
 `security-reviewer` High 1: **`licence_check.py` exits 1 on `certifi` (MPL-2.0)**, added this wave
-(`d3b0e09`), pulled in transitively by `testcontainers[kafka]` → `docker` → `requests`. **Blocking
-condition 1** in section 8.
+(`d3b0e09`), pulled in transitively by `testcontainers[kafka]` → `docker` → `requests`.
+**APPROVED by the human, 2026-09-23** — unmodified, dev group only, never shipped, scoped to that
+transitive path. Recorded in ADR-001 2.3 as **its own approval, not an extension** of the
+`orjson`/`hypothesis`/`pathspec` decision: that one was written as covering *those three packages*, and
+a transitive arrival is precisely the case its scope note anticipated. Extending it quietly would have
+made the scope note decorative. Arriving by a different path, or into a runtime group, is a different
+dependency and needs a fresh decision.
 
 *Architect-verified* by reading the manifests: `testcontainers[kafka]` is in the root
 `[dependency-groups] dev` only, and no package declares `httpx` — the HTTP loader uses stdlib `urllib`
 — so `certifi` is genuinely dev-group only and not in the default distribution. The risk is therefore
 CI-and-policy, not shipped-artefact.
 
-**I am not extending the MPL approval, and the reason is scope rather than caution.** CLAUDE.md permits
-"MPL only as an unmodified dependency approved by the architect", so the authority exists — but the same
-file escalates "a dependency with a non-permissive license" to a human, the Phase 0 precedent sent all
-three MPL items to the human, and that approval was recorded as covering *those three packages
-unmodified*. A fourth arriving by transitive resolution is exactly the case the scope note was written
-for. Correctly routed to the human by the lead.
+**Why it went to the human rather than being approved here.** CLAUDE.md permits "MPL only as an
+unmodified dependency approved by the architect", so the authority arguably existed — but the same file
+escalates "a dependency with a non-permissive license" to a human, and the Phase 0 precedent sent all
+three MPL items that way. Recording the reasoning because the two clauses can be read as conflicting,
+and the next transitive MPL arrival should not have to re-derive which one wins: **escalate.**
+
+**One follow-up, and it is a code change I do not own.** `licence_check.py`'s `MPL_APPROVED` list must
+gain `certifi`, and that file is `devops-engineer`'s. Routed to them. **CI stays red until it lands**,
+so condition 3 (the push) cannot succeed before it.
 
 **How this one hid is the reusable part.** The root manifest annotates the dependency
 `"testcontainers[kafka]>=4.8",  # Apache-2.0`. That annotation is *correct about testcontainers itself*
@@ -428,7 +436,7 @@ they are recorded rather than summarised away:
 
 | # | Sev | Finding | Disposition |
 |---|---|---|---|
-| 1 | **HIGH** | `licence_check.py` exits 1 on `certifi` (MPL-2.0), added this wave (`d3b0e09`) via `testcontainers[kafka]` → `docker` → `requests`. Dev-group only, unmodified, not in the default distribution — architect-verified from the manifests | **Blocking condition 1.** Human decision, correctly routed by the lead. **No agent extends `MPL_APPROVED`**, including me: see invariant 10 for why this is a scope question rather than a caution |
+| 1 | **HIGH** | `licence_check.py` exits 1 on `certifi` (MPL-2.0), added this wave (`d3b0e09`) via `testcontainers[kafka]` → `docker` → `requests`. Dev-group only, unmodified, not in the default distribution — architect-verified from the manifests | **CLOSED — human APPROVED 2026-09-23**, recorded as its own approval scoped to that transitive path, not as an extension of the existing three (ADR-001 2.3). The `licence_check.py` `MPL_APPROVED` edit is `devops-engineer`'s file and is routed to them; CI stays red until it lands |
 | 2 | **HIGH** | HTTP loader (`client.py:53`) uses the default `urllib` opener, so 3xx is silently followed: a redirected POST becomes a GET with the body dropped, the target's 200 is read as success, **the offset commits and the message is lost.** Plus `Authorization` not stripped on redirect (credential leak to the redirect target) and the `http://`-loopback-only rule checked on the configured URL but not after a redirect (TLS downgrade) | **Blocking condition 2.** `connector-engineer` fixing with a regression test. Invariant 4 assessment downgraded accordingly (section 3) |
 | 3 | LOW | `receivers/mllp/server.py:205,235` use raw `print(json.dumps(...))` instead of the guarded `JsonLogger` | Track, wave 2. Recorded under invariant 6: safe by content today, not by construction |
 | 4 | LOW | `loaders/http/loader.py:235` logs `error=repr(exc)` — free text where the contract wants a classified code | Track, wave 2. Same entry |
@@ -535,9 +543,11 @@ contradicts ADR-001.
 
 **Blocking sign-off:**
 
-1. **The `certifi` (MPL-2.0) decision — human.** `licence_check.py` exits 1, so CI is red until it is
-   resolved either way. Dev-group only and not in the default distribution, which bounds the risk but
-   does not make the decision. No agent extends `MPL_APPROVED` (invariant 10, 5.3 finding 1).
+1. ~~**The `certifi` (MPL-2.0) decision — human.**~~ **DECIDED 2026-09-23: APPROVED**, unmodified, dev
+   group only, never shipped, scoped to the `testcontainers[kafka]` → `docker` → `requests` path and
+   recorded as its own approval in ADR-001 2.3. **One task remains before CI can pass:**
+   `devops-engineer` adds `certifi` to `licence_check.py`'s `MPL_APPROVED` list — a code change in their
+   file, not mine. Until it lands the job still exits 1.
 2. **The HTTP loader redirect fix, with a regression test — `connector-engineer`.** In progress. This is
    silent message loss against invariant 4, plus a credential leak and a TLS-downgrade path from the same
    default-constructor choice. The regression test is part of the condition, not a nicety: the reason this
@@ -601,8 +611,8 @@ refer to nothing at all. Wave 2 should expect the same class of defect and keep 
 | Exit criterion 4 (`code-reviewer` clean) | **PASS.** `code-reviewer-8`: APPROVE, zero findings at any severity |
 | Invariants 1-10 | **No change needed to any invariant.** 1, 2, 5, 7 upheld with evidence; 6, 8 upheld in part with named gaps; 3 partial; **4 breached by an open High (silent message loss on redirect)**; 9 not exercised; **10 at risk on an open High (`certifi` MPL-2.0)** |
 | `code-reviewer-8`, wave diff | **Zero Critical, High, Medium, Low** |
-| `security-reviewer` | **0 Critical, 2 High, 0 Medium, 3 Low.** Own verdict: gate not passed |
+| `security-reviewer` | **0 Critical, 2 High, 0 Medium, 3 Low.** Own verdict: gate not passed as of that review |
 | Unresolved Critical | **None** |
-| Unresolved High | **2.** `certifi` MPL-2.0 (human decision); HTTP loader redirect (`connector-engineer`, fix in flight) |
-| Gate recommendation | **GO WITH CONDITIONS:** 3 blocking (2 Highs plus the CI push), 3 met, 6 carried to wave 2. **Not signable in this state** |
-| Human sign-off | pending — and it should not be given until conditions 1 and 2 are closed |
+| Unresolved High | **1.** High 1 (`certifi`) **decided and approved 2026-09-23**, pending only the `licence_check.py` list edit by `devops-engineer`. High 2 (HTTP loader redirect) **open**, fix in flight with `connector-engineer` |
+| Gate recommendation | **GO WITH CONDITIONS:** 1 High open, plus the `MPL_APPROVED` edit and the CI push. **Not signable until High 2 is fixed with its regression test** |
+| Human sign-off | pending — condition 2 must close first |

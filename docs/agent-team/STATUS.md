@@ -8,10 +8,12 @@ wave's exit criteria here.
 - **Phase / wave:** **Phase 1, wave 1 — walking skeleton. AT GATE.** All eight tasks delivered. Gate
   report [`gates/phase-1-wave-1.md`](gates/phase-1-wave-1.md): **GO WITH CONDITIONS — NOT SIGNABLE YET.**
   All inputs are in. `code-reviewer-8`: APPROVE, zero findings at any severity.
-  **`security-reviewer`: 0 Critical, 2 High, 0 Medium, 3 Low** — both Highs block:
-  (1) `licence_check.py` exits 1 on `certifi` (MPL-2.0), added this wave via `testcontainers[kafka]` →
-  `docker` → `requests`; dev-group only and not in the default distribution, **human decision, no agent
-  extends `MPL_APPROVED`**; (2) the HTTP loader follows 3xx with the default `urllib` opener, so a
+  **`security-reviewer`: 0 Critical, 2 High, 0 Medium, 3 Low.**
+  (1) `certifi` (MPL-2.0), added this wave via `testcontainers[kafka]` → `docker` → `requests` —
+  **human APPROVED 2026-09-23**, unmodified, dev group only, never shipped, scoped to that transitive
+  path and recorded as **its own approval, not an extension** of the three-package one (ADR-001 2.3).
+  Remaining: `devops-engineer` adds it to `licence_check.py`'s `MPL_APPROVED`, without which CI still
+  exits 1. (2) **Still open:** the HTTP loader follows 3xx with the default `urllib` opener, so a
   redirected POST drops its body, the target's 200 reads as success and **the offset commits for a
   message that was never delivered** — invariant 4 breached, `connector-engineer` fixing with a
   regression test. Third condition: a human push, which cannot succeed until (1) is resolved because CI
@@ -152,6 +154,8 @@ All six filed and synthesised. Full threshold table with evidence ratings quoted
 | 2026-09-21 | Lead stopped the running spike cluster (`docker compose down`) because of the all-interfaces exposure (`security-reviewer` High 2). Nothing lost; storage was ephemeral | gate report 1.1 |
 | 2026-09-22 | **Human, "Approve orjson, hypothesis and pathspec":** the three MPL-2.0 dependencies are **APPROVED** as unmodified — `orjson` (shipping runtime, `MPL-2.0 AND (Apache-2.0 OR MIT)`), `hypothesis` (test-only), `pathspec` (build-time). The approval covers these three packages unmodified; **any new or modified MPL dependency needs fresh approval**, and the inventory is known to be incomplete because `[build-system] requires` resolves outside the lockfiles | gate report 5.1, ADR-001 2.3 |
 | 2026-09-22 | **Human: Phase 0 gate signed as GO WITH CONDITIONS.** Does not start Phase 1 | gate report, sign-offs table |
+| 2026-09-23 | **Human: `certifi` (MPL-2.0) APPROVED** as an unmodified, **dev-group-only, never-shipped** dependency, scoped to its current transitive path `testcontainers[kafka]` → `docker` → `requests`. Recorded as **its own approval, not an extension** of the `orjson`/`hypothesis`/`pathspec` decision, whose scope note covered *those three packages* — a transitive arrival is exactly the case that note anticipated. A different path, or a runtime group, is a different dependency needing a fresh decision | ADR-001 2.3, gate `phase-1-wave-1.md` 5.3 |
+| 2026-09-23 | **A hand-written licence comment is not a licence clearance.** `certifi` was found by `licence_check.py` exiting 1 in CI, not by review: the root manifest annotates `testcontainers[kafka]  # Apache-2.0`, which is correct about testcontainers and silent about its transitive closure. Second near-miss of the same shape after Phase 0's `pathspec`, which a lockfile-only inventory missed because `[build-system] requires` resolves separately | ADR-001 2.3 |
 | 2026-09-22 | **Channel spec v0 published** (W1-1): declarative spec referencing code in a digest-pinned bundle. Rejected: a Mirth-parity spec with inline source (breaks invariant 7 and puts arbitrary code on `_tb.channels`, which is RCE across the data plane) and a code-first channel with no document (the UI and control plane could not reason about a channel without executing tenant code) | ADR-007, `contracts/channel-spec/v0` |
 | 2026-09-22 | **`retry-topic` is in the policy enum and rejected by the validator.** Vocabulary stays shared across specs, docs and code; selection is a validation failure until the spike. Chosen over a prose-only ban because both Phase 0 High findings were controls that were specified and then not applied | ADR-007 D5, ADR-003 D1/D2 |
 | 2026-09-22 | **Security rules that a schema can hold are held by the schema**: TLS unless loopback, `tls.clientAuth` stated explicitly, plaintext HTTP only to loopback, no query string in a destination URL, credential-shaped property names rejected, `queue.maxBytes` required. Phase 1 requirements 5 and 8 become validation failures rather than review findings | ADR-007 D7 |
