@@ -1033,12 +1033,14 @@ version = "0.0.0"
 source = { editable = "packages/tributary-loaders" }
 dependencies = [
     { name = "confluent-kafka" },
+    { name = "tributary-runtime" },
     { name = "tributary-sdk" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "confluent-kafka", specifier = ">=2.6.0" },
+    { name = "tributary-runtime", editable = "packages/tributary-runtime" },
     { name = "tributary-sdk", editable = "packages/tributary-sdk" },
 ]
 

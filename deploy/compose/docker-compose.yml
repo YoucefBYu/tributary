@@ -1,6 +1,7 @@
 # Tributary lite stack (Phase 1, W1-7): single-node Kafka (KRaft), ClickHouse, PostgreSQL, the MLLP
-# receiver, and a one-shot job that creates the walking-skeleton topics. `worker` and `loader` are
-# not wired in yet -- see the note at the bottom of this file.
+# receiver, the pipeline worker, the HTTP loader, and two one-shot jobs that create the
+# walking-skeleton topics and publish its channel spec. See the note near the bottom of this file for
+# what `loader` cannot demonstrate yet (there is no HTTP stub server in this stack).
 #
 # Start:   docker compose -f deploy/compose/docker-compose.yml up -d
 # Stop:    docker compose -f deploy/compose/docker-compose.yml down
@@ -154,15 +155,21 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
-      topic-bootstrap:
+      channel-publish:
         condition: service_completed_successfully
     command:
       - tributary.receivers.mllp
-      - --channel-spec=/contracts/channel-spec/v0/examples/valid/walking-skeleton-loopback.json
+      - --channel-spec=/generated/channel.json
       - --env=dev
       - --bootstrap=kafka:9092
+    environment:
+      # kafka_publisher.py reads clients.receiver_producer (acks, idempotence, delivery timeout)
+      # from topic-defaults.json rather than hardcoding it (must_not_hardcode), so it needs the same
+      # contracts/ mount and TB_CONTRACTS_DIR as the worker below.
+      TB_CONTRACTS_DIR: /contracts
     volumes:
-      - ../../contracts/channel-spec/v0/examples/valid/walking-skeleton-loopback.json:/contracts/channel-spec/v0/examples/valid/walking-skeleton-loopback.json:ro
+      - channel-spec-published:/generated:ro
+      - ../../contracts:/contracts:ro
     read_only: true
     tmpfs:
       - /tmp
@@ -181,8 +188,128 @@ services:
       retries: 24
       start_period: 5s
 
-# worker and loader are not defined yet: tributary-runtime has no consumer entry point (W1-4) and
-# tributary-loaders has no HTTP loader (W1-6) as of this file. Once both exist, add them here the same
-# way as mllp-receiver (python-app.Dockerfile, TB_PACKAGE=tributary-runtime / tributary-loaders),
-# wire worker's out.http-stub consumption to the loader, and update the "under two minutes" verify
-# note in README.md to include them.
+  channel-spec-volume-init:
+    # Docker creates a new named volume owned by root:root, and every application container in this
+    # file runs as uid 10001 (Phase 1 requirement 7: non-root), so channel-publish cannot write to
+    # `channel-spec-published` until something chowns it. This is that something: it does one thing,
+    # as root, for the shortest possible time, and nothing else in the stack runs as root.
+    image: python:3.12-slim@sha256:2f17fc044b579bab302c2e8054d3a686e2cb9a83de48e70534b94cd8ebbe06a9
+    container_name: tb-channel-spec-volume-init
+    user: root
+    restart: "no"
+    command: ["chown", "10001:10001", "/generated"]
+    volumes:
+      - channel-spec-published:/generated
+
+  channel-publish:
+    # There is no control plane (Phase 2) or CLI yet to stamp metadata.version and produce the
+    # channel spec onto _tb.<env>.channels, which is the worker's only source of truth for a channel
+    # (tributary.runtime.channels). Compose-only stand-in, same status as topic-bootstrap -- see
+    # publish_channel.py's docstring.
+    build:
+      context: ./channel-publish
+    container_name: tb-channel-publish
+    restart: "no"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      topic-bootstrap:
+        condition: service_completed_successfully
+      channel-spec-volume-init:
+        condition: service_completed_successfully
+    volumes:
+      - ../../contracts/channel-spec/v0/examples/valid/walking-skeleton-loopback.json:/contracts/channel.json:ro
+      # Written here, not just produced to Kafka: `tributary.loaders.http.main` requires
+      # metadata.version outright (no default the way the receiver has one), so the receiver and the
+      # loader below are pointed at *this* published file rather than the raw contract example --
+      # otherwise each component would need its own opinion of what version to assume, and
+      # tb-channel-version would disagree between what the receiver stamps and what the worker
+      # actually applied.
+      - channel-spec-published:/generated
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+      TB_ENV: dev
+      TB_CHANNEL_SPEC: /contracts/channel.json
+      TB_CHANNEL_VERSION: "1"
+      TB_PUBLISHED_OUT: /generated/channel.json
+    read_only: true
+
+  worker:
+    build:
+      context: ../..  # repo root: the image needs the full uv workspace to resolve tributary-sdk
+      dockerfile: deploy/compose/images/python-app.Dockerfile
+      args:
+        TB_PACKAGE: tributary-runtime
+    container_name: tb-worker
+    restart: "no"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      channel-publish:
+        condition: service_completed_successfully
+    command: ["tributary.runtime.worker"]
+    environment:
+      TB_ENV: dev
+      TB_CHANNEL: adt-passthrough
+      TB_BOOTSTRAP_SERVERS: kafka:9092
+      TB_INSTANCE_ID: worker-0
+      # The worker refuses to start without contracts/topics/v0/topic-defaults.json
+      # (tributary.runtime.config: "must ship contracts/ or set TB_CONTRACTS_DIR"); mounted, not
+      # baked into the image, for the same reason as topic-bootstrap's mount above.
+      TB_CONTRACTS_DIR: /contracts
+    volumes:
+      - ../../contracts:/contracts:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+
+  loader:
+    build:
+      context: ../..
+      dockerfile: deploy/compose/images/python-app.Dockerfile
+      args:
+        TB_PACKAGE: tributary-loaders
+    container_name: tb-loader
+    restart: "no"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      channel-publish:
+        condition: service_completed_successfully
+      worker:
+        condition: service_started
+    command:
+      - tributary.loaders.http
+      - --channel-spec=/generated/channel.json
+      - --destination=http-stub
+      - --env=dev
+      - --bootstrap=kafka:9092
+    environment:
+      # Consumer defaults (session.timeout.ms, commit_every, ...) come from topic-defaults.json, same
+      # reason and same mount as the worker and the receiver above.
+      TB_CONTRACTS_DIR: /contracts
+    volumes:
+      - channel-spec-published:/generated:ro
+      - ../../contracts:/contracts:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+    # The demo channel's http-stub destination is http://127.0.0.1:8080/ingest -- loopback, same as
+    # the receiver's MLLP bind, and reachable only from inside this container's own network
+    # namespace. There is no HTTP stub server in this stack (W1-8, qa-engineer's e2e test brings its
+    # own); without one, every delivery attempt gets "connection refused" and the destination's own
+    # retry policy (blocking, maxAttempts 5, onExhaust halt-partition) pauses the partition after the
+    # fifth failure. That is correct, observable behaviour, not a bug in this file: it proves the
+    # retry-then-halt path invariant 5 depends on, and it is why this service has no healthcheck --
+    # "running but paused, waiting for a destination" has no single up/down signal to probe.
+
+# Note for whoever adds the archiver (Phase 2) or a real HTTP destination for W1-8: this file's job
+# is the walking skeleton, not a working delivery. Point loader at a real stub service (or
+# let the e2e test bring its own, per deploy/compose/README.md) before treating a "successful
+# delivery" as demonstrated.
+
+volumes:
+  # The one exception to "no named volumes" (see the file header): this carries the published
+  # channel spec from channel-publish to mllp-receiver and loader, not data that needs to survive a
+  # restart, so it is not itself a durability concern. `docker compose down -v` clears it.
+  channel-spec-published:
