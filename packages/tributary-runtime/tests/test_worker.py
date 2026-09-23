@@ -12,8 +12,11 @@ import json
 from pathlib import Path
 from typing import Any
 
+import orjson
 import pytest
 from jsonschema import Draft202012Validator
+from tributary.runtime.clients import KafkaSettings
+from tributary.runtime.config import load_topic_defaults
 from tributary.runtime.errors import DeliveryError, PartitionMismatchError
 from tributary.runtime.events import RecordingEmitter
 from tributary.runtime.executor import StepFailure
@@ -24,8 +27,10 @@ from tributary.runtime.spec import ChannelSpec
 from tributary.runtime.worker import (
     KafkaDlqWriter,
     PipelineHandler,
+    WorkerSettings,
     check_partition_counts,
     dlq_message,
+    emit_profile_warning,
     out_message,
     quarantine_message,
 )
@@ -317,3 +322,47 @@ def test_an_unordered_channel_does_not_care_about_partition_counts() -> None:
     """`ordering: none` already round-robins, so there is no key-to-partition mapping to break."""
     unordered = spec()
     check_partition_counts(FakeAdmin({"dev.adt-passthrough.raw": 3}), "dev", unordered)
+
+
+# -- the lite profile's mandatory startup warning (topics/v0 README 3.8) ---------------------------
+
+
+def test_the_lite_profile_warning_is_emitted_at_startup() -> None:
+    """Mandatory and testable: at WARN level, in the structured log, on by default, no way to suppress
+    it. RF=1 with min.insync.replicas=1 cannot guarantee RPO=0 for an acknowledged message, which is
+    the one promise invariant 1 makes, so `lite` is a human-approved exception (ADR-002 D14) rather
+    than a quiet weakening."""
+    stream = io.StringIO()
+    defaults = load_topic_defaults()
+
+    assert emit_profile_warning(JsonLogger("worker", stream=stream), defaults, profile="lite") is True
+
+    written = orjson.loads(stream.getvalue())
+    assert written["level"] == "warning"
+    assert written["event"] == "lite_profile_active"
+    assert written["profile"] == "lite"
+    assert written["production_use"] == "barred"
+    assert "RPO=0" in written["detail"]
+
+
+def test_no_warning_is_emitted_for_the_production_profile() -> None:
+    """The other half of the acceptance criterion: a warning that fires on every profile is one an
+    operator learns to ignore, which is the same as no warning at all."""
+    stream = io.StringIO()
+
+    assert (
+        emit_profile_warning(JsonLogger("worker", stream=stream), load_topic_defaults(), profile="production") is False
+    )
+    assert stream.getvalue() == ""
+
+
+def test_the_worker_defaults_to_the_profile_that_needs_the_warning() -> None:
+    """Defaulting to `production` would leave a single-broker deployment silent, which is the one case
+    the warning exists for."""
+    settings = WorkerSettings(
+        env="dev",
+        channel="adt-passthrough",
+        kafka=KafkaSettings(bootstrap_servers="localhost:9092"),
+        instance_id="pipeline-1",
+    )
+    assert settings.profile == "lite"

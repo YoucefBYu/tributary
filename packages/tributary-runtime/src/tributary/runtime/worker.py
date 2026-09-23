@@ -54,6 +54,10 @@ class WorkerSettings:
     channel: str
     kafka: KafkaSettings
     instance_id: str
+    #: The `topic-defaults.json` profile this deployment runs. Defaults to `lite`, which is the profile
+    #: that requires the warning: a component that defaulted to `production` would stay silent on a
+    #: single-broker cluster, which is the one case the warning exists for.
+    profile: str = "lite"
     contracts_dir: str | None = None
     poll_timeout_s: float = 0.2
     flush_timeout_s: float = 30.0
@@ -65,6 +69,30 @@ class WorkerSettings:
         import socket
 
         return f"worker:{self.instance_id}@{socket.gethostname()}"
+
+
+def emit_profile_warning(log: Logger, defaults: TopicDefaults, *, profile: str) -> bool:
+    """Emit the profile's mandatory startup warning. Returns True when one was emitted.
+
+    `contracts/topics/v0` README 3.8: any component started against a `lite`-profile cluster MUST log
+    this at WARN level, on by default, **with no flag to suppress it** — so there is no parameter here
+    that turns it off, only the profile itself. RF=1 with `min.insync.replicas=1` cannot guarantee
+    RPO=0 for an acknowledged message, which is the one promise invariant 1 makes, and `lite` is a
+    human-approved exception to it (ADR-002 D14) rather than a quiet weakening.
+
+    The text comes from the contract file, not from a literal here: rewording it would drift from the
+    sentence a human actually approved.
+    """
+    warning = defaults.startup_warning(profile)
+    if warning is None:
+        return False
+    log.warning(
+        "lite_profile_active" if profile == "lite" else "profile_warning",
+        profile=profile,
+        production_use="barred" if defaults.barred_from_production(profile) else "permitted",
+        detail=warning[:256],
+    )
+    return True
 
 
 class KafkaDlqWriter:
@@ -371,6 +399,9 @@ class PipelineWorker:
 
         defaults = self.defaults or load_topic_defaults(self.settings.contracts_dir)
         env, channel = self.settings.env, self.settings.channel
+        # Before any client is built: a warning emitted after a failed connection is a warning nobody
+        # sees on the run where it matters most.
+        emit_profile_warning(self.log, defaults, profile=self.settings.profile)
 
         cache_consumer = cast(
             "ChannelsConsumerLike",
@@ -493,6 +524,7 @@ def main() -> int:
         channel=os.environ["TB_CHANNEL"],
         kafka=KafkaSettings(bootstrap_servers=os.environ.get("TB_BOOTSTRAP_SERVERS", "localhost:9092")),
         instance_id=os.environ.get("TB_INSTANCE_ID", f"pipeline-{os.getpid()}"),
+        profile=os.environ.get("TB_PROFILE", "lite"),
         contracts_dir=os.environ.get("TB_CONTRACTS_DIR"),
     )
     worker = PipelineWorker(settings)

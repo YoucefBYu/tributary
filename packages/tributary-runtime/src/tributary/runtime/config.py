@@ -48,6 +48,24 @@ class TopicDefaults:
     class_configs: Mapping[str, Mapping[str, Any]]
     consumer: ConsumerDefaults
     producer: Mapping[str, Any]
+    profiles: Mapping[str, Mapping[str, Any]]
+
+    def startup_warning(self, profile: str) -> str | None:
+        """The warning a profile requires at startup, or `None`.
+
+        The **contract's own text** rather than a paraphrase: README 3.8 says to emit the warning in
+        `profiles.<profile>.warning`, and a component that reworded it would drift from the sentence a
+        human approved as the exception to invariant 1's durability promise (ADR-002 D14).
+        """
+        block = self.profiles.get(profile)
+        if block is None or not block.get("startup_warning_required"):
+            return None
+        warning = block.get("warning")
+        return warning if isinstance(warning, str) else None
+
+    def barred_from_production(self, profile: str) -> bool:
+        """True when the contract bars this profile from production use (README 3.8, rule 2)."""
+        return str(self.profiles.get(profile, {}).get("production_use", "")) == "barred"
 
     def partitions_for(self, topic_class: str, *, raw_partitions: int | None = None) -> int:
         """The partition count for a class, resolving "match the raw topic" to an actual number."""
@@ -97,6 +115,10 @@ def load_topic_defaults(contracts_dir: str | Path | None = None) -> TopicDefault
     except (OSError, json.JSONDecodeError) as exc:
         raise ConfigError(f"cannot read {CONTRACT_RELATIVE.as_posix()}: {type(exc).__name__}") from exc
 
+    profiles = document.get("profiles")
+    if not isinstance(profiles, dict):
+        raise ConfigError(f"{path.name}: profiles is missing or not an object")
+
     classes = _require_mapping(document, "classes", path)
     partitions: dict[str, int | str] = {}
     class_configs: dict[str, Mapping[str, Any]] = {}
@@ -141,6 +163,7 @@ def load_topic_defaults(contracts_dir: str | Path | None = None) -> TopicDefault
             enable_auto_commit=bool(consumer_block.get("enable.auto.commit", False)),
             commit_every=commit_every,
         ),
+        profiles={name: block for name, block in profiles.items() if isinstance(block, dict)},
         producer={
             "acks": producer_block.get("acks", "all"),
             "enable.idempotence": producer_block.get("enable.idempotence", True),
