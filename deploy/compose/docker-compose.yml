@@ -167,6 +167,7 @@ services:
       # from topic-defaults.json rather than hardcoding it (must_not_hardcode), so it needs the same
       # contracts/ mount and TB_CONTRACTS_DIR as the worker below.
       TB_CONTRACTS_DIR: /contracts
+      TB_PROFILE: lite
     volumes:
       - channel-spec-published:/generated:ro
       - ../../contracts:/contracts:ro
@@ -280,7 +281,7 @@ services:
         condition: service_started
     command:
       - tributary.loaders.http
-      - --channel-spec=/generated/channel.json
+      - --channel=adt-passthrough
       - --destination=http-stub
       - --env=dev
       - --bootstrap=kafka:9092
@@ -288,8 +289,8 @@ services:
       # Consumer defaults (session.timeout.ms, commit_every, ...) come from topic-defaults.json, same
       # reason and same mount as the worker and the receiver above.
       TB_CONTRACTS_DIR: /contracts
+      TB_PROFILE: lite
     volumes:
-      - channel-spec-published:/generated:ro
       - ../../contracts:/contracts:ro
     read_only: true
     tmpfs:
