@@ -17,6 +17,7 @@ tributary-sdk = { workspace = true }
 tributary-runtime = { workspace = true }
 tributary-receivers = { workspace = true }
 tributary-loaders = { workspace = true }
+tributary-hl7v2 = { workspace = true }
 
 [dependency-groups]
 dev = [
@@ -24,6 +25,7 @@ dev = [
     "tributary-runtime",
     "tributary-receivers",
     "tributary-loaders",
+    "tributary-hl7v2",
     "pytest>=8.3",
     "hypothesis>=6.112",   # MPL-2.0, human-approved 2026-09-22, unmodified
     "jsonschema>=4.23",    # conformance suite (tests/conformance)
@@ -77,5 +79,6 @@ mypy_path = [
     "packages/tributary-runtime/src",
     "packages/tributary-receivers/src",
     "packages/tributary-loaders/src",
+    "packages/tributary-hl7v2/src",
 ]
 exclude = ['/tests/', '^spikes/']
