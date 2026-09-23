@@ -116,10 +116,7 @@ def file_cases(contract: str) -> tuple[Path, list[Case]]:
     check_runnable_metadata(contract, manifest)
     base = manifest_path.parent
     schema = (base / manifest["schema"]).resolve()
-    cases = [
-        Case(contract, e["file"], load(base / e["file"]), True, None)
-        for e in manifest["valid"]
-    ]
+    cases = [Case(contract, e["file"], load(base / e["file"]), True, None) for e in manifest["valid"]]
     cases += [
         Case(
             contract,
@@ -138,8 +135,7 @@ def topic_cases() -> tuple[Path, list[Case]]:
     schema = (TOPIC_MANIFEST.parent / manifest["schema"]).resolve()
     cases = [Case("topics", n, n, True, None) for n in manifest["valid"]]
     cases += [
-        Case("topics", e["name"], e["name"], False, expected_of("topics", e["name"], e))
-        for e in manifest["invalid"]
+        Case("topics", e["name"], e["name"], False, expected_of("topics", e["name"], e)) for e in manifest["invalid"]
     ]
     return schema, cases
 
@@ -159,17 +155,12 @@ def check() -> int:
             actual = failures(validator, case.instance)
             if case.should_pass:
                 if actual:
-                    problems.append(
-                        f"{case.contract}: {case.label} must validate, but failed at "
-                        f"{sorted(actual)[:5]}"
-                    )
+                    problems.append(f"{case.contract}: {case.label} must validate, but failed at {sorted(actual)[:5]}")
                 else:
                     passed += 1
                 continue
             if not actual:
-                problems.append(
-                    f"{case.contract}: {case.label} validated, but the manifest says it must fail"
-                )
+                problems.append(f"{case.contract}: {case.label} validated, but the manifest says it must fail")
             elif case.expected not in actual:
                 problems.append(
                     f"{case.contract}: {case.label} failed for the wrong reason - expected "
@@ -204,8 +195,7 @@ def emit_expectations() -> int:
                         "example": case.label,
                         "pinned_pair_matches": pinned,
                         "measured": [
-                            {"expected_json_path": f.json_path, "expected_validator": f.validator}
-                            for f in actual
+                            {"expected_json_path": f.json_path, "expected_validator": f.validator} for f in actual
                         ],
                     }
                 )
