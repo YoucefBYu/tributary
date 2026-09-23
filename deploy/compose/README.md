@@ -101,6 +101,15 @@ file, since none of the three take a `--profile` argument today.
   that docstring. `worker`, `mllp-receiver` and `loader` mount the same file (via `TB_CONTRACTS_DIR`)
   for the same reason: `tributary-runtime`'s producer/consumer settings and
   `tributary-receivers`' Kafka producer config both read it rather than hardcode it.
+- **`channel-publish`'s record shape is a contract with `ChannelCache`, not just an implementation
+  detail.** `packages/tributary-runtime/src/tributary/runtime/channels.py` is the consumer: key =
+  channel name (`ChannelCache._apply` decodes it as one), value = the published document with
+  `metadata.version` stamped (channel-spec contract 6). If either changes here without a matching
+  change there, `ChannelCache` does not error — by design, a bad record must not take a channel down
+  (see that file's docstring) — it just keeps running whatever spec it applied last. From the outside
+  that looks like "the worker ignored my deploy," not like a rejected record, so check
+  `channel_spec_applied`/`channels_consumer_error` in the worker's logs first if `channel-publish`
+  exits 0 but the worker's behaviour does not change.
 - **`channel-spec-published` is the one named volume in this file.** `channel-publish` stamps
   `metadata.version` onto the raw contract example and writes the result there; `mllp-receiver` and
   `loader` mount it read-only instead of the raw file, because `tributary.loaders.http.main` requires
