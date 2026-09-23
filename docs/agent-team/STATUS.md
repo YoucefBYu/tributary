@@ -6,28 +6,32 @@ wave's exit criteria here.
 ## Current
 
 - **Phase / wave:** **Phase 1, wave 1 — walking skeleton. AT GATE.** All eight tasks delivered. Gate
-  report [`gates/phase-1-wave-1.md`](gates/phase-1-wave-1.md): **GO WITH CONDITIONS — NOT SIGNABLE YET.**
-  All inputs are in. `code-reviewer-8`: APPROVE, zero findings at any severity.
-  **`security-reviewer`: 0 Critical, 2 High, 0 Medium, 3 Low.**
-  (1) `certifi` (MPL-2.0), added this wave via `testcontainers[kafka]` → `docker` → `requests` —
-  **human APPROVED 2026-09-23**, unmodified, dev group only, never shipped, scoped to that transitive
-  path and recorded as **its own approval, not an extension** of the three-package one (ADR-001 2.3).
-  `devops-engineer` landed the `MPL_APPROVED` edit (`a35528c`); `licence_check.py` passes, 44
-  components, 0 failed. **CLOSED.** (2) **Fix landed (`bec8029`), still open pending
-  `security-reviewer`'s confirmation** that all three of its consequences are closed and nothing new was
-  introduced — the commit existing is not the same claim: the HTTP loader follows 3xx with the default
-  `urllib` opener, so a
-  redirected POST drops its body, the target's 200 reads as success and **the offset commits for a
-  message that was never delivered** — invariant 4 breached, `connector-engineer` fixing with a
-  regression test. Third condition: a human push, which cannot succeed until (1) is resolved because CI
-  is red on it. Phase 0 is complete and signed (2026-09-22).
-- **Exit criterion 4 is PASS and stays PASS.** It is specifically "`code-reviewer` clean on the wave
-  diff", and that reviewer found nothing. The two Highs block through the definition of done item 6
-  (`security-reviewer` on auth, PHI, listeners and dependencies), not through criterion 4 — the
-  distinction determines who has work to do.
+  report [`gates/phase-1-wave-1.md`](gates/phase-1-wave-1.md): **GO WITH ONE CONDITION — a human pushes
+  `wave/1-1` and the CI integration job goes green.** Everything an agent can close is closed.
+  `code-reviewer-8`: APPROVE, zero findings at any severity. **`security-reviewer`, final: 0 Critical,
+  0 High, 0 Medium, 3 Low** — gate passes from their side. Their first pass found 2 High and **both were
+  fixed inside the wave and confirmed closed with the mechanism re-derived, not taken on trust:**
+  (1) `certifi` (MPL-2.0) human-approved 2026-09-23 (the lead attests first-hand; the reviewer cannot
+  verify a human decision) — dev group only, never shipped, scoped to its `testcontainers[kafka]` →
+  `docker` → `requests` path, recorded as **its own approval, not an extension** of the three-package one
+  (ADR-001 2.3); `MPL_APPROVED` landed at `a35528c`, `licence_check.py` passes 44 components / 0 failed.
+  (2) The HTTP loader silently followed 3xx with the default `urllib` opener — a redirected POST dropped
+  its body, the target's 200 read as success and **the offset committed for a message that was never
+  delivered** — fixed at `bec8029`, with three extra gap-checks the reviewer added themselves.
+  Phase 0 is complete and signed (2026-09-22).
+- **Exit criterion 4 is PASS.** It is specifically "`code-reviewer` clean on the wave diff", and that
+  reviewer found nothing. While the two Highs were open they blocked through the definition of done
+  item 6 (`security-reviewer` on auth, PHI, listeners and dependencies), **not** through criterion 4 —
+  the distinction determines who has work to do, and is worth keeping straight at future gates.
+- **Worth carrying into wave 2:** that message-loss bug was in code that had already passed a clean code
+  review, `mypy --strict` and 701 tests. **Reviews find what they look for.** Both Highs, both Phase 0
+  Highs and three of the four contract defects share one shape — *a control never applied to a path
+  nobody thought about* — so wave 2 should spend review effort on library defaults and transitive edges
+  rather than on paths that already have tests.
 - **Branch:** `wave/1-1`
 - **Exit criteria:** 1 **PASS locally, PENDING CI** (nothing has been pushed, so no CI run exists —
-  closing it needs a human push); 2 **PASS for invariants 1, 2, 5; PARTIAL for 3**; 3 **PASS**;
+  closing it needs a human push, and it is the wave's only remaining condition); 2 **PASS for
+  invariants 1, 2, 5; PARTIAL for 3**; 3 **PASS**;
   4 **PASS** (`code-reviewer-8`, zero findings). Engineering checks green as run by the lead: `uv sync`,
   `ruff`, `ruff format`, `mypy packages` (56 files), fast suite **701 passed**, `validate.py` **102 / 0**,
   `pytest tests/conformance` **101 passed**, `pytest -m integration` **6 passed in 227.91 s**.

@@ -1,13 +1,13 @@
 # Gate: Phase 1, wave 1 — walking skeleton
 
 **Branch:** `wave/1-1` · **Date:** 2026-09-23 · **Author:** `architect`
-**Recommendation:** **GO WITH CONDITIONS** — see section 8. **Two High security findings are open and
-both block sign-off.**
+**Recommendation:** **GO WITH ONE CONDITION** — a human push, which is the only thing no agent can do.
+See section 8.
 
-**All inputs are in.** `code-reviewer-8`: APPROVE, zero findings at any severity. `security-reviewer`:
-0 Critical, **2 High**, 0 Medium, 3 Low — their own verdict is "gate not passed as of this review", and I
-agree it cannot be signed in this state. `pytest -m integration`: 6 passed. Nothing below is marked PASS
-on the strength of an expected result.
+**All inputs are in and both High findings are closed.** `code-reviewer-8`: APPROVE, zero findings at
+any severity. `security-reviewer`, final: **0 Critical, 0 High, 0 Medium, 3 Low**, gate passes from their
+side. `pytest -m integration`: 6 passed. `licence_check.py`: 44 components, 0 failed. Nothing below is
+marked PASS on the strength of an expected result.
 
 **One correction to how this has been described.** The two High findings do **not** change exit criterion
 4, which is specifically "`code-reviewer` clean on the wave diff" — that reviewer found nothing, and
@@ -153,13 +153,19 @@ PostgreSQL and the API, assert flow continues). It stays open and moves to wave 
 
 ### Invariant 4 — at-least-once, with a documented and tested idempotency technique per loader
 
-**BREACHED BY AN OPEN HIGH FINDING.** `security-reviewer` High 2: the HTTP loader
-(`loaders/http/client.py:53`) uses the default `urllib` opener, so `HTTPRedirectHandler` silently follows
-3xx. A redirected POST becomes a GET with the body dropped, the redirect target's 200 is classified as
-success, and **the offset commits for a message that was never delivered.** That is not an idempotency
-weakness, it is silent message loss — the failure invariant 4 and invariant 1's "never ACK and drop"
-both exist to prevent. Being fixed by `connector-engineer` with a regression test; **blocking condition
-2** in section 8.
+**COVERED — after a High finding that breached it was found and fixed inside the wave.**
+
+`security-reviewer` High 2: the HTTP loader (`loaders/http/client.py:53`) used the default `urllib`
+opener, so `HTTPRedirectHandler` silently followed 3xx. A redirected POST became a GET with the body
+dropped, the redirect target's 200 was classified as success, and **the offset committed for a message
+that was never delivered.** Not an idempotency weakness — silent message loss, the failure invariant 4
+and invariant 1's "never ACK and drop" both exist to prevent.
+
+**Closed at `bec8029`**, confirmed by `security-reviewer` with the mechanism re-derived rather than taken
+on trust: all three consequences verified independently, plus three gap-checks they added themselves —
+the opener correctly drops the redirect handler, TLS verification is preserved, and the module-level
+opener singleton is safe to share. That last one is a defect the fix could plausibly have introduced and
+nobody had asked about, which is what a confirmation pass is for.
 
 Two things worth naming rather than filing. First, the tests that exist are good and could not have
 caught it: `::test_duplicate_delivery_is_harmless` proves the idempotency technique works and
@@ -432,7 +438,17 @@ they are recorded rather than summarised away:
 | `uv.lock`'s 1192 lines are proportionate to 47 real dependencies | A sanity check on dependency creep, though **not** a licence check — see condition 4 in section 8 |
 | `contracts/validate.py` and `tests/conformance` run as **required, non-optional** CI jobs | The two-checker split in 5.1 is only protection if neither job can be skipped |
 
-**`security-reviewer`: 0 Critical, 2 High, 0 Medium, 3 Low. Verdict: gate not passed as of that review.**
+**`security-reviewer`, final: 0 Critical, 0 High, 0 Medium, 3 Low. Gate passes from their side.** The
+first pass found 2 High; both were fixed inside the wave and confirmed closed in a second pass that
+**re-derived the mechanism rather than accepting the commits**. The table below is the first pass with
+dispositions.
+
+**One provenance note, because the reviewer was right to raise it.** `security-reviewer` cannot verify
+that the human actually gave the `certifi` approval on 2026-09-23 — it is outside anything they can
+inspect. **The lead attests to it directly:** they put the question to the human themselves and received
+an explicit approval, which is what was relayed to me and to `devops-engineer`. Recorded as the lead's
+first-hand attestation, not as an inference from the relay chain, because an approval that only exists
+as a forwarded claim is exactly the kind of thing that should not be load-bearing at a gate.
 
 | # | Sev | Finding | Disposition |
 |---|---|---|---|
@@ -555,15 +571,17 @@ contradicts ADR-001.
    group only, never shipped, scoped to the `testcontainers[kafka]` → `docker` → `requests` path and
    recorded as its own approval in ADR-001 2.3. `devops-engineer` landed the `MPL_APPROVED` edit
    (`a35528c`); `licence_check.py` now passes, **44 components, 0 failed**.
-2. **The HTTP loader redirect fix — `connector-engineer`. Fix landed (`bec8029`); AWAITING
-   `security-reviewer`'s confirmation.** Deliberately not marked closed on the strength of the commit
-   existing. The finding had **three** consequences from one default-constructor choice — silent message
-   loss, an unstripped `Authorization` header on redirect, and a TLS-downgrade path around the
-   loopback-only rule — so "the redirect is fixed" and "all three are closed, with no new gap" are
-   different claims. The lead asked the reviewer rather than accepting their own read, which is the right
-   call: the person who verifies a fix should not be the person who wants it to be finished.
+2. ~~**The HTTP loader redirect fix — `connector-engineer`.**~~ **CLOSED.** Fixed at `bec8029` and
+   confirmed by `security-reviewer` with the mechanism re-derived: all three consequences verified
+   independently, plus three self-initiated gap-checks (redirect handler dropped, TLS verification
+   preserved, shared opener singleton safe). It was held open on the commit alone on purpose — "the
+   redirect is fixed" and "all three consequences are closed with no new gap" are different claims, and
+   the second one needed someone other than the author or the lead to make it.
+
+**Still blocking:**
+
 3. **A human pushes `wave/1-1` and the CI integration job goes green.** The only thing that turns
-   criterion 1 from PASS-locally into PASS. Not an agent action. Condition 1 no longer blocks it.
+   criterion 1 from PASS-locally into PASS, and the only remaining condition. Not an agent action.
 
 **Met since the first draft:**
 
@@ -582,18 +600,22 @@ contradicts ADR-001.
 10. An alert on `partition_halted` before the MVP.
 11. The Linux re-run of S1 and S2.
 
-**Why GO WITH CONDITIONS rather than GO:** two High findings are open, one of which is live silent
-message loss in shipped code. The wave is not done under the definition of done, item 6.
+**Why one condition rather than GO outright:** criterion 1 says "in CI", and no CI run exists for this
+branch because nothing has been pushed. That is a fact about the process, not about the code, and a
+skipped check is a FAIL until it runs.
 
-**Why not NO-GO**, which is the judgement worth defending. Neither High requires redesigning anything:
-one is a licensing decision on a dev-only transitive dependency, and the other is a default-constructor
-choice with a one-line fix and a regression test already in flight. That is the Phase 0 distinction
-between a condition and a defect, applied the same way — Phase 0 also carried 2 Highs (a live
-all-interfaces exposure among them) as blocking conditions rather than a NO-GO, and they were closed
-before signing. Against that: every invariant that could be exercised was, the two that could not are
-blocked on components that do not exist yet rather than on anything discovered, `code-reviewer-8` found
-nothing at any severity across the whole diff, and the four contract defects were all found, understood
-and fixed inside the wave.
+**Why not NO-GO, when two Highs were open earlier in this gate.** Neither required redesigning anything:
+one was a licensing decision on a dev-only transitive dependency, the other a default-constructor choice
+with a one-line fix. Both were fixed and independently confirmed inside the wave. That is the Phase 0
+distinction between a condition and a defect, applied the same way — Phase 0 also carried 2 Highs, a live
+all-interfaces exposure among them, as blocking conditions rather than a NO-GO, and closed them before
+signing.
+
+**What the reviews are and are not evidence of.** `code-reviewer-8` found nothing at any severity across
+the whole diff, and `security-reviewer` now reports zero Critical, High and Medium. That is a real
+result. It is not evidence that the wave is defect-free: the first security pass found a live
+message-loss bug in code that had already passed a clean code review, `mypy --strict` and 701 tests.
+Reviews find what they look for.
 
 **The pattern in both Highs is worth more than either fix.** High 2 exists because the loader accepted a
 library default — `urllib`'s redirect handler — and the tests covered the happy path and the duplicate
@@ -618,10 +640,11 @@ refer to nothing at all. Wave 2 should expect the same class of defect and keep 
 | Exit criterion 2 (invariants 1, 2, 3, 5 tested) | **PASS for 1, 2, 5; PARTIAL for 3** |
 | Exit criterion 3 (contracts published and referenced) | **PASS** |
 | Exit criterion 4 (`code-reviewer` clean) | **PASS.** `code-reviewer-8`: APPROVE, zero findings at any severity |
-| Invariants 1-10 | **No change needed to any invariant.** 1, 2, 5, 7 upheld with evidence; 6, 8 upheld in part with named gaps; 3 partial; **4 breached by an open High (silent message loss on redirect)**; 9 not exercised; **10 at risk on an open High (`certifi` MPL-2.0)** |
+| Invariants 1-10 | **No change needed to any invariant.** 1, 2, 4, 5, 7 upheld with evidence; 6, 8 upheld in part with named gaps; 3 partial; 9 not exercised; 10 upheld, with a fourth MPL approval recorded |
 | `code-reviewer-8`, wave diff | **Zero Critical, High, Medium, Low** |
-| `security-reviewer` | **0 Critical, 2 High, 0 Medium, 3 Low.** Own verdict: gate not passed as of that review |
+| `security-reviewer`, final | **0 Critical, 0 High, 0 Medium, 3 Low.** Gate passes from their side. First pass found 2 High; both fixed inside the wave and confirmed closed with the mechanism re-derived |
 | Unresolved Critical | **None** |
-| Unresolved High | **1, awaiting confirmation.** High 1 (`certifi`) **CLOSED** — approved 2026-09-23, `MPL_APPROVED` edit landed (`a35528c`), `licence_check.py` passes 44 components / 0 failed. High 2 (HTTP loader redirect) **fix landed (`bec8029`), open pending `security-reviewer` confirmation** that all three consequences are closed |
-| Gate recommendation | **GO WITH CONDITIONS:** 1 condition closed, 1 awaiting reviewer confirmation, 1 (the CI push) human-only. **Signable once High 2 is confirmed** |
-| Human sign-off | pending — condition 2's confirmation first, then the push |
+| Unresolved High | **None.** High 1 (`certifi`) closed — human-approved 2026-09-23 (lead's first-hand attestation), `MPL_APPROVED` landed at `a35528c`, `licence_check.py` 44 components / 0 failed. High 2 (redirect) closed at `bec8029`, independently confirmed |
+| Unresolved Low | **3**, all tracked in 7.2: two log sites bypassing the guarded logger, no CRL/OCSP for mTLS |
+| Gate recommendation | **GO WITH ONE CONDITION:** a human pushes `wave/1-1` and the CI integration job goes green. Everything an agent can close is closed. 7 items carried to wave 2 |
+| Human sign-off | pending the push |
