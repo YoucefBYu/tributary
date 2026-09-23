@@ -70,6 +70,22 @@ that keeps the exemption honest: a `runnable: true` example whose steps stop res
 `runnable: false` example whose `requires` have all become resolvable also fails, forcing promotion. A
 stale exemption that outlives the gap it describes is indistinguishable from coverage.
 
+Added after `729cdc1`, from their implementation report: a third rule, **at least one entry must be
+`runnable: true`.** They had already asserted it in the test; it belongs in the manifest because a
+corpus where every example is exempt no longer demonstrates that any channel spec can be executed at
+all, and would go green saying so. That is the same failure shape as the other two rules, so it should
+survive a rewrite of the test that currently enforces it.
+
+**Recorded in `contracts/README.md`: the two-checker split is structural and must not be merged.**
+`validate.py` and `tests/conformance` answer whether a document is well-formed and fails for its
+documented reason; the corpus test in `tributary-runtime` answers whether the things a document *names*
+resolve. Neither could have caught the walking-skeleton defect alone and neither can catch the next one
+alone — name resolution needs a runtime, and running on a clean clone before `uv sync` is the whole
+reason the standalone checker exists. Three of the four wave-1 contract defects were found by an
+implementer rather than by any checker, all the same shape: internally valid, referring to something
+that did not exist. **A green conformance run means the contracts are self-consistent, not that they
+agree with the code.**
+
 ## 2026-09-23 (W1-4 follow-up) — the ordinary reject shape, so records stop being over-quarantined
 
 `platform-engineer` reported that section 2.3's ordinary reject path is unimplemented: every decode

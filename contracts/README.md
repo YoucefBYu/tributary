@@ -81,6 +81,28 @@ it are predictions, and the point of the mode is that nobody has to accept a pre
 tool ever prints an instance or part of one — a contract example is record-shaped, so that is a PHI
 rule (invariant 6), not a style one.
 
+### Two checkers, and the split is structural — do not merge them
+
+A third checker sits outside `contracts/`: the schema-corpus test in `tributary-runtime`, which loads
+the channel-spec examples and resolves the steps they name.
+
+| Checker | Answers | Cannot answer |
+|---|---|---|
+| `contracts/validate.py` and `tests/conformance` | Is the document well-formed, and does each invalid example fail for its documented reason? | Whether anything the document *names* exists — it has only `jsonschema` and no installed distribution |
+| Corpus test in `tributary-runtime` | Do the steps an example names actually resolve? | Nothing, on a clean clone: it needs the workspace installed |
+
+**Neither could have caught the wave-1 walking-skeleton defect alone, and neither can catch the next
+one alone.** A channel spec referencing `adt_flow.steps.passthrough` — a package nothing in the repo
+publishes — was schema-valid and unrunnable, and `validate.py` was green throughout. That is a property
+of the problem, not a gap to close: name resolution needs a runtime, and running on a clean clone before
+`uv sync` is why the standalone checker exists at all. Recorded here because the obvious later
+"simplification" is to merge them, which would quietly drop one of the two questions.
+
+Three of the four contract defects found during wave 1 were found by an implementer rather than by any
+checker, all with the same shape: the document was internally valid and referred to something that did
+not exist. So **a green conformance run means the contracts are self-consistent, not that they agree
+with the code.**
+
 **Status: `validate.py` 102 / 0 and `pytest tests/conformance` 106 passed, 2026-09-23.** The two
 counts differ because `validate.py` counts examples across all four contracts while pytest counts
 test cases including its own meta-tests.
