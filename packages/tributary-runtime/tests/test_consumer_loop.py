@@ -59,6 +59,19 @@ class ScriptedHandler:
             raise self.error
 
 
+class PerPartitionHandler:
+    """Fails every record from `failing_partition`, succeeds everywhere else."""
+
+    def __init__(self, failing_partition: int) -> None:
+        self.failing_partition = failing_partition
+        self.seen: list[tuple[int, int]] = []
+
+    def handle(self, record: ConsumedRecord) -> None:
+        self.seen.append((record.partition, record.offset))
+        if record.partition == self.failing_partition:
+            raise DeliveryError("HTTP_503", retryable=True)
+
+
 class RecordingDlq:
     def __init__(self) -> None:
         self.dead: list[tuple[str, str]] = []
@@ -215,6 +228,72 @@ def test_a_paused_partition_yields_nothing_until_the_backoff_elapses() -> None:
 
     assert handler.seen == [0], "a partition in backoff must not deliver anything, including later offsets"
     assert consumer.resume_calls == []
+
+
+def test_a_paused_partition_does_not_stop_the_others() -> None:
+    """The difference between blocking retry and stopping the channel (ADR-003 D7).
+
+    A destination failure pauses **one** partition. The rest keep flowing, which is why a cooperative
+    design can afford to preserve order by stopping: an ADT backlog for one patient does not become an
+    outage for every other patient on the topic. Nothing tested this before — the retry tests were all
+    single-partition, so a loop that paused the *consumer* rather than the partition would have passed
+    every one of them.
+    """
+    consumer = FakeConsumer()
+    for offset in range(2):
+        consumer.append(record(offset, partition=0))
+    for offset in range(3):
+        consumer.append(record(offset, partition=1))
+    clock = Clock()
+    handler = PerPartitionHandler(failing_partition=0)
+    loop, events = build(consumer, handler, commit_every=1, clock=clock)
+
+    loop.run(max_iterations=6)
+
+    # Partition 0 failed once and is in backoff; partition 1 was delivered and committed in the SAME run.
+    assert (TOPIC, 0) in consumer.paused
+    assert consumer.pause_calls == [(TOPIC, 0)], "only the failing partition is paused, never the consumer"
+    delivered_from_one = [offset for partition, offset in handler.seen if partition == 1]
+    assert delivered_from_one == [0, 1, 2], "the healthy partition drained while the other sat in backoff"
+    committed_one = [entry for commit in consumer.committed for entry in commit if entry[1] == 1]
+    assert committed_one, "and its offsets were committed, not held behind the paused partition"
+    assert not [entry for commit in consumer.committed for entry in commit if entry[1] == 0], (
+        "the paused partition commits nothing: its record has not been delivered"
+    )
+    assert events.stages().count("partition_paused") == 1
+
+
+def test_the_paused_partition_resumes_and_catches_up_without_disturbing_the_other() -> None:
+    """The other half of the same claim: pausing one partition is temporary and scoped."""
+    consumer = FakeConsumer()
+    consumer.append(record(0, partition=0))
+    consumer.append(record(0, partition=1))
+    clock = Clock()
+
+    class FailsOnceOnPartitionZero:
+        def __init__(self) -> None:
+            self.seen: list[tuple[int, int]] = []
+            self.failed = False
+
+        def handle(self, record: ConsumedRecord) -> None:
+            self.seen.append((record.partition, record.offset))
+            if record.partition == 0 and not self.failed:
+                self.failed = True
+                raise DeliveryError("HTTP_503", retryable=True)
+
+    handler = FailsOnceOnPartitionZero()
+    loop, events = build(consumer, handler, commit_every=1, clock=clock)
+
+    loop.run(max_iterations=3)
+    assert (0, 0) in handler.seen and (1, 0) in handler.seen
+
+    clock.advance(1.0)
+    loop.run(max_iterations=3)
+
+    assert handler.seen.count((0, 0)) == 2, "the failed record is redelivered after the backoff"
+    assert handler.seen.count((1, 0)) == 1, "the healthy partition is not replayed by the other's retry"
+    assert events.stages().count("partition_resumed") == 1
+    assert consumer.paused == set()
 
 
 def test_backoff_grows_exponentially_and_is_capped_and_jittered() -> None:
