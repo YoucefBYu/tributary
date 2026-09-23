@@ -1,0 +1,21 @@
+{
+  "v": 0,
+  "kind": "message",
+  "ts": "2026-09-23T08:41:19.320Z",
+  "channel": "adt-to-fhir",
+  "channel_version": 7,
+  "stage": "queued",
+  "status": "error",
+  "instance": "worker:pipeline-2@worker-4",
+  "message_id": "018f3a5c-7d21-7b3e-9f01-2c4a6e8b0d13",
+  "attempt": 0,
+  "content_type": "application/octet-stream",
+  "size_bytes": 1180,
+  "topic": "prod.adt-to-fhir.dlq",
+  "partition": 1,
+  "offset": 77,
+  "error_code": "HEADER_PARSE_ERROR",
+  "error_message": "unparseable header values normalised on reject: tb-attempt",
+  "traceparent": "00-9d8c7b6a5f4e3d2c1b0a998877665544-0a1b2c3d4e5f6071-01",
+  "attrs": { "bad_header": "tb-attempt" }
+}

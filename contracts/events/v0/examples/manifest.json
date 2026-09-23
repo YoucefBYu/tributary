@@ -12,6 +12,7 @@
     { "file": "valid/claim-checked-received.json", "note": "Claim-check: size_bytes 0 plus a URI" },
     { "file": "valid/partition-paused.json", "note": "Blocking retry paused a partition; triggering message id included" },
     { "file": "valid/partition-resumed.json", "note": "Partition resumed; duration_ms is the outage length" },
+    { "file": "valid/reject-header-parse-error.json", "note": "Ordinary reject (envelope 2.3.1): identity was readable, one non-identity header was malformed and has been normalised on the DLQ record. attrs.bad_header names the offending header, which is safe because only REGISTERED header names can trigger a parse reject - the names are ours, the values are the sender's" },
     { "file": "valid/record-quarantined.json", "note": "kind=record: a record whose headers could not be decoded, identified by topic/partition/offset. message_id is the id minted for the DLQ quarantine wrapper, never a value read out of the broken record" }
   ],
   "invalid": [

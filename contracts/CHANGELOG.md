@@ -3,6 +3,50 @@
 Newest first. Each entry names the contract, the version, whether the change is additive or
 breaking, and the reason. Breaking changes reference an ADR.
 
+## 2026-09-23 (W1-4 follow-up) — the ordinary reject shape, so records stop being over-quarantined
+
+`platform-engineer` reported that section 2.3's ordinary reject path is unimplemented: every decode
+failure becomes a full `RECORD_UNDECODABLE` quarantine, even when identity is perfectly readable and
+one non-identity header is malformed. They were right not to guess — a `dlq` record must carry a
+schema-valid core header set and the offending header is part of it, so producing it verbatim fails
+conformance. The contract owed them a rule for the bad value. Additive; no schema change.
+
+**New envelope section 2.3.1.** The discriminator is identity, and identity is `tb-msg-id`: present,
+decodable and a valid UUIDv7 means an ordinary reject that keeps the record's own identity; absent,
+undecodable or not a UUIDv7 means quarantine. A third trigger was found while writing it — **a
+malformed `tb-claim-check` quarantines regardless of `tb-msg-id`**, because the payload lives elsewhere
+and the pointer to it is the broken part, so normalising would produce a perfectly conformant record
+whose bytes cannot be found.
+
+**An ordinary reject normalises and does not preserve the bad value**, with a placeholder pinned per
+header (`tb-attempt` → `"0"`, `tb-content-type` → `application/octet-stream`, `tb-channel` and
+`tb-channel-version` from the subscription and applied spec, `tb-source` the rejecting component,
+`tb-received-at` the reject time, `traceparent` a new trace, optional headers dropped).
+
+Why normalise rather than copy, which is also **the asymmetry with quarantine** and the reason the two
+shapes exist: the original is still on the source topic at a known offset, so a reject needs the record
+to stay findable, not duplicated. Quarantine copies because an unidentifiable record cannot be looked up
+by message id at all, and because `dlq` retention (30 d) outlives `raw` (7 d), so a pointer expires
+before a late investigation reaches it.
+
+**Normalising is silent, so the event must not be.** A reject record with `tb-attempt: "0"` is
+indistinguishable from a first attempt, so the `error` event carries `attrs.bad_header`. Header *names*
+are safe to record where values are not: a consumer must ignore unrecognised headers, so only
+registered names can trigger a parse reject — the names are ours, the values are the sender's. New
+example `events valid/reject-header-parse-error.json`. **Not schema-enforceable** — a normalised reject
+is structurally identical to an ordinary `dlq` record, which is what normalising is for — so it is a
+code rule needing a unit test per placeholder.
+
+Two smaller items from the same report:
+
+| Item | Decision |
+|---|---|
+| Header-name fidelity in the quarantine blob | **Documented as a client limitation, in 5.2.1.** `confluent-kafka` hands header names to Python already decoded as `str` with no API for the wire bytes, so a non-UTF-8 name cannot be preserved byte for byte; `surrogateescape` round-trips what the client decoded, **not necessarily what arrived**. Values are exact. So a blob header name is evidence of what the client saw, not proof of what was sent, and must not be treated as authoritative in a forensic review. Marked **assumption, unverified** — nobody has tested a non-UTF-8 name end to end |
+| A finer log-only `reason_code` below the contract code | **Allowed, with two limits** (2.3): never in an envelope header or an event, and **nothing may alert or dashboard on it.** A log-only taxonomy that operations depends on has become a contract nobody reviewed. If one becomes load-bearing it comes to the architect and becomes a real `tb-error-code` |
+
+Byte order confirmed: `platform-engineer`'s implementation is big-endian (`struct.pack(">I", ...)`),
+matching what 5.2.1 pins. Contract and code agree; no churn.
+
 ## 2026-09-22 (W1-4 implementation) — quarantine blob framing, the original key, and a stage that stops being a guess
 
 Three items `platform-engineer` raised while implementing quarantine (`a96edb1`). All **additive**;

@@ -161,9 +161,9 @@ a deliberately malformed record from a compromised writer all look the same at t
 | UUID (`tb-msg-id`, `tb-correlation-id`, `tb-parent-id`) | Same, against the canonical form. |
 | Enumerated (`tb-stage`, `tb-content-type`, `tb-error-code`) | An unknown value is not a parse failure — see "lenient consumers" in 1.2. Do not reject a record for a `tb-stage` value from a newer producer. |
 
-**Reject** means: do not process the record, route it to `dlq` with `tb-stage` set to the stage that
-read it and `tb-error-code: HEADER_PARSE_ERROR`, emit an `error` event, and commit the offset. It
-does **not** mean an unhandled exception, and it does not mean skipping the record silently.
+**Reject** means: do not process the record, route it to `dlq`, emit an `error` event, and commit the
+offset. It does **not** mean an unhandled exception, and it does not mean skipping the record
+silently. There are two shapes of reject, and 2.3.1 says which applies.
 
 Three consequences that are easy to get wrong:
 
@@ -191,6 +191,59 @@ A rise in `HEADER_PARSE_ERROR` points at one producer's field; a rise in `RECORD
 at framing, corruption or someone writing to the topic. Collapsing them hides the second behind the
 first. Other codes are chosen by the component that raises them, within `^[A-Z][A-Z0-9_]{0,63}$`;
 there is deliberately no central registry to keep in sync.
+
+A component MAY keep a finer internal reason code (`HEADER_NOT_TEXT`, `ENVELOPE_INVALID`) for its own
+log line, below the contract code. Two limits: it MUST NOT appear in an envelope header or an event,
+and **nothing may alert or dashboard on it.** A log-only taxonomy that operations comes to depend on
+has become a contract nobody reviewed. If one of those codes turns out to be operationally
+load-bearing, bring it to the architect and it becomes a real `tb-error-code`.
+
+### 2.3.1 The two reject shapes, and what a reject does with the bad value
+
+**The discriminator is identity, and identity is `tb-msg-id`.**
+
+| Condition | Shape |
+|---|---|
+| `tb-msg-id` is present, decodable and a valid UUIDv7 | **Ordinary reject.** The record keeps its own identity. `tb-error-code: HEADER_PARSE_ERROR`, `tb-stage` = the stage that read it. |
+| `tb-msg-id` is absent, undecodable or not a valid UUIDv7 | **Quarantine** (section 5.2). Nothing about the record is trustworthy. `tb-error-code: RECORD_UNDECODABLE`, `tb-stage: quarantined`. |
+| `tb-claim-check` is undecodable or malformed, whatever `tb-msg-id` says | **Quarantine.** The payload lives elsewhere and the pointer to it is the broken part, so normalising would produce a conformant record whose bytes cannot be found. The blob preserves the malformed URI for a human to repair. |
+
+**An ordinary reject normalises the malformed header. It does not preserve the bad value anywhere in
+the envelope.**
+
+| Malformed header | Value on the reject record |
+|---|---|
+| `tb-channel` | The channel the consumer is subscribed to. Known from the subscription, not from the record. |
+| `tb-channel-version` | The applied spec version, known from `_tb.<env>.channels`. |
+| `tb-source` | The **rejecting** component and instance. Not the original peer, which is no longer trustworthy. |
+| `tb-received-at` | The reject time. Same caveat as a quarantine wrapper: end-to-end latency for this record is meaningless and must not be computed. |
+| `tb-content-type` | `application/octet-stream`. |
+| `tb-attempt` | `"0"`. |
+| `traceparent` | A **new** trace. An unparseable trace context cannot be continued, and inventing a parent id would corrupt an unrelated trace. The event links the record by `message_id`. |
+| Any optional header (`tb-correlation-id`, `tb-parent-id`, `tb-destination`, `tb-retry-not-before`) | **Dropped.** |
+
+**Why normalise rather than preserve.** The original record is still on the topic it was read from, at
+a known partition and offset, for that topic's retention. A reject does not need to copy the bytes to
+keep them; it needs the record to stay findable, and the event carries enough to find it. Copying them
+would mean either an invalid header value on the DLQ, which fails conformance, or a second blob format
+for a case that does not need one.
+
+**That is the asymmetry with quarantine, which does copy**, and the two reasons are why the shapes
+differ at all: an unidentifiable record cannot be looked up by message id in the browser, so the bytes
+are the only handle on it; and `dlq` retention (30 d) outlives `raw` (7 d), so a pointer expires before
+a late investigation gets to it.
+
+**Normalising is silent unless the event says otherwise, so the event must say.** A reject record with
+`tb-attempt: "0"` is indistinguishable from a first attempt. The `error` event therefore carries an
+`attrs` entry `bad_header` naming an offending header, and `error_message` may name all of them.
+Header **names** are safe to record where values are not: a consumer must ignore headers it does not
+recognise (section 1.2), so the only headers that can trigger a parse reject are registered ones from
+the closed set in section 3. The names are ours; the values are the sender's.
+
+**None of this is schema-enforceable**, because a normalised reject record is structurally identical to
+an ordinary `dlq` record — which is exactly what normalising is for. It is a code rule needing a unit
+test per placeholder, in the same category as the rules in 5.2.1 and in the channel-spec contract's
+section 6.
 
 ### 2.4 Known envelope drift in Phase 0 code — do not reproduce
 
@@ -405,6 +458,20 @@ payload                                  to the end of the record value
   what makes this safe to pin now.
 - Names and values are **raw bytes, not text.** They are what could not be decoded; re-encoding them
   would destroy the evidence the blob exists to preserve.
+
+**Fidelity limit on header names, and it is a client limitation rather than a choice.** `confluent-kafka`
+hands header *names* to Python already decoded as `str`, with no API for the bytes that were on the
+wire. A name that was not valid UTF-8 therefore cannot be written to the blob byte for byte; the
+practical approach is to re-encode with `surrogateescape`, which round-trips whatever the client
+decoded — **not necessarily what arrived.** Header *values* are untouched bytes and are exact. So for
+values 5.2.1 is literally true, and for names it is true only as far as the client allows.
+
+Consequences to state rather than discover: a blob header name is evidence of what the client saw, not
+proof of what was sent, so it must not be treated as authoritative in a forensic review; and the common
+undecodable cases — framing damage and value corruption — are unaffected, because they do not turn on
+name bytes. **Assumption, unverified:** nobody has tested a non-UTF-8 header name end to end. Raised by
+`platform-engineer` while implementing, and documented rather than worked around, which was the right
+call — a client limitation hidden behind a conformant-looking blob is worse than one written down.
 
 Two consumer rules:
 
