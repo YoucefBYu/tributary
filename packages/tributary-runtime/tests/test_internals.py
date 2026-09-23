@@ -17,6 +17,7 @@ from tributary.runtime.logs import JsonLogger
 from tributary.runtime.records import (
     RECORD_UNDECODABLE,
     ConsumedRecord,
+    DecodeContext,
     RecordDecodeError,
     apply_usr_headers,
     decode_record,
@@ -137,24 +138,28 @@ def test_a_well_formed_record_decodes() -> None:
     ("mutate", "reason"),
     [
         (lambda hs: [(name, value) for name, value in hs if name != h.TB_MSG_ID], "ENVELOPE_INVALID"),
-        (lambda hs: [*hs, (h.TB_ATTEMPT, b"1_0")], "ENVELOPE_INVALID"),
-        (lambda hs: [*hs, (h.TB_CHANNEL_VERSION, b"one")], "ENVELOPE_INVALID"),
         (lambda hs: [*hs, (h.TB_MSG_ID, b"not-a-uuid7")], "ENVELOPE_INVALID"),
         (lambda hs: [*hs, (h.TB_CHANNEL, bytes([0xFF, 0xFE]))], "HEADER_NOT_TEXT"),
     ],
 )
-def test_a_malformed_record_is_a_typed_reject_with_a_dlq_code(mutate: object, reason: str) -> None:
+def test_an_unidentifiable_record_quarantines_with_one_contract_code(mutate: object, reason: str) -> None:
     """One contract code out (`RECORD_UNDECODABLE`), a finer reason code for the log line.
 
-    The envelope schema keys its quarantine rules on `tb-error-code: RECORD_UNDECODABLE`, so that is
-    what reaches the wrapper and the event; the reason distinguishes "a header is not text" from "the
-    envelope is unusable" for whoever reads the log.
+    Only records whose **identity** is unusable land here; a malformed `tb-attempt` on an identifiable
+    record is an ordinary reject and is covered in `test_reject.py` — a decode context is what separates
+    the two, so this test passes one deliberately rather than relying on the no-context fallback.
     """
     message = make_message(b"synthetic", key=b"K")
     headers = mutate(raw_headers(message))  # type: ignore[operator]
     with pytest.raises(RecordDecodeError) as caught:
         decode_record(
-            topic="dev.adt-passthrough.raw", partition=0, offset=1, key=b"K", value=b"synthetic", headers=headers
+            topic="dev.adt-passthrough.raw",
+            partition=0,
+            offset=1,
+            key=b"K",
+            value=b"synthetic",
+            headers=headers,
+            context=DecodeContext(channel="adt-passthrough", channel_version=1, source="worker:test@localhost"),
         )
     assert caught.value.error_code == RECORD_UNDECODABLE
     assert caught.value.reason_code == reason

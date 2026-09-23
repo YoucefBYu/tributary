@@ -45,7 +45,7 @@ from tributary.sdk.context import Logger
 from .errors import DeliveryError
 from .events import EventEmitter, MessageEvent, PartitionEvent, RecordEvent
 from .executor import StepFailure
-from .records import ConsumedRecord, RecordDecodeError, decode_record
+from .records import ConsumedRecord, DecodeContext, RecordDecodeError, RecordRejectError, decode_record
 from .spec import RetryPolicy
 
 #: librdkafka's "reached the end of this partition" signal. Informational, not an error.
@@ -130,6 +130,7 @@ class LoopStats:
     retried: int = 0
     dead_lettered: int = 0
     quarantined: int = 0
+    rejected: int = 0
     commits: int = 0
     pauses: int = 0
     resumes: int = 0
@@ -170,6 +171,7 @@ class ConsumerLoop:
         instance: str,
         dlq: DlqWriter | None = None,
         destination: str | None = None,
+        read_stage: str = "queued",
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._consumer = consumer
@@ -184,6 +186,10 @@ class ConsumerLoop:
         self._instance = instance
         self._dlq = dlq
         self._destination = destination
+        #: The stage stamped on an ordinary reject: `queued` for a worker reading `raw`, `pending` for a
+        #: loader reading `out.<dest>` (envelope 2.3.1). A **quarantine** wrapper ignores this and is
+        #: always `quarantined`, because that record never reached any stage.
+        self._read_stage = read_stage
         self._clock = clock
         self._retry_state: dict[Key, RetryState] = {}
         self._since_commit = 0
@@ -261,7 +267,15 @@ class ConsumerLoop:
                 key=raw.key(),
                 value=raw.value(),
                 headers=raw.headers(),
+                context=DecodeContext(
+                    channel=self._channel,
+                    channel_version=self._channel_version,
+                    source=self._instance,
+                ),
             )
+        except RecordRejectError as exc:
+            self._reject(exc)
+            return
         except RecordDecodeError as exc:
             self._quarantine(raw, topic, partition, offset, exc)
             return
@@ -449,6 +463,54 @@ class ConsumerLoop:
             )
         )
         self._retry_state.pop((record.topic, record.partition), None)
+        self._mark((record.topic, record.partition), record.offset)
+
+    def _reject(self, exc: RecordRejectError) -> None:
+        """An ordinary reject: identity intact, one or more other registered headers malformed.
+
+        The normalised record goes to the DLQ keeping its own `tb-msg-id` and the reading stage, and the
+        bad values are not preserved — the original is still on the source topic at a known offset, so a
+        reject needs the record findable rather than duplicated (envelope 2.3.1).
+
+        **Normalising is silent, so the event is not.** A reject record with `tb-attempt: "0"` is
+        indistinguishable from a genuine first attempt, so the event names the offending headers. Names
+        are safe where values are not: only registered names from the closed set can trigger a reject,
+        so the names are ours and the values are the sender's.
+        """
+        record = exc.record
+        if self._dlq is None:
+            raise DeliveryError(exc.error_code, retryable=False, detail="no DLQ configured")
+        self._dlq.dead_letter(record, error_code=exc.error_code, stage=self._read_stage)
+        self.stats.rejected += 1
+        self.stats.dead_lettered += 1
+        self._emitter.emit(
+            MessageEvent(
+                stage="error",
+                status="error",
+                channel=self._channel,
+                channel_version=self._channel_version,
+                instance=self._instance,
+                message_id=record.msg_id or "",
+                destination=self._destination,
+                topic=record.topic,
+                partition=record.partition,
+                offset=record.offset,
+                error_code=exc.error_code,
+                error_message=f"malformed headers normalised: {', '.join(exc.bad_headers)}"[:512],
+                traceparent=record.message.traceparent,
+                attrs={"bad_header": exc.bad_headers[0]},
+            )
+        )
+        self._log.warning(
+            "record_rejected",
+            channel=self._channel,
+            topic=record.topic,
+            partition=record.partition,
+            offset=record.offset,
+            message_id=record.msg_id,
+            error_code=exc.error_code,
+            bad_headers=",".join(exc.bad_headers),
+        )
         self._mark((record.topic, record.partition), record.offset)
 
     def _quarantine(self, raw: Any, topic: str, partition: int, offset: int, exc: RecordDecodeError) -> None:

@@ -16,7 +16,7 @@ import re
 from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime
 
-from .errors import HeaderValueError, MissingHeaderError
+from .errors import HeaderError, HeaderValueError, MissingHeaderError
 
 TB_MSG_ID = "tb-msg-id"
 TB_CHANNEL = "tb-channel"
@@ -78,6 +78,30 @@ _TIMESTAMP = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\.(\d{3,9})(Z|\+
 _UUID_ANY = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12}$")
 _UUID7 = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 _TRACEPARENT = re.compile(r"^00-(?![0]{32})[0-9a-f]{32}-(?![0]{16})[0-9a-f]{16}-[0-9a-f]{2}$")
+_CLAIM_CHECK = re.compile(r"^(s3|gs|az|https)://[A-Za-z0-9._-]{1,253}(:[0-9]{2,5})?(/[A-Za-z0-9._-]{1,128}){1,16}$")
+_CHANNEL_NAME = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
+_DESTINATION_NAME = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
+_SOURCE = re.compile(r"^[A-Za-z0-9._:@/=\[\]-]{1,253}$")
+_CONTENT_TYPE = re.compile(r"^[a-z]+/[a-zA-Z0-9.+_-]+( *; *[a-zA-Z0-9._-]+=[^;]{1,64})*$")
+_ERROR_CODE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+
+#: The `tb-stage` enum from the envelope contract's section 3 stage definition.
+STAGES: frozenset[str] = frozenset(
+    {
+        "received",
+        "queued",
+        "filtered",
+        "transformed",
+        "routed",
+        "pending",
+        "sent",
+        "retrying",
+        "replied",
+        "error",
+        "dlq",
+        "quarantined",
+    }
+)
 
 
 def decode_headers(raw: Iterable[tuple[str, bytes | str | None]]) -> dict[str, str]:
@@ -176,6 +200,27 @@ def parse_timestamp(name: str, value: str | None) -> datetime:
     return parsed
 
 
+def parse_claim_check(name: str, value: str | None) -> str:
+    """Validate a `tb-claim-check` locator and return it unchanged.
+
+    The pattern is the contract's: scheme, host or bucket, optional port, path segments — and **no query
+    string, no fragment, no userinfo**. A presigned URL carries its signature in the query string and an
+    embedded `user:password@host` carries credentials in userinfo, and this value is persisted to Kafka,
+    copied into `_tb.events`, written to ClickHouse and rendered in the browser, so either one would
+    become a stored, replayable credential that outlives its own expiry in backups (envelope 5.1).
+    """
+    if value is None:
+        raise MissingHeaderError(name)
+    if not isinstance(value, str) or not _CLAIM_CHECK.match(value):
+        length = len(value) if isinstance(value, str) else None
+        raise HeaderValueError(
+            name,
+            "value must be an opaque object locator with no query string, fragment or userinfo",
+            value_length=length,
+        )
+    return value
+
+
 def parse_traceparent(name: str, value: str | None) -> str:
     """Validate a W3C `traceparent` (version 00, non-zero trace and span ids) and return it unchanged."""
     if value is None:
@@ -197,6 +242,43 @@ def format_timestamp(moment: datetime) -> str:
     if moment.tzinfo is None:
         raise HeaderValueError("<timestamp>", "datetime must be timezone-aware")
     return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.") + f"{moment.microsecond // 1000:03d}Z"
+
+
+def is_well_formed(name: str, value: str) -> bool:
+    """True when a registered header's value satisfies the contract's pattern for it.
+
+    Total and never raising: a caller deciding whether to reject a record needs a verdict per header,
+    not an exception per header. Unregistered names return `True` — a consumer must not reject a record
+    for a header it does not recognise (envelope contract 1.2).
+    """
+    try:
+        if name in INTEGER_HEADERS:
+            parse_int(name, value)
+        elif name in TIMESTAMP_HEADERS:
+            parse_timestamp(name, value)
+        elif name == TB_MSG_ID:
+            parse_uuid(name, value, version7=True)
+        elif name in (TB_CORRELATION_ID, TB_PARENT_ID):
+            parse_uuid(name, value)
+        elif name == TRACEPARENT:
+            parse_traceparent(name, value)
+        elif name == TB_CLAIM_CHECK:
+            parse_claim_check(name, value)
+        elif name == TB_CHANNEL:
+            return bool(_CHANNEL_NAME.match(value))
+        elif name == TB_DESTINATION:
+            return bool(_DESTINATION_NAME.match(value))
+        elif name == TB_SOURCE:
+            return bool(_SOURCE.match(value))
+        elif name == TB_CONTENT_TYPE:
+            return len(value) <= 255 and bool(_CONTENT_TYPE.match(value))
+        elif name == TB_ERROR_CODE:
+            return bool(_ERROR_CODE.match(value))
+        elif name == TB_STAGE:
+            return value in STAGES
+    except HeaderError:
+        return False
+    return True
 
 
 def usr_name(name: str) -> str:

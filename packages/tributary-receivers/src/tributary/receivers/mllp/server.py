@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import ssl
 import time
 from typing import Any
@@ -223,6 +224,26 @@ async def serve_from_channel_spec(
         publisher.close()
 
 
+def emit_lite_profile_warning(*, profile: str) -> None:
+    """`contracts/topics/v0` README 3.8 / `topic-defaults.json` `profiles.lite`: RF=1
+    (`min.insync.replicas: 1`) cannot guarantee RPO=0 for an acknowledged message. Every data-plane
+    component must emit this, unsuppressed, at startup when running against a lite deployment —
+    `deploy/compose/topic-bootstrap/bootstrap_topics.py` emits its own copy for the topic-creation
+    job; this is the receiver's (`tributary-loaders.http.main` carries the loader's)."""
+    if profile != "lite":
+        return
+    print(
+        json.dumps(
+            {
+                "event": "lite_profile_active",
+                "detail": "RF=1, min.insync.replicas=1: no RPO=0 guarantee for an acknowledged message "
+                "(contracts/topics/v0/topic-defaults.json profiles.lite)",
+            }
+        ),
+        flush=True,
+    )
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--channel-spec", required=True, help="path to a contracts/channel-spec/v0 JSON document")
@@ -231,7 +252,14 @@ def main() -> None:
     p.add_argument("--instance", default="mllp-0", help="this process's identity, for tb-source")
     p.add_argument("--secrets-dir", help="overrides TB_SECRETS_DIR / the default secrets mount")
     p.add_argument("--metrics-file")
+    p.add_argument(
+        "--profile",
+        default=os.environ.get("TB_PROFILE", "lite"),
+        choices=["lite", "production"],
+        help="topic-defaults.json profile in use; 'lite' emits the mandatory RF=1 startup warning",
+    )
     a = p.parse_args()
+    emit_lite_profile_warning(profile=a.profile)
     with open(a.channel_spec, encoding="utf-8") as f:
         spec = json.load(f)
     resolver = DirSecretResolver(a.secrets_dir) if a.secrets_dir else None

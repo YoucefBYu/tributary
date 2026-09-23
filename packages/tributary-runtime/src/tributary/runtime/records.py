@@ -8,12 +8,14 @@ that produces a DLQ record and a lifecycle event, never an exception that kills 
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 from tributary.sdk import Message
 from tributary.sdk import headers as h
 from tributary.sdk.errors import HeaderError, TributaryError
+from tributary.sdk.ids import new_traceparent
 
 RawHeaders = Sequence[tuple[str, bytes | None]] | None
 
@@ -60,6 +62,41 @@ class ConsumedRecord:
         return self.message.get(h.TB_MSG_ID)
 
 
+#: The contract code for the ordinary reject path (envelope 2.3.1): one malformed header on a record
+#: whose identity is intact. Distinct from `RECORD_UNDECODABLE` on purpose — see that constant.
+HEADER_PARSE_ERROR = "HEADER_PARSE_ERROR"
+
+
+@dataclass(frozen=True, slots=True)
+class DecodeContext:
+    """What the consumer knows independently of the record, and therefore what a reject normalises to.
+
+    Every value here comes from the subscription, the applied spec or this component — never from the
+    record, whose headers are the thing under suspicion (envelope 2.3.1).
+    """
+
+    channel: str
+    channel_version: int
+    source: str
+
+
+class RecordRejectError(TributaryError):
+    """One or more registered headers were malformed on a record whose identity is intact.
+
+    Carries the **normalised** record: the offending headers replaced by the contract's placeholders,
+    or dropped when optional. The bad values are not preserved anywhere in the envelope — the original
+    record is still on the topic it was read from at a known offset, so a reject needs the record to
+    stay findable, not copied (envelope 2.3.1). `bad_headers` names them for the event, which is the
+    only place the silence is broken; header names are ours, values are the sender's.
+    """
+
+    def __init__(self, record: ConsumedRecord, bad_headers: tuple[str, ...]) -> None:
+        super().__init__(f"{HEADER_PARSE_ERROR}: {', '.join(bad_headers)}")
+        self.record = record
+        self.bad_headers = bad_headers
+        self.error_code = HEADER_PARSE_ERROR
+
+
 def decode_record(
     *,
     topic: str,
@@ -68,8 +105,19 @@ def decode_record(
     key: bytes | None,
     value: bytes | None,
     headers: RawHeaders,
+    context: DecodeContext | None = None,
 ) -> ConsumedRecord:
-    """Build a `ConsumedRecord`, or raise `RecordDecodeError` with a DLQ-ready code."""
+    """Build a `ConsumedRecord`, or raise the right kind of reject (envelope 2.3.1).
+
+    * `RecordDecodeError` (`RECORD_UNDECODABLE`) — nothing about the record is trustworthy: the headers
+      are not text, or `tb-msg-id` is absent or not a valid UUIDv7, or `tb-claim-check` is malformed.
+      The caller quarantines it.
+    * `RecordRejectError` (`HEADER_PARSE_ERROR`) — identity is intact and some other registered header
+      is malformed. The caller dead-letters the normalised record it carries.
+
+    Without a `context` the normalising branch cannot run (it has no channel or version to normalise to),
+    so every malformed header is treated as undecodable. Callers in the data plane always pass one.
+    """
     try:
         decoded = h.decode_headers(headers or [])
     except HeaderError as exc:
@@ -78,20 +126,79 @@ def decode_record(
         ) from exc
 
     message = Message(headers=decoded, payload=value, key=key)
-    _require_usable(message)
-    return ConsumedRecord(topic=topic, partition=partition, offset=offset, message=message)
+
+    # Identity first: it is the discriminator between the two shapes.
+    if not h.is_well_formed(h.TB_MSG_ID, decoded.get(h.TB_MSG_ID, "")):
+        raise RecordDecodeError("ENVELOPE_INVALID", "tb-msg-id is absent or not a valid UUIDv7")
+
+    # Then the claim check, which quarantines whatever the identity says: the payload lives in the
+    # object store and the pointer to it is the broken part, so a normalised record would be perfectly
+    # conformant and its bytes unfindable — silent loss that passes every other check.
+    claim_check = decoded.get(h.TB_CLAIM_CHECK)
+    if claim_check is not None and not h.is_well_formed(h.TB_CLAIM_CHECK, claim_check):
+        raise RecordDecodeError("CLAIM_CHECK_INVALID", "tb-claim-check is malformed; the payload is unfindable")
+
+    bad = _malformed_headers(decoded)
+    if not bad:
+        return ConsumedRecord(topic=topic, partition=partition, offset=offset, message=message)
+
+    if context is None:
+        raise RecordDecodeError("ENVELOPE_INVALID", "a registered header is malformed and no decode context was given")
+
+    normalised = _normalise(message, bad, context)
+    raise RecordRejectError(ConsumedRecord(topic=topic, partition=partition, offset=offset, message=normalised), bad)
 
 
-def _require_usable(message: Message) -> None:
-    """The minimum a worker needs to route, retry and report a record.
+#: Required headers and the placeholder a reject substitutes, per the table in envelope 2.3.1. The
+#: placeholder is a function of the decode context, never of the record.
+_PLACEHOLDERS: tuple[tuple[str, Callable[[DecodeContext], str]], ...] = (
+    (h.TB_CHANNEL, lambda ctx: ctx.channel),
+    (h.TB_CHANNEL_VERSION, lambda ctx: str(ctx.channel_version)),
+    (h.TB_SOURCE, lambda ctx: ctx.source),
+    (h.TB_RECEIVED_AT, lambda _ctx: h.format_timestamp(datetime.now(UTC))),
+    (h.TB_CONTENT_TYPE, lambda _ctx: "application/octet-stream"),
+    (h.TB_ATTEMPT, lambda _ctx: "0"),
+    (h.TRACEPARENT, lambda _ctx: new_traceparent()),
+)
 
-    Deliberately small: a consumer must not reject a record for an unknown header (envelope contract
-    1.2), so only what the engine itself reads is checked.
+#: Optional headers a reject drops rather than replaces: there is no honest placeholder for a
+#: correlation id or a destination, and a wrong one is worse than an absent one.
+_DROPPED: tuple[str, ...] = (
+    h.TB_CORRELATION_ID,
+    h.TB_PARENT_ID,
+    h.TB_DESTINATION,
+    h.TB_RETRY_NOT_BEFORE,
+    h.TB_STAGE,
+    h.TB_ERROR_CODE,
+)
+
+
+def _malformed_headers(decoded: Mapping[str, str]) -> tuple[str, ...]:
+    """Registered headers that are absent-but-required or present-and-malformed.
+
+    Unregistered names are never checked: a consumer must ignore what it does not recognise (1.2), which
+    is also why only the closed set from section 3 can trigger a reject — so naming them in an event is
+    safe where quoting a value would not be.
     """
-    try:
-        _ = (message.msg_id, message.channel, message.channel_version, message.attempt)
-    except HeaderError as exc:
-        raise RecordDecodeError("ENVELOPE_INVALID", str(exc)) from exc
+    bad: list[str] = []
+    for name, _placeholder in _PLACEHOLDERS:
+        value = decoded.get(name)
+        if value is None or not h.is_well_formed(name, value):
+            bad.append(name)
+    bad.extend(name for name in _DROPPED if name in decoded and not h.is_well_formed(name, decoded[name]))
+    return tuple(bad)
+
+
+def _normalise(message: Message, bad: tuple[str, ...], context: DecodeContext) -> Message:
+    """Replace each malformed required header with its placeholder and drop each malformed optional one."""
+    result = message
+    for name, placeholder in _PLACEHOLDERS:
+        if name in bad:
+            result = result.with_header(name, placeholder(context))
+    for name in _DROPPED:
+        if name in bad:
+            result = result.without_header(name)
+    return result
 
 
 QUARANTINE_MAGIC = b"TBQ1"
