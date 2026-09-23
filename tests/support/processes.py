@@ -1,0 +1,201 @@
+"""Spawning the real receiver, loader and worker as OS subprocesses for e2e and chaos tests.
+
+Real processes, not in-process calls: a chaos test needs to `kill()` a broker without the worker or
+receiver cooperating, and an e2e test should exercise the actual `python -m tributary.receivers.mllp`
+/ `python -m tributary.loaders.http` / `python -m tributary.runtime.worker` entry points, the same ones
+`deploy/compose/docker-compose.yml` runs — the same reasoning
+`packages/tributary-runtime/tests/test_integration_kafka.py::spawn_worker` uses for the worker alone.
+
+Each component prints one JSON line to stdout (or stderr, merged here) when it is actually ready to
+receive traffic: the receiver prints `{"event": "listening", ...}` itself
+(`tributary.receivers.mllp.server.main`), the loader and worker log `{"event": "loader_started", ...}`
+/ `{"event": "worker_started", ...}` through `tributary.runtime.logs.JsonLogger`. `wait_for_event`
+follows those rather than a fixed sleep, and fails fast if the process exits first instead of hanging
+until a timeout that would look like "the fault didn't fire" in a chaos test.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import queue
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+from typing import Any
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+class ProcessDiedError(AssertionError):
+    pass
+
+
+def _pump(stream: Any, sink: queue.Queue[bytes | None]) -> None:
+    for line in iter(stream.readline, b""):
+        sink.put(line)
+    sink.put(None)
+
+
+class ManagedProcess:
+    """One subprocess plus a background reader thread draining its (merged) stdout/stderr.
+
+    The reader keeps running for the process's whole life so log lines after the readiness wait are
+    never left to fill an OS pipe buffer and deadlock the child — tests that want them can inspect
+    `.lines` after the fact.
+    """
+
+    def __init__(self, args: list[str], *, env: dict[str, str] | None = None) -> None:
+        self.args = args
+        self.process = subprocess.Popen(  # noqa: S603 - args are built by this module, not from user input
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=env,
+        )
+        self._queue: queue.Queue[bytes | None] = queue.Queue()
+        self._eof = False
+        self.lines: list[dict[str, Any]] = []
+        assert self.process.stdout is not None
+        self._reader = threading.Thread(target=_pump, args=(self.process.stdout, self._queue), daemon=True)
+        self._reader.start()
+
+    def wait_for_event(self, event: str, *, timeout_s: float = 30.0) -> dict[str, Any]:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            remaining = max(0.1, deadline - time.monotonic())
+            try:
+                raw = self._queue.get(timeout=min(0.5, remaining))
+            except queue.Empty:
+                if self.process.poll() is not None:
+                    raise ProcessDiedError(
+                        f"{self.args!r} exited (code {self.process.returncode}) before emitting {event!r}; "
+                        f"output so far: {self.lines!r}"
+                    ) from None
+                continue
+            if raw is None:
+                self._eof = True
+                raise ProcessDiedError(f"{self.args!r} closed its output before emitting {event!r}: {self.lines!r}")
+            try:
+                record = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            self.lines.append(record)
+            if record.get("event") == event:
+                return record
+        raise ProcessDiedError(f"{self.args!r} did not emit {event!r} within {timeout_s}s: {self.lines!r}")
+
+    def kill_and_wait(self, timeout_s: float = 30.0) -> int:
+        self.process.kill()
+        return self.process.wait(timeout=timeout_s)
+
+    def terminate_and_wait(self, timeout_s: float = 15.0) -> int:
+        if self.process.poll() is None:
+            self.process.terminate()
+        try:
+            return self.process.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            return self.kill_and_wait(timeout_s)
+
+
+def _worker_env(bootstrap: str) -> dict[str, str]:
+    """`PYTHONPATH` includes the repo root so `tests.support.demo_steps` — the stand-in pipeline step,
+    see that module's docstring — resolves inside the worker's own process, the same dotted-path
+    mechanism `contracts/channel-spec/v0` describes for a real bundle."""
+    existing = os.environ.get("PYTHONPATH", "")
+    pythonpath = f"{REPO_ROOT}{os.pathsep}{existing}" if existing else str(REPO_ROOT)
+    return {**os.environ, "PYTHONPATH": pythonpath, "TB_BOOTSTRAP_SERVERS": bootstrap}
+
+
+def spawn_mllp_receiver(
+    *, channel_spec: Path, env: str, bootstrap: str, instance: str = "mllp-e2e", timeout_s: float = 30.0
+) -> ManagedProcess:
+    proc = ManagedProcess(
+        [
+            sys.executable,
+            "-m",
+            "tributary.receivers.mllp",
+            "--channel-spec",
+            str(channel_spec),
+            "--env",
+            env,
+            "--bootstrap",
+            bootstrap,
+            "--instance",
+            instance,
+        ],
+        env=dict(os.environ),
+    )
+    proc.wait_for_event("listening", timeout_s=timeout_s)
+    return proc
+
+
+def spawn_http_loader(
+    *,
+    channel: str,
+    destination: str,
+    env: str,
+    bootstrap: str,
+    instance_id: str = "loader-e2e",
+    timeout_s: float = 30.0,
+) -> ManagedProcess:
+    proc = ManagedProcess(
+        [
+            sys.executable,
+            "-m",
+            "tributary.loaders.http",
+            "--channel",
+            channel,
+            "--destination",
+            destination,
+            "--env",
+            env,
+            "--bootstrap",
+            bootstrap,
+            "--instance-id",
+            instance_id,
+        ],
+        env=dict(os.environ),
+    )
+    proc.wait_for_event("loader_started", timeout_s=timeout_s)
+    return proc
+
+
+WORKER_PROGRAM = """
+import sys
+from tributary.runtime.clients import KafkaSettings
+from tributary.runtime.config import load_topic_defaults
+from tributary.runtime.worker import PipelineWorker, WorkerSettings
+
+worker = PipelineWorker(
+    settings=WorkerSettings(
+        env=sys.argv[1],
+        channel=sys.argv[2],
+        kafka=KafkaSettings(bootstrap_servers=sys.argv[3]),
+        instance_id=sys.argv[4],
+        poll_timeout_s=0.1,
+    ),
+    defaults=load_topic_defaults(),
+)
+worker.build()
+worker.run()
+"""
+
+
+def spawn_pipeline_worker(
+    *, env: str, channel: str, bootstrap: str, instance_id: str, timeout_s: float = 30.0
+) -> ManagedProcess:
+    """A real worker process resolving its step through `steps.py`'s dotted-path loader, same as a
+    deployed channel would — the channel spec published to `_tb.<env>.channels` must point
+    `pipeline.steps[0].ref` at `tests.support.demo_steps.passthrough`
+    (`tests/support/channel_spec.py::walking_skeleton_document`), and `PYTHONPATH` (below) is what
+    makes that importable inside this subprocess.
+    """
+    proc = ManagedProcess(
+        [sys.executable, "-c", WORKER_PROGRAM, env, channel, bootstrap, instance_id],
+        env=_worker_env(bootstrap),
+    )
+    proc.wait_for_event("worker_started", timeout_s=timeout_s)
+    return proc
