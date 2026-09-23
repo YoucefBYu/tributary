@@ -5,10 +5,27 @@ wave's exit criteria here.
 
 ## Current
 
-- **Phase / wave:** **Phase 1, wave 1 — walking skeleton. IN PROGRESS.** Team of five: `architect`,
-  `platform-engineer`, `connector-engineer`, `devops-engineer`, `qa-engineer`. Phase 0 is complete and
-  signed (**GO WITH CONDITIONS**, 2026-09-22).
+- **Phase / wave:** **Phase 1, wave 1 — walking skeleton. AT GATE.** All eight tasks delivered. Gate
+  report [`gates/phase-1-wave-1.md`](gates/phase-1-wave-1.md): **GO WITH CONDITIONS, provisional** — it
+  is not final, because `code-reviewer` and `security-reviewer` are still running and the full
+  `pytest -m integration` run is in flight. Phase 0 is complete and signed (2026-09-22).
 - **Branch:** `wave/1-1`
+- **Exit criteria:** 1 **PASS locally, PENDING CI** (nothing has been pushed, so no CI run exists —
+  closing it needs a human push); 2 **PASS for invariants 1, 2, 5; PARTIAL for 3**; 3 **PASS**;
+  4 **PENDING** on `code-reviewer`. Engineering checks green as run by the lead: `uv sync`, `ruff`,
+  `ruff format`, `mypy packages` (56 files), fast suite **701 passed**, `validate.py` **102 / 0**,
+  `pytest tests/conformance` **101 passed**.
+- **Invariant 3 is now PARTIAL, not "not exercised".** The mechanism is implemented and tested —
+  `runtime/channels.py` reads the compacted `_tb.<env>.channels` topic and imports no database driver,
+  no HTTP client and calls no API, with 12 tests — but PostgreSQL, the API and ClickHouse do not exist
+  yet, so "keeps running while they are down" is *vacuously* true rather than tested. The chaos coverage
+  in gate `phase-0-spikes.md` 7.2 item 19 stays open and moves to wave 3.
+- **The wave's most useful finding is a pattern, not a defect: four contract defects, all found by
+  implementers, none by any checker** — each a document that was internally valid and named something
+  that did not exist. Recorded in gate report 5.1 and in `contracts/README.md`. Consequence to carry:
+  **a green conformance run means the contracts are self-consistent, not that they agree with the
+  code**, and the two-checker split (`validate.py` for well-formedness, the corpus test in
+  `tributary-runtime` for name resolution) must not be merged.
 - **W1-1 contracts (architect): DONE and verified.**
   `tributary.channel-spec/v0` is published — schema, README, 23 examples (4 valid, 19 invalid) — plus
   `contracts/validate.py`, a standalone checker for all four contracts. Envelope gained section 2.3
