@@ -81,9 +81,38 @@ def expected_of(contract: str, label: str, entry: dict[str, Any]) -> Failure:
     return Failure(entry["expected_json_path"], entry["expected_validator"])
 
 
+def check_runnable_metadata(contract: str, manifest: dict[str, Any]) -> None:
+    """Channel-spec valid examples must classify themselves as runnable or not.
+
+    Only this contract needs it: its examples name code (`uses` entry points, `ref` dotted paths),
+    so an example can be schema-valid and still reference something nothing provides - which is how
+    the walking-skeleton example shipped unrunnable. Envelope and events examples are record
+    projections and event bodies; they name nothing that has to exist.
+
+    This checks the metadata is present, not that the names resolve: resolution needs the installed
+    distribution, and this script deliberately runs on a clean clone with only jsonschema. The
+    resolving test lives in tributary-runtime and reads these same fields.
+    """
+    if contract != "channel-spec":
+        return
+    for entry in manifest["valid"]:
+        name = entry["file"]
+        if "runnable" not in entry:
+            raise SystemExit(
+                f"{contract}: {name} does not declare `runnable`. Every valid channel-spec example "
+                "says whether its steps resolve today; see the manifest's runnable_note."
+            )
+        if not entry["runnable"] and not entry.get("requires"):
+            raise SystemExit(
+                f"{contract}: {name} is runnable: false with no `requires`. Name what is missing "
+                "and the task that delivers it, or the exemption is permanent by accident."
+            )
+
+
 def file_cases(contract: str) -> tuple[Path, list[Case]]:
     manifest_path = CONTRACTS / contract / "v0" / "examples" / "manifest.json"
     manifest = load(manifest_path)
+    check_runnable_metadata(contract, manifest)
     base = manifest_path.parent
     schema = (base / manifest["schema"]).resolve()
     cases = [

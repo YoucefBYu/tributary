@@ -3,21 +3,29 @@
   "schema": "../channel.schema.json",
   "note": "Examples are JSON because a channel spec is authored in YAML and validated after parsing; the schema sees the parsed document either way. All names, hosts and digests are synthetic. No example carries a payload, a record key or a credential value.",
   "expectation_note": "MEASURED 2026-09-22 by qa-engineer with `contracts/validate.py --emit-expectations` against jsonschema Draft 2020-12, and independently by the lead (94 checks, 0 failed, first run). Every expected_json_path/expected_validator pair below is the failing location and keyword that example MUST produce, so an example that fails for the WRONG reason goes red instead of passing (code-reviewer Medium 2, Phase 0 gate). These 19 pairs were first written as architect predictions - this session has no shell - and all 19 matched the measured run exactly, including the three flagged as least certain; no correction was needed. Paths and keywords only, never instance values, so this file is PHI-safe. An example may fail on more than one pair; the test asserts the pinned pair is among the failures.",
+  "runnable_note": "Every valid entry declares `runnable`. true means every step it names resolves in the shipping distribution TODAY, so a test may load and execute it. false means it illustrates a channel a later wave will make authorable, and `requires` lists the namespaces or mechanisms that do not exist yet, each with the task that delivers it. This is DATA rather than prose because the same classification is needed by the schema corpus test in tributary-runtime, and an allow-list duplicated in a test drifts from the contract that owns it. Two rules for whoever maintains that test: a `runnable: true` example whose steps stop resolving is a failure, and a `runnable: false` example whose `requires` have ALL become resolvable is also a failure - the entry must then be promoted to true and its `requires` deleted, so a stale exemption cannot silently mask a real gap.",
   "valid": [
     {
       "file": "valid/walking-skeleton-loopback.json",
-      "note": "Wave 1 E2E shape and the ONLY example that must actually run: MLLP on loopback with no TLS, ordering none, HTTP stub on loopback, idempotency 'none' with the required justification. Its step uses `uses: tributary.core.passthrough`, an entry point in the running image, because `ref` needs bundle-fetch and that does not exist in wave 1 (README 3.3.1). Every other example here is illustrative and references code that is deliberately fictional"
+      "runnable": true,
+      "note": "Wave 1 E2E shape and the only currently runnable example: MLLP on loopback with no TLS, ordering none, HTTP stub on loopback, idempotency 'none' with the required justification. Its step uses `uses: tributary.core.passthrough`, an entry point in the running image, because `ref` needs bundle-fetch and that does not exist in wave 1 (README 3.3.1)"
     },
     {
       "file": "valid/adt-to-fhir-per-key-mtls.json",
+      "runnable": false,
+      "requires": ["tributary.hl7v2. (W2-1)", "bundle-fetch for ref steps (unscheduled)"],
       "note": "Production shape: wildcard bind with mTLS, per-key ordering, byte-bounded queue, three steps, HTTPS destination with blocking retry and halt-partition"
     },
     {
       "file": "valid/published-with-version.json",
+      "runnable": false,
+      "requires": ["tributary.hl7v2. (W2-1)", "bundle-fetch for ref steps (unscheduled)"],
       "note": "The form on _tb.<env>.channels: metadata.version set by the control plane, partitions and retention overrides, transactional pipeline"
     },
     {
       "file": "valid/two-destinations-fanout.json",
+      "runnable": false,
+      "requires": ["tributary.hl7v2. (W2-1)"],
       "note": "Two destinations with different idempotency techniques and different exhaustion behaviour on one unordered channel"
     }
   ],

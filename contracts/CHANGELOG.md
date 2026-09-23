@@ -41,8 +41,34 @@ New README section 3.3.1 states the rest:
   example claims to run, and it is the one that has to resolve.
 
 **Depends on `platform-engineer` registering `tributary.core.passthrough`** in `tributary-runtime`'s
-`tributary.steps` entry points. Until that lands the example is schema-valid and still unrunnable, which
-is the same state it was in — the contract change alone does not fix the Compose stack.
+`tributary.steps` entry points. **Done, `754845d`**, verified by loading and *running* the
+walking-skeleton example's steps through the shipping loader rather than asserting the name exists.
+
+### Follow-up the same day: `runnable` becomes a manifest field
+
+`platform-engineer` then found the other three valid examples are in the same class — they name
+`tributary.hl7v2.parse` / `to_json`, which no package provides — and correctly did **not** treat it as a
+defect: illustrating a channel wave 2 will make authorable is a legitimate job for an example. They made
+the distinction testable with a namespace allow-list in their corpus test, and asked whether the corpus
+should instead contain only runnable examples.
+
+**Decision: keep illustrative examples, and move the classification out of their test into this
+manifest.** A corpus restricted to what wave 1 happens to have built would be a picture of current
+progress rather than of the document, and ADR-001 6.1's own example is illustrative for the same reason.
+But the classification was then living in two places — my README prose and their hard-coded allow-list —
+and a duplicated allow-list drifts from the contract that owns the examples.
+
+So every `valid` entry now declares `runnable`, and a `false` entry lists `requires`: what is missing and
+the task that delivers it. `contracts/validate.py` enforces that the field is present, and that a
+`false` entry names its `requires`, so a new example cannot skip the classification. It deliberately does
+**not** check that the names resolve — that needs the installed distribution, and this script runs on a
+clean clone with only `jsonschema`. The resolving test stays in `tributary-runtime` and now reads these
+fields instead of its own list.
+
+Their mutation control is adopted as a contract rule rather than a test detail, because it is the part
+that keeps the exemption honest: a `runnable: true` example whose steps stop resolving fails, **and** a
+`runnable: false` example whose `requires` have all become resolvable also fails, forcing promotion. A
+stale exemption that outlives the gap it describes is indistinguishable from coverage.
 
 ## 2026-09-23 (W1-4 follow-up) — the ordinary reject shape, so records stop being over-quarantined
 

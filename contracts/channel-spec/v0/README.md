@@ -177,11 +177,25 @@ entry points provide those steps, which is the worker or runtime image itself. T
 digest-pinning exists for: "what code ran" is answerable from `tb-channel-version` alone, regardless of
 which step form a channel used.
 
-**Every other valid example in this contract is illustrative, not runnable.** They reference
-`tributary.hl7v2.parse` (W2-1) and bundle-local modules such as `adt_flow` and `lab_flow` that are
-deliberately fictional, because their job is to show the document's shape. Only
-`walking-skeleton-loopback.json` claims to be the wave-1 runnable shape, and it is the one that has to
-resolve.
+**Which examples are runnable is recorded as data, not prose.** Every `valid` entry in
+[`examples/manifest.json`](examples/manifest.json) declares `runnable`, and a `false` entry lists in
+`requires` what does not exist yet and which task delivers it. Today only
+`walking-skeleton-loopback.json` is `runnable: true`; the other three illustrate channels wave 2 will
+make authorable and reference `tributary.hl7v2.*` (W2-1) plus deliberately fictional bundle modules
+such as `adt_flow` and `lab_flow`.
+
+Illustrative examples are kept deliberately. A corpus restricted to what wave 1 happens to have built
+would be a picture of current progress rather than of the document, and ADR-001 6.1's own example is
+illustrative for the same reason.
+
+The field is data because two places need the classification: this contract and the schema-corpus test
+in `tributary-runtime`. An allow-list of exempt namespaces hard-coded in that test drifts from the
+contract that owns the examples — so the test reads these fields instead. `contracts/validate.py`
+enforces that every valid entry declares `runnable`, and that a `false` one names its `requires`, so a
+new example cannot skip the classification. Two rules for the resolving test, stated in the manifest:
+a `runnable: true` example whose steps stop resolving fails, and a `runnable: false` example whose
+`requires` have **all** become resolvable also fails — it must then be promoted, so a stale exemption
+cannot quietly mask a real gap.
 
 ### 3.4 `spec.destinations` (v0 defines `http` only)
 
