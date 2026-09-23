@@ -66,6 +66,16 @@ services:
       KAFKA_MIN_INSYNC_REPLICAS: "1"
       KAFKA_UNCLEAN_LEADER_ELECTION_ENABLE: "false"
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      # __consumer_offsets and the transaction-state log are internal topics the broker creates
+      # itself, so KAFKA_DEFAULT_REPLICATION_FACTOR does not reach them -- they have their own
+      # settings, defaulting to 3. On a single broker that default can never be satisfied:
+      # __consumer_offsets never gets created, every consumer group hangs at FIND_COORDINATOR forever,
+      # and nothing ever reaches out.<dest> even though produce-and-ACK on raw keeps working (found by
+      # qa-engineer-2 building W1-8, confirmed against a real cluster; same three values
+      # platform-engineer's testcontainers fixture already uses for a single-broker Kafka).
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
       KAFKA_HEAP_OPTS: ${TB_KAFKA_HEAP:--Xmx512M -Xms512M}
     healthcheck:
       test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1 || exit 1"]
