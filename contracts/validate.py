@@ -23,8 +23,9 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Iterator, NamedTuple
+from typing import Any, NamedTuple
 
 try:
     from jsonschema import Draft202012Validator, FormatChecker
