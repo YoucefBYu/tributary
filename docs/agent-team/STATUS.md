@@ -5,10 +5,26 @@ wave's exit criteria here.
 
 ## Current
 
-- **Phase / wave:** **Phase 1, wave 1 — walking skeleton. AT GATE.** All eight tasks delivered. Gate
-  report [`gates/phase-1-wave-1.md`](gates/phase-1-wave-1.md): **GO WITH ONE CONDITION — a human pushes
-  `wave/1-1` and the CI integration job goes green.** Everything an agent can close is closed.
-  `code-reviewer-8`: APPROVE, zero findings at any severity. **`security-reviewer`, final: 0 Critical,
+- **Phase / wave:** **Phase 1, wave 2 — pipelines and delivery. IN PROGRESS.** Wave 1 CI passed and merged
+  to `main` (2026-09-24). Architect and lead approved Wave 2 planning. Team assembled. Starting week 1
+  (HL7 parser + FHIR design + retry-topic spike S7).
+- **Branch:** `wave/1-2`
+- **Planning documents:** [`wave-2-README.md`](phases/wave-2-README.md), [`wave-2-plan.md`](phases/wave-2-plan.md),
+  [`wave-2-spikes.md`](phases/wave-2-spikes.md), [`wave-2-lead-checklist.md`](phases/wave-2-lead-checklist.md)
+- **Duration estimate:** 3–4 weeks, 5 people, 35 person-days
+- **Exit criteria:** (1) ADT→FHIR/ClickHouse end-to-end flow, (2) ordered channels preserve order under chaos,
+  (3) every loader has duplicate-delivery test, (4) throughput report vs Phase 0 baseline
+
+### Wave 1 exit (completed 2026-09-24)
+
+- **Gate report:** [`gates/phase-1-wave-1.md`](gates/phase-1-wave-1.md) **APPROVED: GO**
+- **Status:** All eight tasks delivered. Code and security review clean (code-reviewer APPROVE, security 0 Critical/High).
+- **CI:** `pytest -m integration` 6 passed (227.91s), `contracts/validate.py` 102/0, `ruff`/`mypy` green
+- **Wave 1 findings to carry into Wave 2:**
+  - Reviews find what they look for; Phase 0 pattern (control not applied to an unthought path) → W2 reviews focus on
+    library defaults and transitive edges rather than already-tested paths
+  - Four contract defects found by implementers, not checkers → conformance green ≠ code agreement
+  - HTTP loader redirect bug (HIGHEST lesson) → `code-reviewer-8`: APPROVE, zero findings at any severity. **`security-reviewer`, final: 0 Critical,
   0 High, 0 Medium, 3 Low** — gate passes from their side. Their first pass found 2 High and **both were
   fixed inside the wave and confirmed closed with the mechanism re-derived, not taken on trust:**
   (1) `certifi` (MPL-2.0) human-approved 2026-09-23 (the lead attests first-hand; the reviewer cannot
