@@ -24,7 +24,7 @@ from tributary.sdk import headers as h
 from tributary.sdk.context import Logger
 from tributary.sdk.ids import child_traceparent, new_traceparent, uuid7
 
-from .channels import ChannelCache, ChannelsConsumerLike
+from .channels import ChannelsConsumerLike, LiveSpecSource, open_spec_source
 from .clients import KafkaSettings, consumer_config, events_producer_config, max_poll_interval_ms, producer_config
 from .config import TopicDefaults, load_topic_defaults
 from .consumer import ConsumerLoop, KafkaConsumerLike, LoopSettings, LoopStats
@@ -363,7 +363,7 @@ class PipelineWorker:
     defaults: TopicDefaults | None = None
     log: Logger = field(default_factory=lambda: JsonLogger("worker"))
     loop: ConsumerLoop | None = field(default=None, init=False)
-    cache: ChannelCache | None = field(default=None, init=False)
+    specs: LiveSpecSource | None = field(default=None, init=False)
     emitter: EventEmitter = field(default_factory=NullEmitter, init=False)
 
     def build(self) -> ConsumerLoop:
@@ -383,10 +383,13 @@ class PipelineWorker:
                 )
             ),
         )
-        self.cache = ChannelCache(cache_consumer, channels_topic(env), log=self.log)
-        self.cache.start()
-        self.cache.catch_up()
-        spec = self.cache.require(channel)
+        self.specs = open_spec_source(
+            channel=channel,
+            consumer=cache_consumer,
+            topic=channels_topic(env),
+            log=self.log,
+        )
+        spec = self.specs.current()
 
         data_producer = Producer(
             producer_config(self.settings.kafka, defaults, client_id=f"tb-{env}-{channel}-{self.settings.instance_id}")
@@ -463,11 +466,10 @@ class PipelineWorker:
         return self.loop
 
     def _current_spec(self) -> ChannelSpec:
-        """The latest applied spec, refreshed without blocking: this is the hot-reload path."""
-        if self.cache is None:
-            raise RuntimeConfigurationError("worker was not built: no channel-spec cache")
-        self.cache.poll_once(timeout_s=0.0)
-        return self.cache.require(self.settings.channel)
+        """The latest applied spec, refreshed without blocking (`LiveSpecSource`, the one reload path)."""
+        if self.specs is None:
+            raise RuntimeConfigurationError("worker was not built: no channel-spec source")
+        return self.specs.current()
 
     def run(self, *, max_iterations: int | None = None) -> LoopStats:
         loop = self.loop or self.build()
@@ -476,8 +478,8 @@ class PipelineWorker:
         finally:
             # The loop has already committed; this only flushes the event tail, briefly.
             self.emitter.close()
-            if self.cache is not None:
-                self.cache.close()
+            if self.specs is not None:
+                self.specs.close()
 
     def stop(self) -> None:
         if self.loop is not None:

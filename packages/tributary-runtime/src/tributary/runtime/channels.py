@@ -160,3 +160,55 @@ class ChannelCache:
 
     def names(self) -> list[str]:
         return sorted(self._specs)
+
+
+class LiveSpecSource:
+    """One channel's spec, refreshed from `_tb.<env>.channels` without blocking.
+
+    This is the hot-reload path, and it is deliberately the *only* one: every component that needs a
+    spec — the pipeline worker, a loader, later the replier — calls `current()` once per message, so a
+    republished `metadata.version` takes effect on the next record and nobody has to restart. A
+    component that read its spec once at startup would drift from the deployed channel and need a
+    rolling restart to pick up a change, which is the failure invariant 3 is written against.
+
+    `current()` does not block: `poll_once(0.0)` costs a non-blocking librdkafka call, and a spec that
+    fails to parse leaves the previously applied one running (channel-spec contract 6 rule 1).
+    """
+
+    __slots__ = ("_cache", "_channel")
+
+    def __init__(self, cache: ChannelCache, channel: str) -> None:
+        self._cache = cache
+        self._channel = channel
+
+    @property
+    def cache(self) -> ChannelCache:
+        return self._cache
+
+    def current(self) -> ChannelSpec:
+        self._cache.poll_once(timeout_s=0.0)
+        return self._cache.require(self._channel)
+
+    def close(self) -> None:
+        self._cache.close()
+
+
+def open_spec_source(
+    *,
+    channel: str,
+    consumer: ChannelsConsumerLike,
+    topic: str,
+    log: Logger,
+    catch_up_timeout_s: float = 30.0,
+) -> LiveSpecSource:
+    """Build a caught-up `LiveSpecSource`, or raise rather than start without the spec.
+
+    Raising is the point: a worker or loader that starts with no spec has nothing to apply, and
+    guessing (an empty pipeline, a default retry policy) would be worse than not starting.
+    """
+    cache = ChannelCache(consumer, topic, log=log)
+    cache.start()
+    cache.catch_up(timeout_s=catch_up_timeout_s)
+    source = LiveSpecSource(cache, channel)
+    source.current()  # fails now, loudly, if this channel is not deployed
+    return source
