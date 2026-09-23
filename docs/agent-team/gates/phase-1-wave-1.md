@@ -1,12 +1,20 @@
 # Gate: Phase 1, wave 1 — walking skeleton
 
 **Branch:** `wave/1-1` · **Date:** 2026-09-23 · **Author:** `architect`
-**Recommendation:** **GO WITH CONDITIONS** — provisional, see section 8.
+**Recommendation:** **GO WITH CONDITIONS** — see section 8. **Two High security findings are open and
+both block sign-off.**
 
-**This report is not final.** Two inputs are outstanding at the time of writing: `code-reviewer`'s
-cumulative-diff pass (exit criterion 4 depends entirely on it) and `security-reviewer`'s pass, both
-running. The full `pytest -m integration` run is also in flight. Sections 5 and 8 must be refilled
-before this is signed. Nothing below is marked PASS on the strength of an expected result.
+**All inputs are in.** `code-reviewer-8`: APPROVE, zero findings at any severity. `security-reviewer`:
+0 Critical, **2 High**, 0 Medium, 3 Low — their own verdict is "gate not passed as of this review", and I
+agree it cannot be signed in this state. `pytest -m integration`: 6 passed. Nothing below is marked PASS
+on the strength of an expected result.
+
+**One correction to how this has been described.** The two High findings do **not** change exit criterion
+4, which is specifically "`code-reviewer` clean on the wave diff" — that reviewer found nothing, and
+recording their clean pass as a failure would misattribute it. The Highs block the gate through the
+definition of done, item 6: *"Changes to auth, crypto, network listeners, PHI handling or dependencies
+also pass `security-reviewer`."* Criterion 4 stays PASS; the wave is not done. The distinction matters
+because it determines who has work to do — `connector-engineer` and the human, not the code reviewer.
 
 **What the architect did and did not verify.** I have no shell. Every command result quoted here was
 run by the lead or by `qa-engineer`/`qa-engineer-2` and is attributed. What I verified myself is source
@@ -25,7 +33,9 @@ with lifecycle events on `_tb.<env>.events`, a channel-spec cache reading the co
 
 Contract set 1.0 is published and conformant. The engineering checks are green as run by the lead:
 `uv sync`, `ruff check .`, `ruff format --check .`, `mypy packages` (56 files), fast suite **701 passed**,
-`contracts/validate.py` **102 / 0**, `pytest tests/conformance` **101 passed**.
+`contracts/validate.py` **102 / 0**, `pytest tests/conformance` **101 passed**, and
+`pytest -m integration` **6 passed in 227.91 s** (4 runtime Kafka tests, 1 e2e, 1 chaos; 701 deselected).
+`code-reviewer-8` on the cumulative wave diff: **APPROVE, zero findings at any severity.**
 
 **The most important finding of this wave is not a defect, it is a pattern.** Four contract defects were
 found by implementers rather than by any checker, all with the same shape: a document that was
@@ -38,17 +48,22 @@ conformance suite could not have caught any of them, and that is structural rath
 
 | # | Criterion | Verdict | Evidence |
 |---|---|---|---|
-| 1 | The E2E test passes in CI | **PASS locally, PENDING CI** | `tests/e2e/test_mllp_to_http_e2e.py::test_synthetic_adt_flows_from_mllp_to_the_http_stub` passes in isolated runs (lead). **It has never run in CI**, because nothing has been pushed. See 2.1. |
+| 1 | The E2E test passes in CI | **PASS locally, PENDING CI** | `pytest -m integration` **6 passed in 227.91 s** (lead), including `tests/e2e/test_mllp_to_http_e2e.py::test_synthetic_adt_flows_from_mllp_to_the_http_stub`. **It has never run in CI**, because nothing has been pushed. See 2.1. |
 | 2 | Invariants 1, 2, 3 and 5 covered by automated tests | **PASS for 1, 2, 5; PARTIAL for 3** | Section 3. Invariant 3's *mechanism* is implemented and tested; its *failure mode* is not exercisable this wave. |
 | 3 | Contracts v1 published and referenced by code and tests | **PASS** | Section 4. Published as **contract set 1.0**, lead-approved naming; there are deliberately no `contracts/*/v1/` directories. |
-| 4 | `code-reviewer` clean on the wave diff | **PENDING** | Review in progress. Cannot be marked PASS. |
+| 4 | `code-reviewer` clean on the wave diff | **PASS** | `code-reviewer-8`, cumulative diff: **APPROVE, zero Critical, High, Medium and Low findings.** Detail in 5.3. |
 
 ### 2.1 Why criterion 1 is not a bare PASS
 
-The criterion says "in CI". The test passes on a developer machine against testcontainers Kafka, and
-`devops-engineer` wired the workflow (`.github/workflows/ci.yml`, contracts job at `f649665`) — but no
-commit has been pushed, so no CI run of any kind exists for this branch. Under the gate rule that a
-skipped check is a FAIL until it runs, "passes locally" is the strongest honest verdict.
+The criterion says "in CI". The whole integration suite now passes on a developer machine against
+testcontainers Kafka — one run, all six tests, 227.91 s — and `devops-engineer` wired the workflow
+(`.github/workflows/ci.yml`, contracts job at `f649665`, with `contracts/validate.py` and
+`tests/conformance` as required non-optional jobs, confirmed by `code-reviewer-8`). But no commit has
+been pushed, so **no CI run of any kind exists for this branch**. Under the gate rule that a skipped
+check is a FAIL until it runs, "passes locally" is the strongest honest verdict.
+
+The 227.91 s figure is worth carrying: this suite is slow enough that a CI runner's timeout and
+parallelism settings matter, and nobody has seen it run under those.
 
 **What closing it requires: a human pushes `wave/1-1`, and the workflow's integration job goes green on
 a runner.** That is not an agent action (CLAUDE.md: never push). Two things could plausibly differ on a
@@ -138,7 +153,24 @@ PostgreSQL and the API, assert flow continues). It stays open and moves to wave 
 
 ### Invariant 4 — at-least-once, with a documented and tested idempotency technique per loader
 
-**COVERED for the one loader that exists.** One of one is not a strong sample, and the contract is what
+**BREACHED BY AN OPEN HIGH FINDING.** `security-reviewer` High 2: the HTTP loader
+(`loaders/http/client.py:53`) uses the default `urllib` opener, so `HTTPRedirectHandler` silently follows
+3xx. A redirected POST becomes a GET with the body dropped, the redirect target's 200 is classified as
+success, and **the offset commits for a message that was never delivered.** That is not an idempotency
+weakness, it is silent message loss — the failure invariant 4 and invariant 1's "never ACK and drop"
+both exist to prevent. Being fixed by `connector-engineer` with a regression test; **blocking condition
+2** in section 8.
+
+Two things worth naming rather than filing. First, the tests that exist are good and could not have
+caught it: `::test_duplicate_delivery_is_harmless` proves the idempotency technique works and
+`::test_idempotency_header_reaches_the_server` proves the header arrives, but nothing asserted that a
+non-2xx outcome reached by redirect is *not* treated as success. The suite tested the happy path and the
+duplicate path; the misclassification path was not a test that failed, it was a test that did not exist.
+Second, the same finding carries a credential leak (the `Authorization` header is not stripped on
+redirect) and a TLS-downgrade path (the `http://`-loopback-only rule is checked on the configured URL,
+not after a redirect) — so one default-constructor choice breaks three separate contract rules at once.
+
+**The rest of the invariant holds.** One of one is not a strong sample, and the contract is what
 makes it scale: `contracts/channel-spec/v0` requires an `idempotency` block on every destination, with a
 written justification when the technique is `none`, so a future loader cannot ship without declaring
 one. The key is always `tb-msg-id` and is not configurable.
@@ -186,9 +218,26 @@ the envelope validation projection carries `key_present`/`key_size` and never th
 log-leak test driving a record whose payload, key and header *name* are all markers — **reported, not
 seen by me.**
 
-**Gap:** no automated PHI scan of log output in CI. Gate `phase-0-spikes.md` 7.1 requirement 15 names
-it and it is `devops-engineer`'s. Every PHI control in this wave is a unit test plus source review;
-nothing scans what a running component actually printed.
+`security-reviewer` confirmed the PHI guards are reached at **all real production log and event call
+sites**, including the quarantine and reject paths after the later changes, and that the loader never
+logs a response body or headers. That is the check I could not make by reading two files.
+
+**Three gaps, two of them newly found and neither blocking.**
+
+1. **No automated PHI scan of log output in CI.** Gate `phase-0-spikes.md` 7.1 requirement 15,
+   `devops-engineer`'s. Every PHI control in this wave is a unit test plus source review; nothing scans
+   what a running component actually printed.
+2. **Two log call sites bypass the guard** (`security-reviewer` Low a/b): `receivers/mllp/server.py:205`
+   and `:235` use raw `print(json.dumps(...))` instead of the guarded `JsonLogger`, and
+   `loaders/http/loader.py:235` logs `error=repr(exc)` — a free-text field where the contract wants a
+   classified code. Both are safe today by the content that happens to reach them, not by construction.
+   **This is the shape of failure this project has hit repeatedly: a control that exists and is simply
+   not applied at one site.** The guard raises when it is used; the point of a guard is that there is no
+   way not to use it.
+
+Not blocking, because neither leaks anything today and both are one-line changes — but they belong on
+the wave-2 list rather than in a backlog, because "safe by luck" degrades the moment the surrounding
+code changes.
 
 ### Invariant 7 — channels are declarative, steps unit-testable without Kafka
 
@@ -228,14 +277,38 @@ commits.
 
 ### Invariant 10 — clean-room and licensing
 
-**UPHELD, unchanged from Phase 0, and not re-verified this wave.** The three MPL-2.0 dependencies
-(`orjson`, `hypothesis`, `pathspec`) are human-approved as unmodified, 2026-09-22, and that approval does
-not extend to a new or modified MPL dependency. Wave 1 added runtime dependencies (`confluent-kafka`,
-`httpx` and others) and **no licence or SBOM scan has been run on them** — gate 7.1 requirement 15,
-`devops-engineer`. The Phase 0 lesson stands: never state a licence from a source annotation, and a
-lockfile inventory is not complete because `[build-system] requires` resolves separately.
+**AT RISK — one open High, and it is a human decision.** The scan that condition 4 asked for has now
+been run, and it found something.
 
-**This is a condition for GO** (section 8): the wave added dependencies and nothing has checked them.
+`security-reviewer` High 1: **`licence_check.py` exits 1 on `certifi` (MPL-2.0)**, added this wave
+(`d3b0e09`), pulled in transitively by `testcontainers[kafka]` → `docker` → `requests`. **Blocking
+condition 1** in section 8.
+
+*Architect-verified* by reading the manifests: `testcontainers[kafka]` is in the root
+`[dependency-groups] dev` only, and no package declares `httpx` — the HTTP loader uses stdlib `urllib`
+— so `certifi` is genuinely dev-group only and not in the default distribution. The risk is therefore
+CI-and-policy, not shipped-artefact.
+
+**I am not extending the MPL approval, and the reason is scope rather than caution.** CLAUDE.md permits
+"MPL only as an unmodified dependency approved by the architect", so the authority exists — but the same
+file escalates "a dependency with a non-permissive license" to a human, the Phase 0 precedent sent all
+three MPL items to the human, and that approval was recorded as covering *those three packages
+unmodified*. A fourth arriving by transitive resolution is exactly the case the scope note was written
+for. Correctly routed to the human by the lead.
+
+**How this one hid is the reusable part.** The root manifest annotates the dependency
+`"testcontainers[kafka]>=4.8",  # Apache-2.0`. That annotation is *correct about testcontainers itself*
+and says nothing about its transitive closure — so it reads as a licence clearance while clearing
+nothing. Same shape as Phase 0's `pathspec` case, where a lockfile-only inventory reported clean because
+`[build-system] requires` resolves separately. **Two independent near-misses now say the same thing: a
+licence claim is only as good as the resolution it came from, and a hand-written comment is not a
+resolution.** When the human records the `certifi` decision, it is worth recording which source the
+licence was read from.
+
+Otherwise unchanged from Phase 0: `orjson`, `hypothesis` and `pathspec` are human-approved as unmodified
+(2026-09-22); clean-room is intact, and `code-reviewer-8` confirmed no `spikes/` imports in `packages/`.
+No SAST, CVE or image scanner exists on this machine, so the wave's position on those remains
+source-review-only.
 
 ---
 
@@ -300,14 +373,36 @@ See 7.3.
 
 ### 5.2 Process: three shared-checkout commit-mixing incidents
 
-Three incidents where a commit included files outside the committing agent's ownership. **Disclosed by
-the agents involved and verified harmless by the lead.**
+Three commits, all `platform-engineer`'s, swept in files owned by someone else because every agent shares
+one git index in this checkout. Each was disclosed at the time.
 
-**I did not verify these** — I have no shell and have not read the commits. `TODO(lead)`: add the commit
-hashes, which files crossed which boundary, and who disclosed each, before this is signed. The reason to
-record them rather than treat them as noise is Phase 0 High 1: a `.gitignore` change riding along in
-someone else's commit silently removed protection for `samples/mirth/`, and nothing caught it for a
-whole wave. Disclosure is what made these three cheap; the pattern is worth naming at every gate.
+| Commit | Swept in | Owner | Disclosed by |
+|---|---|---|---|
+| `92ecd6a` "feat(runtime): implement envelope 2.3.1, the ordinary reject path" | `receivers/mllp/server.py`, `receivers/tests/mllp/test_lite_profile_warning.py` (the lite-profile startup warning) | `connector-engineer` | `platform-engineer`, immediately after committing |
+| `a96edb1` "feat(runtime): quarantine undecodable records per envelope 5.2…" | 4 files: `tributary-receivers/pyproject.toml`, `config.py`, `kafka_publisher.py`, `test_producer_config.py` — the `must_not_hardcode` fix reading `acks`/`enable.idempotence`/`delivery.timeout.ms` from the contract | `connector-engineer` | `connector-engineer` |
+| `777c699` "fix(sdk): close the tb-usr-* deny-list bypass…" | then-uncommitted `deploy/compose/topic-bootstrap/*` and a 1-line `pyproject.toml` `testpaths` change | `devops-engineer` | `devops-engineer` |
+
+**Verified, and not by me** (no shell, and I have not read the commits): `code-reviewer-8` found every
+swept file has sane content at `HEAD` with nothing lost, and an ownership spot-check of six commits found
+no violations beyond these three. The lead additionally confirmed each swept file was byte-for-byte
+identical to the intended author's working tree at the time (`git diff HEAD -- <path>` empty) and that no
+history was rewritten.
+
+**A fix was adopted mid-wave and it is the part worth keeping:** commits moved to
+`git commit -F - -- <paths>`, pathspec-limited, instead of `git add` followed by a plain `git commit`,
+which commits the whole shared index regardless of what you staged. That is a mechanical fix to a
+mechanical problem, which is the right kind.
+
+"Sane content at HEAD" is the right check, and it is worth saying why rather than treating it as a
+formality. Phase 0 High 1 was a `.gitignore` change riding along in someone else's commit, which
+silently removed protection for `samples/mirth/` and went unnoticed for a whole wave — a *deletion*
+surviving into `HEAD` is exactly what that check catches. What it does not tell us is whether an
+intermediate commit was momentarily wrong, which for a branch nobody has pushed does not matter.
+
+The mechanism, not the discipline, is the cause: a shared index means a `git add` of a path you own can
+pick up a neighbour's in-flight edit to the same path prefix. Disclosure is what made these three cheap.
+Worth naming at every gate while the shared checkout is the working mode; git worktrees are the
+documented alternative (`OWNERSHIP.md`) if the frequency rises.
 
 One related change went the other way and is worth the contrast. The `.gitignore` gap for
 `.claude/agent-memory/` — where a per-file list the human wrote in `5aa6c54` had been outgrown by two
@@ -316,11 +411,42 @@ commit, verified with `git check-ignore`. Additive, isolated, verified: the oppo
 and recorded because gate 7.2 item 22 assigns `.gitignore` to `devops-engineer` and this is Phase 1's
 first change to it.
 
-### 5.3 `code-reviewer` and `security-reviewer`
+### 5.3 Reviews
 
-**PENDING.** `TODO(lead)`: fold in both results here, one row per finding with severity and disposition.
-Exit criterion 4 cannot be assessed until the first of these lands, and per the definition of done,
-Critical and High findings must be addressed before the wave is done.
+**`code-reviewer-8`, cumulative wave diff: APPROVE, zero findings at any severity.** That closes exit
+criterion 4. Four checks in that review are load-bearing for claims made elsewhere in this report, so
+they are recorded rather than summarised away:
+
+| Confirmed | Why it matters here |
+|---|---|
+| `validate_for_produce` is enforced at **every real produce call site** — receivers call it directly, loaders go through the runtime's shared `RecordProducer` / `KafkaDlqWriter` choke point | This is the evidence behind invariant 8 and half of invariant 6. My own reading covered the two files I opened; a reviewer checking every call site is what makes it a claim about the system rather than about two modules |
+| Repo hygiene clean: no `.pem`/`.key` tracked, no `spikes/` imports in `packages/` | The Phase 0 ground rule that spike code stays out of `packages/` held under actual review, not just intent |
+| `uv.lock`'s 1192 lines are proportionate to 47 real dependencies | A sanity check on dependency creep, though **not** a licence check — see condition 4 in section 8 |
+| `contracts/validate.py` and `tests/conformance` run as **required, non-optional** CI jobs | The two-checker split in 5.1 is only protection if neither job can be skipped |
+
+**`security-reviewer`: 0 Critical, 2 High, 0 Medium, 3 Low. Verdict: gate not passed as of that review.**
+
+| # | Sev | Finding | Disposition |
+|---|---|---|---|
+| 1 | **HIGH** | `licence_check.py` exits 1 on `certifi` (MPL-2.0), added this wave (`d3b0e09`) via `testcontainers[kafka]` → `docker` → `requests`. Dev-group only, unmodified, not in the default distribution — architect-verified from the manifests | **Blocking condition 1.** Human decision, correctly routed by the lead. **No agent extends `MPL_APPROVED`**, including me: see invariant 10 for why this is a scope question rather than a caution |
+| 2 | **HIGH** | HTTP loader (`client.py:53`) uses the default `urllib` opener, so 3xx is silently followed: a redirected POST becomes a GET with the body dropped, the target's 200 is read as success, **the offset commits and the message is lost.** Plus `Authorization` not stripped on redirect (credential leak to the redirect target) and the `http://`-loopback-only rule checked on the configured URL but not after a redirect (TLS downgrade) | **Blocking condition 2.** `connector-engineer` fixing with a regression test. Invariant 4 assessment downgraded accordingly (section 3) |
+| 3 | LOW | `receivers/mllp/server.py:205,235` use raw `print(json.dumps(...))` instead of the guarded `JsonLogger` | Track, wave 2. Recorded under invariant 6: safe by content today, not by construction |
+| 4 | LOW | `loaders/http/loader.py:235` logs `error=repr(exc)` — free text where the contract wants a classified code | Track, wave 2. Same entry |
+| 5 | LOW | `tls.py` has no CRL/OCSP revocation checking for mTLS client certificates | Track. Accepted for a walking skeleton; section 7.2 |
+
+**Re-verified in this pass rather than carried from earlier rounds** — worth listing, because a review
+that trusts its predecessors is how the Phase 0 High findings survived a whole wave: all 5 images
+digest-pinned, non-root, read-only plus tmpfs; every published port bound to `127.0.0.1` with no
+`0.0.0.0` host binding; `lite` RF=1 barred-from-production with unsuppressable warnings on the receiver,
+loader and topic-bootstrap; no secrets or keys tracked; `secret_scan.py` and `gitignore_guard.py` pass;
+the PHI guards reached at every real production log and event call site, quarantine and reject paths
+included, *after* the later changes; the loader never logs a response body or headers.
+
+**Explicitly relied on prior reviews and not re-derived:** the `tb-usr-*` fix, the MLLP bind rule, the
+byte-budget queue, the stuck-executor fix, MLLP framing limits, and Kafka client config. **Unverified:**
+Kafka ACLs and SASL are contract-only with no deployment artefact yet. **No SAST, CVE or image scanner
+exists on this machine**, so that part of the wave's security position is source-review-only, exactly as
+in Phase 0.
 
 Two mechanical fixes to `contracts/validate.py` (`bcb651d`, `b6d136f`) were made by the lead during gate
 checks — format and lint only, no design change, my file, and I have no objection.
@@ -366,6 +492,9 @@ decoded, not necessarily what arrived) is an assumption.
   objects. Enforcement needs something that knows it is in production, which does not exist yet.
 - **`halt-partition` needs an alert before the MVP ships, not after.** ADR-003 D3 says so. The runtime
   emits `partition_halted`; nothing alerts on it. A halted partition is silent lag until someone looks.
+- **No CRL or OCSP revocation checking for mTLS client certificates** (`tls.py`, `security-reviewer`
+  Low 5). Accepted for a walking skeleton: a revoked sender certificate would still be trusted until it
+  expires. Track for the point where mTLS is used against a real sender population.
 - **Envelope 2.3.1's reject placeholders are not schema-checkable**, because a normalised reject record
   is structurally identical to an ordinary `dlq` record — which is what normalising is for. Needs a unit
   test per row of that table; `platform-engineer` reports the reject path itself is not yet implemented,
@@ -406,17 +535,24 @@ contradicts ADR-001.
 
 **Blocking sign-off:**
 
-1. **`code-reviewer` clean on the cumulative wave diff.** Exit criterion 4 is unassessable without it,
-   and Critical or High findings must be addressed before done.
-2. **`security-reviewer` pass**, with attention to the quarantine path: it deliberately writes unvalidated
-   bytes to a topic and is the newest PHI-adjacent code in the wave.
-3. **Full `pytest -m integration` run green**, reported with the count. In flight at the time of writing;
-   piece-by-piece runs are not the same evidence as one suite run.
-4. **A licence and dependency check on what the wave added.** Invariant 10 was upheld in Phase 0 and has
-   not been re-verified against `confluent-kafka`, `httpx` and the rest. Gate 7.1 requirement 15. Must
-   cover `[build-system] requires` as well as the locked groups.
-5. **A human pushes `wave/1-1` and the CI integration job goes green**, which is the only thing that
-   turns criterion 1 from PASS-locally into PASS. Not an agent action.
+1. **The `certifi` (MPL-2.0) decision — human.** `licence_check.py` exits 1, so CI is red until it is
+   resolved either way. Dev-group only and not in the default distribution, which bounds the risk but
+   does not make the decision. No agent extends `MPL_APPROVED` (invariant 10, 5.3 finding 1).
+2. **The HTTP loader redirect fix, with a regression test — `connector-engineer`.** In progress. This is
+   silent message loss against invariant 4, plus a credential leak and a TLS-downgrade path from the same
+   default-constructor choice. The regression test is part of the condition, not a nicety: the reason this
+   shipped is that the misclassification path had no test at all.
+3. **A human pushes `wave/1-1` and the CI integration job goes green.** The only thing that turns
+   criterion 1 from PASS-locally into PASS. Not an agent action, and it cannot happen before condition 1
+   is resolved, because `licence_check.py` fails the run.
+
+**Met since the first draft:**
+
+4. ~~`code-reviewer` clean on the cumulative wave diff.~~ **MET** — APPROVE, zero at any severity.
+5. ~~Full `pytest -m integration` run green.~~ **MET** — 6 passed in 227.91 s.
+6. ~~A licence and dependency check on what the wave added.~~ **RUN, and it found finding 1.** The check
+   existing is what turned an assumption into a decision; that is condition 4 working as intended even
+   though the result is red.
 
 **Not blocking, carried to wave 2:**
 
@@ -427,11 +563,26 @@ contradicts ADR-001.
 10. An alert on `partition_halted` before the MVP.
 11. The Linux re-run of S1 and S2.
 
-**Why GO WITH CONDITIONS rather than GO:** two of four exit criteria are not closeable by any agent —
-one needs a human push, one needs a reviewer that is still running. **Why not NO-GO:** every invariant
-that could be exercised was, the two that could not are blocked on components that do not exist yet
-rather than on anything discovered, and the four contract defects were all found, understood and fixed
-within the wave.
+**Why GO WITH CONDITIONS rather than GO:** two High findings are open, one of which is live silent
+message loss in shipped code. The wave is not done under the definition of done, item 6.
+
+**Why not NO-GO**, which is the judgement worth defending. Neither High requires redesigning anything:
+one is a licensing decision on a dev-only transitive dependency, and the other is a default-constructor
+choice with a one-line fix and a regression test already in flight. That is the Phase 0 distinction
+between a condition and a defect, applied the same way — Phase 0 also carried 2 Highs (a live
+all-interfaces exposure among them) as blocking conditions rather than a NO-GO, and they were closed
+before signing. Against that: every invariant that could be exercised was, the two that could not are
+blocked on components that do not exist yet rather than on anything discovered, `code-reviewer-8` found
+nothing at any severity across the whole diff, and the four contract defects were all found, understood
+and fixed inside the wave.
+
+**The pattern in both Highs is worth more than either fix.** High 2 exists because the loader accepted a
+library default — `urllib`'s redirect handler — and the tests covered the happy path and the duplicate
+path but not the misclassification path. High 1 exists because a hand-written `# Apache-2.0` comment sat
+next to a dependency whose transitive closure nobody had resolved. Neither is carelessness; both are
+**controls that were never applied to a path nobody thought about.** That is the same shape as the two
+Phase 0 Highs and as three of the four contract defects in 5.1. Wave 2 should assume it recurs and spend
+its review effort on defaults and transitive edges rather than on the paths that have tests.
 
 **Why this wave's most useful output is a process finding.** Four contract defects were found by
 implementers and none by a checker. The checkers were not weak — 102 conformance cases, 701 fast tests,
@@ -444,12 +595,14 @@ refer to nothing at all. Wave 2 should expect the same class of defect and keep 
 
 | Item | Status |
 |---|---|
-| Exit criterion 1 (E2E in CI) | **PASS locally, PENDING CI push** |
+| Exit criterion 1 (E2E in CI) | **PASS locally, PENDING CI push.** `pytest -m integration` 6 passed in 227.91 s; no CI run exists |
 | Exit criterion 2 (invariants 1, 2, 3, 5 tested) | **PASS for 1, 2, 5; PARTIAL for 3** |
 | Exit criterion 3 (contracts published and referenced) | **PASS** |
-| Exit criterion 4 (`code-reviewer` clean) | **PENDING** |
-| Invariants 1-10 | No change needed. 1, 2, 5, 7 upheld with evidence; 4, 6, 8 upheld in part with named gaps; 3 partial; 9 not exercised; 10 not re-verified this wave |
-| Unresolved Critical | **Unknown — reviews outstanding** |
-| Unresolved High | **Unknown — reviews outstanding** |
-| Gate recommendation | **GO WITH CONDITIONS (provisional):** 5 blocking, 6 carried forward |
-| Human sign-off | pending |
+| Exit criterion 4 (`code-reviewer` clean) | **PASS.** `code-reviewer-8`: APPROVE, zero findings at any severity |
+| Invariants 1-10 | **No change needed to any invariant.** 1, 2, 5, 7 upheld with evidence; 6, 8 upheld in part with named gaps; 3 partial; **4 breached by an open High (silent message loss on redirect)**; 9 not exercised; **10 at risk on an open High (`certifi` MPL-2.0)** |
+| `code-reviewer-8`, wave diff | **Zero Critical, High, Medium, Low** |
+| `security-reviewer` | **0 Critical, 2 High, 0 Medium, 3 Low.** Own verdict: gate not passed |
+| Unresolved Critical | **None** |
+| Unresolved High | **2.** `certifi` MPL-2.0 (human decision); HTTP loader redirect (`connector-engineer`, fix in flight) |
+| Gate recommendation | **GO WITH CONDITIONS:** 3 blocking (2 Highs plus the CI push), 3 met, 6 carried to wave 2. **Not signable in this state** |
+| Human sign-off | pending — and it should not be given until conditions 1 and 2 are closed |

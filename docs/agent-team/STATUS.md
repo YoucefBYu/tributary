@@ -6,15 +6,26 @@ wave's exit criteria here.
 ## Current
 
 - **Phase / wave:** **Phase 1, wave 1 — walking skeleton. AT GATE.** All eight tasks delivered. Gate
-  report [`gates/phase-1-wave-1.md`](gates/phase-1-wave-1.md): **GO WITH CONDITIONS, provisional** — it
-  is not final, because `code-reviewer` and `security-reviewer` are still running and the full
-  `pytest -m integration` run is in flight. Phase 0 is complete and signed (2026-09-22).
+  report [`gates/phase-1-wave-1.md`](gates/phase-1-wave-1.md): **GO WITH CONDITIONS — NOT SIGNABLE YET.**
+  All inputs are in. `code-reviewer-8`: APPROVE, zero findings at any severity.
+  **`security-reviewer`: 0 Critical, 2 High, 0 Medium, 3 Low** — both Highs block:
+  (1) `licence_check.py` exits 1 on `certifi` (MPL-2.0), added this wave via `testcontainers[kafka]` →
+  `docker` → `requests`; dev-group only and not in the default distribution, **human decision, no agent
+  extends `MPL_APPROVED`**; (2) the HTTP loader follows 3xx with the default `urllib` opener, so a
+  redirected POST drops its body, the target's 200 reads as success and **the offset commits for a
+  message that was never delivered** — invariant 4 breached, `connector-engineer` fixing with a
+  regression test. Third condition: a human push, which cannot succeed until (1) is resolved because CI
+  is red on it. Phase 0 is complete and signed (2026-09-22).
+- **Exit criterion 4 is PASS and stays PASS.** It is specifically "`code-reviewer` clean on the wave
+  diff", and that reviewer found nothing. The two Highs block through the definition of done item 6
+  (`security-reviewer` on auth, PHI, listeners and dependencies), not through criterion 4 — the
+  distinction determines who has work to do.
 - **Branch:** `wave/1-1`
 - **Exit criteria:** 1 **PASS locally, PENDING CI** (nothing has been pushed, so no CI run exists —
   closing it needs a human push); 2 **PASS for invariants 1, 2, 5; PARTIAL for 3**; 3 **PASS**;
-  4 **PENDING** on `code-reviewer`. Engineering checks green as run by the lead: `uv sync`, `ruff`,
-  `ruff format`, `mypy packages` (56 files), fast suite **701 passed**, `validate.py` **102 / 0**,
-  `pytest tests/conformance` **101 passed**.
+  4 **PASS** (`code-reviewer-8`, zero findings). Engineering checks green as run by the lead: `uv sync`,
+  `ruff`, `ruff format`, `mypy packages` (56 files), fast suite **701 passed**, `validate.py` **102 / 0**,
+  `pytest tests/conformance` **101 passed**, `pytest -m integration` **6 passed in 227.91 s**.
 - **Invariant 3 is now PARTIAL, not "not exercised".** The mechanism is implemented and tested —
   `runtime/channels.py` reads the compacted `_tb.<env>.channels` topic and imports no database driver,
   no HTTP client and calls no API, with 12 tests — but PostgreSQL, the API and ClickHouse do not exist
