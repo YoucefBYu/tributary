@@ -47,6 +47,19 @@ Two smaller items from the same report:
 Byte order confirmed: `platform-engineer`'s implementation is big-endian (`struct.pack(">I", ...)`),
 matching what 5.2.1 pins. Contract and code agree; no churn.
 
+### Verified, on the second run
+
+`contracts/validate.py` **102 / 0** and `pytest tests/conformance` **106 passed** (lead). Recorded
+because the **first** run failed, and that is the useful part: the new valid example carried a
+`traceparent` with a 34-character trace id where the pattern requires 32 — an architect typo, not a
+schema bug, caught by the run and fixed in one character. The other three examples written the same
+day were checked for the same error class and were correct.
+
+Worth keeping straight for the gate: the 23-of-23 record on predicted failure pairs is about reasoning
+over schema semantics, and it does not transfer to hand-typed example data. Counting hex characters is
+clerical, and only running the validator catches it. A hand-authored valid example is never "verified"
+until something has executed it.
+
 ## 2026-09-22 (W1-4 implementation) — quarantine blob framing, the original key, and a stage that stops being a guess
 
 Three items `platform-engineer` raised while implementing quarantine (`a96edb1`). All **additive**;
