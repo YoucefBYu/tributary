@@ -1,19 +1,20 @@
 # Tributary lite stack (Compose)
 
 The walking-skeleton deployment for local development: one Kafka broker (KRaft), ClickHouse,
-PostgreSQL, the MLLP receiver, and a one-shot job that creates the demo topics. **Development only —
-see the warning block at the top of `docker-compose.yml`.** Never point this stack at real patient
-data (CLAUDE.md: synthetic data only).
+PostgreSQL, the MLLP receiver, the pipeline worker, the HTTP loader, and two one-shot jobs that seed
+the topics and the channel spec. **Development only — see the warning block at the top of
+`docker-compose.yml`.** Never point this stack at real patient data (CLAUDE.md: synthetic data only).
 
 ## Start
 
 ```bash
 docker compose -f deploy/compose/docker-compose.yml up -d
-docker compose -f deploy/compose/docker-compose.yml ps   # everything should say "healthy"
+docker compose -f deploy/compose/docker-compose.yml ps   # kafka/clickhouse/postgres/mllp-receiver: "healthy"
 ```
 
-Comes up healthy in under 20 seconds on a warm image cache (measured; the two-minute budget in
-`docs/agent-team/phases/phase-1.md` W1-7 leaves headroom for a cold `--build`).
+Reaches that state in 16–30 seconds, measured repeatedly, warm or cold (`--build`) — well under the
+two-minute budget in `docs/agent-team/phases/phase-1.md` W1-7. `worker` and `loader` have no
+healthcheck (see the table below for why) but show "Up" with `RestartCount: 0`.
 
 ## What's running
 
@@ -22,12 +23,23 @@ Comes up healthy in under 20 seconds on a warm image cache (measured; the two-mi
 | `kafka` | `apache/kafka:4.0.0` | `127.0.0.1:19092` (host), `kafka:9092` (containers) | KRaft, single node, **lite profile: RF=1, min.insync.replicas=1** |
 | `clickhouse` | `clickhouse/clickhouse-server:24.8-alpine` | `127.0.0.1:8123` (HTTP), `127.0.0.1:9000` (native) | empty archive; nothing writes to it yet |
 | `postgres` | `postgres:16-alpine` | `127.0.0.1:5432` (db/user `tributary`, no password: `trust` auth) | empty control-plane DB; nothing writes to it yet |
-| `topic-bootstrap` | built from `topic-bootstrap/` | n/a (runs once, then exits 0) | creates the `adt-passthrough` demo channel's topics from `contracts/topics/v0/topic-defaults.json` |
-| `mllp-receiver` | built from `images/python-app.Dockerfile` | see below | `packages/tributary-receivers`, channel `contracts/channel-spec/v0/examples/valid/walking-skeleton-loopback.json` |
+| `channel-spec-volume-init` | `python:3.12-slim` | n/a (runs once, exits 0) | chowns the `channel-spec-published` volume so a non-root job can write to it — see Design notes |
+| `topic-bootstrap` | built from `topic-bootstrap/` | n/a (runs once, exits 0) | creates the `adt-passthrough` demo channel's topics from `contracts/topics/v0/topic-defaults.json` |
+| `channel-publish` | built from `channel-publish/` | n/a (runs once, exits 0) | stamps `metadata.version` and produces the demo channel spec to `_tb.dev.channels`, the worker's only source of truth for a channel; also writes the same published document to a shared volume for the receiver and loader to read |
+| `mllp-receiver` | built from `images/python-app.Dockerfile` | see below | `packages/tributary-receivers`; channel spec is the published document from `channel-publish`, not the raw contract example |
+| `worker` | built from `images/python-app.Dockerfile` | n/a (no listener) | `packages/tributary-runtime`, `python -m tributary.runtime.worker`; consumes `_tb.dev.channels` and `dev.adt-passthrough.raw` |
+| `loader` | built from `images/python-app.Dockerfile` | n/a (no listener) | `packages/tributary-loaders`, `python -m tributary.loaders.http`, destination `http-stub`; see below for why delivery never succeeds in this stack |
 
-`worker` and `loader` are **not defined yet**: `tributary-runtime` has no consumer entry point (W1-4)
-and `tributary-loaders` has no HTTP loader (W1-6) as this file is written. Ask `devops-engineer` to
-add them once both exist — see the comment at the end of `docker-compose.yml`.
+### The loader never successfully delivers here, and that's expected
+
+The demo channel's `http-stub` destination is `http://127.0.0.1:8080/ingest` — loopback, same
+reasoning as the receiver's bind below — and there is no HTTP server listening there in this stack
+(W1-8, `qa-engineer`'s e2e test brings its own). Every delivery attempt gets "connection refused";
+`loader` retries per the destination's policy (blocking, `maxAttempts: 5`) and then halts the
+partition. That is the retry-then-halt behaviour invariant 5 depends on, observable and correct, not a
+bug in this file — it is why `loader` has no healthcheck ("running but paused, waiting for a
+destination" has no single up/down signal to probe). Point it at a real stub, or let a future e2e test
+bring its own, before treating a successful delivery as demonstrated.
 
 ## Reaching the MLLP receiver
 
@@ -59,14 +71,16 @@ workaround: see `docker-compose.yml`'s `mllp-receiver` comment.
 RF=1 / min.insync.replicas=1 is a human-approved, documented exception to invariant 1 (ADR-002 D14),
 **barred from production**. `topic-bootstrap` logs the mandatory startup warning
 (`topic-defaults.json` `profiles.lite.warning`) at `WARNING` level on every run — it cannot be turned
-off. Each data-plane component must also emit it once it exists (`contracts/topics/v0` README 3.8);
-that is tracked against W1-4/5/6, not this stack.
+off. Whether `mllp-receiver`, `worker` and `loader` also emit it themselves is up to
+`connector-engineer`/`platform-engineer` (`contracts/topics/v0` README 3.8); not verified from this
+file, since none of the three take a `--profile` argument today.
 
 ## Design notes
 
-- **No named volumes.** `stop`/`start` preserves a container's data; `down` starts clean. This avoids
-  the root-owned-volume permission trap on Windows/WSL2 (`spikes/common/docker-compose.yml` hit the
-  same thing) and keeps the "under two minutes" bar honest. Add your own volumes for a longer-lived
+- **No named volumes for data.** `stop`/`start` preserves a container's data; `down` starts clean.
+  This avoids the root-owned-volume permission trap on Windows/WSL2 (`spikes/common/docker-compose.yml`
+  hit the same thing, and `channel-spec-volume-init` below exists because a *different* named volume
+  hit it anyway) and keeps the "under two minutes" bar honest. Add your own volumes for a longer-lived
   local sandbox.
 - **`restart: "no"` everywhere.** A future chaos test (`tests/chaos`, W1-8) kills a container
   mid-stream; any restart policy would resurrect it inside the outage window and invalidate the test,
@@ -84,4 +98,14 @@ that is tracked against W1-4/5/6, not this stack.
   re-measurement of `session.timeout.ms`/partition defaults reaches this stack without a rebuild —
   see the file's own `must_not_hardcode` block and `topic-bootstrap/bootstrap_topics.py`'s docstring.
   `_tb.<env>.audit` and `<channel>.reply` are deliberately never created here; both reasons are in
-  that docstring.
+  that docstring. `worker`, `mllp-receiver` and `loader` mount the same file (via `TB_CONTRACTS_DIR`)
+  for the same reason: `tributary-runtime`'s producer/consumer settings and
+  `tributary-receivers`' Kafka producer config both read it rather than hardcode it.
+- **`channel-spec-published` is the one named volume in this file.** `channel-publish` stamps
+  `metadata.version` onto the raw contract example and writes the result there; `mllp-receiver` and
+  `loader` mount it read-only instead of the raw file, because `tributary.loaders.http.main` requires
+  `metadata.version` outright and because using one stamped file (rather than each component
+  inventing its own version) keeps `tb-channel-version` consistent with what the worker actually
+  applied. `channel-spec-volume-init` exists only because Docker creates a new named volume owned by
+  `root:root`, and every long-running container here is non-root (Phase 1 requirement 7) — it chowns
+  the volume once, as root, and is the only thing in this file that runs as root.
