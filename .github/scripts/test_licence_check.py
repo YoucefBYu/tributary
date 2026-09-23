@@ -42,18 +42,44 @@ def test_missing_metadata_fails() -> None:
     assert lc.classify("x", FakeDist("x"))[0] == "fail"
 
 
-def test_mpl_only_for_the_approved_set() -> None:
+def test_mpl_only_for_the_approved_set_in_its_approved_scope() -> None:
     mpl = {"License-Expression": "MPL-2.0"}
-    for name in ("orjson", "hypothesis", "pathspec", "certifi"):
-        assert lc.classify(name, FakeDist(name, **mpl))[0] == "mpl-approved"
+    # orjson is approved "runtime": it must be in the runtime closure to pass.
+    assert lc.classify("orjson", FakeDist("orjson", **mpl), runtime_names=frozenset({"orjson"}))[0] == "mpl-approved"
+    # hypothesis, pathspec, certifi are approved "non-runtime": absent from the runtime closure.
+    for name in ("hypothesis", "pathspec", "certifi"):
+        assert lc.classify(name, FakeDist(name, **mpl), runtime_names=frozenset())[0] == "mpl-approved"
     assert lc.classify("newthing", FakeDist("newthing", **mpl))[0] == "fail"
+
+
+def test_mpl_approval_does_not_transfer_across_scope() -> None:
+    """The approval answered a specific question (is it in the runtime closure or not); a package
+    that moves across that line needs a fresh decision, not automatic coverage by its old approval."""
+    mpl = {"License-Expression": "MPL-2.0"}
+    # orjson approved "runtime" but not actually in the runtime closure this run: fails.
+    status, detail = lc.classify("orjson", FakeDist("orjson", **mpl), runtime_names=frozenset())
+    assert status == "fail"
+    assert "moved" in detail
+    # certifi approved "non-runtime" but now present in the runtime closure: fails.
+    status, detail = lc.classify("certifi", FakeDist("certifi", **mpl), runtime_names=frozenset({"certifi"}))
+    assert status == "fail"
+    assert "moved" in detail
 
 
 def test_orjson_compound_expression_is_still_mpl_gated() -> None:
     expr = {"License-Expression": "MPL-2.0 AND (Apache-2.0 OR MIT)"}
-    assert lc.classify("orjson", FakeDist("orjson", **expr))[0] == "mpl-approved"
+    assert lc.classify("orjson", FakeDist("orjson", **expr), runtime_names=frozenset({"orjson"}))[0] == "mpl-approved"
     assert lc.classify("other", FakeDist("other", **expr))[0] == "fail"
 
 
 def test_build_requires_are_collected() -> None:
     assert any(r.startswith("hatchling") for r in lc.build_requires())
+
+
+def test_runtime_closure_excludes_the_dev_group() -> None:
+    """Real resolution against this repo, not a fake: this is the set `classify`'s scope check
+    trusts, so a mistake here would silently defeat it rather than fail loudly."""
+    names = lc.runtime_closure_names()
+    assert "orjson" in names  # tributary-runtime's own dependency: must ship
+    for dev_only in ("hypothesis", "pathspec", "certifi", "pytest", "ruff", "mypy", "testcontainers"):
+        assert dev_only not in names

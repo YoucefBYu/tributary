@@ -6,8 +6,14 @@ Covers everything that can end up on a build or run path:
     transitively. Phase 0 found pathspec (MPL-2.0) only there: a lock-file-only check misses it.
 
 Fails on anything outside Apache-2.0, MIT, BSD, ISC, PSF, except the human-approved unmodified
-MPL-2.0 dependencies in MPL_APPROVED. A new or modified MPL dependency needs fresh human approval:
-do not just extend that set.
+MPL-2.0 dependencies in MPL_APPROVED. Each entry names a *scope*, not just a package: "runtime" means
+the approval covers it shipping in the default distribution (invariant 10's actual concern), "non-
+runtime" means the opposite -- approved only for staying out of it (dev group or `[build-system]
+requires`). The check enforces the scope, not just the licence: a package approved non-runtime that
+starts appearing in the runtime-only dependency closure fails, even though its name is on the list,
+because that closure is a different question than the one that was answered. A new or modified MPL
+dependency, or an existing one arriving by a new path or into a new scope, needs fresh human approval:
+do not just extend this set.
 
 Writes a CycloneDX 1.5 SBOM to --sbom (default sbom.cdx.json).
 """
@@ -26,10 +32,26 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 
-# Human-approved 2026-09-22 (docs/agent-team/gates/phase-0-spikes.md section 8), plus certifi,
-# human-approved 2026-09-23: dev-only, unmodified, via testcontainers[kafka] -> docker -> requests ->
-# certifi. Never shipped in the default distribution. Unmodified only.
-MPL_APPROVED = {"orjson", "hypothesis", "pathspec", "certifi"}
+# Each approval is scoped: "runtime" means human-approved to ship in the default distribution;
+# "non-runtime" means human-approved to be a dev-group or build-system-only dependency and NOT to
+# ship in it. All four are unmodified dependencies.
+#
+# orjson: human-approved 2026-09-22 (docs/agent-team/gates/phase-0-spikes.md section 8). A
+#   tributary-runtime dependency: ships in the distribution, so scope is "runtime".
+# hypothesis, pathspec: same approval, same date. Test framework and a mypy/hatchling dependency
+#   respectively: neither ships, so scope is "non-runtime".
+# certifi: SEPARATE approval, human-approved 2026-09-23 (ADR-001 2.3; wave-1 gate report 5.3) -- not
+#   folded into the 2026-09-22 decision, which was written to cover exactly those three packages.
+#   Current path is testcontainers[kafka] -> docker -> requests -> certifi, dev group only, so scope
+#   is "non-runtime". If certifi (or any of these) ever arrives in the runtime closure or by a
+#   different path, that is a different dependency and needs its own fresh approval -- it must not be
+#   silently covered by broadening this comment.
+MPL_APPROVED: dict[str, str] = {
+    "orjson": "runtime",
+    "hypothesis": "non-runtime",
+    "pathspec": "non-runtime",
+    "certifi": "non-runtime",
+}
 
 ALLOWED = ("apache", "mit", "bsd", "isc", "psf", "python software foundation", "zlib", "0bsd")
 DENIED = re.compile(
@@ -74,17 +96,31 @@ def licences(dist: md.Distribution) -> list[str]:
     return out
 
 
-def classify(name: str, dist: md.Distribution) -> tuple[str, str]:
-    """Return (status, detail): status is ok, mpl-approved or fail."""
+def classify(name: str, dist: md.Distribution, *, runtime_names: frozenset[str] = frozenset()) -> tuple[str, str]:
+    """Return (status, detail): status is ok, mpl-approved or fail.
+
+    `runtime_names` is the set of packages in the runtime-only dependency closure (every workspace
+    package's own `dependencies`, none of the dev group or `[build-system] requires`) -- the actual
+    default-distribution surface invariant 10 is about. An MPL package's approval scope is checked
+    against it: "runtime" must be in that closure, "non-runtime" must not be. A scope mismatch fails
+    even for an approved name, because the approval answered a different question than the one this
+    resolution is now asking.
+    """
     found = [OVERRIDES[name]] if name in OVERRIDES else licences(dist)
     detail = " | ".join(found) or "NO LICENCE METADATA"
     if any(DENIED.search(x) for x in found):
         return "fail", detail
     if any("mpl" in x.lower() or "mozilla" in x.lower() for x in found):
         # MPL as one term of an AND expression (orjson) still needs the approval.
-        if name in MPL_APPROVED:
-            return "mpl-approved", detail
-        return "fail", detail + " (MPL not approved for this package)"
+        scope = MPL_APPROVED.get(name)
+        if scope is None:
+            return "fail", detail + " (MPL not approved for this package)"
+        in_runtime = name in runtime_names
+        if scope == "runtime" and not in_runtime:
+            return "fail", detail + f" (approved runtime-only, but not in the runtime closure: {name!r} moved)"
+        if scope == "non-runtime" and in_runtime:
+            return "fail", detail + f" (approved non-runtime only, but now in the runtime closure: {name!r} moved)"
+        return "mpl-approved", detail
     if not found:
         return "fail", detail
     ok = any(_terms_ok(x) for x in found)
@@ -99,15 +135,28 @@ def build_requires() -> list[str]:
     return sorted(set(reqs))
 
 
-def resolve(target: Path) -> None:
+def _export(*extra: str) -> list[str]:
     export = subprocess.run(
-        ["uv", "export", "--frozen", "--all-groups", "--no-emit-workspace", "--no-hashes", "--no-header"],
+        ["uv", "export", "--frozen", "--no-emit-workspace", "--no-hashes", "--no-header", *extra],
         cwd=ROOT,
         check=True,
         capture_output=True,
         text=True,
     ).stdout
-    reqs = [ln for ln in export.splitlines() if ln and not ln.startswith(("#", " "))]
+    return [ln for ln in export.splitlines() if ln and not ln.startswith(("#", " "))]
+
+
+def runtime_closure_names() -> frozenset[str]:
+    """Every package in the runtime-only dependency closure: each workspace member's own
+    `dependencies`, with the dev group excluded. This is the default-distribution surface, as
+    opposed to the full `--all-groups` export `resolve()` installs to check everything at once."""
+    reqs = _export("--no-dev", "--all-packages")
+    names = {re.split(r"[<>=!~\[; ]", r, maxsplit=1)[0] for r in reqs}
+    return frozenset(_norm(n) for n in names if n)
+
+
+def resolve(target: Path) -> None:
+    reqs = _export("--all-groups")
     reqs += build_requires()
     req_file = target / "requirements.in"
     req_file.write_text("\n".join(reqs) + "\n", encoding="utf-8")
@@ -136,10 +185,11 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         tdir = Path(tmp)
         resolve(tdir)
+        runtime_names = runtime_closure_names()
         components, failures = [], []
         for dist in sorted(md.distributions(path=[str(tdir / "site")]), key=lambda d: _norm(d.metadata["Name"])):
             name, version = _norm(dist.metadata["Name"]), dist.version
-            status, detail = classify(name, dist)
+            status, detail = classify(name, dist, runtime_names=runtime_names)
             print(f"{status:12} {name}=={version}  [{detail}]")
             components.append(
                 {
