@@ -10,6 +10,11 @@ dependencies = [
     "orjson>=3.10.0",          # MPL-2.0 AND (Apache-2.0 OR MIT), human-approved 2026-09-22, unmodified
 ]
 
+# Steps the engine provides, resolvable by a channel spec's `uses:` with no bundle fetch
+# (ADR-001 6.2, channel-spec README 3.3.1). The entry-point NAME is what a spec writes.
+[project.entry-points."tributary.steps"]
+"tributary.core.passthrough" = "tributary.runtime.core_steps:passthrough"
+
 [build-system]
 requires = ["hatchling==1.27.0"]
 build-backend = "hatchling.build"
