@@ -130,6 +130,10 @@ def build_loop(a: argparse.Namespace) -> tuple[ConsumerLoop, HttpRecordHandler]:
         instance=instance,
         dlq=dlq,
         destination=a.destination,
+        # envelope 2.3.1: the stage stamped on an ordinary reject (a malformed non-identity header
+        # dead-lettered before dispatch). "pending" is the loader's read stage; the default "queued"
+        # is the pipeline worker's, reading raw (platform-engineer).
+        read_stage="pending",
     )
     loop.start()
     log.info("loader_started", channel=a.channel, destination=a.destination, channel_version=spec.version)
