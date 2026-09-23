@@ -42,9 +42,9 @@ def test_missing_metadata_fails() -> None:
     assert lc.classify("x", FakeDist("x"))[0] == "fail"
 
 
-def test_mpl_only_for_the_approved_three() -> None:
+def test_mpl_only_for_the_approved_set() -> None:
     mpl = {"License-Expression": "MPL-2.0"}
-    for name in ("orjson", "hypothesis", "pathspec"):
+    for name in ("orjson", "hypothesis", "pathspec", "certifi"):
         assert lc.classify(name, FakeDist(name, **mpl))[0] == "mpl-approved"
     assert lc.classify("newthing", FakeDist("newthing", **mpl))[0] == "fail"
 

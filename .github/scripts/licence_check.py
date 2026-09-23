@@ -26,8 +26,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 
-# Human-approved 2026-09-22 (docs/agent-team/gates/phase-0-spikes.md section 8). Unmodified only.
-MPL_APPROVED = {"orjson", "hypothesis", "pathspec"}
+# Human-approved 2026-09-22 (docs/agent-team/gates/phase-0-spikes.md section 8), plus certifi,
+# human-approved 2026-09-23: dev-only, unmodified, via testcontainers[kafka] -> docker -> requests ->
+# certifi. Never shipped in the default distribution. Unmodified only.
+MPL_APPROVED = {"orjson", "hypothesis", "pathspec", "certifi"}
 
 ALLOWED = ("apache", "mit", "bsd", "isc", "psf", "python software foundation", "zlib", "0bsd")
 DENIED = re.compile(
