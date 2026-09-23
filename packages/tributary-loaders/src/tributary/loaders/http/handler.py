@@ -12,9 +12,9 @@ machinery a second time now that it exists.
 
 `HttpLoader.deliver` is a coroutine; `ConsumerLoop.run` is a plain synchronous loop with no event loop
 of its own. `handle` drives one persistent event loop with `run_until_complete` per record rather than
-spinning one up per call — `asyncio.run` closes and garbage-collects the loop's thread pool executor
-each time, which `HttpLoader.deliver` uses for every attempt (`client.stdlib_send` via
-`asyncio.to_thread`).
+spinning one up per call — a fresh `asyncio.run` per record would also mean a fresh `HttpLoader`
+executor per record (`loader.py`'s dedicated bounded thread pool), defeating the point of it being a
+bound at all.
 """
 
 from __future__ import annotations
@@ -47,5 +47,9 @@ class HttpRecordHandler:
             return
         raise DeliveryError(ERROR_CODES[outcome.reason], retryable=outcome.retryable)
 
+    def metrics_snapshot(self) -> dict[str, int]:
+        return self._http_loader.metrics.snapshot()
+
     def close(self) -> None:
+        self._http_loader.close()
         self._loop.close()

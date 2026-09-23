@@ -44,12 +44,12 @@ def build_loop(a: argparse.Namespace) -> tuple[ConsumerLoop, HttpRecordHandler]:
     destination = channel_spec.destination(a.destination)
     config = http_destination_config_from_destination(channel_spec.name, destination)
 
+    log = JsonLogger(f"loader-{a.destination}", base={"channel": channel_spec.name, "destination": a.destination})
     resolver = DirSecretResolver(a.secrets_dir) if a.secrets_dir else DirSecretResolver()
-    handler = HttpRecordHandler(HttpLoader(config, secret_resolver=resolver))
+    handler = HttpRecordHandler(HttpLoader(config, secret_resolver=resolver, log=log))
 
     kafka_settings = KafkaSettings(bootstrap_servers=a.bootstrap)
     defaults = load_topic_defaults(a.contracts_dir)
-    log = JsonLogger(f"loader-{a.destination}")
     instance = a.instance_id or f"loader-{a.destination}-{os.getpid()}"
 
     data_producer = Producer(
@@ -121,9 +121,17 @@ def main() -> None:
     try:
         stats = loop.run()
     finally:
+        metrics = handler.metrics_snapshot()
         handler.close()
     print(
-        json.dumps({"event": "loader_exit", "handled": stats.handled, "uptime_s": round(time.monotonic() - started, 1)})
+        json.dumps(
+            {
+                "event": "loader_exit",
+                "handled": stats.handled,
+                "uptime_s": round(time.monotonic() - started, 1),
+                "delivery_metrics": metrics,
+            }
+        )
     )
 
 
