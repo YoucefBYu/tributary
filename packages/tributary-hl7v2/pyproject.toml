@@ -1,0 +1,30 @@
+[project]
+name = "tributary-hl7v2"
+version = "0.0.0"
+description = "Lazy HL7 v2 parser, serializer, accessors and ACK builder."
+license = "Apache-2.0"
+requires-python = ">=3.12"
+dependencies = [
+    "tributary-sdk",  # only for the `tributary.hl7v2.parse` @step (step.py); itself stdlib-only
+]
+
+# Otherwise stdlib only, on purpose (S1: python-hl7 and hl7apy both failed the throughput or memory bar
+# for the hot path -- see docs/spikes/S1-hl7-throughput.md). A third-party parser dependency here runs
+# on every worker core, and the winning design in S1 was a segment-indexed split with none at all.
+# `message.py`, `delimiters.py`, `escaping.py`, `paths.py` and `ack.py` import nothing outside stdlib.
+
+# `tributary.hl7v2.parse` (contracts/channel-spec/v0 examples/valid/*, CHANGELOG 2026-09-23) -- a
+# channel spec's `uses:` names the entry-point NAME, which resolves through tributary-runtime's
+# `load_step` with no bundle fetch (ADR-001 6.2).
+[project.entry-points."tributary.steps"]
+"tributary.hl7v2.parse" = "tributary.hl7v2.step:parse"
+
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tributary"]
+
+[tool.uv.sources]
+tributary-sdk = { workspace = true }
