@@ -12,8 +12,11 @@ wave's exit criteria here.
   (1) `certifi` (MPL-2.0), added this wave via `testcontainers[kafka]` → `docker` → `requests` —
   **human APPROVED 2026-09-23**, unmodified, dev group only, never shipped, scoped to that transitive
   path and recorded as **its own approval, not an extension** of the three-package one (ADR-001 2.3).
-  Remaining: `devops-engineer` adds it to `licence_check.py`'s `MPL_APPROVED`, without which CI still
-  exits 1. (2) **Still open:** the HTTP loader follows 3xx with the default `urllib` opener, so a
+  `devops-engineer` landed the `MPL_APPROVED` edit (`a35528c`); `licence_check.py` passes, 44
+  components, 0 failed. **CLOSED.** (2) **Fix landed (`bec8029`), still open pending
+  `security-reviewer`'s confirmation** that all three of its consequences are closed and nothing new was
+  introduced — the commit existing is not the same claim: the HTTP loader follows 3xx with the default
+  `urllib` opener, so a
   redirected POST drops its body, the target's 200 reads as success and **the offset commits for a
   message that was never delivered** — invariant 4 breached, `connector-engineer` fixing with a
   regression test. Third condition: a human push, which cannot succeed until (1) is resolved because CI

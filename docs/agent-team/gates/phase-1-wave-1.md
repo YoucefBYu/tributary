@@ -437,7 +437,7 @@ they are recorded rather than summarised away:
 | # | Sev | Finding | Disposition |
 |---|---|---|---|
 | 1 | **HIGH** | `licence_check.py` exits 1 on `certifi` (MPL-2.0), added this wave (`d3b0e09`) via `testcontainers[kafka]` → `docker` → `requests`. Dev-group only, unmodified, not in the default distribution — architect-verified from the manifests | **CLOSED — human APPROVED 2026-09-23**, recorded as its own approval scoped to that transitive path, not as an extension of the existing three (ADR-001 2.3). The `licence_check.py` `MPL_APPROVED` edit is `devops-engineer`'s file and is routed to them; CI stays red until it lands |
-| 2 | **HIGH** | HTTP loader (`client.py:53`) uses the default `urllib` opener, so 3xx is silently followed: a redirected POST becomes a GET with the body dropped, the target's 200 is read as success, **the offset commits and the message is lost.** Plus `Authorization` not stripped on redirect (credential leak to the redirect target) and the `http://`-loopback-only rule checked on the configured URL but not after a redirect (TLS downgrade) | **Blocking condition 2.** `connector-engineer` fixing with a regression test. Invariant 4 assessment downgraded accordingly (section 3) |
+| 2 | **HIGH** | HTTP loader (`client.py:53`) uses the default `urllib` opener, so 3xx is silently followed: a redirected POST becomes a GET with the body dropped, the target's 200 is read as success, **the offset commits and the message is lost.** Plus `Authorization` not stripped on redirect (credential leak to the redirect target) and the `http://`-loopback-only rule checked on the configured URL but not after a redirect (TLS downgrade) | **Fix landed `bec8029`; blocking condition 2 stays OPEN pending `security-reviewer` confirmation that all three consequences are closed and no new gap was introduced.** Invariant 4 assessment (section 3) stays downgraded until then |
 | 3 | LOW | `receivers/mllp/server.py:205,235` use raw `print(json.dumps(...))` instead of the guarded `JsonLogger` | Track, wave 2. Recorded under invariant 6: safe by content today, not by construction |
 | 4 | LOW | `loaders/http/loader.py:235` logs `error=repr(exc)` — free text where the contract wants a classified code | Track, wave 2. Same entry |
 | 5 | LOW | `tls.py` has no CRL/OCSP revocation checking for mTLS client certificates | Track. Accepted for a walking skeleton; section 7.2 |
@@ -500,6 +500,14 @@ decoded, not necessarily what arrived) is an assumption.
   objects. Enforcement needs something that knows it is in production, which does not exist yet.
 - **`halt-partition` needs an alert before the MVP ships, not after.** ADR-003 D3 says so. The runtime
   emits `partition_halted`; nothing alerts on it. A halted partition is silent lag until someone looks.
+- **The CI control scripts are outside the type-check scope.** `mypy packages` is the command CLAUDE.md
+  defines, and `.github/scripts/` is not under `packages/` — so `licence_check.py` and its test are not
+  type-checked. `devops-engineer` found a pre-existing `mypy` error there (a `FakeDist.locate_file`
+  signature mismatch in `test_licence_check.py`, predating this wave, lead-confirmed). The error itself
+  is cosmetic and not worth fixing now. **The coverage gap is the part worth recording:** these scripts
+  are controls — `licence_check.py` is what caught the `certifi` High that review missed — and a control
+  that no static check covers is one nobody notices decaying. Wave 2: extend the type-check scope to the
+  scripts, then fix what it reports.
 - **No CRL or OCSP revocation checking for mTLS client certificates** (`tls.py`, `security-reviewer`
   Low 5). Accepted for a walking skeleton: a revoked sender certificate would still be trusted until it
   expires. Track for the point where mTLS is used against a real sender population.
@@ -543,18 +551,19 @@ contradicts ADR-001.
 
 **Blocking sign-off:**
 
-1. ~~**The `certifi` (MPL-2.0) decision — human.**~~ **DECIDED 2026-09-23: APPROVED**, unmodified, dev
+1. ~~**The `certifi` (MPL-2.0) decision — human.**~~ **CLOSED.** **APPROVED 2026-09-23**, unmodified, dev
    group only, never shipped, scoped to the `testcontainers[kafka]` → `docker` → `requests` path and
-   recorded as its own approval in ADR-001 2.3. **One task remains before CI can pass:**
-   `devops-engineer` adds `certifi` to `licence_check.py`'s `MPL_APPROVED` list — a code change in their
-   file, not mine. Until it lands the job still exits 1.
-2. **The HTTP loader redirect fix, with a regression test — `connector-engineer`.** In progress. This is
-   silent message loss against invariant 4, plus a credential leak and a TLS-downgrade path from the same
-   default-constructor choice. The regression test is part of the condition, not a nicety: the reason this
-   shipped is that the misclassification path had no test at all.
+   recorded as its own approval in ADR-001 2.3. `devops-engineer` landed the `MPL_APPROVED` edit
+   (`a35528c`); `licence_check.py` now passes, **44 components, 0 failed**.
+2. **The HTTP loader redirect fix — `connector-engineer`. Fix landed (`bec8029`); AWAITING
+   `security-reviewer`'s confirmation.** Deliberately not marked closed on the strength of the commit
+   existing. The finding had **three** consequences from one default-constructor choice — silent message
+   loss, an unstripped `Authorization` header on redirect, and a TLS-downgrade path around the
+   loopback-only rule — so "the redirect is fixed" and "all three are closed, with no new gap" are
+   different claims. The lead asked the reviewer rather than accepting their own read, which is the right
+   call: the person who verifies a fix should not be the person who wants it to be finished.
 3. **A human pushes `wave/1-1` and the CI integration job goes green.** The only thing that turns
-   criterion 1 from PASS-locally into PASS. Not an agent action, and it cannot happen before condition 1
-   is resolved, because `licence_check.py` fails the run.
+   criterion 1 from PASS-locally into PASS. Not an agent action. Condition 1 no longer blocks it.
 
 **Met since the first draft:**
 
@@ -613,6 +622,6 @@ refer to nothing at all. Wave 2 should expect the same class of defect and keep 
 | `code-reviewer-8`, wave diff | **Zero Critical, High, Medium, Low** |
 | `security-reviewer` | **0 Critical, 2 High, 0 Medium, 3 Low.** Own verdict: gate not passed as of that review |
 | Unresolved Critical | **None** |
-| Unresolved High | **1.** High 1 (`certifi`) **decided and approved 2026-09-23**, pending only the `licence_check.py` list edit by `devops-engineer`. High 2 (HTTP loader redirect) **open**, fix in flight with `connector-engineer` |
-| Gate recommendation | **GO WITH CONDITIONS:** 1 High open, plus the `MPL_APPROVED` edit and the CI push. **Not signable until High 2 is fixed with its regression test** |
-| Human sign-off | pending — condition 2 must close first |
+| Unresolved High | **1, awaiting confirmation.** High 1 (`certifi`) **CLOSED** — approved 2026-09-23, `MPL_APPROVED` edit landed (`a35528c`), `licence_check.py` passes 44 components / 0 failed. High 2 (HTTP loader redirect) **fix landed (`bec8029`), open pending `security-reviewer` confirmation** that all three consequences are closed |
+| Gate recommendation | **GO WITH CONDITIONS:** 1 condition closed, 1 awaiting reviewer confirmation, 1 (the CI push) human-only. **Signable once High 2 is confirmed** |
+| Human sign-off | pending — condition 2's confirmation first, then the push |
