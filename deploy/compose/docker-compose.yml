@@ -258,6 +258,10 @@ services:
       # (tributary.runtime.config: "must ship contracts/ or set TB_CONTRACTS_DIR"); mounted, not
       # baked into the image, for the same reason as topic-bootstrap's mount above.
       TB_CONTRACTS_DIR: /contracts
+      # Matches topic-bootstrap/mllp-receiver/loader. The worker already defaults to "lite" and would
+      # warn either way; explicit here so the day this block is copied toward a production deployment,
+      # a reviewer sees a decision (TB_PROFILE: production) rather than an absence.
+      TB_PROFILE: lite
     volumes:
       - ../../contracts:/contracts:ro
     read_only: true

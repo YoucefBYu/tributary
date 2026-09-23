@@ -69,12 +69,14 @@ workaround: see `docker-compose.yml`'s `mllp-receiver` comment.
 ## The lite-profile durability warning
 
 RF=1 / min.insync.replicas=1 is a human-approved, documented exception to invariant 1 (ADR-002 D14),
-**barred from production**. `topic-bootstrap`, `mllp-receiver` and `loader` all log the mandatory
-startup warning (`topic-defaults.json` `profiles.lite.warning`) at `WARNING` level, unsuppressed, when
-`TB_PROFILE=lite` (this stack's default) — set explicitly in this file's `environment:` blocks even
-though `--profile`/`TB_PROFILE` defaults to `lite` on both, per `contracts/topics/v0` README 3.8.
-`worker` does not take a `--profile` argument as of this file; ask `platform-engineer` if that still
-needs closing.
+**barred from production**. Every one of `topic-bootstrap`, `mllp-receiver`, `worker` and `loader` logs
+the mandatory startup warning (`topic-defaults.json` `profiles.lite.warning`, or `worker`'s own copy
+gated on the contract's `startup_warning_required` flag rather than the literal string `lite`) at
+`WARNING` level, unsuppressed, satisfying `contracts/topics/v0` README 3.8. All four default to `lite`
+on their own, so nothing here would go quiet without it, but `TB_PROFILE: lite` is set explicitly on
+each service's `environment:` block anyway: the day this block is copied toward a production
+deployment, an explicit `TB_PROFILE: production` is a decision a reviewer can see, where an absent
+variable defaulting to a warning is not.
 
 ## Design notes
 
