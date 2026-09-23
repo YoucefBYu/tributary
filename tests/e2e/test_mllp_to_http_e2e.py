@@ -6,19 +6,20 @@ subprocesses running the actual entry points `deploy/compose/docker-compose.yml`
 `tributary.receivers.mllp`, the pipeline worker, `tributary.loaders.http`. `uv run pytest -m
 integration tests/e2e`.
 
-Two things stand in for pieces wave 1 has not built yet, both intentional and both documented where
-they live:
+The worker resolves its step for real: `PipelineWorker` here carries no `steps_override`, so
+`tributary.runtime.steps.load_step` runs against `pipeline.steps` exactly as published —
+`uses: tributary.core.passthrough`, the contract example's own value, a real `tributary.steps` entry
+point `tributary-runtime` registers (architect/platform-engineer, 2026-09-23). An earlier version of
+this test used `steps_override` plus a local stand-in step reachable only via a `PYTHONPATH` hack,
+because the example's original `ref` named a bundle module (`adt_flow.steps.passthrough`) nothing in
+the repo published — that bug is what got found and fixed, and it lived exactly in the resolution path
+`steps_override` bypasses. Kept unoverridden on purpose now: this test must be able to see the next one.
 
-* The channel's pipeline step resolves to `tests.support.demo_steps.passthrough` rather than the
-  contract example's `adt_flow.steps.passthrough` — nothing in the repo can fetch an OCI bundle yet, and
-  no package ships `adt_flow` (confirmed against the compose stack's own worker image; reported to
-  architect/devops-engineer 2026-09-23). Wave 1 has no HL7-to-FHIR mapping regardless, so a no-op step
-  is the correct stand-in, not a shortcut around what this test proves.
-* Kafka is single-node/RF=1 (the lite profile), built the same way
-  `packages/tributary-runtime/tests/test_integration_kafka.py` builds its testcontainers broker
-  (`KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1` included — the compose stack's own kafka service is
-  missing that and cannot form a consumer group at all; also reported 2026-09-23). The chaos test in
-  `tests/chaos` is where a 3-broker cluster belongs.
+Kafka is single-node/RF=1 (the lite profile), built the same way
+`packages/tributary-runtime/tests/test_integration_kafka.py` builds its testcontainers broker
+(`KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1` included — the compose stack's own kafka service was
+missing that and could not form a consumer group at all; reported and fixed 2026-09-23). The chaos test
+in `tests/chaos` is where a 3-broker cluster belongs.
 
 Assertions, in order: the stub sees nothing before we send anything (so "it received something" is not
 vacuously true); the receiver ACKs with `MSA|AA` carrying our control id; the stub's request carries

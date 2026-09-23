@@ -1,10 +1,13 @@
 """A runnable copy of the walking-skeleton channel-spec example for tests.
 
 `contracts/channel-spec/v0/examples/valid/walking-skeleton-loopback.json` hardcodes an MLLP port
-(6661), an HTTP destination (`http://127.0.0.1:8080/ingest`) and a step ref
-(`adt_flow.steps.passthrough`) that only make sense for the devops-owned compose stack. Tests need
-their own free ports (parallel runs collide otherwise) and a step ref that actually resolves — see
-`tests/support/demo_steps.py` for why the contract example's own ref cannot be used yet.
+(6661) and an HTTP destination (`http://127.0.0.1:8080/ingest`) that only make sense for the
+devops-owned compose stack; tests need their own free ports so parallel runs never collide. The
+example's `pipeline.steps` is left untouched: it resolves `uses: tributary.core.passthrough`, a real
+`tributary.steps` entry point registered by `tributary-runtime`
+(architect/platform-engineer, 2026-09-23, replacing an earlier `ref` at a bundle module nothing
+published) — the same step name `deploy/compose/docker-compose.yml`'s worker resolves, so a test using
+this document exercises the real step-resolution path, not a stand-in for it.
 """
 
 from __future__ import annotations
@@ -20,8 +23,6 @@ WALKING_SKELETON_EXAMPLE = (
     CONTRACTS_DIR / "channel-spec" / "v0" / "examples" / "valid" / "walking-skeleton-loopback.json"
 )
 
-STEP_REF = "tests.support.demo_steps.passthrough"
-
 
 def walking_skeleton_document(
     *,
@@ -31,7 +32,8 @@ def walking_skeleton_document(
     destination: str = "http-stub",
     version: int = 1,
 ) -> dict[str, Any]:
-    """The contract example, retargeted at test-owned ports and a resolvable step.
+    """The contract example, retargeted at test-owned ports. `pipeline.steps` is not touched — see
+    the module docstring.
 
     `metadata.version` is stamped here rather than left absent: `tributary.runtime.spec.ChannelSpec`
     requires it even though the schema makes it optional for an authored file (only the *published*
@@ -41,7 +43,6 @@ def walking_skeleton_document(
     document["metadata"]["name"] = channel
     document["metadata"]["version"] = version
     document["spec"]["source"]["port"] = mllp_port
-    document["spec"]["pipeline"]["steps"] = [{"name": "passthrough", "ref": STEP_REF}]
     document["spec"]["destinations"][0]["name"] = destination
     document["spec"]["destinations"][0]["with"]["url"] = http_url
     return document

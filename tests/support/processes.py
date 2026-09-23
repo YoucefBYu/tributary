@@ -26,8 +26,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-
 
 class ProcessDiedError(AssertionError):
     pass
@@ -98,15 +96,6 @@ class ManagedProcess:
             return self.process.wait(timeout=timeout_s)
         except subprocess.TimeoutExpired:
             return self.kill_and_wait(timeout_s)
-
-
-def _worker_env(bootstrap: str) -> dict[str, str]:
-    """`PYTHONPATH` includes the repo root so `tests.support.demo_steps` — the stand-in pipeline step,
-    see that module's docstring — resolves inside the worker's own process, the same dotted-path
-    mechanism `contracts/channel-spec/v0` describes for a real bundle."""
-    existing = os.environ.get("PYTHONPATH", "")
-    pythonpath = f"{REPO_ROOT}{os.pathsep}{existing}" if existing else str(REPO_ROOT)
-    return {**os.environ, "PYTHONPATH": pythonpath, "TB_BOOTSTRAP_SERVERS": bootstrap}
 
 
 def spawn_mllp_receiver(
@@ -187,15 +176,20 @@ worker.run()
 def spawn_pipeline_worker(
     *, env: str, channel: str, bootstrap: str, instance_id: str, timeout_s: float = 30.0
 ) -> ManagedProcess:
-    """A real worker process resolving its step through `steps.py`'s dotted-path loader, same as a
-    deployed channel would — the channel spec published to `_tb.<env>.channels` must point
-    `pipeline.steps[0].ref` at `tests.support.demo_steps.passthrough`
-    (`tests/support/channel_spec.py::walking_skeleton_document`), and `PYTHONPATH` (below) is what
-    makes that importable inside this subprocess.
+    """A real worker process, resolving its step exactly as a deployed one would: no
+    `steps_override`, so `tributary.runtime.steps.load_step` runs for real against whatever
+    `pipeline.steps` the published channel spec names — `tests/support/channel_spec.py`'s document
+    leaves that as the contract example's own `uses: tributary.core.passthrough`, a
+    `tributary.steps` entry point `tributary-runtime` registers, so nothing beyond the installed
+    venv is needed for it to resolve. Deliberate: an earlier version of this helper used
+    `steps_override` plus a `PYTHONPATH` stand-in step, which would have stayed green through the
+    entire step-resolution bug this suite caught in the walking-skeleton example
+    (architect/platform-engineer, 2026-09-23) — see `tests/e2e/test_mllp_to_http_e2e.py`'s module
+    docstring.
     """
     proc = ManagedProcess(
         [sys.executable, "-c", WORKER_PROGRAM, env, channel, bootstrap, instance_id],
-        env=_worker_env(bootstrap),
+        env=dict(os.environ),
     )
     proc.wait_for_event("worker_started", timeout_s=timeout_s)
     return proc
