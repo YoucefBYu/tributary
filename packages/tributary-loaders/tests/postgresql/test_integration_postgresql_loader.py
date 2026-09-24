@@ -162,6 +162,42 @@ def test_verify_idempotency_constraint_accepts_a_unique_index_not_just_a_primary
         asyncio.run(run())  # no exception
 
 
+def test_verify_idempotency_constraint_refuses_a_partial_unique_index() -> None:
+    """A partial index does not cover every row, so `ON CONFLICT (idColumn)` cannot infer it — Postgres
+    itself refuses to plan that `ON CONFLICT` clause against a partial index with no matching predicate.
+    Architect (cce95fa): this must not satisfy the startup proof even though `indisunique` is true."""
+    with PostgresContainer("postgres:16", driver=None) as container:
+
+        async def run() -> None:
+            async with _open_pool(container) as pool:
+                await pool.execute("CREATE TABLE observations (tb_msg_id TEXT NOT NULL, value INTEGER NOT NULL)")
+                await pool.execute(
+                    "CREATE UNIQUE INDEX observations_tb_msg_id_partial ON observations (tb_msg_id) WHERE value > 0"
+                )
+                loader = PostgresqlLoader(make_config(), pool)
+                await loader.verify_idempotency_constraint()
+
+        with pytest.raises(IdempotencyConstraintError):
+            asyncio.run(run())
+
+
+def test_verify_idempotency_constraint_refuses_an_expression_index() -> None:
+    """An expression index's key is not the column itself (`i.indkey[0] == 0` for that slot), so it is
+    not a target `ON CONFLICT (idColumn)` can use even though the expression happens to reference
+    `idColumn`. Architect (cce95fa): must not satisfy the startup proof."""
+    with PostgresContainer("postgres:16", driver=None) as container:
+
+        async def run() -> None:
+            async with _open_pool(container) as pool:
+                await pool.execute("CREATE TABLE observations (tb_msg_id TEXT NOT NULL, value INTEGER NOT NULL)")
+                await pool.execute("CREATE UNIQUE INDEX observations_tb_msg_id_expr ON observations (lower(tb_msg_id))")
+                loader = PostgresqlLoader(make_config(), pool)
+                await loader.verify_idempotency_constraint()
+
+        with pytest.raises(IdempotencyConstraintError):
+            asyncio.run(run())
+
+
 def test_undefined_table_is_a_pg_error_code_not_retryable() -> None:
     """Real `asyncpg.exceptions.UndefinedTableError`, not a hand-picked fixture: the classification in
     `loader.py` catches what the driver actually raises."""
