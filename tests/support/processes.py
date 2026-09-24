@@ -195,6 +195,46 @@ def spawn_http_loader(
     return proc
 
 
+def spawn_postgresql_loader(
+    *,
+    channel: str,
+    destination: str,
+    env: str,
+    bootstrap: str,
+    instance_id: str = "loader-e2e",
+    secrets_dir: Path | str | None = None,
+    timeout_s: float = 30.0,
+) -> ManagedProcess:
+    """Same shape as `spawn_http_loader`, for `tributary.loaders.postgresql`'s real entry point
+    (`packages/tributary-loaders/src/tributary/loaders/postgresql/main.py`, connector-engineer, W2-6) --
+    added for a genuine-redelivery duplicate-delivery test in that package's own style
+    (`tests.integration.test_http_loader_duplicate_delivery_uncommitted_redelivery` is the reference
+    implementation for HTTP; this loader's connection pool needs `--secrets-dir` pointed at a
+    `DirSecretResolver`-shaped directory, `<secrets_dir>/<secretRef>/<key>`, `tributary.loaders.secrets`)
+    for the destination's `secretRef` -- there is no default that works against a testcontainers
+    PostgreSQL instance."""
+    args = [
+        sys.executable,
+        "-m",
+        "tributary.loaders.postgresql",
+        "--channel",
+        channel,
+        "--destination",
+        destination,
+        "--env",
+        env,
+        "--bootstrap",
+        bootstrap,
+        "--instance-id",
+        instance_id,
+    ]
+    if secrets_dir is not None:
+        args += ["--secrets-dir", str(secrets_dir)]
+    proc = ManagedProcess(args, env=dict(os.environ))
+    proc.wait_for_event("loader_started", timeout_s=timeout_s)
+    return proc
+
+
 WORKER_PROGRAM = """
 import sys
 from tributary.runtime.clients import KafkaSettings
