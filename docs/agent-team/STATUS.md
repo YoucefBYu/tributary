@@ -5,28 +5,50 @@ wave's exit criteria here.
 
 ## Current
 
-- **Phase / wave:** **Phase 1, wave 2 — pipelines and delivery. IN PROGRESS.** Wave 1 CI passed and merged
-  to `main` (2026-09-24). Architect and lead approved Wave 2 planning. Team assembled. Starting week 1
-  (HL7 parser + FHIR design + retry-topic spike S7).
-- **Branch:** `wave/1-2`
-- **Planning documents:** [`wave-2-README.md`](phases/wave-2-README.md), [`wave-2-plan.md`](phases/wave-2-plan.md),
-  [`wave-2-spikes.md`](phases/wave-2-spikes.md), [`wave-2-lead-checklist.md`](phases/wave-2-lead-checklist.md)
-- **Duration estimate:** 3–4 weeks, 5 people, 35 person-days
-- **Exit criteria:** (1) ADT→FHIR/ClickHouse end-to-end flow, (2) ordered channels preserve order under chaos,
-  (3) every loader has duplicate-delivery test, (4) throughput report vs Phase 0 baseline
+- **Phase / wave:** **Phase 1, wave 2 — pipelines and delivery. STARTED 2026-09-24** on the human's
+  approval to start wave 2 (relayed by the lead). Architect work this session: contract set 1.1 and
+  the planning-record corrections below.
+- **Branch:** `wave/1-2`. It builds on the wave 1 branch; **wave 1 is not merged to `main`**, which is
+  still at `2c25448`.
+- **Plan:** [`phases/wave-2.md`](phases/wave-2.md), which replaces six lead drafts the architect had not
+  reviewed. They contained errors, including three open human decisions marked "approved" and a claim
+  that the architect had approved the plan. `wave-2.md` section 9 lists every removal; the six files are
+  now one-line pointers, for the lead to `git rm`. Authoritative scope remains
+  [`phase-1.md`](phases/phase-1.md), Wave 2.
+- **Exit criteria** (verbatim, `phase-1.md`): (1) an HL7 ADT flow to a FHIR server and to ClickHouse
+  works end to end from a YAML channel; (2) an ordered channel preserves per-key order under chaos
+  tests; (3) every loader has a passing duplicate-delivery test; (4) throughput — msg/s per core and ACK
+  p99 against the Phase 0 numbers. Operational readings are in `wave-2.md` section 3.
+- **Contracts: set 1.1 published 2026-09-24, UNVERIFIED.** It adds the wave 2 connector shapes (3 source
+  types, 7 destination types), per-destination steps, `partitionKey` semantics, and written lift
+  criteria for `retry-topic`, which stays refused. 20 new examples; the 16 expected-failure pairs are
+  architect predictions. The conformance run was requested from `qa-engineer` and **not yet reported**.
+  `contracts/CHANGELOG.md`, ADR-007 D10-D17.
+- **Linux re-run of S1/S2: NOT DONE.** Approved 2026-09-21 as "the first Phase 1 CI task, before the
+  receiver is built". The receiver was built in wave 1. `.github/workflows/bench-linux.yml` exists as a
+  stub: it records the environment and locked versions, then prints "not wired yet: qa-engineer to add
+  the S1 (parser) and S2 (MLLP to Kafka) entry points". It is manual-trigger only, and
+  `benchmarks/results/` holds only the Phase 0 Windows output. Confirmation from `qa-engineer` has been
+  requested, so this is **the architect's reading of the repository, 2026-09-24**. It matters for exit
+  criterion 4: without it, the throughput report compares against laptop numbers only.
+- **Blocked on a human:** the SFTP client licence (W2-6/W2-7 `sftp`); see open questions. The
+  PostgreSQL *loader* is **not** blocked: it uses `asyncpg` (Apache-2.0 per the lead; `licence_check.py`
+  confirms it when the dependency lands). `psycopg` matters only to the wave 3 control plane.
+- **Waiting on teammates:** the conformance run of set 1.1 (`qa-engineer`); the `ctx.fhir` /
+  `ctx.terminology` proposal (`healthcare-standards-engineer`, review criteria sent); the shared key
+  evaluator's signature and a response on per-destination steps (`platform-engineer`).
 
-### Wave 1 exit (completed 2026-09-24)
+### Wave 1 exit
 
-- **Gate report:** [`gates/phase-1-wave-1.md`](gates/phase-1-wave-1.md) **APPROVED: GO**
-- **Status:** All eight tasks delivered. Code and security review clean (code-reviewer APPROVE, security 0 Critical/High).
-- **CI:** `pytest -m integration` 6 passed (227.91s), `contracts/validate.py` 102/0, `ruff`/`mypy` green
-- **Wave 1 findings to carry into Wave 2:**
-  - Reviews find what they look for; Phase 0 pattern (control not applied to an unthought path) → W2 reviews focus on
-    library defaults and transitive edges rather than already-tested paths
-  - Four contract defects found by implementers, not checkers → conformance green ≠ code agreement
-  - HTTP loader redirect bug (HIGHEST lesson) → `code-reviewer-8`: APPROVE, zero findings at any severity. **`security-reviewer`, final: 0 Critical,
-  0 High, 0 Medium, 3 Low** — gate passes from their side. Their first pass found 2 High and **both were
-  fixed inside the wave and confirmed closed with the mechanism re-derived, not taken on trust:**
+- **State: pushed, CI green (human-confirmed 2026-09-24, relayed by the lead), every gate condition
+  closed, NOT merged to `main`.** The gate report's one remaining condition was "a human pushes
+  `wave/1-1` and the CI integration job goes green". Per the human, that is now met.
+- **Gate report:** [`gates/phase-1-wave-1.md`](gates/phase-1-wave-1.md). **GO WITH ONE CONDITION**,
+  and that condition is now met. All eight tasks were delivered.
+- **Reviews:** `code-reviewer-8` APPROVE, zero findings at any severity. **`security-reviewer`, final:
+  0 Critical, 0 High, 0 Medium, 3 Low**, so the gate passes from their side. Their first pass found 2
+  High, and **both were fixed inside the wave and confirmed closed with the mechanism re-derived, not
+  taken on trust:**
   (1) `certifi` (MPL-2.0) human-approved 2026-09-23 (the lead attests first-hand; the reviewer cannot
   verify a human decision) — dev group only, never shipped, scoped to its `testcontainers[kafka]` →
   `docker` → `requests` path, recorded as **its own approval, not an extension** of the three-package one
@@ -34,7 +56,7 @@ wave's exit criteria here.
   (2) The HTTP loader silently followed 3xx with the default `urllib` opener — a redirected POST dropped
   its body, the target's 200 read as success and **the offset committed for a message that was never
   delivered** — fixed at `bec8029`, with three extra gap-checks the reviewer added themselves.
-  Phase 0 is complete and signed (2026-09-22).
+- **Phase 0 is complete and signed** (2026-09-22).
 - **Exit criterion 4 is PASS.** It is specifically "`code-reviewer` clean on the wave diff", and that
   reviewer found nothing. While the two Highs were open they blocked through the definition of done
   item 6 (`security-reviewer` on auth, PHI, listeners and dependencies), **not** through criterion 4 —
@@ -45,8 +67,8 @@ wave's exit criteria here.
   nobody thought about* — so wave 2 should spend review effort on library defaults and transitive edges
   rather than on paths that already have tests.
 - **Branch:** `wave/1-1`
-- **Exit criteria:** 1 **PASS locally, PENDING CI** (nothing has been pushed, so no CI run exists —
-  closing it needs a human push, and it is the wave's only remaining condition); 2 **PASS for
+- **Exit criteria:** 1 **PASS**. It was PASS locally and pending CI at the gate; the human confirmed on
+  2026-09-24 that CI passed on the pushed branch. The architect has not seen the CI run itself. 2 **PASS for
   invariants 1, 2, 5; PARTIAL for 3**; 3 **PASS**;
   4 **PASS** (`code-reviewer-8`, zero findings). Engineering checks green as run by the lead: `uv sync`,
   `ruff`, `ruff format`, `mypy packages` (56 files), fast suite **701 passed**, `validate.py` **102 / 0**,
@@ -138,7 +160,7 @@ All six filed and synthesised. Full threshold table with evidence ratings quoted
 | Checkpoint | Decision | Date | Notes |
 |---|---|---|---|
 | Phase 0 go/no-go | **GO WITH CONDITIONS (signed by the human)** | 2026-09-22 | Instruction: *"Approve orjson, hypothesis and pathspec; record Phase 0 GO WITH CONDITIONS signed"*. All four blocking conditions were met first. **The conditions still standing are the non-blocking open items only:** audit retention (open, blocks the `_tb.<env>.audit` contract), the Mirth corpus (not decided), the keyed-hash mechanism (unresolved until before the archiver is built), and the Phase 1 requirements table in `gates/phase-0-spikes.md` 7.1. **Signing does NOT start Phase 1 — Phase 1 needs the human's separate go-ahead.** |
-| Phase 1 wave 1 exit | pending | | |
+| Phase 1 wave 1 exit | **CI passed on the pushed branch; starting wave 2 approved** | 2026-09-24 | Recorded exactly as relayed by the lead: the human confirmed that CI passed and approved starting wave 2. That met the gate's one remaining condition. **Not recorded here, because it was not stated:** a merge to `main` (none has happened; `main` is at `2c25448`) and any separate signature on the gate report |
 | Phase 1 wave 2 exit | pending | | |
 | Phase 1 wave 3 exit | pending | | |
 | MVP release decision | pending | | |
@@ -189,6 +211,16 @@ All six filed and synthesised. Full threshold table with evidence ratings quoted
 | 2026-09-22 | **Phase 1 requirement 13 generalised**: every integer, timestamp and UUID header is parse-or-reject, with `reject` defined (dlq + `HEADER_PARSE_ERROR` + event + commit) and the failing value kept out of the error string. A missing required header is the same class of failure | `contracts/envelope/v0` 2.3 |
 | 2026-09-22 | **`topic-defaults.json` is read, never restated as a literal**, in runtime, control plane, topic creation, Compose and Helm. Reason: `min.insync.replicas` is topic-level, so a copied-and-forgotten literal makes invariant 1 silently false — the HIGH finding's original mechanism | `contracts/topics/v0` 3.7 |
 | 2026-09-22 | Both gate High findings closed: root `.gitignore` restored (human `325cef1`) and the spike data plane bound to localhost (`e553fd7`, `71364c7`). Conformance suite now asserts *why* each invalid example fails (`83a1fd2`, 76 passed), and the AA-withheld-until-publish-resolves unit test exists (`a5df2c7`) | gate report 1.1 |
+| 2026-09-24 | **Human (relayed by the lead): wave 1 CI passed; start wave 2.** Wave 1 is not merged to `main` | sign-offs table |
+| 2026-09-24 | **Contract set 1.1 published, additive, unverified**: wave 2 connector shapes, per-destination steps, `partitionKey` semantics, receiver consumer-group role | `contracts/CHANGELOG.md` |
+| 2026-09-24 | **ADR-007 D6 amended (D10):** connector types enter the enum at the start of the wave that builds them. Rejected: shapes arriving with each connector, which would have ten connectors inventing the contract in parallel | ADR-007 5a |
+| 2026-09-24 | **Kafka connectors always use their own explicit connection and credentials** (D11). Rejected: a "local cluster" mode on the engine's principal, which is an ACL-model change owned by ADR-004 | ADR-007 5a |
+| 2026-09-24 | **The `fhir` destination is transaction-only** (D12), which keeps identifiers out of request lines without a no-log exception. Rejected: conditional create/update with `?identifier=` | ADR-007 5a |
+| 2026-09-24 | **SQL sinks take a step-built row; no mapping language in the spec** (D13). Each destination type may declare only the idempotency techniques it can honour, and the SQL loaders verify theirs at startup (D14) | ADR-007 5a |
+| 2026-09-24 | **`retry-topic` lift criteria fixed before the spike** (D15), including that retried messages' reordering is characterised, not denied, and that a per-key channel must say `acceptReordering: true` | channel-spec README 4.1.1 |
+| 2026-09-24 | **A refused Kafka-source record halts the source partition** (D16). The first draft dead-lettered it; the receiver ACL has no `dlq` WRITE, so that rule was unimplementable, and it was caught by tracing it into `topics/v0` before publishing | ADR-007 5a |
+| 2026-09-24 | **Per-destination steps** (D17), run in the pipeline worker with no new hop. Exit criterion 1 needs a FHIR Bundle and a table row from one channel | channel-spec README 3.5 |
+| 2026-09-24 | **Wave 2 planning drafts consolidated into `phases/wave-2.md`**; six lead drafts reduced to pointers, and errors listed in its section 9 | `phases/wave-2.md` |
 
 ## Open questions for the human
 
@@ -196,10 +228,26 @@ All six filed and synthesised. Full threshold table with evidence ratings quoted
 sign-off followed on 2026-09-22** — see the decisions log above. What remains open is listed here. Items
 struck through were decided and are kept for one revision so the change is visible.
 
-**Nothing blocks the Phase 0 gate any more — it is signed.** The next human decision is whether to start
-Phase 1, which the sign-off deliberately does not do.
+**Nothing blocks the Phase 0 gate any more — it is signed.** Wave 1 is complete and wave 2 has started
+on the human's approval (2026-09-24).
 
-**Open:**
+**Open, new in wave 2:**
+
+- **SFTP client licence — blocks W2-6/W2-7 `sftp`.** To the architect's knowledge, **unverified and to
+  be confirmed by `licence_check.py` from resolved metadata**: `paramiko` is LGPL-2.1, and `asyncssh` is
+  EPL-2.0 or GPL-2.0-or-later. Invariant 10 permits neither. Options: approve one as an unmodified
+  dependency, shell out to an OpenSSH `sftp` binary, or descope SFTP from the MVP. The contract shape
+  stands either way. `channel-spec/v0` README 10.2.
+- **`psycopg` 3 in the CLAUDE.md stack table — answer needed before wave 3.** CLAUDE.md names it for
+  the control plane. It is LGPL-3.0, and `licence_check.py` denies it (reported by the lead and
+  `connector-engineer`). Invariant 10 has no LGPL path. The options: approve it as an unmodified
+  dependency, or amend the stack table to a permissive driver. The wave 2 loaders already use `asyncpg`
+  (Apache-2.0), which shows one exists. Choosing the stack is the human's decision. Not a wave 2 blocker.
+- **Linux re-run capacity.** The approved re-run has not happened (see Current). The memo priced it as
+  "CI runner time and a dedicated 3-broker cluster". A hosted runner is not a dedicated cluster.
+  Whether to pay for dedicated capacity is cloud spend.
+
+**Open, carried:**
 
 - **Audit retention — still open, and it blocks the `_tb.<env>.audit` contract.** What retention duty
   applies to the control-plane and access audit trail? HIPAA §164.316(b)(2)(i) requires six-year
@@ -264,9 +312,21 @@ version is `docs/spikes/PHASE-0-DECISION.md` section 9 and ADR-001 section 13.
 
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
-| Contract schemas pass conformance, but the green run predates the round-2 security fixes; a re-run is outstanding (expected 74 tests) | Medium | Low | `qa-engineer` re-runs `tests/conformance`; keep it in CI so a contract edit cannot silently break an example |
+| ~~Contract schemas pass conformance, but the green run predates the round-2 security fixes~~ **Closed**: re-run at 76 (`83a1fd2`), then 106 at the wave 1 gate; the suite is a required CI job (`f649665`). Set 1.1 is the new unverified case, under wave 2 risks | — | — | — |
 | **A green test whose fault never fired is indistinguishable from a passing system.** Five S5 claims were first rated `WEAKLY SUPPORTED` for exactly this: a kill at `commit_every=1` replays nothing, a joiner assigned nothing measures no rebalance, a `txn_crash` between transactions proves nothing | Medium | High | Fixed in S5 by making the run **fail** when the fault does not fire, plus mutation controls. Carry the pattern into Phase 1 test design: assert the fault happened, and keep a broken-implementation control for any check backing a headline claim |
 | **Every Phase 0 number comes from one Windows laptop with Docker Desktop.** Latency figures are the least transferable; capacity figures are lower bounds | High | Medium | Linux re-run of S1 and S2 as the first Phase 1 CI task; no external publication or capacity planning from these numbers until then |
 | A contract can look complete and still omit a security control (the v0 config contract specified `acks` and `linger.ms` but no TLS, auth or ACLs; the durability floor was set per profile but not per topic) | Medium | High | Both fixed. Lesson applied going forward: every contract that configures a component states its required security posture and its failure-safe defaults explicitly, and `security-reviewer` sees contracts, not only code |
 | Claim-check (payloads over 1 MB) is untested by any Phase 0 spike | Medium | Medium | Call it out as an untested path in the Phase 1 plan; ADR-004 owns object lifecycle |
 | The record key is often a patient identifier, so any log, metric label or span attribute built from it is a PHI leak | Medium | High | Stated in `contracts/envelope/v0` section 4; reviewers treat it as Critical |
+
+### Risks added in wave 2
+
+| Risk | Likelihood | Impact | Mitigation |
+|---|---|---|---|
+| **No permissively licensed SFTP client** | Medium | Medium | Human decision before any SFTP code (open questions) |
+| **Contract set 1.1 has a defect only an implementer finds** (wave 1 had four, all found that way) | High | Medium | Conformance run first; implementers send diffs; the manifest's `connector:` entries keep unbuilt connectors out of "runnable" |
+| **A client-library default silently breaks a guarantee** (redirects, TLS verification, driver retries, error text quoting payload). Wave 2 adds seven client libraries | Medium | High | The loader rules in channel-spec README 3.4; reviews target defaults and transitive edges (`wave-2.md` 6.3) |
+| **Remote file names and object keys carry PHI** (new surfaces with SFTP and S3) | Medium | High | Names built from `tb-msg-id` only on output; inbound file names never logged (README 3.2.4, 3.4.4) |
+| **ClickHouse duplicate test passes falsely**, because deduplication is eventual | Medium | Medium | Assert a `FINAL` count (README 5.1) |
+| **Exit criterion 4 reported against laptop numbers only** | High | Medium | Run the Linux re-run, or say so in the report rather than compare as if the numbers were comparable |
+| **Claim-check is unscheduled** while file and HTTP sources make large inputs more common | Medium | Medium | Every source refuses input over 1 MB; the lead decides whether to schedule the spike (`wave-2.md` 5.2) |

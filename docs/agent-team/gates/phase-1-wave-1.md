@@ -647,4 +647,4 @@ refer to nothing at all. Wave 2 should expect the same class of defect and keep 
 | Unresolved High | **None.** High 1 (`certifi`) closed — human-approved 2026-09-23 (lead's first-hand attestation), `MPL_APPROVED` landed at `a35528c`, `licence_check.py` 44 components / 0 failed. High 2 (redirect) closed at `bec8029`, independently confirmed |
 | Unresolved Low | **3**, all tracked in 7.2: two log sites bypassing the guarded logger, no CRL/OCSP for mTLS |
 | Gate recommendation | **GO WITH ONE CONDITION:** a human pushes `wave/1-1` and the CI integration job goes green. Everything an agent can close is closed. 7 items carried to wave 2 |
-| Human sign-off | pending the push |
+| Human sign-off | **2026-09-24, relayed by the lead:** the human confirmed CI passed on the pushed branch and approved starting wave 2. That meets condition 3, the last one. Wave 1 is **not merged to `main`**. The architect has not seen the CI run itself |
