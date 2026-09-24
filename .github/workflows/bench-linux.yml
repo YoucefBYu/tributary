@@ -1,8 +1,11 @@
 # Linux re-run of the Phase 0 S1/S2 benchmarks (human decision #7, first Phase 1 CI task).
-# STUB: records the environment and dependency versions so the numbers are like-for-like
-# (Phase 0 requirement 9: S1 ran via `uv run --with`, so its versions were never recorded).
-# The measurement steps are wired by qa-engineer once benchmarks/ has a lock-file-backed entry
-# point. Manual trigger only: it never runs on push, and only runs once a human pushes the branch.
+# S1 (benchmarks/s1_hl7_parse_throughput.py) measures the real tributary-hl7v2 package; S2
+# (benchmarks/s2_mllp_ack_latency.py) measures the real tributary.receivers.mllp receiver against a
+# private single-node (lite) Kafka container this job starts itself via testcontainers -- see each
+# script's module docstring for exactly what is and is not comparable to the Phase 0 numbers (S1: no
+# transform step exists yet; S2: lite/RF=1, not the RF=3 topology Phase 0 measured, and closed-loop
+# rather than Phase 0's open-loop load generator). Manual trigger only: it never runs on push, and only
+# runs once a human pushes the branch.
 name: bench-linux
 
 on:
@@ -39,10 +42,10 @@ jobs:
             docker --version
           } | tee benchmarks/results/environment.txt
           uv export --frozen --all-groups --no-emit-workspace --no-hashes > benchmarks/results/locked-versions.txt
-      - name: run S1 and S2
-        run: |
-          echo "not wired yet: qa-engineer to add the S1 (parser) and S2 (MLLP to Kafka) entry points" >&2
-          echo "the environment and locked versions above are already recorded." >&2
+      - name: run S1 (HL7 parse throughput)
+        run: uv run python -m benchmarks.s1_hl7_parse_throughput --count 10000 --repeats 5 --procs 1,2,4,8
+      - name: run S2 (MLLP ACK latency)
+        run: uv run python -m benchmarks.s2_mllp_ack_latency --count 5000 --conns 20
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         if: always()
         with:
