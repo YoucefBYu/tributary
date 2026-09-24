@@ -27,10 +27,15 @@ class CapturedRequest:
 
 
 class _RecordingServer(ThreadingHTTPServer):
-    def __init__(self, *args: object, **kwargs: object) -> None:
+    def __init__(self, *args: object, fail_first_n: int = 0, **kwargs: object) -> None:
         super().__init__(*args, **kwargs)  # type: ignore[arg-type]
         self._lock = threading.Lock()
         self._captured: list[CapturedRequest] = []
+        #: A genuine redelivery test (`contracts/channel-spec/v0/README.md` 5.1: "a genuine redelivery
+        #: from an uncommitted offset, not a second call in the same process") needs a destination that
+        #: fails on its own, from a real network response, so `ConsumerLoop`'s blocking retry is what
+        #: redelivers the record -- not the test calling a loader method twice.
+        self._remaining_failures = fail_first_n
 
     def record(self, request: CapturedRequest) -> None:
         with self._lock:
@@ -39,6 +44,14 @@ class _RecordingServer(ThreadingHTTPServer):
     def snapshot(self) -> list[CapturedRequest]:
         with self._lock:
             return list(self._captured)
+
+    def next_status(self) -> int:
+        """200, unless `fail_first_n` failures are still owed -- each call consumes one."""
+        with self._lock:
+            if self._remaining_failures > 0:
+                self._remaining_failures -= 1
+                return 503
+            return 200
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -56,7 +69,7 @@ class _Handler(BaseHTTPRequestHandler):
                 received_at=time.monotonic(),
             )
         )
-        self.send_response(200)
+        self.send_response(self.server.next_status())
         self.end_headers()
 
     def do_POST(self) -> None:
@@ -77,10 +90,15 @@ class StubHttpServer:
     finding High 2 / SR-8). `port` defaults to one chosen by the OS (bind to 0) so parallel test runs
     never collide; a chaos scenario simulating a destination *outage* (stop this, then start a fresh one
     on the same port once recovery is being tested) passes the prior instance's `port` explicitly so the
-    channel spec's URL -- fixed once published -- still points at something once the stub comes back."""
+    channel spec's URL -- fixed once published -- still points at something once the stub comes back.
 
-    def __init__(self, *, port: int = 0) -> None:
-        self._httpd = _RecordingServer(("127.0.0.1", port), _Handler)
+    `fail_first_n` makes the first N requests to *any* path fail with a real 503 before the rest
+    succeed with 200 -- a real HTTP failure, not a test-side decision, so a caller driving a loader's
+    real `ConsumerLoop` against this gets a genuine blocking-retry redelivery from an uncommitted Kafka
+    offset (`contracts/channel-spec/v0/README.md` 5.1)."""
+
+    def __init__(self, *, port: int = 0, fail_first_n: int = 0) -> None:
+        self._httpd = _RecordingServer(("127.0.0.1", port), _Handler, fail_first_n=fail_first_n)
         self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True, name="http-stub")
 
     @property
