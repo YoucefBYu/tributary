@@ -15,3 +15,11 @@ class LoaderError(Exception):
 class ConfigError(LoaderError):
     """A destination spec cannot be turned into a running loader: missing, contradictory or
     unsupported-in-this-wave configuration. Raised at startup, before any request is sent."""
+
+
+class IdempotencyConstraintError(LoaderError):
+    """A `sink-native` destination's own store does not actually enforce the uniqueness its
+    `ON CONFLICT`/dedup-token technique depends on: no unique index or primary key on `idColumn`
+    (`postgresql`), or a sorting key that does not start with it (`clickhouse`). Raised at startup —
+    `contracts/channel-spec/v0/README.md` 3.4.3: "the loader proves it at startup rather than trusting
+    the declaration" — rather than let every delivery silently produce duplicates."""
