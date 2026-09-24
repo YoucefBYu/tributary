@@ -239,6 +239,7 @@ All six filed and synthesised. Full threshold table with evidence ratings quoted
 | 2026-09-24 | **`with` binds to keyword-only step parameters by name**, refused loudly at load if wrong. The SDK's `@step` changes so that a keyword-only parameter without a default means "required from `with`". Rejected: an untyped `ctx.params` | channel-spec README 3.3 |
 | 2026-09-24 | **Reprocess of any `dlq` record carrying `tb-destination` must be destination-scoped**, and is refused until W3-3 builds it. This covers wave 1 loader-exhaustion records too. A destination-step `dlq` record carries the step's input | ADR-003 follow-up 10 |
 | 2026-09-24 | **W2-5 public surface APPROVED WITH CHANGES.** filter needs an explicit `onUnresolved` and may not filter on identifier fields; the enrich allow-list is trimmed; `Reject(code)` is added to the SDK and may not use engine-reserved codes; split becomes a `@splitter` node with **deterministic child ids** and is refused on per-key channels. Metrics and tracing wait for `security-reviewer` on the `/metrics` listener. `contracts/observability/v0` is to be published by the architect, seeded with `platform-engineer`'s names | channel-spec README 3.3.2 |
+| 2026-09-24 | **W2-2 implemented (`39a4006`); the interface is approved from the architect's side, with five items open.** W2-3 itself stays gated behind the W2-1 security fixes (the lead's gate). (1) **Licence of `fhir.resources`/`fhir-core` UNVERIFIED**: `licence_check.py` passes but does not see them (workspace members outside the dev group are invisible to `uv export`; `devops-engineer` is wiring it), and PyPI classifiers are not a resolution. Must close before the gate. (2) Confirm conditional-only upsert, create and delete on one required identifier. (3) Production fullUrls derived from `tb-msg-id`, not uuid4, so shadow and reprocess diffs stay comparable. (4) Golden files validated against the FHIR R4 JSON schema. (5) Optional runtime attachment, agreed with `platform-engineer`. Informal cost is about 313 µs per resource against the 5 ms budget | `packages/tributary-fhir` |
 | 2026-09-24 | **`postgresql` loader BUILT** (`eca445a`, `connector-engineer`), not yet "Implemented": its duplicate tests repeat `deliver()` in one process, so the 5.1 redelivery test waits for the W2-9 harness. Adopted from the build: all authentication material under `auth.secretRef`; the uniqueness check reads the catalog, because a bare unique index is invisible in `information_schema` | channel-spec README 3.0, 3.4.3 |
 | 2026-09-24 | **Manifest `runnable` checked against W2-1** (`9078982` registers `tributary.hl7v2.parse` only). No example flips: each one naming `parse` also names a `ref` step, and the fanout example needs the unregistered `tributary.hl7v2.to_json`. `requires` lists trimmed to what is still missing | `examples/manifest.json` |
 
@@ -287,7 +288,9 @@ on the human's approval (2026-09-24).
   highest-likelihood, highest-impact risk in ADR-001 section 13. The ordering risk that used to attach to
   this — `samples/mirth/` not being git-ignored — is **closed**: the `.gitignore` was restored in
   `325cef1`, so exports can safely land on disk now.
-- Project name and trademark check (codename Tributary).
+- Project name and trademark check (codename Tributary). **Its cost now rises with time:**
+  `tributary-fhir`'s identifier system `https://tributary.dev/fhir/identifier/tb-msg-id` is written into
+  resources in customers' FHIR servers. Once real data carries it, renaming means a data migration.
 - License and governance model (ADR-006).
 - Whether to engage the Open Integration Engine community, and how.
 
