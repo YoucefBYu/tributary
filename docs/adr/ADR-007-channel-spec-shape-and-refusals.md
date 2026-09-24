@@ -108,7 +108,7 @@ reworded. Contracts: `channel-spec/v0` is new; `envelope/v0` gains sections 2.3 
 **Decided by the architect at the start of Phase 1 wave 2. No invariant changes.** Every decision
 below is additive to the schema; D6 is amended in wording, and the amendment is D10. Contract text:
 `contracts/channel-spec/v0/README.md` sections 3.0, 3.2.2-3.2.5, 3.4.1-3.4.7, 3.5, 4.1.1, 4.3, 5.1, 10.
-**The schema and its 20 new examples are unverified until the conformance run** (follow-up 7).
+**Verified 2026-09-24** (follow-up 7).
 
 | # | Decision | Options considered | What it gives up |
 |---|---|---|---|
@@ -126,9 +126,10 @@ exactly as they appear, no normalisation, and an unresolved key is a receiver `p
 null key. The no-normalisation rule is flagged in the contract as the one most worth challenging with
 evidence from real senders.
 
-**Escalated, not decided:** the SFTP client and PostgreSQL driver licences (README 10.2). To the
-architect's knowledge, unverified, the common Python SFTP libraries are LGPL or EPL/GPL, which
-invariant 10 does not permit, and `psycopg` 3 is LGPL-3.0. That is a human decision.
+**Escalated, not decided:** the SFTP client licence (README 10.2). The common Python SFTP libraries
+are LGPL-2.1 (`paramiko`) or EPL-2.0 (`asyncssh`), which invariant 10 does not permit. That is a
+human decision. The PostgreSQL loader uses `asyncpg` (Apache-2.0). `psycopg` 3 (LGPL-3.0), which
+CLAUDE.md names for the control plane, is a separate human decision for wave 3.
 
 ## 6. Follow-ups
 
@@ -145,6 +146,7 @@ invariant 10 does not permit, and `psycopg` 3 is LGPL-3.0. That is a human decis
 5. **Sync-reply fields** arrive with W2-8. ~~`partitionKey` expression semantics with W2-4.~~
    Semantics fixed in set 1.1 (README 4.3); the evaluator is W2-4.
 6. ~~**Destination-level filters** were deliberately omitted.~~ A `Drop` in a destination step (D17).
-7. **Measure set 1.1**: `validate.py`, `--emit-expectations`, `pytest tests/conformance`. Correct any
-   predicted pair from the measurement, never the other way round.
-8. **SFTP and PostgreSQL driver licences** — human decision before either dependency is added.
+7. ~~**Measure set 1.1**.~~ **DONE 2026-09-24** (`qa-engineer`): `validate.py` 122 / 0, 86 pairs
+   matched with 0 mismatches, `pytest tests/conformance` 127 passed.
+8. **SFTP client licence** — human decision before any SFTP dependency or subprocess is added.
+   `psycopg` for the wave 3 control plane — human decision.

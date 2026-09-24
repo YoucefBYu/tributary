@@ -3,6 +3,23 @@
 Newest first. Each entry names the contract, the version, whether the change is additive or
 breaking, and the reason. Breaking changes reference an ADR.
 
+## 2026-09-24 (later) — set 1.1 follow-ups from implementers; no schema change
+
+All in `channel-spec/v0/README.md`, all additive or corrections to prose. The schema is unchanged.
+One valid example changed (its key expression), so the conformance run should be repeated.
+
+| Change | Why |
+|---|---|
+| **PID-3 repetition selector** `hl7:SEG.F[c:VALUE]`, e.g. `hl7:PID.3[5:MR].1` (4.3). Fits the published pattern, so the schema is unchanged. `valid/adt-mllp-to-fhir-clickhouse-mllp.json` now uses it | `platform-engineer`: PID-3 repeats and senders order it differently, so a bare `PID.3.1` can give one patient two keys, which is invariant 5 broken silently in the reference ADT flow. Brought forward from "v1" because the wave 2 exit-criterion channel keys on exactly this field |
+| **Normalisation text corrected** (4.3) | My rule said "normalise in a step". The receiver evaluates the key before any step runs, so that was impossible. Set 1.1 has no place to normalise a key, and the text now says so |
+| Header-name matching and duplicate headers (4.3) | Case-insensitive for HTTP, exact for Kafka; a repeated header is unresolved, never "the first one" |
+| **`with` binds to keyword-only step parameters by name** (3.3) | `platform-engineer`'s proposal, approved. An unknown or non-identifier key, or a missing required value, is refused at step load |
+| **A destination-step `dlq` record carries the step's input**; reprocess of any `tb-destination` record must be destination-scoped (3.5, ADR-003 follow-up 10) | Re-injecting into `raw` would re-deliver to every destination under a new `tb-msg-id`. This is already true of wave 1 loader-exhaustion records |
+| FHIR `conditional-update` (3.4.2) broadened | It covers a conditional PUT on a unique business identifier, as the W2-2 proposal needs and README 5 already listed. It still requires exactly one identifier system and no unconditional POST |
+| PostgreSQL loader not blocked on licensing (3.0, 10.2) | It uses `asyncpg`. `psycopg` is a separate wave 3 question |
+| Manifest `requires` trimmed after W2-1 (`9078982`) | `tributary.hl7v2.parse` exists; no example flips to runnable (each also names a `ref` step, or `to_json`) |
+| Manifest labels | PREDICTED changed to MEASURED |
+
 ## 2026-09-24 (wave 2 start) — contract set 1.1: the wave 2 connectors, destination steps, key semantics
 
 **Additive throughout.** Every document valid under set 1.0 is still valid; nothing a conforming
@@ -60,13 +77,12 @@ artefact was traced into that contract before publishing.
 - **The envelope's registered content types** (`envelope/v0` section 3) are what `contentType` and
   `accept` enumerate, minus `application/dicom` (claim-check is unimplemented).
 
-### Not yet verified
+### Verified, first run
 
-**No one has run this set.** Needed, in order: `contracts/validate.py` (expect **all 43 channel-spec
-examples** to behave as the manifest says, which with the other three contracts would take the
-last-measured 102 to about 122); `--emit-expectations`, and any pair that differs from the prediction is
-corrected in the manifest **from the measurement**; then `pytest tests/conformance`. Requested from
-`qa-engineer`. Until then the set 1.1 pairs stay labelled PREDICTED.
+`qa-engineer`, 2026-09-24, committed at `ffc1580`: `contracts/validate.py` **122 / 0**;
+`--emit-expectations` **86 pairs, all matched, 0 mismatches** (the 16 set 1.1 predictions included,
+and the least certain one, `propertyNames` reporting `enum` at `$.spec.source`, among them);
+`pytest tests/conformance` **127 passed**. No manifest correction needed.
 
 ## 2026-09-23 (W1-8) — the walking-skeleton example is made runnable; `ref` is documented as unimplemented
 

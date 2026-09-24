@@ -8,7 +8,7 @@
   },
   "spec": {
     "ordering": "per-key",
-    "partitionKey": "hl7:PID.3.1",
+    "partitionKey": "hl7:PID.3[5:MR].1",
     "source": {
       "type": "mllp",
       "bind": "0.0.0.0",

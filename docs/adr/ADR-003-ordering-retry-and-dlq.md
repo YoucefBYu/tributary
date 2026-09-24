@@ -264,3 +264,9 @@ partition pause means; Kafka share groups for unordered destinations.
 9. Port `test_librdkafka_semantics.py` into the runtime's test suite. It is four small tests that pin
    the client behaviours the whole design assumes — including the one that proves pause-then-resume
    without seeking back **silently loses the failed message**.
+10. **Reprocess must be destination-scoped for any `dlq` record carrying `tb-destination`**
+    (2026-09-24, found by `platform-engineer` while designing per-destination steps). D5 re-injects
+    into `raw` with a new `tb-msg-id`. For a record that failed at one destination, that re-delivers
+    to every destination under an id no loader has seen, and loader idempotency cannot absorb it. The
+    gap already exists for wave 1 loader-exhaustion records. W3-3 implements destination-scoped
+    re-entry. Until then, reprocess refuses these records. `contracts/channel-spec/v0/README.md` 3.5.

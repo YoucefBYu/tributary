@@ -15,7 +15,7 @@ disagree, they win and this document is wrong.
 |---|---|
 | Wave 1 | **Pushed; CI passed (human-confirmed 2026-09-24); gate conditions closed. NOT merged to `main`** — `main` is still at `2c25448`. Wave 2 builds on the wave 1 branch, not on `main` |
 | Phase 0 human decisions | Seven decided 2026-09-21, MPL approval and gate sign-off 2026-09-22, `certifi` 2026-09-23. **Still open:** audit retention, the Mirth corpus, and three governance items (section 7) |
-| Contracts | Set 1.0 frozen at the wave 1 gate. **Set 1.1 published 2026-09-24 for wave 2 — unverified until the conformance run** (section 4) |
+| Contracts | Set 1.0 frozen at the wave 1 gate. **Set 1.1 published and verified 2026-09-24** (section 4) |
 | Linux re-run of S1/S2 | **Not done.** Approved 2026-09-21 as the first Phase 1 CI task, "before the receiver is built"; the receiver was built in wave 1. `.github/workflows/bench-linux.yml` is a stub that records the environment and does not measure. See 6.1 |
 | Compose | Has Kafka (KRaft), ClickHouse and PostgreSQL since W1-7 (gate `phase-1-wave-1.md` section 6) |
 
@@ -70,8 +70,7 @@ Contract set 1.1, published 2026-09-24 — `contracts/CHANGELOG.md` top entry, A
 - `retry-topic` still refused, with written lift criteria.
 - Consumer-group role `receiver` in `topics/v0` 3.6.
 
-**Unverified** until `qa-engineer` runs `validate.py`, `--emit-expectations` and
-`pytest tests/conformance`. Contract changes during the wave: message the architect with the exact
+**Verified 2026-09-24**: `validate.py` 122 / 0, 86 pairs matched, conformance 127 passed. Contract changes during the wave: message the architect with the exact
 diff and the reason; breaking changes need an ADR.
 
 **No other contract change is expected**, with one exception: W2-8's `reply` block.

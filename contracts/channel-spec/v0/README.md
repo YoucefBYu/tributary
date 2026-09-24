@@ -12,11 +12,9 @@ additive**: every document valid under 1.0 is still valid. Breaking changes crea
 Realises invariant 7 (channels are declarative, steps are unit-testable functions) and carries the
 declarative half of invariants 1, 4 and 5.
 
-**Set 1.0 verified 2026-09-22**: `check_schema` passes, all 23 examples behave as the manifest says,
-and every invalid example fails at the pinned location and keyword. **Set 1.1 is NOT yet verified**:
-its 4 valid and 16 invalid examples and their 16 expected-failure pairs were written by the
-architect, who has no shell, and stay labelled PREDICTED until `validate.py` and
-`--emit-expectations` have been run — see section 8.
+**Set 1.0 verified 2026-09-22; set 1.1 verified 2026-09-24** (`qa-engineer`): `validate.py` 122 / 0,
+all 86 expected-failure pairs matched with 0 mismatches (the 16 set 1.1 predictions included), and
+`pytest tests/conformance` 127 passed. See section 8.
 
 ---
 
@@ -280,6 +278,18 @@ batches of `commit_every` (`topics/v0` 3.3), which is also this source's replay 
 configuration turns into a program the runtime has to interpret. Property names that denote a
 credential (`password`, `token`, `apiKey`, …) are rejected outright.
 
+**How `with` reaches a step (set 1.1, approved 2026-09-24).** Each key binds, by exact name, to a
+**keyword-only parameter** of the step function, e.g. `def parse(message, ctx, *, version: str = "2.5.1")`.
+The runtime binds once, when it loads the step. The following are refused with a `ChannelSpecError`
+at load, loudly, and the previous spec keeps running:
+- an unknown key;
+- a key that is not a Python identifier (the schema admits `-`; the binder does not);
+- a required keyword-only parameter with no `with` value.
+
+`run_step` takes the same `with` values, so a step is unit-tested with its config. Rejected
+alternative: `ctx.params` as an untyped mapping, where a mistyped key is silently ignored, which is the
+failure this contract exists to prevent.
+
 #### 3.3.1 `ref` needs bundle-fetch, which does not exist in wave 1
 
 The two step forms resolve by different mechanisms, and only one of them is implemented:
@@ -533,7 +543,14 @@ table row, and wave 2's exit criterion 1 needs both from one channel.
 - A `Drop` in a destination step filters the message for that destination only; the others proceed.
   This is also the per-destination filter set 1.0 listed as an open item.
 - A failure is retried in place `pipeline.stepRetries` times, then dead-lettered with `tb-destination`
-  set. It does not stop the other destinations.
+  set. It does not stop the other destinations. **The `dlq` record's payload is the destination
+  step's input** (the pipeline output), not the raw payload. That is what failed, and it is what a
+  destination-scoped reprocess needs.
+- **Reprocess must be destination-scoped** for any `dlq` record carrying `tb-destination`. This
+  covers destination-step failures and loader exhaustion alike, and the latter already exists in
+  wave 1. Re-injecting such a record into `raw` would re-deliver it to *every* destination under a
+  new `tb-msg-id`, which no loader's idempotency can absorb. Until W3-3 implements destination-scoped
+  re-entry, the reprocess tooling must refuse these records. Recorded in ADR-003 D5.
 - The `raw` offset is committed once every destination has either been produced to or dead-lettered;
   a redelivery re-runs all of them, which invariant 4's loader idempotency absorbs. With
   `pipeline.transactional: true`, all the `out` records for one message commit atomically.
@@ -640,7 +657,7 @@ function's parser at deploy, so a malformed locator is refused before it reaches
 
 | Scheme | Locator grammar | Evaluated against | Valid for |
 |---|---|---|---|
-| `hl7:` | `SEG.F`, `SEG.F.C` or `SEG.F.C.S` — segment id, then 1-based field, component, subcomponent, HL7 numbering (`MSH.3` is sending application). `[n]` repetition syntax is **reserved** | First occurrence of the segment; first repetition of the field | `application/hl7-v2+er7` payloads |
+| `hl7:` | `SEG.F`, `SEG.F.C` or `SEG.F.C.S` — segment id, then 1-based field, component, subcomponent, HL7 numbering (`MSH.1` is the field separator, `MSH.3` sending application). Optional **repetition selector** on the field: `SEG.F[c:VALUE]` picks the first repetition whose component `c` equals `VALUE` exactly, e.g. `hl7:PID.3[5:MR].1` (the MR-typed identifier). A numeric `[n]` index stays **reserved** | First occurrence of the segment; the first repetition of the field, or the first matching the selector | `application/hl7-v2+er7` payloads |
 | `json:` | An RFC 6901 JSON Pointer, e.g. `json:/subject/reference`. `~0`/`~1` escapes are not expressible in set 1.1 | The parsed payload | `application/json`, `application/fhir+json` |
 | `header:` | A header name on the **inbound transport message** | HTTP request header (`http` source); inbound record header (`kafka` source) | `http`, `kafka` sources |
 | `record:key` | Literal | The inbound Kafka record key, byte for byte | `kafka` source |
@@ -650,9 +667,20 @@ function's parser at deploy, so a malformed locator is refused before it reaches
 
 - **The key is the value's bytes exactly as they appear**: UTF-8 for text formats, no HL7 unescaping,
   no trimming, no case folding. Normalising is a choice with clinical consequences (is `12345` the same
-  patient as `012345`?) and belongs in a step before the data reaches a key, not hidden in the
-  evaluator. **This is the rule most worth challenging** — if W2-4 finds real senders that make it
-  unworkable, bring the evidence and it changes before anything ships on it.
+  patient as `012345`?), and set 1.1 offers **no place to make it**. The receiver evaluates the key
+  before any step runs, so a step cannot normalise it. (The first version of this rule said "normalise
+  in a step". That was impossible; `platform-engineer` caught it.) A channel whose senders encode one
+  patient's identifier differently cannot key reliably on it in set 1.1. Fix it at the sender, or
+  choose a field that is stable. A declarative normalisation is a candidate for a later set.
+- **Key on a field that identifies one thing.** PID-3 repeats, and senders order its repetitions
+  differently, so a bare `hl7:PID.3.1` can take an MR number from one feed and an account number from
+  another. The same patient then lands on two partitions and is reordered silently: an invariant 5
+  failure in exactly the case the key exists for. **Use the selector (`hl7:PID.3[5:MR].1`)** whenever
+  the field repeats. The control plane warns on an unselected key into a field that repeats in the
+  HL7 standard. It warns rather than refuses because set 1.0 examples use the bare form.
+- **Header names** match case-insensitively for the `http` source (HTTP semantics) and exactly for the
+  `kafka` source. A header present more than once is unresolved (`KEY_HEADER_AMBIGUOUS`), never "the
+  first one".
 - **Unresolved** means: the segment, field, pointer target or header is absent, the value is empty,
   the value is not a scalar, or it exceeds 256 bytes (`envelope/v0` key limit). On a per-key channel an
   unresolved key is a **`parse-error` at the receiver** — the NACK column of 3.2.2 — and never a null
@@ -766,13 +794,11 @@ uv run --no-project --python 3.12 --with jsonschema python contracts/validate.py
 [`examples/manifest.json`](examples/manifest.json) and assert that each invalid example fails at the
 `expected_json_path` and `expected_validator` it pins, not merely that it fails.
 
-**Set 1.1 status: UNMEASURED.** The 16 new pairs are architect predictions, labelled
-`PREDICTED ... UNMEASURED` in the manifest, and the 4 new valid examples are hand-typed — and a
-hand-typed valid example has already failed once on a clerical error only a run caught (`CHANGELOG`,
-2026-09-23). The one pair flagged as least certain is `source-field-from-another-type.json`
-(`propertyNames` reporting `enum` at the containing object). Nothing here is PASS until
-`validate.py`, `--emit-expectations` and `pytest tests/conformance` have been run by someone with a
-shell.
+**Set 1.1 status: passing, first run, 2026-09-24** (`qa-engineer`, local Windows checkout):
+`validate.py` **122 / 0**; `--emit-expectations` **86 pairs, all matched, 0 mismatches**, including the
+one flagged as least certain (`source-field-from-another-type.json`, `$.spec.source` / `enum`);
+`pytest tests/conformance` **127 passed**. All 16 set 1.1 pairs were architect predictions, and none
+needed correcting.
 
 **Set 1.0 status: passing.** Three independent runs on 2026-09-22, all first-run green:
 

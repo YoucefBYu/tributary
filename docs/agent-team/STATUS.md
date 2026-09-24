@@ -19,24 +19,33 @@ wave's exit criteria here.
   works end to end from a YAML channel; (2) an ordered channel preserves per-key order under chaos
   tests; (3) every loader has a passing duplicate-delivery test; (4) throughput — msg/s per core and ACK
   p99 against the Phase 0 numbers. Operational readings are in `wave-2.md` section 3.
-- **Contracts: set 1.1 published 2026-09-24, UNVERIFIED.** It adds the wave 2 connector shapes (3 source
-  types, 7 destination types), per-destination steps, `partitionKey` semantics, and written lift
-  criteria for `retry-topic`, which stays refused. 20 new examples; the 16 expected-failure pairs are
-  architect predictions. The conformance run was requested from `qa-engineer` and **not yet reported**.
-  `contracts/CHANGELOG.md`, ADR-007 D10-D17.
+- **Contracts: set 1.1 published and VERIFIED 2026-09-24** (`qa-engineer`, committed `ffc1580`):
+  `validate.py` **122 / 0**; `--emit-expectations` **86 pairs, 0 mismatches**, all 16 set 1.1
+  predictions included; `pytest tests/conformance` **127 passed**. Set 1.1 adds the wave 2 connector
+  shapes (3 source types, 7 destination types), per-destination steps, `partitionKey` semantics, and
+  written lift criteria for `retry-topic`, which stays refused. `contracts/CHANGELOG.md`, ADR-007
+  D10-D17. **Later the same day**: README follow-ups from implementers, with no schema change, and one
+  valid example's key changed to `hl7:PID.3[5:MR].1`. **A conformance re-run is needed for that one
+  example.**
 - **Linux re-run of S1/S2: NOT DONE.** Approved 2026-09-21 as "the first Phase 1 CI task, before the
   receiver is built". The receiver was built in wave 1. `.github/workflows/bench-linux.yml` exists as a
   stub: it records the environment and locked versions, then prints "not wired yet: qa-engineer to add
   the S1 (parser) and S2 (MLLP to Kafka) entry points". It is manual-trigger only, and
-  `benchmarks/results/` holds only the Phase 0 Windows output. Confirmation from `qa-engineer` has been
-  requested, so this is **the architect's reading of the repository, 2026-09-24**. It matters for exit
-  criterion 4: without it, the throughput report compares against laptop numbers only.
+  `benchmarks/results/` holds only the Phase 0 Windows output. **Confirmed independently by
+  `qa-engineer`**, who owns wiring it and has not started (the chaos suite came first). It matters for
+  exit criterion 4: without it, the throughput report compares against laptop numbers only.
+- **Exit criterion 3 gap, found by `qa-engineer`:** the existing HTTP and PostgreSQL
+  `test_duplicate_delivery_is_harmless` tests call `deliver()` twice in one process. Under channel-spec
+  README 5.1 that does not count as a genuine redelivery. `qa-engineer` builds the redelivery harness
+  (a real consumer loop with offset replay) in W2-9, coordinating the interface with
+  `connector-engineer`.
 - **Blocked on a human:** the SFTP client licence (W2-6/W2-7 `sftp`); see open questions. The
   PostgreSQL *loader* is **not** blocked: it uses `asyncpg` (Apache-2.0 per the lead; `licence_check.py`
   confirms it when the dependency lands). `psycopg` matters only to the wave 3 control plane.
-- **Waiting on teammates:** the conformance run of set 1.1 (`qa-engineer`); the `ctx.fhir` /
-  `ctx.terminology` proposal (`healthcare-standards-engineer`, review criteria sent); the shared key
-  evaluator's signature and a response on per-destination steps (`platform-engineer`).
+- **Waiting on teammates:** final W2-2 signatures after the conditions (`healthcare-standards-engineer`);
+  the `retry-topic` spike report (`platform-engineer`). The first model result has pause-until-due at
+  p50 lateness of about 515 s at production tiers, which is option (a)'s head-of-line cost made
+  concrete. A delay-buffer variant is being measured.
 
 ### Wave 1 exit
 
@@ -221,6 +230,13 @@ All six filed and synthesised. Full threshold table with evidence ratings quoted
 | 2026-09-24 | **A refused Kafka-source record halts the source partition** (D16). The first draft dead-lettered it; the receiver ACL has no `dlq` WRITE, so that rule was unimplementable, and it was caught by tracing it into `topics/v0` before publishing | ADR-007 5a |
 | 2026-09-24 | **Per-destination steps** (D17), run in the pipeline worker with no new hop. Exit criterion 1 needs a FHIR Bundle and a table row from one channel | channel-spec README 3.5 |
 | 2026-09-24 | **Wave 2 planning drafts consolidated into `phases/wave-2.md`**; six lead drafts reduced to pointers, and errors listed in its section 9 | `phases/wave-2.md` |
+| 2026-09-24 | **W2-2 `ctx.fhir` / `ctx.terminology` APPROVED WITH CONDITIONS.** Local Bundle-entry construction with no network; terminology behind a Protocol with fakes; no `ctx.ids` (it would reach the human-reserved `_hmac` question). Conditions: `fhir.resources`/`fhir-core` pass `licence_check.py`; per-message cost measured; R4B models guarded by validating the golden files against the FHIR R4 JSON schema; conditional entries on exactly one unique identifier system; no unconditional create; deterministic fullUrls; runtime attachment optional, not a hard import (agreed with `platform-engineer`) | channel-spec README 3.4.2 (corrected the same day: a business-identifier conditional PUT qualifies) |
+| 2026-09-24 | **Contract set 1.1 verified**: 122 / 0, 86 pairs matched, conformance 127 passed (`qa-engineer`, `ffc1580`) | `contracts/CHANGELOG.md` |
+| 2026-09-24 | **Key evaluator APPROVED** as `tributary.sdk.keys` (`platform-engineer`): pure, stdlib only, and returns `ResolvedKey \| UnresolvedKey(reason code)` rather than raising, so the unresolved path cannot carry the value. The repr is redacted | channel-spec README 4.3 |
+| 2026-09-24 | **PID-3 repetition selector** `hl7:PID.3[5:MR].1` added now, not in v1. Evidence (`platform-engineer`): repetition order differs between senders, so a bare `PID.3.1` gives one patient two keys. The "normalise in a step" advice was withdrawn as impossible, because keys are evaluated before steps | channel-spec README 4.3 |
+| 2026-09-24 | **`with` binds to keyword-only step parameters by name**, refused loudly at load if wrong. The SDK's `@step` changes so that a keyword-only parameter without a default means "required from `with`". Rejected: an untyped `ctx.params` | channel-spec README 3.3 |
+| 2026-09-24 | **Reprocess of any `dlq` record carrying `tb-destination` must be destination-scoped**, and is refused until W3-3 builds it. This covers wave 1 loader-exhaustion records too. A destination-step `dlq` record carries the step's input | ADR-003 follow-up 10 |
+| 2026-09-24 | **Manifest `runnable` checked against W2-1** (`9078982` registers `tributary.hl7v2.parse` only). No example flips: each one naming `parse` also names a `ref` step, and the fanout example needs the unregistered `tributary.hl7v2.to_json`. `requires` lists trimmed to what is still missing | `examples/manifest.json` |
 
 ## Open questions for the human
 
