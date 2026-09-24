@@ -288,11 +288,17 @@ likewise an ADR-004 question; the requirement that encryption be on is not.
 ### 3.6 Consumer group naming
 
 ```
-tb.<env>.<channel>.<role>[.<destination>]     role = pipeline | loader | replier | archiver
+tb.<env>.<channel>.<role>[.<destination>]     role = pipeline | loader | replier | archiver | receiver
 ```
 
 For example `tb.prod.adt-to-fhir.loader.fhir-server`. A shadow deployment appends
 `.shadow-<label>`, which is what makes shadow deploys free: a second group on the same `raw` topic.
+
+**`receiver` (set 1.1, additive)** is the group of a `kafka` source (`channel-spec/v0` 3.2.5). That
+group lives on the **external** cluster the source reads, under the source's own credentials — never
+the engine's receiver principal — so section 3.4's ACL shape and `security.acls` gain nothing and lose
+nothing. The name is fixed here only so two deployments of one channel cannot collide on a foreign
+cluster.
 
 ### 3.7 These values are read from the contract, not copied into code
 

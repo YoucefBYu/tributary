@@ -21,6 +21,11 @@ directory rename: set 1.0 is the four contracts above, frozen together at the wa
 | Set version | Members | Frozen |
 |---|---|---|
 | 1.0 | `envelope/v0`, `topics/v0`, `events/v0`, `channel-spec/v0` | at the Phase 1 wave 1 gate |
+| 1.1 | Same four directories. **Additive only**: wave 2 connector types, destination steps and key semantics in `channel-spec/v0`; consumer-group role `receiver` in `topics/v0` | Published 2026-09-24 at the start of wave 2; **unverified** until the conformance run. Freezes at the wave 2 gate |
+
+A minor set version is additive by definition: every document valid under 1.0 is valid under 1.1.
+A change that would make a 1.0-valid document invalid is breaking, creates a `v1/` directory and needs
+an ADR.
 
 **Why not `envelope/v1/` and so on.** The rule below says a new major *directory* is created by a
 breaking change **after** a freeze, not by the freeze itself. Copying the three contracts into `v1/`

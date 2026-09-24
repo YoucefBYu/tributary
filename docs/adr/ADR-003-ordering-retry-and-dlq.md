@@ -250,7 +250,10 @@ partition pause means; Kafka share groups for unordered destinations.
    Mirth users, who expect per-destination queues with automatic retry. Include D9's `AE` semantics.
 5. **Spike `retry-topic` with delay tiers** (D2) before any destination may select it: choose between
    one topic plus `tb-retry-not-before` and one topic per tier, and measure the head-of-line cost that
-   separates them. It is the only policy in ADR-001 6.4 with no evidence behind it.
+   separates them. It is the only policy in ADR-001 6.4 with no evidence behind it. **The criteria for
+   lifting the refusal are fixed in advance** in `contracts/channel-spec/v0/README.md` 4.1.1 (ADR-007
+   D15), 2026-09-24 — including that the spike characterises how retried messages reorder rather than
+   claiming they do not. Owner: `platform-engineer`, inside W2-4.
 6. **Decouple resume from the poll timeout** in `tributary-runtime`: about 155 ms of each 169 ms retry
    cycle was `poll_timeout_s`, not backoff (S5 follow-up 1).
 7. **Test a multi-minute destination outage** against `max.poll.interval.ms`. S5's pauses lasted

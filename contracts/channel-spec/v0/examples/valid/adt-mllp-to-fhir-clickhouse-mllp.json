@@ -1,0 +1,78 @@
+{
+  "apiVersion": "tributary.dev/v1",
+  "kind": "Channel",
+  "metadata": {
+    "name": "adt-to-fhir-and-analytics",
+    "labels": { "domain": "adt", "owner": "integration-team" },
+    "description": "Wave 2 exit criterion 1 shape: ADT over MLLP to a FHIR server and to ClickHouse, plus an MLLP forward. Synthetic only."
+  },
+  "spec": {
+    "ordering": "per-key",
+    "partitionKey": "hl7:PID.3.1",
+    "source": {
+      "type": "mllp",
+      "bind": "0.0.0.0",
+      "port": 6661,
+      "tls": { "secretRef": "mllp-tls", "clientAuth": "required", "minVersion": "1.3" },
+      "ack": { "mode": "after-commit", "nackOn": ["parse-error", "queue-full"], "timeoutMs": 10000 },
+      "maxMessageBytes": 1000000,
+      "queue": { "maxBytes": 67108864 }
+    },
+    "pipeline": {
+      "bundle": "ghcr.io/tributary-synth/adt-integration@sha256:3f7a1c9e2b5d48a06e1f8c3d7b2a95e04c6d8f1a3b5c7d9e0f2a4b6c8d0e2f46",
+      "steps": [
+        { "name": "parse", "uses": "tributary.hl7v2.parse", "with": { "version": "2.5.1" } },
+        { "name": "filter", "ref": "adt_flow.filters.only_admit_transfer_discharge" }
+      ]
+    },
+    "destinations": [
+      {
+        "name": "fhir-server",
+        "type": "fhir",
+        "steps": [{ "name": "to-bundle", "ref": "adt_flow.mapping.to_fhir_transaction_bundle" }],
+        "with": {
+          "url": "https://fhir.example.org/fhir",
+          "fhirVersion": "4.0.1",
+          "interaction": "transaction",
+          "timeoutMs": 8000,
+          "auth": { "type": "oauth2-client-credentials", "secretRef": "fhir-oauth" },
+          "circuitBreaker": { "failureThreshold": 10, "openSeconds": 30 }
+        },
+        "idempotency": {
+          "technique": "conditional-update",
+          "note": "Every Bundle entry is a conditional PUT or ifNoneExist POST on one unique identifier; README 3.4.2"
+        },
+        "retry": { "policy": "blocking", "backoff": "exponential", "initialDelayMs": 250, "maxDelayMs": 60000, "maxAttempts": 10, "onExhaust": "halt-partition" }
+      },
+      {
+        "name": "adt-analytics",
+        "type": "clickhouse",
+        "steps": [{ "name": "to-row", "ref": "adt_flow.mapping.to_adt_event_row" }],
+        "with": {
+          "host": "clickhouse.example.org",
+          "port": 8443,
+          "database": "analytics",
+          "table": "adt_events",
+          "auth": { "type": "password", "secretRef": "clickhouse-adt" },
+          "tls": { "mode": "verify-full", "secretRef": "clickhouse-ca" },
+          "timeoutMs": 5000
+        },
+        "idempotency": { "technique": "sink-native", "note": "ReplacingMergeTree ORDER BY tb_msg_id; readers query with FINAL" },
+        "retry": { "policy": "blocking", "maxAttempts": 20, "onExhaust": "halt-partition" }
+      },
+      {
+        "name": "downstream-lis",
+        "type": "mllp",
+        "with": {
+          "host": "lis.example.org",
+          "port": 2575,
+          "tls": { "secretRef": "lis-mllp-ca", "minVersion": "1.2" },
+          "timeoutMs": 10000,
+          "onNegativeAck": "fail"
+        },
+        "idempotency": { "technique": "none", "note": "The LIS applies ADT updates idempotently by visit; a replayed A08 is harmless there" },
+        "retry": { "policy": "blocking", "maxAttempts": 10, "onExhaust": "halt-partition" }
+      }
+    ]
+  }
+}

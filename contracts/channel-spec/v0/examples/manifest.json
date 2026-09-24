@@ -3,7 +3,7 @@
   "schema": "../channel.schema.json",
   "note": "Examples are JSON because a channel spec is authored in YAML and validated after parsing; the schema sees the parsed document either way. All names, hosts and digests are synthetic. No example carries a payload, a record key or a credential value.",
   "expectation_note": "MEASURED 2026-09-22 by qa-engineer with `contracts/validate.py --emit-expectations` against jsonschema Draft 2020-12, and independently by the lead (94 checks, 0 failed, first run). Every expected_json_path/expected_validator pair below is the failing location and keyword that example MUST produce, so an example that fails for the WRONG reason goes red instead of passing (code-reviewer Medium 2, Phase 0 gate). These 19 pairs were first written as architect predictions - this session has no shell - and all 19 matched the measured run exactly, including the three flagged as least certain; no correction was needed. Paths and keywords only, never instance values, so this file is PHI-safe. An example may fail on more than one pair; the test asserts the pinned pair is among the failures.",
-  "runnable_note": "Every valid entry declares `runnable`. true means every step it names resolves in the shipping distribution TODAY, so a test may load and execute it. false means it illustrates a channel a later wave will make authorable, and `requires` lists the namespaces or mechanisms that do not exist yet, each with the task that delivers it. This is DATA rather than prose because the same classification is needed by the schema corpus test in tributary-runtime, and an allow-list duplicated in a test drifts from the contract that owns it. Three rules for whoever maintains that test: a `runnable: true` example whose steps stop resolving is a failure; a `runnable: false` example whose `requires` have ALL become resolvable is also a failure - the entry must then be promoted to true and its `requires` deleted, so a stale exemption cannot silently mask a real gap; and AT LEAST ONE entry must be `runnable: true`, because a corpus where every example is exempt no longer demonstrates that any channel spec can be executed at all, and would go green saying so.",
+  "runnable_note": "Every valid entry declares `runnable`. true means every step it names resolves in the shipping distribution TODAY, so a test may load and execute it. false means it illustrates a channel a later wave will make authorable, and `requires` lists the namespaces or mechanisms that do not exist yet, each with the task that delivers it. This is DATA rather than prose because the same classification is needed by the schema corpus test in tributary-runtime, and an allow-list duplicated in a test drifts from the contract that owns it. Three rules for whoever maintains that test: a `runnable: true` example whose steps stop resolving is a failure; a `runnable: false` example whose `requires` have ALL become resolvable is also a failure - the entry must then be promoted to true and its `requires` deleted, so a stale exemption cannot silently mask a real gap; and AT LEAST ONE entry must be `runnable: true`, because a corpus where every example is exempt no longer demonstrates that any channel spec can be executed at all, and would go green saying so. SET 1.1 ADDITION: `runnable` now covers CONNECTORS as well as steps. A `requires` entry of the form `connector:<source|destination>/<type> (task)` names a receiver or loader type that is in the schema but not yet shipped; such an example is not runnable however its steps resolve. The step-resolution test cannot see connectors, so it must treat a `connector:` entry as unresolved until the entry is deleted, and the owning engineer asks the architect to delete it when the connector ships with its duplicate-delivery test. Every set 1.1 example also names a `ref` step, so none can be promoted by W2-1 landing alone.",
   "valid": [
     {
       "file": "valid/walking-skeleton-loopback.json",
@@ -13,20 +13,68 @@
     {
       "file": "valid/adt-to-fhir-per-key-mtls.json",
       "runnable": false,
-      "requires": ["tributary.hl7v2. (W2-1)", "bundle-fetch for ref steps (unscheduled)"],
+      "requires": ["bundle-fetch for ref steps (unscheduled)"],
       "note": "Production shape: wildcard bind with mTLS, per-key ordering, byte-bounded queue, three steps, HTTPS destination with blocking retry and halt-partition"
     },
     {
       "file": "valid/published-with-version.json",
       "runnable": false,
-      "requires": ["tributary.hl7v2. (W2-1)", "bundle-fetch for ref steps (unscheduled)"],
+      "requires": ["bundle-fetch for ref steps (unscheduled)"],
       "note": "The form on _tb.<env>.channels: metadata.version set by the control plane, partitions and retention overrides, transactional pipeline"
     },
     {
       "file": "valid/two-destinations-fanout.json",
       "runnable": false,
-      "requires": ["tributary.hl7v2. (W2-1)"],
+      "requires": ["tributary.hl7v2.to_json (unscheduled: W2-1 registered tributary.hl7v2.parse only, 9078982)"],
       "note": "Two destinations with different idempotency techniques and different exhaustion behaviour on one unordered channel"
+    },
+    {
+      "file": "valid/adt-mllp-to-fhir-clickhouse-mllp.json",
+      "runnable": false,
+      "requires": [
+        "bundle-fetch for ref steps (unscheduled)",
+        "per-destination steps (W2-5)",
+        "connector:destination/fhir (W2-6)",
+        "connector:destination/clickhouse (W2-6)",
+        "connector:destination/mllp (W2-6)"
+      ],
+      "note": "Set 1.1. Wave 2 exit criterion 1 shape: per-key MLLP with mTLS to a FHIR transaction destination, a ClickHouse row destination and an MLLP forward, each sink getting its own payload through destination steps"
+    },
+    {
+      "file": "valid/http-fhir-ingest-to-fhir-and-postgresql.json",
+      "runnable": false,
+      "requires": [
+        "bundle-fetch for ref steps (unscheduled)",
+        "per-destination steps (W2-5)",
+        "connector:source/http (W2-7)",
+        "connector:destination/fhir (W2-6)",
+        "connector:destination/postgresql (W2-6)"
+      ],
+      "note": "Set 1.1. HTTP/FHIR ingest with bearer auth over TLS, keyed by a JSON pointer, to a FHIR server and a PostgreSQL table"
+    },
+    {
+      "file": "valid/sftp-drop-to-s3-and-sftp.json",
+      "runnable": false,
+      "requires": [
+        "bundle-fetch for ref steps (unscheduled)",
+        "connector:source/sftp (W2-7)",
+        "connector:destination/s3 (W2-6)",
+        "connector:destination/sftp (W2-6)"
+      ],
+      "note": "Set 1.1. SFTP poller with pinned host keys and move-after-commit, to a KMS-encrypted S3 bucket and a second SFTP server, both named from tb-msg-id"
+    },
+    {
+      "file": "valid/kafka-lab-events-to-clickhouse-and-kafka.json",
+      "runnable": false,
+      "requires": [
+        "bundle-fetch for ref steps (unscheduled)",
+        "per-destination steps (W2-5)",
+        "record:key evaluator (W2-4)",
+        "connector:source/kafka (W2-7)",
+        "connector:destination/clickhouse (W2-6)",
+        "connector:destination/kafka (W2-6)"
+      ],
+      "note": "Set 1.1. External Kafka source over SASL_SSL keyed by the inbound record key, to ClickHouse and to a partner cluster over mTLS with the key preserved"
     }
   ],
   "invalid": [
@@ -145,6 +193,118 @@
       "violates": "metadata.name must match ^[a-z][a-z0-9-]{0,63}$: it becomes a topic segment and the tb-channel header, and Kafka metrics collapse '.' and are case-sensitive",
       "expected_json_path": "$.metadata.name",
       "expected_validator": "pattern"
+    },
+    {
+      "file": "invalid/source-http-without-auth.json",
+      "violates": "an http source must state auth.type, with no default - the same rule as tls.clientAuth",
+      "expected_json_path": "$.spec.source",
+      "expected_validator": "required",
+      "expectation_note": "PREDICTED by the architect (set 1.1), UNMEASURED until --emit-expectations is run"
+    },
+    {
+      "file": "invalid/source-http-unauthenticated-remote.json",
+      "violates": "auth.type none on a non-loopback http listener: TLS protects the transport, not against fabricated messages from anyone who can reach the port",
+      "expected_json_path": "$.spec.source.bind",
+      "expected_validator": "pattern",
+      "expectation_note": "PREDICTED by the architect (set 1.1), UNMEASURED until --emit-expectations is run"
+    },
+    {
+      "file": "invalid/source-http-mtls-without-client-cert.json",
+      "violates": "auth.type mtls requires tls.clientAuth required: a listener that does not demand a certificate cannot authenticate by one",
+      "expected_json_path": "$.spec.source.tls.clientAuth",
+      "expected_validator": "const",
+      "expectation_note": "PREDICTED by the architect (set 1.1), UNMEASURED until --emit-expectations is run"
+    },
+    {
+      "file": "invalid/source-field-from-another-type.json",
+      "violates": "a source may carry only the fields of its own type; an sftp source with a bind address is a spec error, never silently ignored",
+      "expected_json_path": "$.spec.source",
+      "expected_validator": "enum",
+      "expectation_note": "PREDICTED by the architect (set 1.1), UNMEASURED. propertyNames is expected to report at the containing object with the inner keyword, as the step-with-inline-secret and events attrs precedents do. If this reports anything else, the per-type field allow-list is not the rule that failed"
+    },
+    {
+      "file": "invalid/source-sftp-without-host-keys.json",
+      "violates": "an sftp source must pin the server's host keys; SSH without host key verification is TLS without certificate verification",
+      "expected_json_path": "$.spec.source.sftp",
+      "expected_validator": "required",
+      "expectation_note": "PREDICTED by the architect (set 1.1), UNMEASURED until --emit-expectations is run"
+    },
+    {
+      "file": "invalid/source-kafka-plaintext-remote.json",
+      "violates": "PLAINTEXT Kafka only when every bootstrap server is this host; PHI in flight to a remote broker is TLS or it is a breach",
+      "expected_json_path": "$.spec.source.kafka.connection.bootstrapServers[0]",
+      "expected_validator": "pattern",
+      "expectation_note": "PREDICTED by the architect (set 1.1), UNMEASURED until --emit-expectations is run"
+    },
+    {
+      "file": "invalid/source-kafka-reads-platform-topic.json",
+      "violates": "a kafka connector may not name a _tb.* platform topic; reading _tb.<env>.channels through a connector bypasses the ACL model, and writing it is RCE across the data plane (topics/v0 3.4)",
+      "expected_json_path": "$.spec.source.kafka.topic",
+      "expected_validator": "not",
+      "expectation_note": "PREDICTED by the architect (set 1.1), UNMEASURED until --emit-expectations is run"
+    },
+    {
+      "file": "invalid/partition-key-unknown-scheme.json",
+      "violates": "partitionKey scheme must be hl7, json, xpath (reserved), header or the literal record:key",
+      "expected_json_path": "$.spec.partitionKey",
+      "expected_validator": "pattern",
+      "expectation_note": "PREDICTED by the architect (set 1.1), UNMEASURED until --emit-expectations is run"
+    },
+    {
+      "file": "invalid/destination-postgresql-tls-disabled-remote.json",
+      "violates": "tls.mode disable is permitted only when the database host is loopback",
+      "expected_json_path": "$.spec.destinations[0].with.host",
+      "expected_validator": "pattern",
+      "expectation_note": "PREDICTED by the architect (set 1.1), UNMEASURED until --emit-expectations is run"
+    },
+    {
+      "file": "invalid/destination-postgresql-wrong-idempotency.json",
+      "violates": "a postgresql destination can honour only sink-native idempotency (a unique tb-msg-id column); declaring a header technique it cannot apply is a false invariant-4 claim",
+      "expected_json_path": "$.spec.destinations[0].idempotency.technique",
+      "expected_validator": "enum",
+      "expectation_note": "PREDICTED by the architect (set 1.1), UNMEASURED until --emit-expectations is run"
+    },
+    {
+      "file": "invalid/destination-s3-without-encryption.json",
+      "violates": "an s3 destination must state serverSideEncryption; topics/v0 3.5 requires encryption at rest for every PHI store",
+      "expected_json_path": "$.spec.destinations[0].with",
+      "expected_validator": "required",
+      "expectation_note": "PREDICTED by the architect (set 1.1), UNMEASURED until --emit-expectations is run"
+    },
+    {
+      "file": "invalid/destination-s3-inline-access-key.json",
+      "violates": "no connector object has a field that can carry a credential value; access keys come through auth.secretRef. The value in this example is a synthetic placeholder, not a key",
+      "expected_json_path": "$.spec.destinations[0].with",
+      "expected_validator": "additionalProperties",
+      "expectation_note": "PREDICTED by the architect (set 1.1), UNMEASURED until --emit-expectations is run"
+    },
+    {
+      "file": "invalid/destination-sftp-without-host-keys.json",
+      "violates": "an sftp destination must pin the server's host keys; there is no trust-on-first-use option",
+      "expected_json_path": "$.spec.destinations[0].with",
+      "expected_validator": "required",
+      "expectation_note": "PREDICTED by the architect (set 1.1), UNMEASURED until --emit-expectations is run"
+    },
+    {
+      "file": "invalid/destination-fhir-plain-create.json",
+      "violates": "the fhir destination supports interaction transaction only in set 1.1, which keeps conditional identifiers in the Bundle body and out of the request line (ADR-007 D12)",
+      "expected_json_path": "$.spec.destinations[0].with.interaction",
+      "expected_validator": "const",
+      "expectation_note": "PREDICTED by the architect (set 1.1), UNMEASURED until --emit-expectations is run"
+    },
+    {
+      "file": "invalid/destination-mllp-remote-without-tls.json",
+      "violates": "an mllp destination on a non-loopback host requires tls",
+      "expected_json_path": "$.spec.destinations[0].with",
+      "expected_validator": "required",
+      "expectation_note": "PREDICTED by the architect (set 1.1), UNMEASURED until --emit-expectations is run"
+    },
+    {
+      "file": "invalid/destination-kafka-writes-channel-topic.json",
+      "violates": "a kafka destination may not name a topic shaped like this engine's own channel topics; writing another channel's raw through a connector bypasses the per-channel ACL model",
+      "expected_json_path": "$.spec.destinations[0].with.topic",
+      "expected_validator": "not",
+      "expectation_note": "PREDICTED by the architect (set 1.1), UNMEASURED until --emit-expectations is run"
     }
   ]
 }

@@ -103,6 +103,33 @@ sub-decisions follow, each expressed in the schema rather than in prose wherever
 reworded. Contracts: `channel-spec/v0` is new; `envelope/v0` gains sections 2.3 and 2.4;
 `topics/v0` gains 3.7 and 3.8. All additive, all recorded in `contracts/CHANGELOG.md`.
 
+## 5a. Amendment 1 — contract set 1.1, wave 2 connectors (2026-09-24)
+
+**Decided by the architect at the start of Phase 1 wave 2. No invariant changes.** Every decision
+below is additive to the schema; D6 is amended in wording, and the amendment is D10. Contract text:
+`contracts/channel-spec/v0/README.md` sections 3.0, 3.2.2-3.2.5, 3.4.1-3.4.7, 3.5, 4.1.1, 4.3, 5.1, 10.
+**The schema and its 20 new examples are unverified until the conformance run** (follow-up 7).
+
+| # | Decision | Options considered | What it gives up |
+|---|---|---|---|
+| D10 | **D6 amended: connector types enter the enum at the start of the wave that builds them**, with their config shape, not when the code lands | (a) keep D6: each shape arrives with its connector; (b) publish all at wave start (chosen); (c) publish every connector ADR-001 ever names | (a) has seven loaders and three receivers inventing the contract in parallel with a runtime and an evaluator — the opposite of contract-first. (c) is invented detail. **Cost of (b):** a spec can select a type whose connector has not shipped and fail at startup rather than at validation. Loud, tracked in README 3.0, and the same trade already accepted for `ref` |
+| D11 | **Kafka connectors always use an explicit connection with their own credentials**, even to the engine's own cluster, and cannot name `_tb.*` or channel-shaped topics | (a) allow "local cluster" with the engine's principal; (b) explicit only (chosen) | (a) needs READ/WRITE grants on arbitrary foreign topics for data-plane principals, which is an ACL-model change owned by ADR-004 and a human. **Cost of (b):** a same-cluster bridge needs a second credential. Channel chaining is out of set 1.1 |
+| D12 | **The `fhir` destination is transaction-only** | (a) create/update/conditional operations with a no-log exception for `?identifier=`; (b) transaction only, conditions in the Bundle body (chosen); (c) leave FHIR to the `http` type | (a) puts identifiers in request lines that proxies log, rescued by a rule the Phase 0 pattern says will be missed somewhere. (c) gives FHIR no idempotency or outcome semantics. **Cost of (b):** servers without transaction support must use `http`, and plain create/update/batch are unavailable |
+| D13 | **SQL sinks take a row-shaped JSON payload built by a step**; no column-mapping language in the spec | (a) declarative column mapping (`column: json:/path`); (b) row built by a step (chosen) | (a) is where configuration becomes a program the loader interprets, the same line D1 draws for inline code. **Cost of (b):** a trivial mapping still needs a step, a module and a test |
+| D14 | **Each destination type may declare only the idempotency techniques it can honour**, and the SQL loaders verify theirs at startup | (a) any technique on any type, trust the declaration; (b) restrict per type in the schema, verify in the loader (chosen) | (a) lets a spec claim invariant 4 at a sink that cannot deliver it, which is a false guarantee, worse than none. **Cost:** a novel sink-side mechanism on a restricted type needs a contract change |
+| D15 | **`retry-topic` stays refused; nine lift criteria are written down now**, including that a per-key channel selecting it must also say `acceptReordering: true` | (a) lift on "spike done"; (b) criteria fixed before the spike (chosen) | (a) lets the spike define its own pass mark, and invites the claim that retry-topic preserves order, which ADR-003 D1 already says it does not. **Cost:** the spike has more to show |
+| D16 | **A refused Kafka-source record halts the source partition** | (a) write it to the channel's `dlq`; (b) skip and log; (c) halt (chosen) | (a) is unimplementable: the receiver's ACL is WRITE on `raw` only (`topics/v0` `security.acls`), and widening it is ADR-004's. (b) is "ACK and drop", which invariant 1 forbids. **Cost of (c):** one bad record stalls a source partition until an operator acts |
+| D17 | **Per-destination steps** (`destinations[].steps`), run in the pipeline worker before `out.<dest>` | (a) one channel per sink; (b) a routing return type in the SDK (`Routed({...})`); (c) per-destination steps (chosen) | (a) cannot share one MLLP listener across two channels. (b) moves routing into code where the UI cannot see it. **Cost of (c):** the executor becomes a small tree; a failure in one destination's steps dead-letters that destination only, so a message can be partially delivered, which is already true of per-destination loaders |
+
+Also fixed as semantics rather than as schema: the `partitionKey` schemes (README 4.3) — key bytes
+exactly as they appear, no normalisation, and an unresolved key is a receiver `parse-error`, never a
+null key. The no-normalisation rule is flagged in the contract as the one most worth challenging with
+evidence from real senders.
+
+**Escalated, not decided:** the SFTP client and PostgreSQL driver licences (README 10.2). To the
+architect's knowledge, unverified, the common Python SFTP libraries are LGPL or EPL/GPL, which
+invariant 10 does not permit, and `psycopg` 3 is LGPL-3.0. That is a human decision.
+
 ## 6. Follow-ups
 
 1. ~~**Measure the expected-failure pairs.**~~ **DONE 2026-09-22.** `contracts/validate.py` 96 / 0
@@ -111,7 +138,13 @@ reworded. Contracts: `channel-spec/v0` is new; `envelope/v0` gains sections 2.3 
    `validate.py` **100 / 0**, `pytest tests/conformance` **105 passed**. CI job wired at `f649665`.
 2. **`queue.maxBytes` default** is `TODO(connector-engineer)` — the contract fixes the unit, not the
    number, and the number should come from a measurement.
-3. **`retry-topic` spike** (ADR-003 D2, gate 7.2 item 18) removes the `not` in D5.
-4. **Claim-check spike** decides whether a channel-level knob is needed at all.
-5. **Sync-reply fields** arrive with W2-8; **`partitionKey` expression semantics** with W2-4.
-6. **Destination-level filters** were deliberately omitted; revisit if a real channel needs one.
+3. **`retry-topic` spike** (ADR-003 D2, gate 7.2 item 18) removes the `not` in D5 — **only against
+   the D15 criteria**, README 4.1.1.
+4. **Claim-check spike** decides whether a channel-level knob is needed at all. Not scheduled in
+   wave 2.
+5. **Sync-reply fields** arrive with W2-8. ~~`partitionKey` expression semantics with W2-4.~~
+   Semantics fixed in set 1.1 (README 4.3); the evaluator is W2-4.
+6. ~~**Destination-level filters** were deliberately omitted.~~ A `Drop` in a destination step (D17).
+7. **Measure set 1.1**: `validate.py`, `--emit-expectations`, `pytest tests/conformance`. Correct any
+   predicted pair from the measurement, never the other way round.
+8. **SFTP and PostgreSQL driver licences** — human decision before either dependency is added.

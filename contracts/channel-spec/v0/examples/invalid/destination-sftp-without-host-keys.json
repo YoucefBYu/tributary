@@ -1,0 +1,27 @@
+{
+  "apiVersion": "tributary.dev/v1",
+  "kind": "Channel",
+  "metadata": { "name": "adt-passthrough" },
+  "spec": {
+    "ordering": "none",
+    "source": { "type": "mllp", "bind": "127.0.0.1", "port": 6661, "ack": { "mode": "after-commit" } },
+    "pipeline": {
+      "bundle": "ghcr.io/tributary-synth/adt-integration@sha256:3f7a1c9e2b5d48a06e1f8c3d7b2a95e04c6d8f1a3b5c7d9e0f2a4b6c8d0e2f46",
+      "steps": [{ "name": "passthrough", "uses": "tributary.core.passthrough" }]
+    },
+    "destinations": [
+      {
+        "name": "partner-relay",
+        "type": "sftp",
+        "with": {
+          "host": "sftp.receiver.example.org",
+          "auth": { "type": "password", "secretRef": "receiver-sftp" },
+          "directory": "/inbound",
+          "timeoutMs": 15000
+        },
+        "idempotency": { "technique": "deterministic-name" },
+        "retry": { "policy": "blocking", "maxAttempts": 5, "onExhaust": "halt-partition" }
+      }
+    ]
+  }
+}

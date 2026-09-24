@@ -3,6 +3,71 @@
 Newest first. Each entry names the contract, the version, whether the change is additive or
 breaking, and the reason. Breaking changes reference an ADR.
 
+## 2026-09-24 (wave 2 start) — contract set 1.1: the wave 2 connectors, destination steps, key semantics
+
+**Additive throughout.** Every document valid under set 1.0 is still valid; nothing a conforming
+producer could send before is refused now. Set 1.0 was frozen at the wave 1 gate, so this is recorded
+as **set 1.1** rather than as an in-place Draft edit. Decisions, options and what each gives up are in
+[ADR-007](../docs/adr/ADR-007-channel-spec-shape-and-refusals.md) D10-D17.
+
+**Why now and not "with each connector" as set 1.0 said.** ADR-007 D6 said each connector would bring
+its own config object when it landed. Wave 2 builds seven loaders and three receivers in parallel,
+against a runtime and an evaluator being built at the same time; letting each shape arrive with its
+code would have the implementers inventing the contract. D6 is amended (D10), not abandoned: types
+still enter the enum only for a wave that is building them.
+
+### `tributary.channel-spec/v0`
+
+| Change | Detail |
+|---|---|
+| `source.type` gains `http`, `sftp`, `kafka` | Per-type field sets enforced by `propertyNames`; listeners stay flat as `mllp` was, client types nest (`sftp: {}`, `kafka: {}`). README 3.2.2 defines what ACK and NACK mean per type — the invariant 1 table |
+| `http` source | `path`, `accept`, `auth` required; `auth: none` only on a loopback bind; `auth: mtls` requires `tls.clientAuth: required`. An ingest endpoint, not a FHIR server |
+| `sftp` source | Pinned host keys required (no TOFU), `afterCommit` required with no default, `rejectDirectory` required. **Remote file names are PHI** |
+| `kafka` source | Explicit connection with its own credentials, `PLAINTEXT` only to loopback, `startFrom` required, cannot name `_tb.*` or channel-shaped topics. A refused record **halts the source partition** — the receiver's ACL has no `dlq` WRITE (D16) |
+| `destination.type` gains `fhir`, `postgresql`, `clickhouse`, `sftp`, `s3`, `mllp`, `kafka` | One params object per type, selected by an `allOf` branch on `type` so a failure reports at the wrong field, not as an opaque `oneOf` |
+| Per-type idempotency | Each type may declare only the techniques it can honour (README 5.1, D14). `http` unrestricted as before |
+| `fhir` | `interaction: transaction` only — identifiers stay in the Bundle body (D12) |
+| `postgresql` / `clickhouse` | Row-shaped JSON payload built by a step, no mapping language (D13); `sink-native` idempotency **verified by the loader at startup** (unique index; `ReplacingMergeTree` sorting key) |
+| `s3` | `serverSideEncryption` required; key from `tb-msg-id` and `tb-received-at` only |
+| `sftp` / `mllp` destinations | Host keys pinned; MLLP TLS unless loopback; `onNegativeAck` required with no default |
+| `kafka` destination | `key: preserve \| none` required; `tb-msg-id` header only; at-least-once (cross-cluster) |
+| **New `destinations[].steps`** | Per-destination steps in the pipeline worker, no new hop (D17). Needed because one payload cannot be a FHIR Bundle and a table row, and exit criterion 1 needs both |
+| `partitionKey` | Adds `record:key`. **Semantics fixed** per scheme in README 4.3: bytes exactly as they appear, unresolved = receiver `parse-error`, one shared evaluator. `xpath:` reserved. The pattern was *not* tightened per scheme — that would narrow a frozen contract |
+| `retry-topic` | **Still refused.** README 4.1.1 now lists the nine things the spike must show to lift it, and what changes on lift (D15) |
+| Refactor, no validation change | `httpParams` now references shared `$defs` (`destinationUrl`, `plaintextHttpLoopbackOnly`, `staticHeaders`, `httpAuth`, `circuitBreaker`, `timeoutMs`). The instance paths the set 1.0 pairs pin are unchanged |
+| Manifest | `runnable` now covers connectors: a `connector:<kind>/<type> (task)` entry in `requires` |
+| Examples | 4 valid, 16 invalid. **16 expected-failure pairs are PREDICTED, UNMEASURED** |
+
+One schema detail worth recording because it was caught before publishing, not after: the first draft
+of `remotePath` was `^/([...]{1,64}/?){0,16}$`. With the separator optional, a backtracking regex engine
+can split a long run of characters across groups exponentially many ways, and this validator reads
+tenant-supplied documents. The published pattern makes the separator mandatory.
+
+### `tributary.topics/v0`
+
+Section 3.6 gains consumer-group role `receiver`, for the `kafka` source's group on the external
+cluster. No ACL change: that group runs under the source's own credentials.
+
+### Found while writing it: two cross-contract checks
+
+Per the rule I adopted after W1-1's contradictions, every new rule that names another contract's
+artefact was traced into that contract before publishing.
+
+- **A Kafka source cannot dead-letter.** The first draft routed a refused Kafka record to the channel's
+  `dlq`. `topics/v0` `security.acls.receiver` grants WRITE on `raw` only, so that rule was
+  unimplementable. Changed to halt the source partition, rather than widening an ACL shape that
+  ADR-004 owns.
+- **The envelope's registered content types** (`envelope/v0` section 3) are what `contentType` and
+  `accept` enumerate, minus `application/dicom` (claim-check is unimplemented).
+
+### Not yet verified
+
+**No one has run this set.** Needed, in order: `contracts/validate.py` (expect **all 43 channel-spec
+examples** to behave as the manifest says, which with the other three contracts would take the
+last-measured 102 to about 122); `--emit-expectations`, and any pair that differs from the prediction is
+corrected in the manifest **from the measurement**; then `pytest tests/conformance`. Requested from
+`qa-engineer`. Until then the set 1.1 pairs stay labelled PREDICTED.
+
 ## 2026-09-23 (W1-8) — the walking-skeleton example is made runnable; `ref` is documented as unimplemented
 
 `qa-engineer-2` found that `valid/walking-skeleton-loopback.json` pointed `steps[0].ref` at
