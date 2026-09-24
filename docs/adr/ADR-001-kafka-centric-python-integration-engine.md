@@ -118,12 +118,11 @@ Sources to re-check: openintegrationengine.org and the OIE GitHub repository (li
   **Scope:** unmodified `paramiko`, as a dependency of `tributary-loaders` (the SFTP loader) and
   `tributary-receivers` (the SFTP poller), for SFTP only. Any other package depending on it, or a
   modified or vendored copy, needs a fresh decision.
-  **Its dependency closure is not blanket-approved.** Architect's reading of "through its own
-  dependency closure": each package paramiko pulls in (to the architect's unverified knowledge,
-  `bcrypt`, `cryptography`, `pynacl` and their build dependencies) must still pass
-  `licence_check.py` on its own licence. Any non-permissive package found there is a different
-  dependency and needs a fresh decision. The lead has been asked to confirm this reading with the
-  human.
+  **Its dependency closure is not approved.** The option the human chose stated that paramiko's own
+  dependencies are permissive; it approved paramiko alone. The wider "dependency closure" wording was
+  the lead's relay, not the human's (confirmed by the lead, 2026-09-24). So each package paramiko pulls
+  in must pass `licence_check.py` on its own licence, and any non-permissive one is a different
+  dependency needing a fresh decision.
   **Obligations:** what distributing an LGPL-2.1 library inside a container image requires
   (notices, availability of the library's source) belongs to the W4-7 release pipeline and its SBOM,
   and to the legal review in 10.3. It is not settled here, and this is not legal advice.
