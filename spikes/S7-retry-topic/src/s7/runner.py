@@ -426,6 +426,10 @@ def analyse(
     if any(lag.values()):
         result.fail("drained", f"committed offsets short of the high watermark: {lag}")
 
+    anonymous = sum(1 for ack in evidence.acks if not ack["acked"])
+    if anonymous:
+        # Blind evidence would read as "never acknowledged" and fail commit_order for the wrong reason.
+        result.fail("commit_order", f"{anonymous} ack line(s) carry no message id: the evidence is blind")
     resolved = checks.resolution_times(evidence)
     journal_violations = checks.commit_violations(resolved, evidence.commits)
     if journal_violations:

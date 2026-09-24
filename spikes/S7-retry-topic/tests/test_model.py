@@ -17,9 +17,9 @@ plans = st.builds(
     seed=st.integers(0, 10_000),
     fail_first=st.tuples(st.floats(0, 0.3), st.floats(0, 0.2), st.floats(0, 0.1)),
     poison=st.floats(0, 0.05),
-    outages=st.lists(
-        st.tuples(st.floats(0, 20), st.floats(0.1, 5)).map(lambda w: (w[0], w[0] + w[1])), max_size=2
-    ).map(tuple),
+    outages=st.lists(st.tuples(st.floats(0, 20), st.floats(0.1, 5)).map(lambda w: (w[0], w[0] + w[1])), max_size=2).map(
+        tuple
+    ),
 )
 workloads = st.builds(
     steady_arrivals,

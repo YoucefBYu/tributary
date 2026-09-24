@@ -14,8 +14,20 @@ OUT, RETRY = "x.out", "x.retry"
 
 
 def attempt(ts: float, msg_id: str, n: int, ok: bool, t: str, o: int, *, nb: float | None = None) -> dict[str, Any]:
-    return {"ts": ts, "w": "a", "id": msg_id, "k": 0, "s": 0, "n": n, "nb": nb, "ok": ok, "src": t, "t": t, "p": 0,
-            "o": o}
+    return {
+        "ts": ts,
+        "w": "a",
+        "id": msg_id,
+        "k": 0,
+        "s": 0,
+        "n": n,
+        "nb": nb,
+        "ok": ok,
+        "src": t,
+        "t": t,
+        "p": 0,
+        "o": o,
+    }
 
 
 def ack(ts: float, msg_id: str, n: int, *, dlq: bool = False) -> dict[str, Any]:

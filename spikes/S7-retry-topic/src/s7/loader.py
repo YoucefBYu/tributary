@@ -207,25 +207,34 @@ class Loader:
 
     # -- producing -----------------------------------------------------------------------------
 
-    def _on_delivery(self, err: KafkaError | None, msg: Any) -> None:
+    def _on_delivery(self, msg_id: str | None, attempt: int, err: KafkaError | None, msg: Any) -> None:
         if err is not None:
             self.produce_errors.append(str(err))
             return
         # The broker acknowledged a retry or DLQ record. The commit-order check needs the time of this,
         # not of produce(): a commit is only safe once the record it depends on is durable.
-        headers = list(msg.headers() or [])
+        # The id and attempt are bound at produce time because a delivery report's `headers()` is None
+        # (confluent-kafka 2.15): reading them from `msg` journals every ack as anonymous.
         self._write(
             {
                 "ts": time.time(),
                 "w": self.worker,
-                "acked": _header(headers, H_MSG_ID),
-                "n": int(_header(headers, H_ATTEMPT) or "0"),
+                "acked": msg_id,
+                "n": attempt,
                 "dlq": msg.topic() == self.args.dlq_topic,
             }
         )
 
     def _produce(self, topic: str, key: bytes | None, value: bytes | None, headers: list[tuple[str, bytes]]) -> None:
-        self.producer.produce(topic, value=value, key=key, headers=headers, on_delivery=self._on_delivery)
+        msg_id = _header(headers, H_MSG_ID)
+        attempt = int(_header(headers, H_ATTEMPT) or "0")
+        self.producer.produce(
+            topic,
+            value=value,
+            key=key,
+            headers=headers,
+            on_delivery=lambda err, msg: self._on_delivery(msg_id, attempt, err, msg),
+        )
         self.producer.poll(0)
 
     def _flush(self) -> None:
