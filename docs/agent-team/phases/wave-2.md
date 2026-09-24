@@ -33,7 +33,7 @@ add; nothing else is added.
 | W2-3 | `healthcare-standards-engineer` | ADT A01/A03/A08 and ORU R01 to FHIR, golden files | Golden-file tests; rules cite the mapping source | Must define the identifier system each resource type is conditional on, so every Bundle entry is idempotent (channel-spec README 3.4.2) |
 | W2-4 | `platform-engineer` | Retry-topic with delay tiers, DLQ, transactional K2K stage, key partitioning from a spec expression | Fault-injection property tests; duplicate rate reported | Key semantics fixed in channel-spec README 4.3; **one shared evaluator**, receivers call it. `retry-topic` stays refused until the nine criteria in README 4.1.1 are met — "stays refused" is an acceptable outcome |
 | W2-5 | `platform-engineer` | Filter, enrich, validate, split steps; per-step timing and tracing | Tests plus metrics visible in Compose | **Plus per-destination steps** (README 3.5, ADR-007 D17), which exit criterion 1 needs |
-| W2-6 | `connector-engineer` | Loaders: FHIR REST, PostgreSQL, ClickHouse, SFTP, S3, MLLP client, Kafka — **seven** | Duplicate-delivery test per loader | Shapes in README 3.4.x; what the duplicate test must assert per sink in 5.1. **The SFTP licence is a human decision first** (7); PostgreSQL uses `asyncpg` |
+| W2-6 | `connector-engineer` | Loaders: FHIR REST, PostgreSQL, ClickHouse, SFTP, S3, MLLP client, Kafka — **seven** | Duplicate-delivery test per loader | Shapes in README 3.4.x; what the duplicate test must assert per sink in 5.1. SFTP uses `paramiko` (human-approved 2026-09-24); PostgreSQL uses `asyncpg` |
 | W2-7 | `connector-engineer` | Receivers: HTTP/FHIR, SFTP poller, Kafka source | Integration test per receiver | Shapes in README 3.2.x. Phase 0 requires **per-connection head-of-line isolation and multi-process receivers** (memo 8.3) |
 | W2-8 | `connector-engineer` with `platform-engineer` | Sync-reply mode | Latency and timeout tests | Batched-commit path, fail-fast plus DLQ, `AE` = "committed, outcome unknown" (ADR-003 D9). The `reply` block is a contract proposal still to come |
 | W2-9 | `qa-engineer` | Conformance suites; chaos: worker kill, rebalance, destination outage; ordering assertions | `pytest -m chaos` passes with duplicate rates reported | Every chaos check asserts that its fault fired, with a broken-implementation control (Phase 0 lesson) |
@@ -158,7 +158,7 @@ The drafts marked the first three as approved. **They are not.**
 | Audit retention (30 d vs a possible six-year duty) | **Open — human** | The `_tb.<env>.audit` contract (wave 3) |
 | Mirth corpus | **Open — human** | Any migration estimate (S6 INCONCLUSIVE) |
 | Keyed-hash (`_hmac`) mechanism | **Deliberately unresolved by human decision (2026-09-21)** until before the archiver is built; no agent designs it | Per-patient search in the browser (wave 3/4) |
-| **SFTP client licence** (new) | **Open — human.** Unverified: common Python SFTP libraries are LGPL or EPL/GPL | W2-6 `sftp`, W2-7 `sftp` |
+| ~~SFTP client licence~~ | **Decided 2026-09-24: `paramiko` approved**, unmodified and scoped (ADR-001 2.3) | — |
 | **`psycopg` 3 in the CLAUDE.md stack** (new) | **Open — human.** LGPL-3.0, denied by `licence_check.py`. The W2-6 loader is unaffected: it uses `asyncpg` (Apache-2.0) | Wave 3 control plane only |
 | **Linux re-run capacity** (new) | **Open — human** if it needs paid dedicated infrastructure | Exit criterion 4 being meaningful |
 | Project name, licence and governance (ADR-006), OIE engagement | Open — human | Release |
@@ -171,7 +171,7 @@ Lite mode RF=1 **is** decided (ADOPTED 2026-09-21, ADR-002 D14).
 
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
-| SFTP has no permissively licensed client | Medium | Medium | Human decision before any code; the options are in channel-spec README 10.2 |
+| paramiko's host-key default (auto-add) silently disables verification | Medium | High | Fingerprint check before authentication, no auto-add fallback (channel-spec README 10.2); `security-reviewer` checks it |
 | Set 1.1 has a contract defect found only by an implementer (wave 1 had four) | High | Medium | Conformance run first; implementers send diffs; the corpus test keeps `connector:` entries unresolved |
 | A driver default silently breaks a guarantee (redirects, TLS, retries, error text) | Medium | High | Section 6.3; the loader rules in channel-spec README 3.4 |
 | ClickHouse deduplication is eventual, so a naive duplicate test passes falsely | Medium | Medium | Assert on `FINAL` (README 5.1) |

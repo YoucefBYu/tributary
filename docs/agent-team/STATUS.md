@@ -25,8 +25,8 @@ wave's exit criteria here.
   shapes (3 source types, 7 destination types), per-destination steps, `partitionKey` semantics, and
   written lift criteria for `retry-topic`, which stays refused. `contracts/CHANGELOG.md`, ADR-007
   D10-D17. **Later the same day**: README follow-ups from implementers, with no schema change, and one
-  valid example's key changed to `hl7:PID.3[5:MR].1`. **A conformance re-run is needed for that one
-  example.**
+  valid example's key changed to `hl7:PID.3[5:MR].1`. Re-verified by the lead: `validate.py`
+  **122 / 0**, conformance **127 passed** (`e628891`).
 - **Linux re-run of S1/S2: NOT DONE.** Approved 2026-09-21 as "the first Phase 1 CI task, before the
   receiver is built". The receiver was built in wave 1. `.github/workflows/bench-linux.yml` exists as a
   stub: it records the environment and locked versions, then prints "not wired yet: qa-engineer to add
@@ -39,7 +39,8 @@ wave's exit criteria here.
   README 5.1 that does not count as a genuine redelivery. `qa-engineer` builds the redelivery harness
   (a real consumer loop with offset replay) in W2-9, coordinating the interface with
   `connector-engineer`.
-- **Blocked on a human:** the SFTP client licence (W2-6/W2-7 `sftp`); see open questions. The
+- **Nothing in wave 2 is blocked on a human.** SFTP was unblocked on 2026-09-24: the human approved
+  `paramiko` (see decisions log). The
   PostgreSQL *loader* is **not** blocked: it uses `asyncpg` (Apache-2.0 per the lead; `licence_check.py`
   confirms it when the dependency lands). `psycopg` matters only to the wave 3 control plane.
 - **Waiting on teammates:** final W2-2 signatures after the conditions (`healthcare-standards-engineer`);
@@ -231,11 +232,13 @@ All six filed and synthesised. Full threshold table with evidence ratings quoted
 | 2026-09-24 | **Per-destination steps** (D17), run in the pipeline worker with no new hop. Exit criterion 1 needs a FHIR Bundle and a table row from one channel | channel-spec README 3.5 |
 | 2026-09-24 | **Wave 2 planning drafts consolidated into `phases/wave-2.md`**; six lead drafts reduced to pointers, and errors listed in its section 9 | `phases/wave-2.md` |
 | 2026-09-24 | **W2-2 `ctx.fhir` / `ctx.terminology` APPROVED WITH CONDITIONS.** Local Bundle-entry construction with no network; terminology behind a Protocol with fakes; no `ctx.ids` (it would reach the human-reserved `_hmac` question). Conditions: `fhir.resources`/`fhir-core` pass `licence_check.py`; per-message cost measured; R4B models guarded by validating the golden files against the FHIR R4 JSON schema; conditional entries on exactly one unique identifier system; no unconditional create; deterministic fullUrls; runtime attachment optional, not a hard import (agreed with `platform-engineer`) | channel-spec README 3.4.2 (corrected the same day: a business-identifier conditional PUT qualifies) |
+| 2026-09-24 | **Human: `paramiko` (LGPL-2.1) APPROVED** as an unmodified dependency of `tributary-loaders` and `tributary-receivers`, for SFTP only. The lead asked the human directly and the human chose option 1 of three (shell-out to OpenSSH and descoping SFTP were the others). Recorded as **its own approval, not an extension** of the MPL or `certifi` decisions. Any other package, or a modified copy, needs a fresh decision. paramiko's own dependencies must each still pass `licence_check.py`; confirming that reading with the human is with the lead. SFTP contract shapes unchanged, `hostKeys` stay SHA-256 fingerprints | ADR-001 2.3 |
 | 2026-09-24 | **Contract set 1.1 verified**: 122 / 0, 86 pairs matched, conformance 127 passed (`qa-engineer`, `ffc1580`) | `contracts/CHANGELOG.md` |
 | 2026-09-24 | **Key evaluator APPROVED** as `tributary.sdk.keys` (`platform-engineer`): pure, stdlib only, and returns `ResolvedKey \| UnresolvedKey(reason code)` rather than raising, so the unresolved path cannot carry the value. The repr is redacted | channel-spec README 4.3 |
 | 2026-09-24 | **PID-3 repetition selector** `hl7:PID.3[5:MR].1` added now, not in v1. Evidence (`platform-engineer`): repetition order differs between senders, so a bare `PID.3.1` gives one patient two keys. The "normalise in a step" advice was withdrawn as impossible, because keys are evaluated before steps | channel-spec README 4.3 |
 | 2026-09-24 | **`with` binds to keyword-only step parameters by name**, refused loudly at load if wrong. The SDK's `@step` changes so that a keyword-only parameter without a default means "required from `with`". Rejected: an untyped `ctx.params` | channel-spec README 3.3 |
 | 2026-09-24 | **Reprocess of any `dlq` record carrying `tb-destination` must be destination-scoped**, and is refused until W3-3 builds it. This covers wave 1 loader-exhaustion records too. A destination-step `dlq` record carries the step's input | ADR-003 follow-up 10 |
+| 2026-09-24 | **W2-5 public surface APPROVED WITH CHANGES.** filter needs an explicit `onUnresolved` and may not filter on identifier fields; the enrich allow-list is trimmed; `Reject(code)` is added to the SDK and may not use engine-reserved codes; split becomes a `@splitter` node with **deterministic child ids** and is refused on per-key channels. Metrics and tracing wait for `security-reviewer` on the `/metrics` listener. `contracts/observability/v0` is to be published by the architect, seeded with `platform-engineer`'s names | channel-spec README 3.3.2 |
 | 2026-09-24 | **Manifest `runnable` checked against W2-1** (`9078982` registers `tributary.hl7v2.parse` only). No example flips: each one naming `parse` also names a `ref` step, and the fanout example needs the unregistered `tributary.hl7v2.to_json`. `requires` lists trimmed to what is still missing | `examples/manifest.json` |
 
 ## Open questions for the human
@@ -249,11 +252,10 @@ on the human's approval (2026-09-24).
 
 **Open, new in wave 2:**
 
-- **SFTP client licence — blocks W2-6/W2-7 `sftp`.** To the architect's knowledge, **unverified and to
-  be confirmed by `licence_check.py` from resolved metadata**: `paramiko` is LGPL-2.1, and `asyncssh` is
-  EPL-2.0 or GPL-2.0-or-later. Invariant 10 permits neither. Options: approve one as an unmodified
-  dependency, shell out to an OpenSSH `sftp` binary, or descope SFTP from the MVP. The contract shape
-  stands either way. `channel-spec/v0` README 10.2.
+- ~~**SFTP client licence.**~~ **DECIDED 2026-09-24: `paramiko` approved**, unmodified and scoped
+  (decisions log, ADR-001 2.3). Kept for one revision so the change is visible. **One follow-up for the
+  lead:** confirm with the human that "through paramiko's own dependency closure" means each package in
+  it must still pass `licence_check.py`, and is not a blanket approval.
 - **`psycopg` 3 in the CLAUDE.md stack table — answer needed before wave 3.** CLAUDE.md names it for
   the control plane. It is LGPL-3.0, and `licence_check.py` denies it (reported by the lead and
   `connector-engineer`). Invariant 10 has no LGPL path. The options: approve it as an unmodified
@@ -339,7 +341,7 @@ version is `docs/spikes/PHASE-0-DECISION.md` section 9 and ADR-001 section 13.
 
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
-| **No permissively licensed SFTP client** | Medium | Medium | Human decision before any SFTP code (open questions) |
+| ~~No permissively licensed SFTP client~~ **Closed 2026-09-24**: `paramiko` approved. Residual risk: its auto-add host-key policy is the library default to watch | Medium | High | Fingerprint check before authentication, no auto-add fallback (channel-spec README 10.2) |
 | **Contract set 1.1 has a defect only an implementer finds** (wave 1 had four, all found that way) | High | Medium | Conformance run first; implementers send diffs; the manifest's `connector:` entries keep unbuilt connectors out of "runnable" |
 | **A client-library default silently breaks a guarantee** (redirects, TLS verification, driver retries, error text quoting payload). Wave 2 adds seven client libraries | Medium | High | The loader rules in channel-spec README 3.4; reviews target defaults and transitive edges (`wave-2.md` 6.3) |
 | **Remote file names and object keys carry PHI** (new surfaces with SFTP and S3) | Medium | High | Names built from `tb-msg-id` only on output; inbound file names never logged (README 3.2.4, 3.4.4) |

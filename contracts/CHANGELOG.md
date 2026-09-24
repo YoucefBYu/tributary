@@ -19,6 +19,9 @@ One valid example changed (its key expression), so the conformance run should be
 | PostgreSQL loader not blocked on licensing (3.0, 10.2) | It uses `asyncpg`. `psycopg` is a separate wave 3 question |
 | Manifest `requires` trimmed after W2-1 (`9078982`) | `tributary.hl7v2.parse` exists; no example flips to runnable (each also names a `ref` step, or `to_json`) |
 | Manifest labels | PREDICTED changed to MEASURED |
+| **Built-in steps' `with` shapes** (3.3.2): `filter` (required `onUnresolved`; identifier segments denied as `field`), `enrich` (`attrFrom` allow-list), `validate` plus the SDK's non-retryable `Reject(code)` | W2-5 public surface, `platform-engineer`'s proposal with changes |
+| **Split** (3.3.2): a `@splitter` node, **deterministic child ids** derived from the parent id plus the child index, refused on per-key channels in set 1.1, capped at 10,000 children | Random child ids would make every replay a new set of messages, breaking invariant 4; multi-patient batches keyed on one patient would break invariant 5. `tb-parent-id` for split children was already in `envelope/v0` |
+| SFTP licence decided (3.0, 10.2) | Human approved `paramiko` 2026-09-24 (ADR-001 2.3). Shapes unchanged |
 
 ## 2026-09-24 (wave 2 start) — contract set 1.1: the wave 2 connectors, destination steps, key semantics
 

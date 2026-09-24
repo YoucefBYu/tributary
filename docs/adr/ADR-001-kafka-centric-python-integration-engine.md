@@ -110,6 +110,23 @@ Sources to re-check: openintegrationengine.org and the OIE GitHub repository (li
   **Why a separate approval rather than adding a fourth name to the list above:** that approval was
   recorded as covering *those three packages*, and a transitive arrival is exactly the case the scope
   note was written for. Extending it silently would have made the scope note decorative.
+- **`paramiko` (LGPL-2.1), HUMAN-APPROVED 2026-09-24** as its own decision. It is **not** an
+  extension of the MPL approvals above, nor of `certifi`'s. This is the first LGPL dependency and the
+  first non-permissive one in the **shipped runtime** other than `orjson`. The human chose it, when
+  asked directly by the lead, over two alternatives: shelling out to OpenSSH, or descoping SFTP
+  (`contracts/channel-spec/v0/README.md` 10.2).
+  **Scope:** unmodified `paramiko`, as a dependency of `tributary-loaders` (the SFTP loader) and
+  `tributary-receivers` (the SFTP poller), for SFTP only. Any other package depending on it, or a
+  modified or vendored copy, needs a fresh decision.
+  **Its dependency closure is not blanket-approved.** Architect's reading of "through its own
+  dependency closure": each package paramiko pulls in (to the architect's unverified knowledge,
+  `bcrypt`, `cryptography`, `pynacl` and their build dependencies) must still pass
+  `licence_check.py` on its own licence. Any non-permissive package found there is a different
+  dependency and needs a fresh decision. The lead has been asked to confirm this reading with the
+  human.
+  **Obligations:** what distributing an LGPL-2.1 library inside a container image requires
+  (notices, availability of the library's source) belongs to the W4-7 release pipeline and its SBOM,
+  and to the legal review in 10.3. It is not settled here, and this is not legal advice.
 - **How this one nearly passed unnoticed, which is the reusable part.** The root manifest annotates
   `"testcontainers[kafka]>=4.8",  # Apache-2.0`. That comment is *correct about testcontainers itself*
   and says nothing about its transitive closure, so it reads as a clearance while clearing nothing —

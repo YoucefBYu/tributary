@@ -126,9 +126,9 @@ exactly as they appear, no normalisation, and an unresolved key is a receiver `p
 null key. The no-normalisation rule is flagged in the contract as the one most worth challenging with
 evidence from real senders.
 
-**Escalated, not decided:** the SFTP client licence (README 10.2). The common Python SFTP libraries
-are LGPL-2.1 (`paramiko`) or EPL-2.0 (`asyncssh`), which invariant 10 does not permit. That is a
-human decision. The PostgreSQL loader uses `asyncpg` (Apache-2.0). `psycopg` 3 (LGPL-3.0), which
+**Escalated, then decided by the human 2026-09-24:** the SFTP client licence (README 10.2).
+`paramiko` (LGPL-2.1) is approved as an unmodified dependency of the loaders and receivers, for SFTP
+only (ADR-001 2.3). The PostgreSQL loader uses `asyncpg` (Apache-2.0). `psycopg` 3 (LGPL-3.0), which
 CLAUDE.md names for the control plane, is a separate human decision for wave 3.
 
 ## 6. Follow-ups
@@ -148,5 +148,5 @@ CLAUDE.md names for the control plane, is a separate human decision for wave 3.
 6. ~~**Destination-level filters** were deliberately omitted.~~ A `Drop` in a destination step (D17).
 7. ~~**Measure set 1.1**.~~ **DONE 2026-09-24** (`qa-engineer`): `validate.py` 122 / 0, 86 pairs
    matched with 0 mismatches, `pytest tests/conformance` 127 passed.
-8. **SFTP client licence** — human decision before any SFTP dependency or subprocess is added.
-   `psycopg` for the wave 3 control plane — human decision.
+8. ~~**SFTP client licence**~~ — `paramiko` human-approved 2026-09-24 (ADR-001 2.3).
+   `psycopg` for the wave 3 control plane — still a human decision.

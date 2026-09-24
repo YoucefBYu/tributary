@@ -120,13 +120,13 @@ when a connector lands with its tests.
 |---|---|---|---|
 | source | `mllp` | W1-5 | **Implemented** |
 | source | `http` (HTTP and FHIR ingest) | W2-7 | Contracted, not built |
-| source | `sftp` (poller) | W2-7 | Contracted, not built. **Licence question open, section 10.2** |
+| source | `sftp` (poller) | W2-7 | Contracted, not built. `paramiko`, human-approved (section 10.2) |
 | source | `kafka` | W2-7 | Contracted, not built |
 | destination | `http` | W1-6 | **Implemented** |
 | destination | `fhir` | W2-6 | Contracted, not built |
 | destination | `postgresql` | W2-6 | Contracted, not built. Driver: `asyncpg` (section 10.2) |
 | destination | `clickhouse` | W2-6 | Contracted, not built |
-| destination | `sftp` | W2-6 | Contracted, not built. **Licence question open, section 10.2** |
+| destination | `sftp` | W2-6 | Contracted, not built. `paramiko`, human-approved (section 10.2) |
 | destination | `s3` | W2-6 | Contracted, not built |
 | destination | `mllp` (client) | W2-6 | Contracted, not built |
 | destination | `kafka` | W2-6 | Contracted, not built |
@@ -338,6 +338,43 @@ new example cannot skip the classification. Two rules for the resolving test, st
 a `runnable: true` example whose steps stop resolving fails, and a `runnable: false` example whose
 `requires` have **all** become resolvable also fails — it must then be promoted, so a stale exemption
 cannot quietly mask a real gap.
+
+#### 3.3.2 Built-in steps (W2-5, approved 2026-09-24)
+
+Their `with` shapes are public surface, so they live here. Locators use the `partitionKey` grammar
+and the shared evaluator (4.3), so there is one locator language.
+
+| Step | `with` | Rules |
+|---|---|---|
+| `tributary.core.filter` | `field` plus exactly one of `in`, `notIn`, `present`; **`onUnresolved: drop \| keep \| reject`, required, no default** | Emits `Drop(reason="FILTERED")`. Silently dropping a clinical message because a field was absent is a choice the author writes down. **`field` may not point at a patient-identifying segment** (`PID`, `PD1`, `NK1`, `GT1`, `IN1`, `IN2`, `MRG`), and a JSON `field` may not end in `identifier`, `name`, `birthDate`, `telecom` or `address`. The reason: the `in` values are written in the spec, which is published on `_tb.<env>.channels` and shown in the UI, and a spec must not carry PHI. This is a deny-list, not a proof |
+| `tributary.core.enrich` | `attrs` (static), `usr` (static), `attrFrom` (locator) | `attrFrom` is limited to an allow-list: `MSH.3`, `MSH.4`, `MSH.5`, `MSH.6`, `MSH.9.x`, `MSH.11`, `MSH.12`, `EVN.1`, `json:/resourceType`. Values still pass the `attrs` guard. `usr` is static only, because copying payload into a header launders PHI |
+| `tributary.core.validate` | `requireSegments`, `version` | Raises `Reject(code)` (below). JSON-schema validation comes later |
+| `tributary.core.split` | per splitter | See the split rules below |
+
+**`Reject(code)`**, a new SDK exception: the step fails **non-retryably**. The executor dead-letters
+the message immediately with `tb-error-code` = the code (`^[A-Z][A-Z0-9_]{2,63}$`), skipping
+`stepRetries`. A step may not raise a code the engine reserves (`envelope/v0` 2.3: `HEADER_PARSE_ERROR`,
+`RECORD_UNDECODABLE`, and the engine's own), so an alert on an engine code stays meaningful. Any
+other exception is still retryable.
+
+**Split rules.** Split is a separate node type, a `@splitter` decorator, not a widened return type
+for every step. Fan-out changes identity, commit and ordering, so it should be visible, not something
+any step can do by returning a list.
+1. **Child ids are deterministic.** A child's `tb-msg-id` is a UUIDv7 whose timestamp is the
+   parent's and whose remaining bits come from `SHA-256(parent tb-msg-id ‖ child index)`. Redelivery of
+   the parent therefore reproduces the same children, and loader idempotency absorbs them. A random id
+   per run would make every replay a new set of messages, breaking invariant 4. This is deterministic
+   id derivation from a random parent id, not a keyed construction; nothing secret is involved.
+2. Children carry `tb-parent-id` = the parent's id, **and the parent's key**, and run through the
+   remaining steps and destinations in list order. The `raw` offset commits once every child has been
+   produced or dead-lettered.
+3. **Split is refused at load on a `per-key` channel in set 1.1.** A multi-patient HL7 batch is keyed
+   at the receiver on one patient, so its children would inherit the wrong key, and a later message
+   for another patient in the batch could overtake them. That is invariant 5 broken silently. Batches
+   destined for per-key channels must be split **at ingest**, where each message is keyed on its own.
+   A receiver-side batch option is a candidate for a later set.
+4. At most 10,000 children, otherwise `Reject("SPLIT_TOO_LARGE")`. An empty result is
+   `Drop(reason="EMPTY_SPLIT")`.
 
 ### 3.4 `spec.destinations`
 
@@ -879,7 +916,9 @@ Apache-2.0, MIT, BSD, ISC and PSF, MPL by approval, and names no LGPL or EPL pat
 - **PostgreSQL loader: settled.** It uses `asyncpg` (Apache-2.0, as reported; `licence_check.py`
   confirms it when the dependency lands). The control plane's `psycopg` (LGPL-3.0, denied by
   `licence_check.py`) is a separate human decision for wave 3, because CLAUDE.md names it.
-- **SFTP source and destination:** if no permissive SFTP client exists, the options are an unmodified
-  LGPL/EPL dependency by human approval, shelling out to an OpenSSH `sftp` binary, or descoping SFTP
-  from the MVP. **That is a licensing decision, so it goes to the human.** `connector-engineer` should
-  not add an SFTP dependency until it is made. The contract shapes above stand whichever way it goes.
+- **SFTP source and destination: decided 2026-09-24.** The human approved `paramiko` (LGPL-2.1) as
+  an unmodified dependency of `tributary-loaders` and `tributary-receivers`, for SFTP only (ADR-001
+  2.3). The shapes above are unchanged. `hostKeys` stay SHA-256 fingerprints, which the loader compares
+  against the fingerprint of the key the server presents. That comparison must happen before
+  authentication, and there must be no fallback to paramiko's auto-add policy, whose permissive
+  default is the library default to watch here.
