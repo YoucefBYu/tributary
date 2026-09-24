@@ -16,6 +16,7 @@ until a timeout that would look like "the fault didn't fire" in a chaos test.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import queue
@@ -60,6 +61,17 @@ class ManagedProcess:
         self._reader = threading.Thread(target=_pump, args=(self.process.stdout, self._queue), daemon=True)
         self._reader.start()
 
+    def _kill_quietly(self) -> None:
+        """Best-effort cleanup before `wait_for_event` raises: a process that is still alive when the
+        wait gives up (slow to start, or wedged before ever emitting the event) would otherwise leak
+        for the rest of the test session -- nothing else in this class's lifecycle reaps it, because a
+        test that got an exception from `wait_for_event` typically never reaches its own `finally`
+        block's `terminate_and_wait()` call, since that call is usually written to depend on the very
+        variable this constructor's return value would have been assigned to."""
+        with contextlib.suppress(Exception):  # best effort; the process may already be gone
+            self.process.kill()
+            self.process.wait(timeout=5.0)
+
     def wait_for_event(self, event: str, *, timeout_s: float = 30.0) -> dict[str, Any]:
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
@@ -75,6 +87,7 @@ class ManagedProcess:
                 continue
             if raw is None:
                 self._eof = True
+                self._kill_quietly()
                 raise ProcessDiedError(f"{self.args!r} closed its output before emitting {event!r}: {self.lines!r}")
             try:
                 record = json.loads(raw)
@@ -83,6 +96,7 @@ class ManagedProcess:
             self.lines.append(record)
             if record.get("event") == event:
                 return record
+        self._kill_quietly()
         raise ProcessDiedError(f"{self.args!r} did not emit {event!r} within {timeout_s}s: {self.lines!r}")
 
     def collect_pending(self) -> list[dict[str, Any]]:

@@ -24,6 +24,13 @@ Because the HTTP loader does not forward Kafka headers to the destination (`Http
 only `Content-Type`, an optional idempotency header and auth -- never `tb-msg-id`), a message's identity
 here is carried in its own payload bytes (`key`, `seq`), which is what every assertion below reads back
 out of the stub's captured request bodies.
+
+**"Sustained", proven per partition, not just counted across the batch**: `_wait_for_sustained_retry`
+waits for one SINGLE partition's `partition_paused` `attempt` to reach 2, not merely for two
+`partition_paused` lines anywhere in the log -- the batch spans multiple partitions, and two different
+partitions each failing their first attempt within milliseconds of each other would satisfy a bare
+event count without any one partition actually surviving a real second failed attempt under blocking
+retry (code review, chaos-suite gate, Medium).
 """
 
 from __future__ import annotations
@@ -41,7 +48,12 @@ from tributary.runtime.topics import channels_topic, dlq_topic, events_topic, ou
 from tributary.sdk.testing import make_message
 
 from tests.support.channel_spec import ordered_document
-from tests.support.chaos_assertions import assert_fault_fired, assert_no_acknowledged_loss, duplicate_rate
+from tests.support.chaos_assertions import (
+    assert_fault_fired,
+    assert_no_acknowledged_loss,
+    assert_per_key_order_preserved,
+    duplicate_rate,
+)
 from tests.support.http_stub import CapturedRequest, StubHttpServer
 from tests.support.kafka_helpers import await_broker, free_port, publish_messages
 from tests.support.processes import ManagedProcess, spawn_http_loader
@@ -174,6 +186,29 @@ def _identity(request: CapturedRequest) -> tuple[bytes, int]:
     return body["key"].encode(), int(body["seq"])
 
 
+def _wait_for_sustained_retry(loader: ManagedProcess, *, timeout_s: float = 30.0) -> dict[str, Any]:
+    """Waits for a SINGLE partition's `partition_paused` `attempt` to reach 2, not merely for two
+    `partition_paused` lines total.
+
+    `partition_paused` fires once per failed attempt *per partition* (`ConsumerLoop._begin_retry`), and
+    this scenario's batch spans multiple partitions -- two different partitions each failing their
+    first attempt within milliseconds of each other would satisfy "two `partition_paused` events" while
+    proving nothing about a *sustained* outage on any one of them (code review, chaos-suite gate,
+    Medium). Gating on one partition reaching `attempt >= 2` is what actually shows the same partition
+    surviving a real second failed attempt under blocking retry.
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        for record in loader.collect_pending():
+            if record.get("event") == "partition_paused" and int(record.get("attempt", 0)) >= 2:
+                return record
+        time.sleep(0.2)
+    raise AssertionError(
+        f"no single partition reached a second `partition_paused` attempt within {timeout_s}s: "
+        f"{[line for line in loader.lines if line.get('event') == 'partition_paused']}"
+    )
+
+
 def test_destination_outage_under_blocking_retry_loses_nothing_and_recovers(
     topics: str, deployed_spec: dict[str, Any], destination_port: int
 ) -> None:
@@ -191,11 +226,10 @@ def test_destination_outage_under_blocking_retry_loses_nothing_and_recovers(
 
         batch_b = _publish_batch(topics, start_seq=PER_KEY_PER_BATCH, count_per_key=PER_KEY_PER_BATCH)
 
-        # The fault, confirmed rather than assumed (PHASE-0-DECISION section 4): the loader must
-        # actually observe the outage and pause for blocking retry at least twice, proving this is a
-        # sustained outage under retry, not one lucky blip.
-        loader.wait_for_event("partition_paused", timeout_s=30.0)
-        loader.wait_for_event("partition_paused", timeout_s=30.0)
+        # The fault, confirmed rather than assumed (PHASE-0-DECISION section 4): a single partition
+        # must actually survive a second failed attempt under blocking retry, proving this is a
+        # sustained outage, not one lucky blip on one partition while another merely failed once.
+        _wait_for_sustained_retry(loader, timeout_s=30.0)
 
         # Recovery: a fresh stub takes the same port the channel spec already points at.
         stub_after = StubHttpServer(port=destination_port)
@@ -210,6 +244,12 @@ def test_destination_outage_under_blocking_retry_loses_nothing_and_recovers(
     finally:
         if loader is not None:
             loader.terminate_and_wait()
+        # Unconditional, not only on the success path: if `_wait_for_request_count(stub_before, ...)`
+        # above ever times out, execution never reaches the explicit `stub_before.stop()` call, and the
+        # server thread plus its bound port would otherwise leak for the rest of the session (code
+        # review, chaos-suite gate, High). `StubHttpServer.stop()` is idempotent, so this is safe even
+        # when the explicit mid-test call already ran.
+        stub_before.stop()
         if stub_after is not None:
             stub_after.stop()
 
@@ -243,5 +283,4 @@ def test_destination_outage_under_blocking_retry_loses_nothing_and_recovers(
         seen = order.setdefault(key, [])
         if seq not in seen:
             seen.append(seq)
-    for key, sequences in order.items():
-        assert sequences == sorted(sequences), f"blocking retry did not preserve order for key {key!r}: {sequences}"
+    assert_per_key_order_preserved(order)

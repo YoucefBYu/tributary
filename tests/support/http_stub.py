@@ -100,6 +100,7 @@ class StubHttpServer:
     def __init__(self, *, port: int = 0, fail_first_n: int = 0) -> None:
         self._httpd = _RecordingServer(("127.0.0.1", port), _Handler, fail_first_n=fail_first_n)
         self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True, name="http-stub")
+        self._stopped = False
 
     @property
     def port(self) -> int:
@@ -112,6 +113,12 @@ class StubHttpServer:
         self._thread.start()
 
     def stop(self) -> None:
+        """Idempotent: a chaos scenario's cleanup path (`finally`) and its own mid-test "trigger the
+        outage now" call can both legitimately want to stop the same instance -- the second call is a
+        no-op rather than a double `server_close()` on an already-closed socket."""
+        if self._stopped:
+            return
+        self._stopped = True
         self._httpd.shutdown()
         self._httpd.server_close()
         self._thread.join(timeout=5)
