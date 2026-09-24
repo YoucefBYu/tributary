@@ -253,9 +253,16 @@ on the human's approval (2026-09-24).
 **Open, new in wave 2:**
 
 - ~~**SFTP client licence.**~~ **DECIDED 2026-09-24: `paramiko` approved**, unmodified and scoped
-  (decisions log, ADR-001 2.3). Kept for one revision so the change is visible. **One follow-up for the
-  lead:** confirm with the human that "through paramiko's own dependency closure" means each package in
-  it must still pass `licence_check.py`, and is not a blanket approval.
+  (decisions log, ADR-001 2.3). Kept for one revision so the change is visible. The scope question is
+  settled: the "dependency closure" wording was the lead's relay, not the human's. The human's choice
+  approved paramiko alone, so each of its dependencies must pass `licence_check.py` on its own.
+- **Pending: `licence_check.py` may short-circuit on combined SPDX expressions** in its MPL and LGPL
+  branches (`security-reviewer`; `devops-engineer` is fixing it). **If the MPL branch from `b773158` is
+  affected, the wave 1 licence evidence for `orjson` (`MPL-2.0 AND (Apache-2.0 OR MIT)`) and `certifi`
+  needs a note here**: "44 components / 0 failed" would then have been produced by a checker that
+  could not fail those cases. The human approvals themselves stand either way, because they rest on
+  the licences, not on the checker. What would change is how much that CI evidence proves.
+  Architect to update once `devops-engineer` reports.
 - **`psycopg` 3 in the CLAUDE.md stack table — answer needed before wave 3.** CLAUDE.md names it for
   the control plane. It is LGPL-3.0, and `licence_check.py` denies it (reported by the lead and
   `connector-engineer`). Invariant 10 has no LGPL path. The options: approve it as an unmodified
