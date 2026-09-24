@@ -29,6 +29,13 @@ commit, because those partitions already belong to another member. Pause state i
 partition returns from a rebalance un-paused, so retry state is rebuilt on assign. That costs one
 redelivery, which at-least-once permits and an idempotent loader absorbs (ADR-003 D7).
 
+**A commit can be refused because the group moved on.** A synchronous commit issued while a cooperative
+rebalance is in flight fails with `ILLEGAL_GENERATION`, `REBALANCE_IN_PROGRESS` or `UNKNOWN_MEMBER_ID`
+(measured in S7: a loader crashed on exactly this during a planned handover, then hung on exit). That
+is not a failure of anything already delivered, so the offsets stay pending and the next commit - or
+the revoke callback - carries them; the worst case is a replay, which at-least-once permits. Any other
+commit error still raises.
+
 **A `TopicPartition` is never formatted into a log line.** Its `repr` crashes on Windows, and the
 record it is logging beside is then silently dropped.
 """
@@ -41,7 +48,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from confluent_kafka import TopicPartition
+from confluent_kafka import KafkaError, KafkaException, TopicPartition
 from tributary.sdk.context import Logger
 
 from .errors import DeliveryError
@@ -52,6 +59,11 @@ from .spec import RetryPolicy
 
 #: librdkafka's "reached the end of this partition" signal. Informational, not an error.
 PARTITION_EOF = -191
+
+#: Commit errors that mean "the group moved on" rather than "something is broken" (see the docstring).
+REBALANCE_COMMIT_ERRORS: frozenset[int] = frozenset(
+    {KafkaError.ILLEGAL_GENERATION, KafkaError.REBALANCE_IN_PROGRESS, KafkaError.UNKNOWN_MEMBER_ID}
+)
 
 
 class KafkaConsumerLike(Protocol):
@@ -134,6 +146,7 @@ class LoopStats:
     quarantined: int = 0
     rejected: int = 0
     commits: int = 0
+    commits_refused: int = 0
     pauses: int = 0
     resumes: int = 0
     halts: int = 0
@@ -314,7 +327,17 @@ class ConsumerLoop:
         offsets = [
             TopicPartition(topic, partition, offset + 1) for (topic, partition), offset in self.stats.pending.items()
         ]
-        self._consumer.commit(offsets=offsets, asynchronous=False)
+        try:
+            self._consumer.commit(offsets=offsets, asynchronous=False)
+        except KafkaException as exc:
+            error = exc.args[0] if exc.args else None
+            code = error.code() if isinstance(error, KafkaError) else None
+            if code not in REBALANCE_COMMIT_ERRORS:
+                raise
+            # Nothing delivered is undone: keep the offsets pending for the next commit or the revoke.
+            self.stats.commits_refused += 1
+            self._log.warning("commit_refused", channel=self._channel, error_code=str(error.name()) if error else "")
+            return
         self.stats.commits += 1
         self._since_commit = 0
         self.stats.pending.clear()
@@ -575,8 +598,15 @@ class ConsumerLoop:
         self._log.info("partitions_assigned", channel=self._channel, count=len(partitions))
 
     def _on_revoke(self, consumer: KafkaConsumerLike, partitions: list[TopicPartition]) -> None:
-        """A planned handover: commit first, then give the partitions up. This is what gives 0 duplicates."""
+        """A planned handover: commit first, then give the partitions up. This is what gives 0 duplicates.
+
+        If that commit is refused, the revoked partitions' pending offsets are dropped rather than kept:
+        a later commit must never name partitions this member no longer owns. The new owner replays
+        from the last committed offset instead.
+        """
         self._commit_pending(force=True)
+        for partition in partitions:
+            self.stats.pending.pop((partition.topic, partition.partition), None)
         consumer.incremental_unassign(partitions)
         for partition in partitions:
             self._retry_state.pop((partition.topic, partition.partition), None)
