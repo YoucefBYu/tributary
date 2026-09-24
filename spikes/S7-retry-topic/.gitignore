@@ -1,0 +1,10 @@
+# Spike-local artefacts. The report (docs/spikes/S7-retry-topic.md, owned by architect) and
+# results/*.json are the durable record; everything else is regenerable with `python -m s7.runner`.
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.hypothesis/
+
+# Per-run output: attempt journals (one line per delivery attempt) and loader stderr.
+runs/
