@@ -6,14 +6,16 @@ Covers everything that can end up on a build or run path:
     transitively. Phase 0 found pathspec (MPL-2.0) only there: a lock-file-only check misses it.
 
 Fails on anything outside Apache-2.0, MIT, BSD, ISC, PSF, except the human-approved unmodified
-MPL-2.0 dependencies in MPL_APPROVED. Each entry names a *scope*, not just a package: "runtime" means
-the approval covers it shipping in the default distribution (invariant 10's actual concern), "non-
-runtime" means the opposite -- approved only for staying out of it (dev group or `[build-system]
-requires`). The check enforces the scope, not just the licence: a package approved non-runtime that
-starts appearing in the runtime-only dependency closure fails, even though its name is on the list,
-because that closure is a different question than the one that was answered. A new or modified MPL
-dependency, or an existing one arriving by a new path or into a new scope, needs fresh human approval:
-do not just extend this set.
+MPL-2.0 dependencies in MPL_APPROVED and the human-approved unmodified LGPL dependencies in
+LGPL_APPROVED. Each entry names a *scope*, not just a package: "runtime" means the approval covers it
+shipping in the default distribution (invariant 10's actual concern), "non-runtime" means the opposite
+-- approved only for staying out of it (dev group or `[build-system] requires`). The check enforces the
+scope, not just the licence: a package approved non-runtime that starts appearing in the runtime-only
+dependency closure fails, even though its name is on the list, because that closure is a different
+question than the one that was answered. A new or modified MPL or LGPL dependency, or an existing one
+arriving by a new path or into a new scope, needs fresh human approval: do not just extend these sets.
+LGPL_APPROVED names a package, not a licence family: every other LGPL (and AGPL) dependency still
+fails via DENIED, approved or not, unless its own name is added deliberately.
 
 Writes a CycloneDX 1.5 SBOM to --sbom (default sbom.cdx.json).
 """
@@ -53,12 +55,23 @@ MPL_APPROVED: dict[str, str] = {
     "certifi": "non-runtime",
 }
 
+# paramiko: LGPL-2.1, human-approved 2026-09-24, unmodified dependency. SFTP support for
+# tributary-loaders and tributary-receivers ships it in the default distribution, so scope is
+# "runtime". No other LGPL package is approved: LGPL_PATTERN below is checked by name against this
+# set only, never as a blanket allowance for the licence family.
+LGPL_APPROVED: dict[str, str] = {
+    "paramiko": "runtime",
+}
+
 ALLOWED = ("apache", "mit", "bsd", "isc", "psf", "python software foundation", "zlib", "0bsd")
 DENIED = re.compile(
     r"\b(a?gpl|lgpl|sspl|bsl|busl|business source|server side public|"
     r"gnu (lesser |affero )?general public)",
     re.I,
 )
+# Narrower than DENIED: LGPL only, never AGPL ("gnu affero general public" does not match). Checked
+# ahead of DENIED so an approved package's LGPL text does not fail before LGPL_APPROVED is consulted.
+LGPL_PATTERN = re.compile(r"lgpl|gnu lesser general public", re.I)
 # Packages whose metadata carries no usable licence field; verified by hand, record the evidence.
 OVERRIDES: dict[str, str] = {}
 
@@ -97,17 +110,29 @@ def licences(dist: md.Distribution) -> list[str]:
 
 
 def classify(name: str, dist: md.Distribution, *, runtime_names: frozenset[str] = frozenset()) -> tuple[str, str]:
-    """Return (status, detail): status is ok, mpl-approved or fail.
+    """Return (status, detail): status is ok, mpl-approved, lgpl-approved or fail.
 
     `runtime_names` is the set of packages in the runtime-only dependency closure (every workspace
     package's own `dependencies`, none of the dev group or `[build-system] requires`) -- the actual
-    default-distribution surface invariant 10 is about. An MPL package's approval scope is checked
-    against it: "runtime" must be in that closure, "non-runtime" must not be. A scope mismatch fails
-    even for an approved name, because the approval answered a different question than the one this
-    resolution is now asking.
+    default-distribution surface invariant 10 is about. An MPL or LGPL package's approval scope is
+    checked against it: "runtime" must be in that closure, "non-runtime" must not be. A scope mismatch
+    fails even for an approved name, because the approval answered a different question than the one
+    this resolution is now asking.
     """
     found = [OVERRIDES[name]] if name in OVERRIDES else licences(dist)
     detail = " | ".join(found) or "NO LICENCE METADATA"
+    if any(LGPL_PATTERN.search(x) for x in found):
+        # Checked ahead of DENIED: DENIED would otherwise fail an approved package's LGPL text before
+        # LGPL_APPROVED gets a say. LGPL as one term of an AND expression still needs the approval.
+        scope = LGPL_APPROVED.get(name)
+        if scope is None:
+            return "fail", detail + " (LGPL not approved for this package)"
+        in_runtime = name in runtime_names
+        if scope == "runtime" and not in_runtime:
+            return "fail", detail + f" (approved runtime-only, but not in the runtime closure: {name!r} moved)"
+        if scope == "non-runtime" and in_runtime:
+            return "fail", detail + f" (approved non-runtime only, but now in the runtime closure: {name!r} moved)"
+        return "lgpl-approved", detail
     if any(DENIED.search(x) for x in found):
         return "fail", detail
     if any("mpl" in x.lower() or "mozilla" in x.lower() for x in found):

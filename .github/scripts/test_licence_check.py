@@ -72,6 +72,30 @@ def test_orjson_compound_expression_is_still_mpl_gated() -> None:
     assert lc.classify("other", FakeDist("other", **expr))[0] == "fail"
 
 
+def test_lgpl_only_for_the_approved_set_in_its_approved_scope() -> None:
+    lgpl = {"License-Expression": "LGPL-2.1"}
+    # paramiko is approved "runtime": it must be in the runtime closure to pass.
+    status, _ = lc.classify("paramiko", FakeDist("paramiko", **lgpl), runtime_names=frozenset({"paramiko"}))
+    assert status == "lgpl-approved"
+    # A different LGPL package is not on the allow-list: the family is not approved, only the name.
+    assert lc.classify("pylibftdi", FakeDist("pylibftdi", **lgpl))[0] == "fail"
+
+
+def test_lgpl_approval_does_not_transfer_across_scope() -> None:
+    """Mirrors the MPL scope check: paramiko approved "runtime" but absent from the runtime closure
+    this run fails, because the approval answered a different question than the one being asked now."""
+    lgpl = {"License-Expression": "LGPL-2.1"}
+    status, detail = lc.classify("paramiko", FakeDist("paramiko", **lgpl), runtime_names=frozenset())
+    assert status == "fail"
+    assert "moved" in detail
+
+
+def test_agpl_is_never_covered_by_the_lgpl_allow_list() -> None:
+    """LGPL_PATTERN must not swallow AGPL text even under paramiko's own name."""
+    agpl = {"License-Expression": "AGPL-3.0-or-later"}
+    assert lc.classify("paramiko", FakeDist("paramiko", **agpl), runtime_names=frozenset({"paramiko"}))[0] == "fail"
+
+
 def test_build_requires_are_collected() -> None:
     assert any(r.startswith("hatchling") for r in lc.build_requires())
 
