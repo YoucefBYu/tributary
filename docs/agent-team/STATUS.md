@@ -239,7 +239,7 @@ All six filed and synthesised. Full threshold table with evidence ratings quoted
 | 2026-09-24 | **`with` binds to keyword-only step parameters by name**, refused loudly at load if wrong. The SDK's `@step` changes so that a keyword-only parameter without a default means "required from `with`". Rejected: an untyped `ctx.params` | channel-spec README 3.3 |
 | 2026-09-24 | **Reprocess of any `dlq` record carrying `tb-destination` must be destination-scoped**, and is refused until W3-3 builds it. This covers wave 1 loader-exhaustion records too. A destination-step `dlq` record carries the step's input | ADR-003 follow-up 10 |
 | 2026-09-24 | **W2-5 public surface APPROVED WITH CHANGES.** filter needs an explicit `onUnresolved` and may not filter on identifier fields; the enrich allow-list is trimmed; `Reject(code)` is added to the SDK and may not use engine-reserved codes; split becomes a `@splitter` node with **deterministic child ids** and is refused on per-key channels. Metrics and tracing wait for `security-reviewer` on the `/metrics` listener. `contracts/observability/v0` is to be published by the architect, seeded with `platform-engineer`'s names | channel-spec README 3.3.2 |
-| 2026-09-24 | **W2-2 implemented (`39a4006`); the interface is approved from the architect's side, with five items open.** W2-3 itself stays gated behind the W2-1 security fixes (the lead's gate). (1) **Licence of `fhir.resources`/`fhir-core` UNVERIFIED**: `licence_check.py` passes but does not see them (workspace members outside the dev group are invisible to `uv export`; `devops-engineer` is wiring it), and PyPI classifiers are not a resolution. Must close before the gate. (2) Confirm conditional-only upsert, create and delete on one required identifier. (3) Production fullUrls derived from `tb-msg-id`, not uuid4, so shadow and reprocess diffs stay comparable. (4) Golden files validated against the FHIR R4 JSON schema. (5) Optional runtime attachment, agreed with `platform-engineer`. Informal cost is about 313 µs per resource against the 5 ms budget | `packages/tributary-fhir` |
+| 2026-09-24 | **W2-2 implemented (`39a4006`); the interface is approved from the architect's side, with five items open.** W2-3 itself stays gated behind the W2-1 security fixes (the lead's gate). (1) ~~Licence of `fhir.resources`/`fhir-core` UNVERIFIED~~ **Closed at `f083c49`**: `licence_check.py` now resolves them, both BSD. (2) Confirm conditional-only upsert, create and delete on one required identifier. (3) Production fullUrls derived from `tb-msg-id`, not uuid4, so shadow and reprocess diffs stay comparable. (4) Golden files validated against the FHIR R4 JSON schema. (5) Optional runtime attachment, agreed with `platform-engineer`. Informal cost is about 313 µs per resource against the 5 ms budget | `packages/tributary-fhir` |
 | 2026-09-24 | **`postgresql` loader BUILT** (`eca445a`, `connector-engineer`), not yet "Implemented": its duplicate tests repeat `deliver()` in one process, so the 5.1 redelivery test waits for the W2-9 harness. Adopted from the build: all authentication material under `auth.secretRef`; the uniqueness check reads the catalog, because a bare unique index is invisible in `information_schema` | channel-spec README 3.0, 3.4.3 |
 | 2026-09-24 | **Manifest `runnable` checked against W2-1** (`9078982` registers `tributary.hl7v2.parse` only). No example flips: each one naming `parse` also names a `ref` step, and the fanout example needs the unregistered `tributary.hl7v2.to_json`. `requires` lists trimmed to what is still missing | `examples/manifest.json` |
 
@@ -258,13 +258,22 @@ on the human's approval (2026-09-24).
   (decisions log, ADR-001 2.3). Kept for one revision so the change is visible. The scope question is
   settled: the "dependency closure" wording was the lead's relay, not the human's. The human's choice
   approved paramiko alone, so each of its dependencies must pass `licence_check.py` on its own.
-- **Pending: `licence_check.py` may short-circuit on combined SPDX expressions** in its MPL and LGPL
-  branches (`security-reviewer`; `devops-engineer` is fixing it). **If the MPL branch from `b773158` is
-  affected, the wave 1 licence evidence for `orjson` (`MPL-2.0 AND (Apache-2.0 OR MIT)`) and `certifi`
-  needs a note here**: "44 components / 0 failed" would then have been produced by a checker that
-  could not fail those cases. The human approvals themselves stand either way, because they rest on
-  the licences, not on the checker. What would change is how much that CI evidence proves.
-  Architect to update once `devops-engineer` reports.
+- **Resolved 2026-09-24: `licence_check.py` did short-circuit on combined SPDX expressions**, in the
+  MPL branch from `b773158` and in the LGPL branch modelled on it. Found by `security-reviewer`; fixed
+  by `devops-engineer` at `f083c49`. Any expression containing "mpl" was approved as a whole, without
+  checking the other terms: `MPL-2.0 AND Proprietary` passed as approved.
+  **Note on the wave 1 licence evidence** (gate `phase-1-wave-1.md` 5.3, "44 components / 0 failed"):
+  - For `orjson`, whose resolved expression is `MPL-2.0 AND (Apache-2.0 OR MIT)`, that result did
+    **not** check the non-MPL terms. The conclusion was still right, since Apache-2.0 and MIT are
+    permissive, but it came from a checker that could not have failed on a bad extra term.
+  - `certifi` is affected only if its resolved expression is compound; a plain `MPL-2.0` hits no
+    short-circuit.
+  - The human approvals stand either way: they rest on the licences, not on the checker.
+  - **The evidence is now real.** The fixed checker passes on the current tree. Its regression tests
+    (`test_mpl_compound_expression_with_an_unapproved_extra_term_is_rejected`, and four LGPL cases)
+    were shown red against the pre-fix code before going green, and the suite is 31 / 31.
+  - Same fix: `tributary-fhir`'s `fhir.resources` and `fhir-core` are now actually checked (BSD), which
+    closes W2-2 open item 1.
 - **`psycopg` 3 in the CLAUDE.md stack table — answer needed before wave 3.** CLAUDE.md names it for
   the control plane. It is LGPL-3.0, and `licence_check.py` denies it (reported by the lead and
   `connector-engineer`). Invariant 10 has no LGPL path. The options: approve it as an unmodified

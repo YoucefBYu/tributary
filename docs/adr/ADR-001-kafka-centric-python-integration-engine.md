@@ -110,6 +110,14 @@ Sources to re-check: openintegrationengine.org and the OIE GitHub repository (li
   **Why a separate approval rather than adding a fourth name to the list above:** that approval was
   recorded as covering *those three packages*, and a transitive arrival is exactly the case the scope
   note was written for. Extending it silently would have made the scope note decorative.
+- **Checker defect, fixed 2026-09-24 (`f083c49`).** `licence_check.py`'s MPL branch (and the LGPL
+  branch modelled on it) approved any expression containing "mpl" without checking the other terms,
+  so `MPL-2.0 AND Proprietary` passed. The wave 1 "0 failed" result therefore never checked the
+  non-MPL terms of `orjson`'s `MPL-2.0 AND (Apache-2.0 OR MIT)`. Those terms are permissive, so the
+  approvals above are unaffected, but the CI evidence was weaker than it read. Regression tests were
+  shown red against the old code. See `docs/agent-team/STATUS.md`. **Third instance of the pattern:**
+  a licence claim is only as good as the mechanism that produced it, and a checker needs a failing
+  case too.
 - **`paramiko` (LGPL-2.1), HUMAN-APPROVED 2026-09-24** as its own decision. It is **not** an
   extension of the MPL approvals above, nor of `certifi`'s. This is the first LGPL dependency and the
   first non-permissive one in the **shipped runtime** other than `orjson`. The human chose it, when
