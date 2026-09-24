@@ -124,7 +124,7 @@ when a connector lands with its tests.
 | source | `kafka` | W2-7 | Contracted, not built |
 | destination | `http` | W1-6 | **Implemented** |
 | destination | `fhir` | W2-6 | Contracted, not built |
-| destination | `postgresql` | W2-6 | Contracted, not built. Driver: `asyncpg` (section 10.2) |
+| destination | `postgresql` | W2-6 | **Built** (`eca445a`, `asyncpg`): integration test against a real PostgreSQL, startup uniqueness check. **Genuine-redelivery duplicate test pending** (W2-9 harness, 5.1) |
 | destination | `clickhouse` | W2-6 | Contracted, not built |
 | destination | `sftp` | W2-6 | Contracted, not built. `paramiko`, human-approved (section 10.2) |
 | destination | `s3` | W2-6 | Contracted, not built |
@@ -132,7 +132,11 @@ when a connector lands with its tests.
 | destination | `kafka` | W2-6 | Contracted, not built |
 
 A connector is "Implemented" when it has its integration test and, for a destination, its
-duplicate-delivery test (invariant 4, wave 2 exit criterion 3) — not when its config parses.
+duplicate-delivery test (invariant 4, wave 2 exit criterion 3) — not when its config parses. The
+duplicate test must meet 5.1: a genuine redelivery from an uncommitted offset. **"Built"** means the
+connector runs and its manifest `connector:` entry is removed, while that redelivery test is still
+pending. Two calls to `deliver()` in one process show that the sink absorbs a repeat, which is
+necessary but not the same thing.
 
 ### 3.1 `metadata`
 
@@ -476,8 +480,8 @@ Both use the same params object:
 | `database` | R | Lowercase identifier |
 | `table` | R | `name` or `schema.name`, lowercase; the loader still quotes it |
 | `idColumn` | O | Default `tb_msg_id`. The loader fills it with `tb-msg-id` |
-| `auth` | R | `password` or `client-certificate`, via `secretRef` |
-| `tls.mode` | R | `verify-full` (certificate and hostname) or `disable` — **loopback only**. There is deliberately no "encrypt without verifying" mode |
+| `auth` | R | `password` or `client-certificate`. **`auth.secretRef` holds everything about how this client authenticates**: the user always, plus the password or the client certificate and key |
+| `tls.mode`, `tls.secretRef` | R, O | `verify-full` (certificate and hostname) or `disable` — **loopback only**. There is deliberately no "encrypt without verifying" mode. `tls.secretRef` holds the CA trust bundle only |
 | `timeoutMs`, `circuitBreaker` | | |
 
 **The payload is a row**: a JSON object (`application/json`) whose keys are column names matching
@@ -491,7 +495,11 @@ declaration:**
 
 - `postgresql`: `INSERT … ON CONFLICT (<idColumn>) DO NOTHING`. At startup the loader checks that a
   unique index or primary key covers exactly `idColumn`, and **refuses to start** otherwise — without
-  it, `ON CONFLICT` has nothing to conflict on and duplicates are silent.
+  it, `ON CONFLICT` has nothing to conflict on and duplicates are silent. **Check the catalog, not
+  `information_schema`**: a bare `CREATE UNIQUE INDEX` satisfies `ON CONFLICT` but has no row in
+  `information_schema.table_constraints` (found by `connector-engineer` against a real server). Only a
+  **non-partial, non-expression** unique index on exactly `idColumn` qualifies: without the predicate,
+  `ON CONFLICT (<idColumn>)` cannot infer a partial index, and an expression index is not on the column.
 - `clickhouse`: ClickHouse has no unique constraint. The table must be a `ReplacingMergeTree`-family
   engine whose sorting key starts with `idColumn`; the loader checks this at startup and refuses to
   start otherwise. **Deduplication is eventual** (at merge time): readers that need exact counts query

@@ -47,8 +47,7 @@
         "bundle-fetch for ref steps (unscheduled)",
         "per-destination steps (W2-5)",
         "connector:source/http (W2-7)",
-        "connector:destination/fhir (W2-6)",
-        "connector:destination/postgresql (W2-6)"
+        "connector:destination/fhir (W2-6)"
       ],
       "note": "Set 1.1. HTTP/FHIR ingest with bearer auth over TLS, keyed by a JSON pointer, to a FHIR server and a PostgreSQL table"
     },

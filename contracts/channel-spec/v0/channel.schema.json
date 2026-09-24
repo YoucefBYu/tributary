@@ -797,7 +797,7 @@
         },
         "secretRef": {
           "$ref": "#/$defs/secretRef",
-          "$comment": "Trust bundle, and a client certificate when auth.type is client-certificate."
+          "$comment": "The CA trust bundle only. A client certificate and key, like a password, belong to auth.secretRef (README 3.4.3)."
         }
       }
     },

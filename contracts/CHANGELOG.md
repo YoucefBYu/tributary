@@ -3,6 +3,18 @@
 Newest first. Each entry names the contract, the version, whether the change is additive or
 breaking, and the reason. Breaking changes reference an ADR.
 
+## 2026-09-24 (PostgreSQL loader built) — documentation only
+
+`connector-engineer` shipped the `postgresql` loader (`eca445a`) against `sqlSinkParams` exactly. The
+schema changes only in a `$comment`, so there is no validation change.
+
+| Change | Why |
+|---|---|
+| README 3.0: `postgresql` is **Built**, a new status meaning "runs, `connector:` entry removed, genuine-redelivery duplicate test still pending" | Its duplicate tests call `deliver()` twice in one process, against a real server in the integration test. That proves the sink absorbs a repeat, but it is not the 5.1 redelivery. "Implemented" waits for the W2-9 harness |
+| `auth.secretRef` holds all client-authentication material (user, password, or client certificate and key); `tls.secretRef` is the CA bundle only | `connector-engineer`'s split, adopted over mine: with the certificate under `tls`, `auth.secretRef` was redundant for certificate auth |
+| The uniqueness check reads the catalog, and only a non-partial, non-expression unique index on exactly `idColumn` qualifies | A bare unique index satisfies `ON CONFLICT` but is invisible in `information_schema.table_constraints` (found against a real server). Partial and expression indexes added by the architect |
+| Manifest: `connector:destination/postgresql` removed from `http-fhir-ingest-to-fhir-and-postgresql.json` | The loader exists; the example is still not runnable (`ref` steps, `fhir`, `http` source) |
+
 ## 2026-09-24 (later) — set 1.1 follow-ups from implementers; no schema change
 
 All in `channel-spec/v0/README.md`, all additive or corrections to prose. The schema is unchanged.
