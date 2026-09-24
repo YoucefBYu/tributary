@@ -9,6 +9,7 @@ real patient data (synthetic fixtures only, per CLAUDE.md).
 from __future__ import annotations
 
 import threading
+import time
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -19,6 +20,10 @@ class CapturedRequest:
     path: str
     headers: dict[str, str]
     body: bytes
+    #: `time.monotonic()` at capture, so a chaos scenario spanning two `StubHttpServer` instances (one
+    #: stopped to simulate an outage, a second started once it is "restored") can merge both servers'
+    #: `requests` and still recover one true chronological order.
+    received_at: float
 
 
 class _RecordingServer(ThreadingHTTPServer):
@@ -43,7 +48,13 @@ class _Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0") or "0")
         body = self.rfile.read(length) if length else b""
         self.server.record(
-            CapturedRequest(method=method, path=self.path, headers=dict(self.headers.items()), body=body)
+            CapturedRequest(
+                method=method,
+                path=self.path,
+                headers=dict(self.headers.items()),
+                body=body,
+                received_at=time.monotonic(),
+            )
         )
         self.send_response(200)
         self.end_headers()
@@ -63,10 +74,13 @@ class _Handler(BaseHTTPRequestHandler):
 
 class StubHttpServer:
     """`http://127.0.0.1:<port>` — loopback-bound, matching every listener in this repo (Phase 0 gate
-    finding High 2 / SR-8). `port` is chosen by the OS (bind to 0) so parallel test runs never collide."""
+    finding High 2 / SR-8). `port` defaults to one chosen by the OS (bind to 0) so parallel test runs
+    never collide; a chaos scenario simulating a destination *outage* (stop this, then start a fresh one
+    on the same port once recovery is being tested) passes the prior instance's `port` explicitly so the
+    channel spec's URL -- fixed once published -- still points at something once the stub comes back."""
 
-    def __init__(self) -> None:
-        self._httpd = _RecordingServer(("127.0.0.1", 0), _Handler)
+    def __init__(self, *, port: int = 0) -> None:
+        self._httpd = _RecordingServer(("127.0.0.1", port), _Handler)
         self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True, name="http-stub")
 
     @property

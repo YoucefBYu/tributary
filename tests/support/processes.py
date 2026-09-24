@@ -85,6 +85,35 @@ class ManagedProcess:
                 return record
         raise ProcessDiedError(f"{self.args!r} did not emit {event!r} within {timeout_s}s: {self.lines!r}")
 
+    def collect_pending(self) -> list[dict[str, Any]]:
+        """Non-blocking: drain whatever has already been printed into `.lines` and return the newly
+        collected records, without waiting for any particular event.
+
+        For a check that needs the whole log so far rather than one named event -- "no halt event was
+        ever printed", say -- because `wait_for_event` only appends a line to `.lines` on its way to a
+        match, so anything printed after the last `wait_for_event` call (or printed but never matched,
+        such as a chaos scenario's process that runs on after the event it was waiting for) would
+        otherwise never reach `.lines` at all: the reader thread keeps queuing lines for the process's
+        whole life (this class's docstring), but nothing before this method drains that queue without
+        also demanding a specific event to stop at.
+        """
+        collected: list[dict[str, Any]] = []
+        while True:
+            try:
+                raw = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            if raw is None:
+                self._eof = True
+                break
+            try:
+                record = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            self.lines.append(record)
+            collected.append(record)
+        return collected
+
     def kill_and_wait(self, timeout_s: float = 30.0) -> int:
         self.process.kill()
         return self.process.wait(timeout=timeout_s)

@@ -48,6 +48,32 @@ def walking_skeleton_document(
     return document
 
 
+def ordered_document(
+    *,
+    mllp_port: int,
+    http_url: str,
+    channel: str = "adt-passthrough-ordered",
+    destination: str = "http-stub",
+    version: int = 1,
+    partition_key: str = "hl7:PID.3.1",
+) -> dict[str, Any]:
+    """The same walking-skeleton shape, but `ordering: per-key`.
+
+    The MLLP receiver refuses `per-key` channels in this wave (no `keyExpression` evaluator yet --
+    `tributary.receivers.mllp.config`, W2-4) -- so a test using this document must publish directly to
+    `raw` (`tests.support.kafka_helpers.publish_messages`) with its own record key rather than run a
+    receiver against it. The worker and loader do not care where the key came from; they only need
+    `spec.ordering` and `spec.partitionKey` to be set so `check_partition_counts` and
+    `validate_for_produce` apply the per-key rules W2-9's chaos suite is testing.
+    """
+    document = walking_skeleton_document(
+        mllp_port=mllp_port, http_url=http_url, channel=channel, destination=destination, version=version
+    )
+    document["spec"]["ordering"] = "per-key"
+    document["spec"]["partitionKey"] = partition_key
+    return document
+
+
 def write_channel_spec_file(path: Path, document: Mapping[str, Any]) -> Path:
     path.write_text(json.dumps(document), encoding="utf-8")
     return path
