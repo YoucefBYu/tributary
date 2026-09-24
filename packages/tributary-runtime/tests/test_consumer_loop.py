@@ -579,3 +579,35 @@ def test_stop_ends_the_loop_and_still_drains() -> None:
     assert handler.seen == [0, 1]
     assert consumer.committed[-1] == [(TOPIC, 0, 2)]
     assert consumer.closed is True
+
+
+def test_poll_timeout_is_clamped_to_the_next_due_resume() -> None:
+    """ADR-003 follow-up 6: a paused partition must not wait out the poll timeout after its backoff.
+
+    Mutation-verified: returning `self._settings.poll_timeout_s` unconditionally turns this red.
+    """
+    consumer = FakeConsumer()
+    consumer.append(record(0))
+    clock = Clock()
+    handler = ScriptedHandler(failures=1)
+    loop = ConsumerLoop(
+        consumer,
+        handler,
+        topics=[TOPIC],
+        retry=RetryPolicy(policy="blocking", max_attempts=5, on_exhaust="halt-partition", backoff="fixed",
+                          initial_delay_ms=40, max_delay_ms=40),
+        settings=LoopSettings(commit_every=1, poll_timeout_s=0.2),
+        emitter=RecordingEmitter(),
+        log=JsonLogger("test", stream=io.StringIO()),
+        channel="adt-passthrough",
+        channel_version=1,
+        instance="worker:test@host",
+        clock=clock,
+    )
+    loop.start()
+    assert loop.poll_timeout() == 0.2  # nothing paused: the configured timeout
+    loop.run(max_iterations=1)  # the record fails: the partition pauses for 20-40 ms (equal jitter)
+    timeout = loop.poll_timeout()
+    assert 0.0 < timeout <= 0.040
+    clock.advance(1.0)
+    assert loop.poll_timeout() == 0.0  # overdue: poll must not block at all

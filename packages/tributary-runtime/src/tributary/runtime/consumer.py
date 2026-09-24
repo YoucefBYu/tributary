@@ -17,8 +17,10 @@ most dangerous detail in this file. The seek happens while the partition is stil
 order races an in-flight fetch.
 
 **Resume is not driven by the poll timeout.** S5 measured about 155 ms of each 169 ms retry cycle being
-the loader's own poll timeout rather than backoff (ADR-003 follow-up 6), so the loop checks due
-partitions at the top of every iteration and keeps the poll timeout short.
+the loader's own poll timeout rather than backoff (ADR-003 follow-up 6). Checking due partitions at the
+top of every iteration is not enough on its own: a quiet consumer sits inside `poll()` for the whole
+timeout while a partition's backoff expires. So the poll timeout is clamped to the time until the next
+due resume (`poll_timeout`), and a resume happens within a scheduler tick of its due time.
 
 **Rebalance.** Cooperative-sticky with custom callbacks requires `incremental_assign`/
 `incremental_unassign` — plain `assign()` raises `Local: Erroneous state`. A revoke commits before
@@ -218,7 +220,7 @@ class ConsumerLoop:
             while self._running and (max_iterations is None or iterations < max_iterations):
                 iterations += 1
                 self._resume_due_partitions()
-                raw = self._consumer.poll(self._settings.poll_timeout_s)
+                raw = self._consumer.poll(self.poll_timeout())
                 if raw is None:
                     continue
                 self._consume_one(raw)
@@ -375,6 +377,13 @@ class ConsumerLoop:
         partition = TopicPartition(record.topic, record.partition, state.offset)
         self._consumer.pause([partition])
         self._consumer.seek(partition)
+
+    def poll_timeout(self) -> float:
+        """The configured poll timeout, clamped so `poll()` returns by the next due resume."""
+        due = [state.resume_at for state in self._retry_state.values() if not state.halted and state.resume_at]
+        if not due:
+            return self._settings.poll_timeout_s
+        return max(0.0, min(self._settings.poll_timeout_s, min(due) - self._clock()))
 
     def _resume_due_partitions(self) -> None:
         now = self._clock()
