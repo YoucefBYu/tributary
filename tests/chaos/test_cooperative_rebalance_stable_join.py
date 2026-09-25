@@ -12,9 +12,11 @@ scenario where the joiner is assigned nothing measures nothing."* This scenario 
    generation (the current owner has to revoke them via its own `poll()` before the broker can grant them
    in the second). An earlier version of this test read the first `partitions_assigned` event per process
    as if it were the final assignment and failed immediately on exactly that 0-in-generation-one case.
-   `_wait_until_settled` instead accumulates every `partitions_assigned` (add) and `partitions_revoked`
-   (subtract) event per process (`ManagedProcess.collect_pending`) until the group's combined total
-   reaches `PARTITIONS` and stays there for several consecutive polls.
+   `tests.support.rebalance_helpers.wait_until_settled` instead accumulates every `partitions_assigned`
+   (add) and `partitions_revoked` (subtract) event per process (`ManagedProcess.collect_pending`) until
+   the group's combined total reaches `PARTITIONS` and stays there for several consecutive polls -- see
+   that module's docstring for the full incident and the grace-period reasoning, shared with
+   `test_cooperative_rebalance_commit_refused_mid_join.py`.
 2. Asserts the joiner's own **net, settled** partition count is greater than zero -- a joiner assigned
    nothing would make every downstream assertion vacuously true.
 3. Publishes traffic only *between* settled rebalances, never during one, so a duplicate in the drained
@@ -30,7 +32,6 @@ docstring for why the MLLP receiver is not used here.
 from __future__ import annotations
 
 import json
-import time
 from collections.abc import Iterator
 from typing import Any
 
@@ -59,6 +60,7 @@ from tests.support.kafka_helpers import (
     wait_for_at_least,
 )
 from tests.support.processes import ManagedProcess, spawn_pipeline_worker
+from tests.support.rebalance_helpers import wait_until_settled
 
 pytestmark = [pytest.mark.integration, pytest.mark.chaos]
 
@@ -135,68 +137,6 @@ def deployed_spec(topics: str) -> dict[str, Any]:
     return document
 
 
-def _net_assigned(process: ManagedProcess) -> int:
-    """The partitions this process currently owns, from its own log: every `partitions_assigned`
-    `count` adds, every `partitions_revoked` `count` subtracts. Relies on `collect_pending` having been
-    called recently enough that the relevant lines are already in `.lines` (see `_wait_until_settled`)."""
-    total = 0
-    for line in process.lines:
-        event = line.get("event")
-        if event == "partitions_assigned":
-            total += int(line.get("count", 0))
-        elif event == "partitions_revoked":
-            total -= int(line.get("count", 0))
-    return total
-
-
-#: A brand-new member joining a group is only *noticed* by the existing members through their own
-#: heartbeat responses -- `heartbeat.interval.ms` (`contracts/topics/v0/topic-defaults.json`
-#: `clients.worker_consumer`, 5000) -- not on their next `poll()`. Declaring the assignment "stable"
-#: before at least a few of those intervals have had a chance to land would just measure "no rebalance
-#: has happened *yet*" as if it meant "no rebalance is going to happen": the very first version of this
-#: helper did exactly that, returned after 1.5s of a brand-new member sitting at a trivially unchanging
-#: 0, and `test_joiner...` failed with `pair["founder2"] == 0` -- not because the rebalance never
-#: happened, but because the settle check never waited long enough to see it.
-MIN_SETTLE_WAIT_S = 15.0
-
-
-def _wait_until_settled(
-    processes: dict[str, ManagedProcess],
-    *,
-    expected_total: int,
-    timeout_s: float = 90.0,
-    quiet_polls: int = 3,
-    poll_interval_s: float = 0.5,
-    min_wait_s: float = MIN_SETTLE_WAIT_S,
-) -> dict[str, int]:
-    """Poll every process's pending output until the group's combined net assignment covers
-    `expected_total` partitions and holds unchanged for `quiet_polls` consecutive samples taken no
-    earlier than `min_wait_s` after this call started -- the "stable assignment" this scenario's
-    docstring requires before treating a rebalance as settled (see `MIN_SETTLE_WAIT_S`)."""
-    started = time.monotonic()
-    deadline = started + timeout_s
-    stable_rounds = 0
-    previous: dict[str, int] | None = None
-    counts: dict[str, int] = {}
-    while time.monotonic() < deadline:
-        for process in processes.values():
-            process.collect_pending()
-        counts = {name: _net_assigned(process) for name, process in processes.items()}
-        eligible = time.monotonic() - started >= min_wait_s
-        if eligible and sum(counts.values()) == expected_total and counts == previous:
-            stable_rounds += 1
-            if stable_rounds >= quiet_polls:
-                return counts
-        else:
-            stable_rounds = 0
-        previous = counts
-        time.sleep(poll_interval_s)
-    raise AssertionError(
-        f"assignment across {sorted(processes)} never settled to {expected_total} partitions "
-        f"within {timeout_s}s (last observed: {counts})"
-    )
-
-
 def _publish_batch(bootstrap: str, *, start_seq: int, count_per_key: int) -> list[str]:
     messages = [
         make_message(
@@ -219,12 +159,12 @@ def test_joiner_against_a_stable_assignment_moves_partitions_without_loss_or_dup
     try:
         founder1 = spawn_pipeline_worker(env=ENV, channel=CHANNEL, bootstrap=topics, instance_id="pipeline-founder-1")
         processes["founder1"] = founder1
-        solo = _wait_until_settled(processes, expected_total=PARTITIONS)
+        solo = wait_until_settled(processes, expected_total=PARTITIONS)
         assert solo["founder1"] == PARTITIONS, "the lone founder must own every partition at first"
 
         founder2 = spawn_pipeline_worker(env=ENV, channel=CHANNEL, bootstrap=topics, instance_id="pipeline-founder-2")
         processes["founder2"] = founder2
-        pair = _wait_until_settled(processes, expected_total=PARTITIONS)
+        pair = wait_until_settled(processes, expected_total=PARTITIONS)
         assert_fault_fired(
             pair["founder2"] > 0,
             description="the second founder settled with zero partitions -- no rebalance actually split the group",
@@ -240,7 +180,7 @@ def test_joiner_against_a_stable_assignment_moves_partitions_without_loss_or_dup
             env=ENV, channel=CHANNEL, bootstrap=topics, instance_id="pipeline-joiner", timeout_s=60.0
         )
         processes["joiner"] = joiner
-        trio = _wait_until_settled(processes, expected_total=PARTITIONS)
+        trio = wait_until_settled(processes, expected_total=PARTITIONS)
         assert_fault_fired(
             trio["joiner"] > 0,
             description="the joiner settled with zero partitions -- this run proves nothing about a live rebalance",
