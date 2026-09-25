@@ -486,3 +486,23 @@ def test_destination_steps_never_reorder_or_lose_a_message(stream: list[tuple[st
     assert gated_dlq == [msg_id for msg_id, _k, marker in consumed_ids if marker == "r"]
     assert gated_filtered == [msg_id for msg_id, _k, marker in consumed_ids if marker == "d"]
     assert all(headers[h.TB_DESTINATION] == "gated" for _k, _v, headers in harness.dlq())
+
+
+def test_an_exception_merely_named_reject_is_retried_like_any_other() -> None:
+    """Only the SDK's `Reject` skips the retries; a class that shares its name does not."""
+
+    class Reject(Exception):  # the point is the name collision
+        pass
+
+    @step
+    def impostor(msg: Message) -> None:
+        CALLS["impostor"] = CALLS.get("impostor", 0) + 1
+        raise Reject
+
+    REGISTRY["t.impostor"] = impostor
+    harness = Harness(channel(pipeline=["t.impostor"], destinations={"fhir": []}, step_retries=2))
+    with pytest.raises(StepFailure) as caught:
+        harness.handler.handle(record())
+    assert CALLS["impostor"] == 3
+    assert caught.value.error_code == "STEP_ERROR"
+    assert not caught.value.rejected

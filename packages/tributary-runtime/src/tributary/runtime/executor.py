@@ -48,6 +48,7 @@ class StepFailure(TributaryError):
         exception_type: str,
         *,
         error_code: str = STEP_ERROR_CODE,
+        rejected: bool = False,
     ) -> None:
         super().__init__(
             f"step {safe_token(step_name)} failed {attempts} time(s) with {safe_token(exception_type)} "
@@ -57,10 +58,8 @@ class StepFailure(TributaryError):
         self.attempts = attempts
         self.exception_type = exception_type
         self.error_code = error_code
-
-    @property
-    def rejected(self) -> bool:
-        return self.exception_type == "Reject"
+        #: True when the step raised the SDK's `Reject`: non-retryable by the step's own decision.
+        self.rejected = rejected
 
 
 @dataclass(slots=True)
@@ -163,7 +162,7 @@ def _attempts(
         except Reject as exc:
             if stats is not None:
                 stats.record(scope, name, "rejected", (time.perf_counter() - started) * 1000)
-            raise StepFailure(name, attempt + 1, "Reject", error_code=exc.code) from None
+            raise StepFailure(name, attempt + 1, "Reject", error_code=exc.code, rejected=True) from None
         except Exception as exc:
             if stats is not None:
                 stats.record(scope, name, "failed", (time.perf_counter() - started) * 1000)
