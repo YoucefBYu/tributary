@@ -120,6 +120,17 @@ def test_parse_row_rejects_a_bad_column_name() -> None:
         parse_row(json.dumps({"Bad-Column": "x"}).encode(), "tb_msg_id")
 
 
+def test_parse_row_never_logs_a_sender_supplied_key_verbatim() -> None:
+    """Code review on the clickhouse loader's identical pattern, Medium: a payload's JSON keys are
+    sender-controlled and can themselves carry PHI (unlike `id_column`, this loader's own config) --
+    the error message must say only a fixed phrase and the key's length, never the key text itself."""
+    secret_looking_key = "PATIENT-JOHN-DOE-1980-01-01"  # noqa: S105 - a synthetic PHI-shaped JSON key, not a credential
+    with pytest.raises(Exception) as exc_info:
+        parse_row(json.dumps({secret_looking_key: "x"}).encode(), "tb_msg_id")
+    assert secret_looking_key not in str(exc_info.value)
+    assert str(len(secret_looking_key)) in str(exc_info.value)
+
+
 def test_parse_row_rejects_a_nested_value() -> None:
     with pytest.raises(Exception, match="non-scalar"):
         parse_row(json.dumps({"nested": {"a": 1}}).encode(), "tb_msg_id")

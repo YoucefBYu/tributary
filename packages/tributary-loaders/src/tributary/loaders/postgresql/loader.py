@@ -149,10 +149,14 @@ def parse_row(payload: bytes | None, id_column: str) -> dict[str, Any]:
     if id_column in row:
         raise PayloadShapeError(f"payload sets {id_column!r} itself; this loader fills it from tb-msg-id")
     for key, value in row.items():
+        # Never interpolate `key` into the message (code review on the clickhouse loader's identical
+        # pattern, Medium): a payload's JSON keys are sender-controlled and can themselves carry PHI,
+        # unlike `id_column` above (this loader's own config). Only a fixed phrase and the key's
+        # length are safe to say anything about.
         if not isinstance(key, str) or not _COLUMN_RE.match(key):
-            raise PayloadShapeError(f"payload key {key!r} is not a valid column name")
+            raise PayloadShapeError(f"payload has a key that is not a valid column name (length {len(key)})")
         if value is not None and not isinstance(value, _SCALAR_TYPES):
-            raise PayloadShapeError(f"payload key {key!r} has a non-scalar value")
+            raise PayloadShapeError(f"payload key {len(key)} chars long has a non-scalar value")
     return row
 
 
