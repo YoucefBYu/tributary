@@ -46,7 +46,7 @@ Conventions:
 - Every change ships with tests. Bug fixes ship with a regression test.
 - Conventional commits. Commit early and often, and only files you own.
 - In the shared checkout, stay on the current `wave/*` branch and never switch branches. Only in your own git worktree use `agent/<role>/<task-id>`.
-- Never `git push`, force-push or rewrite shared history. A human pushes.
+- The lead pushes the current `wave/*` branch to GitHub (`git push -u origin <branch>`) once lint, format, type check and fast tests pass. Teammates commit but do not push. Never force-push or rewrite shared history.
 
 ## Commands
 
