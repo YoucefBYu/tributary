@@ -242,6 +242,7 @@ All six filed and synthesised. Full threshold table with evidence ratings quoted
 | 2026-09-24 | **W2-2 implemented (`39a4006`); the interface is approved from the architect's side, with five items open.** W2-3 itself stays gated behind the W2-1 security fixes (the lead's gate). (1) ~~Licence of `fhir.resources`/`fhir-core` UNVERIFIED~~ **Closed at `f083c49`**: `licence_check.py` now resolves them, both BSD. (2) Confirm conditional-only upsert, create and delete on one required identifier. (3) Production fullUrls derived from `tb-msg-id`, not uuid4, so shadow and reprocess diffs stay comparable. (4) Golden files validated against the FHIR R4 JSON schema. (5) Optional runtime attachment, agreed with `platform-engineer`. Informal cost is about 313 µs per resource against the 5 ms budget | `packages/tributary-fhir` |
 | 2026-09-24 | **`postgresql` loader BUILT** (`eca445a`, `connector-engineer`), not yet "Implemented": its duplicate tests repeat `deliver()` in one process, so the 5.1 redelivery test waits for the W2-9 harness. Adopted from the build: all authentication material under `auth.secretRef`; the uniqueness check reads the catalog, because a bare unique index is invisible in `information_schema` | channel-spec README 3.0, 3.4.3 |
 | 2026-09-24 | **Manifest `runnable` checked against W2-1** (`9078982` registers `tributary.hl7v2.parse` only). No example flips: each one naming `parse` also names a `ref` step, and the fanout example needs the unregistered `tributary.hl7v2.to_json`. `requires` lists trimmed to what is still missing | `examples/manifest.json` |
+| 2026-09-25 | **Human (asked directly by the lead): the `clickhouse` loader uses ClickHouse's HTTP interface through the Python standard library**, built like the HTTP loader: redirects refused, no pooling, no hidden retries, auth in headers from `secretRef`, stdlib TLS. No new dependency. Found by `connector-engineer` on W2-6: `clickhouse-connect` (Apache-2.0) unconditionally requires `certifi` (MPL-2.0), approved dev-only, so `licence_check.py` failed when it entered `tributary-loaders`' runtime closure; the engineer stopped and reverted. Its defaults (`query_retries=2`, internal HTTP retries) also re-send silently on connection failure (`wave-2.md` 6.3). **`certifi`'s scope is unchanged: non-runtime only.** Rejected: approving `certifi` for the runtime; deferring the loader. **Deviates from the CLAUDE.md stack table** (Archive names `clickhouse-connect`) for the loader only; the table is human-owned and the proposed one-line change went to the lead. The wave 3 archiver's client is **not decided** (open questions) | ADR-001 2.3 |
 
 ## Open questions for the human
 
@@ -279,6 +280,13 @@ on the human's approval (2026-09-24).
   `connector-engineer`). Invariant 10 has no LGPL path. The options: approve it as an unmodified
   dependency, or amend the stack table to a permissive driver. The wave 2 loaders already use `asyncpg`
   (Apache-2.0), which shows one exists. Choosing the stack is the human's decision. Not a wave 2 blocker.
+- **ClickHouse client for the wave 3 archiver — answer needed before the archiver is built.** On
+  2026-09-25 the human decided that the `clickhouse` *loader* uses the HTTP interface via the standard
+  library, because `clickhouse-connect` unconditionally pulls in `certifi` (MPL-2.0, approved dev-only)
+  and retries silently by default (decisions log). That decision does **not** cover the archiver. If the
+  archiver uses `clickhouse-connect`, as the CLAUDE.md stack table still says, the same question
+  returns: approve `certifi` for the runtime, or build the archiver on the same stdlib HTTP client as
+  the loader. Not decided, and not a wave 2 blocker.
 - **Linux re-run capacity.** The approved re-run has not happened (see Current). The memo priced it as
   "CI runner time and a dedicated 3-broker cluster". A hosted runner is not a dedicated cluster.
   Whether to pay for dedicated capacity is cloud spend.

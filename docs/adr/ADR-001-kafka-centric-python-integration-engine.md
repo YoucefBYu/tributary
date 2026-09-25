@@ -134,6 +134,17 @@ Sources to re-check: openintegrationengine.org and the OIE GitHub repository (li
   **Obligations:** what distributing an LGPL-2.1 library inside a container image requires
   (notices, availability of the library's source) belongs to the W4-7 release pipeline and its SBOM,
   and to the legal review in 10.3. It is not settled here, and this is not legal advice.
+- **`clickhouse-connect` NOT adopted for the `clickhouse` loader, HUMAN DECISION 2026-09-25.** It is
+  Apache-2.0, but it unconditionally requires `certifi`, whose approval above is non-runtime only, so
+  `licence_check.py` failed when it entered `tributary-loaders`' runtime closure (found by
+  `connector-engineer`, W2-6, and reverted). Its defaults (`query_retries=2`, internal HTTP retries)
+  also re-send silently on connection failure. The loader instead uses ClickHouse's HTTP interface via
+  the standard library, on the HTTP loader's rules: redirects refused, no pooling, no hidden retries,
+  auth headers from `secretRef`, stdlib TLS. **No new dependency; `certifi`'s scope is unchanged.**
+  Rejected: approving `certifi` for the runtime; deferring the loader. This departs from the CLAUDE.md
+  stack table (Archive: `clickhouse-connect`) **for the loader only**. The wave 3 archiver's client is
+  an open human question (`docs/agent-team/STATUS.md`), and `clickhouse-connect` there would raise the
+  same `certifi` question.
 - **How this one nearly passed unnoticed, which is the reusable part.** The root manifest annotates
   `"testcontainers[kafka]>=4.8",  # Apache-2.0`. That comment is *correct about testcontainers itself*
   and says nothing about its transitive closure, so it reads as a clearance while clearing nothing —
