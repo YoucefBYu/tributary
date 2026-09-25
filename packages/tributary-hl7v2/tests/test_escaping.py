@@ -62,3 +62,27 @@ def test_escape_output_never_contains_a_bare_delimiter(text: str) -> None:
     # the property that makes it safe to splice `escaped` into a field without corrupting structure.
     for delimiter in (D.field, D.component, D.subcomponent, D.repetition):
         assert delimiter not in escaped
+
+
+# -- security regression: every C0 control character and DEL, not only CR -------------------------
+
+
+def test_escape_hex_escapes_bare_lf() -> None:
+    """A security review found LF left raw: `with_field("PID.5.1", "EVIL\\nZZZ|1|INJECTED")` on an
+    LF-only message injected a `ZZZ` segment. `escape` must never let a bare LF back out."""
+    escaped = escape("a\nb", D)
+    assert "\n" not in escaped
+    assert unescape(escaped, D) == "a\nb"
+
+
+@given(st.integers(min_value=0x00, max_value=0x1F) | st.just(0x7F))
+def test_escape_hex_escapes_every_c0_control_character_and_del(codepoint: int) -> None:
+    char = chr(codepoint)
+    escaped = escape(char, D)
+    assert char not in escaped
+    assert unescape(escaped, D) == char
+
+
+@given(st.text(alphabet=st.characters(min_codepoint=0x00, max_codepoint=0x1F), max_size=20))
+def test_escape_then_unescape_round_trips_for_c0_control_characters(text: str) -> None:
+    assert unescape(escape(text, D), D) == text

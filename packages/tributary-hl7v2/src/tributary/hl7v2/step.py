@@ -15,7 +15,7 @@ from __future__ import annotations
 from tributary.sdk import Context, Message, step
 
 from .errors import Hl7Error
-from .message import Hl7Message
+from .message import STRUCTURAL_CODE, Hl7Message
 
 #: The `ctx.vars` key downstream steps read. Not part of the channel-spec vocabulary -- a plain
 #: in-process convention between this step and whatever step runs after it in the same pipeline.
@@ -49,8 +49,12 @@ def parse(message: Message, ctx: Context) -> Message:
     ctx.vars[VARS_KEY] = hl7
 
     msg_type, trigger_event, _ = hl7.message_type()
-    if msg_type and trigger_event:
-        # Structural metadata, not PHI: a trigger event names a workflow step, not a patient.
+    if STRUCTURAL_CODE.match(msg_type) and STRUCTURAL_CODE.match(trigger_event):
+        # Only ever a known-shape code, never sender-controlled free text: MSH-9 is sender data, and
+        # `ctx.set_attr` rejects anything else anyway (a space would DLQ the message) -- but silently
+        # losing the attr on a malformed MSH-9 is safer than a parse step that fails on it (a security
+        # review found the un-allowlisted version could still put close-to-arbitrary MSH-9 content into
+        # an archived, searchable field; this closes that, not just the crash).
         ctx.set_attr("hl7_type", f"{msg_type}_{trigger_event}")
     ctx.log.debug("hl7_parsed", segment_count=len(hl7))
     return message

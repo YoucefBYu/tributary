@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 from tributary.hl7v2.errors import FieldPathError
-from tributary.hl7v2.paths import FieldPath, parse
+from tributary.hl7v2.paths import MAX_INDEX, FieldPath, parse
 
 
 def test_segment_only() -> None:
@@ -60,3 +60,21 @@ def test_error_includes_the_path_text_verbatim() -> None:
     with pytest.raises(FieldPathError) as caught:
         parse("PID.0")
     assert "PID.0" in str(caught.value)
+
+
+# -- security/DoS regression: every numeric index is bounded ---------------------------------------
+
+
+def test_max_index_is_accepted() -> None:
+    assert parse(f"PID.{MAX_INDEX}").field == MAX_INDEX
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["PID[10000].5", "PID.10000", "PID.3[10000]", "PID.5.10000", "PID.5.1.10000", "PID.99999999999"],
+)
+def test_an_index_over_max_index_is_rejected(path: str) -> None:
+    """A code review finding: an unbounded index (say, 999999999) reaches `with_field`'s padding loops
+    (`message.py`) and tries to grow a Python list to that length for a single field write."""
+    with pytest.raises(FieldPathError):
+        parse(path)

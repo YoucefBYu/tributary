@@ -260,3 +260,125 @@ def test_with_field_on_a_missing_segment_occurrence_raises() -> None:
     msg = Hl7Message.parse(ADT_A01)
     with pytest.raises(SegmentNotFoundError):
         msg.with_field("OBX.5", "1")
+
+
+# -- raw(): still-escaped wire text, no unescape ---------------------------------------------------
+
+
+def test_raw_does_not_unescape() -> None:
+    raw = ADT_A01.replace(b"SYNTHPATIENT^ALPHA^Q", rb"SYNTHPATIENT\S\ALPHA^Q")
+    msg = Hl7Message.parse(raw)
+    assert msg.raw("PID.5.1") == "SYNTHPATIENT\\S\\ALPHA"  # unlike msg["PID.5.1"], the \S\ stays literal
+    assert msg["PID.5.1"] == "SYNTHPATIENT^ALPHA"
+
+
+def test_raw_on_msh1_and_msh2_matches_get() -> None:
+    msg = Hl7Message.parse(ADT_A01)
+    assert msg.raw("MSH.1") == msg["MSH.1"] == "|"
+    assert msg.raw("MSH.2") == msg["MSH.2"] == "^~\\&"
+
+
+def test_raw_returns_default_when_segment_absent() -> None:
+    msg = Hl7Message.parse(ADT_A01)
+    assert msg.raw("OBX.5") is None
+    assert msg.raw("OBX.5", "fallback") == "fallback"
+
+
+# -- security regression: mixed segment separators are rejected, not silently misread --------------
+
+
+def test_bare_cr_separated_message_parses_every_segment() -> None:
+    msg = Hl7Message.parse(ADT_A01)  # the fixture is bare-CR throughout
+    assert len(msg) == 6
+
+
+def test_crlf_separated_message_parses_every_segment() -> None:
+    raw = ADT_A01.replace(b"\r", b"\r\n")
+    msg = Hl7Message.parse(raw)
+    assert len(msg) == 6
+    assert msg["PID.5.1"] == "SYNTHPATIENT"
+
+
+def test_mixed_cr_and_crlf_separators_are_rejected() -> None:
+    """The bug a code and security review both flagged: a global "does CRLF occur anywhere" check
+    misread a bare-CR message that happened to carry one CRLF byte pair, silently merging every
+    following bare-CR-terminated segment into one. Now a typed reject instead of silent corruption.
+    """
+    raw = ADT_A01.replace(b"NK1|1|SYNTHCONTACT^ONE|SPO\r", b"NK1|1|SYNTHCONTACT^ONE|SPO\r\n", 1)
+    with pytest.raises(MalformedMessageError):
+        Hl7Message.parse(raw)
+
+
+def test_a_single_trailing_cr_with_no_other_separator_still_parses() -> None:
+    """A one-segment message's only `\\r` is the final terminator, which is ambiguous evidence either
+    way and must not itself trigger the mixed-separator reject."""
+    msg = Hl7Message.parse(b"MSH|^~\\&|TRIBUTARY-SYNTH|SYNTH-HOSPITAL|||20260101000000||ADT^A01|1|P|2.5.1\r")
+    assert len(msg) == 1
+
+
+# -- security regression: Segment.name is always the fixed 3-character prefix ----------------------
+
+
+def test_segment_name_is_the_first_three_characters_even_with_no_field_separator() -> None:
+    """`Hl7Message`'s own segment index already used the fixed 3-character prefix; the bug was in
+    `Segment.name` specifically (it searched for a field separator instead), so this reads `.name`
+    directly rather than only `segment_count`, which would not have caught the regression."""
+    raw = b"MSH|^~\\&|TRIBUTARY-SYNTH|||||||ADT^A01|1|P|2.5.1\rZZZNOFIELDSEP\r"
+    msg = Hl7Message.parse(raw)
+    segment = msg.segment("ZZZ", 1)
+    assert segment.name == "ZZZ"
+
+
+# -- security regression: a decode error never carries the offending bytes onward ------------------
+
+
+def test_payload_decode_error_does_not_chain_the_original_exception() -> None:
+    raw = ADT_A01.replace(b"SYNTHPATIENT", b"SYNTHPATIENT\xff\xfe")
+    bad = Hl7Message.parse(raw, encoding="ascii")
+    with pytest.raises(PayloadDecodeError) as caught:
+        _ = bad["PID.5.1"]
+    assert caught.value.__cause__ is None
+
+
+# -- defensive caps: max_bytes / max_segments -------------------------------------------------------
+
+
+def test_max_bytes_default_matches_the_envelope_inline_limit() -> None:
+    assert Hl7Message.INLINE_LIMIT_BYTES == 1_000_000
+
+
+def test_parse_rejects_a_message_over_max_bytes() -> None:
+    with pytest.raises(MalformedMessageError):
+        Hl7Message.parse(ADT_A01, max_bytes=10)
+
+
+def test_parse_accepts_a_message_at_or_under_max_bytes() -> None:
+    Hl7Message.parse(ADT_A01, max_bytes=len(ADT_A01))
+
+
+def test_max_bytes_none_disables_the_check() -> None:
+    Hl7Message.parse(ADT_A01, max_bytes=None)
+
+
+def test_parse_rejects_a_message_over_max_segments() -> None:
+    with pytest.raises(MalformedMessageError):
+        Hl7Message.parse(ADT_A01, max_segments=2)
+
+
+def test_parse_accepts_a_message_at_or_under_max_segments() -> None:
+    Hl7Message.parse(ADT_A01, max_segments=6)
+
+
+# -- code review test gap: a later segment's lazy decode failure is a typed error, not a crash -----
+
+
+def test_a_field_access_after_a_successful_parse_can_still_raise_on_a_later_segment() -> None:
+    """`Hl7Message.parse` only reads MSH eagerly (module docstring): a message that parses cleanly can
+    still fail, loudly and with a typed error, the first time something touches a segment whose bytes
+    are not valid in the requested encoding -- exactly what a downstream mapping step would hit, and it
+    must propagate rather than being swallowed anywhere in this package."""
+    raw = ADT_A01.replace(b"SYNTHPATIENT", b"SYNTHPATIENT\xff\xfe")
+    msg = Hl7Message.parse(raw, encoding="ascii")  # MSH decodes fine; parse() succeeds
+    assert msg.message_type() == ("ADT", "A01", "ADT_A01")  # MSH-only access: still fine
+    with pytest.raises(PayloadDecodeError):
+        msg.segment("PID").field(5, component=1)  # PID's bytes are not valid ascii

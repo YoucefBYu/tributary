@@ -24,13 +24,19 @@ from dataclasses import dataclass
 
 from .errors import FieldPathError
 
+#: The largest index any of the five numeric groups below may hold. `with_field`'s padding loops
+#: (`message.py`) grow a Python list to this many entries in the worst case, so this bounds that work as
+#: well as the value itself -- an unbounded `\d+` here was a code-review finding (an index of, say,
+#: 999999999 would try to append that many empty strings to a component list).
+MAX_INDEX = 9999
+
 _PATH = re.compile(
     r"^(?P<segment>[A-Za-z][A-Za-z0-9]{1,3})"
-    r"(?:\[(?P<segocc>\d+)\])?"
-    r"(?:\.(?P<field>\d+)"
-    r"(?:\[(?P<rep>\d+)\])?"
-    r"(?:\.(?P<component>\d+)"
-    r"(?:\.(?P<subcomponent>\d+))?)?)?$"
+    r"(?:\[(?P<segocc>\d{1,4})\])?"
+    r"(?:\.(?P<field>\d{1,4})"
+    r"(?:\[(?P<rep>\d{1,4})\])?"
+    r"(?:\.(?P<component>\d{1,4})"
+    r"(?:\.(?P<subcomponent>\d{1,4}))?)?)?$"
 )
 
 
@@ -62,6 +68,8 @@ def parse(path: str) -> FieldPath:
         value = int(text)
         if value < 1:
             raise FieldPathError(path, f"{name} must be 1 or greater, got {value}")
+        if value > MAX_INDEX:
+            raise FieldPathError(path, f"{name} must be {MAX_INDEX} or less, got {value}")
         return value
 
     field_text = match.group("field")

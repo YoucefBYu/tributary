@@ -56,8 +56,10 @@ def extract(first_segment: bytes, *, encoding: str) -> Delimiters:
         raise MalformedMessageError("first segment is too short to carry MSH-1 and MSH-2")
     try:
         field_sep = first_segment[3:4].decode(encoding)
-    except (UnicodeDecodeError, LookupError) as exc:
-        raise MalformedMessageError("MSH-1 is not decodable in the given encoding") from exc
+    except (UnicodeDecodeError, LookupError):
+        # `from None`: see message.py's `Segment._fields` for why a decode error is never chained here
+        # (its `.object` attribute holds the undecodable bytes -- invariant 6).
+        raise MalformedMessageError("MSH-1 is not decodable in the given encoding") from None
 
     field_sep_byte = first_segment[3:4]
     rest = first_segment[4:]
@@ -65,8 +67,8 @@ def extract(first_segment: bytes, *, encoding: str) -> Delimiters:
     encoding_chars_bytes = rest if end == -1 else rest[:end]
     try:
         encoding_chars = encoding_chars_bytes.decode(encoding)
-    except (UnicodeDecodeError, LookupError) as exc:
-        raise MalformedMessageError("MSH-2 is not decodable in the given encoding") from exc
+    except (UnicodeDecodeError, LookupError):
+        raise MalformedMessageError("MSH-2 is not decodable in the given encoding") from None
 
     if not encoding_chars:
         raise MalformedMessageError("MSH-2 (encoding characters) is empty")

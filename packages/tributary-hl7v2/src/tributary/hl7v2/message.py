@@ -15,6 +15,8 @@ Immutable, like `tributary.sdk.Message`: every mutator returns a new `Hl7Message
 
 from __future__ import annotations
 
+import re
+
 from . import paths
 from .delimiters import Delimiters
 from .delimiters import extract as extract_delimiters
@@ -22,16 +24,43 @@ from .errors import FieldPathError, MalformedMessageError, PayloadDecodeError, S
 from .escaping import escape, unescape
 from .paths import FieldPath
 
-#: Segment separator candidates, checked longest-first so a CRLF-terminated message is not misread as
-#: LF-terminated (which would leave a stray `\r` glued to the front of every following segment's name).
-_SEPARATORS: tuple[bytes, ...] = (b"\r\n", b"\r", b"\n")
+#: A structural HL7 v2 code (a message type or trigger event component, e.g. `ADT`, `A01`): three
+#: uppercase letters or digits. Used to allowlist sender-supplied `MSH-9` components before they are
+#: ever echoed into new content this package produces -- an ACK's own `MSH-9` (`ack.py`) or an
+#: `_tb.events` `attrs` entry (`tributary.hl7v2.step`) -- rather than relying on escaping alone (a
+#: security review found the escaping route incomplete; an allowlist does not depend on staying complete).
+STRUCTURAL_CODE = re.compile(r"^[A-Z0-9]{3}$")
 
 
 def _detect_separator(raw: bytes) -> bytes:
-    for candidate in _SEPARATORS:
-        if candidate in raw:
-            return candidate
-    return b"\r"  # canonical HL7 segment terminator; irrelevant when there is only one segment
+    """The segment separator: `\\r\\n`, `\\r` or `\\n`, chosen by which one every non-trailing `\\r` in
+    the message is (or is not) followed by.
+
+    A single global "does `\\r\\n` occur anywhere" check is what a security and code review both flagged
+    (independently): a message that genuinely uses bare `\\r` between segments but happens to carry a
+    `\\r\\n` byte pair *inside* one field's data would be misread as CRLF-separated, silently merging
+    every bare-`\\r`-terminated segment that follows into one. Scanning every `\\r` and requiring they
+    agree turns that silent corruption into a loud, typed `MalformedMessageError` instead.
+    """
+    lf_after_cr = 0
+    cr_alone = 0
+    length = len(raw)
+    for index, byte in enumerate(raw):
+        if byte != 0x0D:  # b"\r"
+            continue
+        if index + 1 == length:
+            continue  # a trailing CR with nothing after it is not evidence either way
+        if raw[index + 1] == 0x0A:  # b"\n"
+            lf_after_cr += 1
+        else:
+            cr_alone += 1
+    if lf_after_cr and cr_alone:
+        raise MalformedMessageError("message mixes CRLF and bare CR segment separators")
+    if lf_after_cr:
+        return b"\r\n"
+    if cr_alone or b"\r" in raw:
+        return b"\r"
+    return b"\n" if b"\n" in raw else b"\r"
 
 
 class Segment:
@@ -43,17 +72,23 @@ class Segment:
         self._raw = raw
         self._delimiters = delimiters
         self._encoding = encoding
-        sep_index = raw.find(delimiters.field.encode(encoding))
-        name_bytes = raw if sep_index == -1 else raw[:sep_index]
-        self.name = name_bytes.decode("ascii", errors="replace").upper()
+        # Fixed at 3 characters, matching `Hl7Message.__init__`'s index: the standard fixes every
+        # segment name at exactly 3 characters, so this is a spec assumption, not a heuristic guess (a
+        # code review found this used to search for the field separator instead, which made `name` the
+        # entire segment for one with no separator in it at all).
+        self.name = raw[:3].decode("ascii", errors="replace").upper()
         self._fields_cache: tuple[str, ...] | None = None
 
     def _fields(self) -> tuple[str, ...]:
         if self._fields_cache is None:
             try:
                 text = self._raw.decode(self._encoding)
-            except (UnicodeDecodeError, LookupError) as exc:
-                raise PayloadDecodeError(self._encoding) from exc
+            except (UnicodeDecodeError, LookupError):
+                # `from None`: a `UnicodeDecodeError`'s `.object` attribute holds the undecodable bytes
+                # themselves -- chaining it would let that PHI reach anything that walks the exception
+                # chain (a debugger, a reflective log serializer), even though nothing in this codebase's
+                # own logging does (invariant 6; a security review found this chained).
+                raise PayloadDecodeError(self._encoding) from None
             self._fields_cache = tuple(text.split(self._delimiters.field))
         return self._fields_cache
 
@@ -124,6 +159,21 @@ class Segment:
             unescape(_resolve_within_repetition(rep, path, self._delimiters), self._delimiters) for rep in reps
         )
 
+    def raw(self, path: FieldPath) -> str:
+        """Like `get`, but skips `unescape`: the still-escaped wire text at `path`.
+
+        For copying a field verbatim into a *new* message (`ack.py`'s echoed `MSH` fields) without ever
+        decoding sender-controlled escape sequences into structural characters -- decoding and
+        re-encoding is where a security review found a control-character injection (a decoded value
+        spliced into a new segment with an incompletely escaping `escape()`). Copying the raw text needs
+        no re-escaping at all, because it was already valid wire text the moment it arrived.
+        """
+        if path.field is None:
+            return self._text()
+        if self.name == "MSH" and path.field in (1, 2):
+            return self._field_raw(path.field)
+        return _resolve(self._field_raw(path.field), path, self._delimiters)
+
     def _text(self) -> str:
         return self._delimiters.field.join(self._fields())
 
@@ -177,22 +227,48 @@ class Hl7Message:
 
     # -- construction ------------------------------------------------------------------------------
 
+    #: The envelope contract's inline payload limit (`contracts/envelope/v0`): a message larger than this
+    #: was never meant to travel inline on Kafka at all, so `parse`'s default `max_bytes` matches it as a
+    #: defensive cap, independent of whatever already enforced (or failed to enforce) that limit upstream.
+    INLINE_LIMIT_BYTES = 1_000_000
+
     @classmethod
-    def parse(cls, raw: bytes, *, encoding: str = "utf-8") -> Hl7Message:
+    def parse(
+        cls,
+        raw: bytes,
+        *,
+        encoding: str = "utf-8",
+        max_bytes: int | None = INLINE_LIMIT_BYTES,
+        max_segments: int | None = None,
+    ) -> Hl7Message:
         """Parse a complete HL7 v2 message from bytes.
 
         Only segment boundaries and `MSH-1`/`MSH-2` are read eagerly; everything else is lazy. Raises
         `MalformedMessageError` for anything that cannot be assigned segment boundaries or delimiters at
         all -- never a bare `IndexError`, `UnicodeDecodeError` or similar (W2-1: "malformed input raises
         a typed exception").
+
+        `max_bytes` (default `INLINE_LIMIT_BYTES`) and `max_segments` (default unbounded, since real
+        batch and large-ORU messages vary widely) are defensive caps, checked before any parsing work:
+        without one, a caller assembling an accessor path from unbounded input (a huge segment or
+        occurrence count) has no bound on the work `with_field` or `segments` will do for a single
+        message. Pass `None` to disable either check explicitly.
         """
         if not isinstance(raw, bytes | bytearray | memoryview):
             raise MalformedMessageError("raw message must be bytes")
         raw = bytes(raw)
         if not raw:
             raise MalformedMessageError("message is empty")
+        if max_bytes is not None and len(raw) > max_bytes:
+            raise MalformedMessageError(f"message is {len(raw)} bytes, over the {max_bytes}-byte limit")
         seg_sep = _detect_separator(raw)
         segment_bytes = tuple(raw.split(seg_sep))
+        if max_segments is not None:
+            # Non-empty chunks only, matching `len(Hl7Message(...))`: a trailing separator's empty
+            # chunk is bookkeeping, not a segment, and must not count against a caller's stated cap.
+            actual_segments = sum(1 for chunk in segment_bytes if chunk)
+            if actual_segments > max_segments:
+                raise MalformedMessageError(f"message has over {max_segments} segments")
         if not segment_bytes or not segment_bytes[0]:
             raise MalformedMessageError("message has no first segment")
         delimiters = extract_delimiters(segment_bytes[0], encoding=encoding)
@@ -263,6 +339,16 @@ class Hl7Message:
 
     def __getitem__(self, path: str) -> str:
         return self.require(path)
+
+    def raw(self, path: str, default: str | None = None) -> str | None:
+        """Like `get`, but skips `unescape`: the still-escaped wire text at `path`, or `default` if its
+        segment is not present. See `Segment.raw` for why this exists."""
+        parsed = paths.parse(path)
+        try:
+            segment = self.segment(parsed.segment, parsed.segment_occurrence)
+        except SegmentNotFoundError:
+            return default
+        return segment.raw(parsed)
 
     def repetitions(self, path: str) -> tuple[str, ...]:
         """Every repetition of the field at `path` (the path's own `[repetition]`, if any, is ignored)."""

@@ -79,8 +79,11 @@ def escape(text: str, delimiters: Delimiters) -> str:
     characters (escape sequences this module does not generate on decode, like `\\H\\`, are never produced
     here either -- a step writing a value only needs the delimiters escaped, never highlighting markers).
 
-    Also escapes CR, since a literal carriage return inside a field would be indistinguishable from a
-    segment boundary once serialized.
+    Also hex-escapes (`\\Xhh\\`) every C0 control character (`0x00`-`0x1F`) and DEL (`0x7F`), not just CR:
+    a bare LF, VT or FS in a value a step writes back (or that `ack.py` echoes) would otherwise be
+    indistinguishable from a segment or field boundary once serialized, or from the MLLP end-of-block
+    byte once framed -- a security review found exactly that gap (LF injecting a second segment) and it
+    generalises to the whole C0 range, not only the two or three bytes a proof of concept happened to use.
     """
     esc = delimiters.escape
     replacements = {
@@ -89,9 +92,13 @@ def escape(text: str, delimiters: Delimiters) -> str:
         delimiters.component: f"{esc}S{esc}",
         delimiters.subcomponent: f"{esc}T{esc}",
         delimiters.repetition: f"{esc}R{esc}",
-        "\r": f"{esc}X0D{esc}",
     }
     out: list[str] = []
     for char in text:
-        out.append(replacements.get(char, char))
+        if char in replacements:
+            out.append(replacements[char])
+        elif ord(char) < 0x20 or ord(char) == 0x7F:
+            out.append(f"{esc}X{ord(char):02X}{esc}")
+        else:
+            out.append(char)
     return "".join(out)
