@@ -58,8 +58,8 @@ def test_every_builtin_is_registered_under_its_contract_name() -> None:
         ({"field": "hl7:MSH.9.2", "notIn": ["A08"], "onUnresolved": "reject"}, True),
         ({"field": "hl7:MSH.9.2", "notIn": ["A01"], "onUnresolved": "reject"}, False),
         ({"field": "hl7:PV1.2", "present": True, "onUnresolved": "reject"}, True),
-        ({"field": "hl7:PV2.1", "present": True, "onUnresolved": "reject"}, False),
-        ({"field": "hl7:PV2.1", "present": False, "onUnresolved": "reject"}, True),
+        ({"field": "hl7:ORC.1", "present": True, "onUnresolved": "reject"}, False),
+        ({"field": "hl7:ORC.1", "present": False, "onUnresolved": "reject"}, True),
     ],
 )
 def test_filter_keeps_or_drops_on_the_field(with_: dict[str, object], kept: bool) -> None:
@@ -77,7 +77,7 @@ def test_filter_keeps_or_drops_on_the_field(with_: dict[str, object], kept: bool
 )
 def test_filter_on_unresolved_does_what_the_author_wrote(choice: str, expected: type) -> None:
     """A missing field is not silently a drop: the author chose, and `onUnresolved` has no default."""
-    with_ = {"field": "hl7:ZZZ.1", "in": ["X"], "onUnresolved": choice}
+    with_ = {"field": "hl7:ORC.5", "in": ["X"], "onUnresolved": choice}
     ctx = FakeContext()
     outcome = run_step(filter_step, hl7(), with_=with_, ctx=ctx)
     assert isinstance(outcome, expected)
@@ -102,6 +102,36 @@ def test_filter_present_treats_a_wrong_format_as_unresolved_not_absent() -> None
         filter_step, fhir({"a": 1}), with_={"field": "hl7:PV1.2", "present": False, "onUnresolved": "drop"}
     )
     assert outcome == Drop(reason="FILTERED_UNRESOLVED")
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "hl7:PV1.19",  # visit number
+        "hl7:ORC.3",  # filler order number
+        "hl7:OBR.3",
+        "hl7:OBX.5",  # a result value
+        "hl7:ZPI.1",  # any Z-segment
+        "hl7:MSH.10",  # message control id: unique per message, a correlation handle
+        "hl7:MSH.9",  # the whole field is not on the list, only its components
+        "json:/subject/display",
+        "json:/subject/reference",
+        "json:/id",
+        "json:/code/text",
+    ],
+)
+def test_filter_fields_are_an_allow_list_not_a_deny_list(field: str) -> None:
+    """Security review, W2-5 MEDIUM 3: each of these passed the segment deny-list and can carry an
+    identifier or a free-text value into the published spec."""
+    with pytest.raises(StepConfigError, match="may only be one of"):
+        filter_step.bind({"field": field, "in": ["X"], "onUnresolved": "drop"})
+
+
+def test_every_allow_listed_filter_field_binds() -> None:
+    from tributary.runtime.builtins.filter import FILTER_FIELDS
+
+    for field in sorted(FILTER_FIELDS):
+        filter_step.bind({"field": field, "in": ["X"], "onUnresolved": "drop"})
 
 
 def test_filter_reads_json_with_the_shared_evaluator() -> None:

@@ -13,11 +13,14 @@ choice the author writes down, which is why `onUnresolved` has no default. For `
 field is the answer ("not present"), so only a payload the locator cannot read at all - wrong format,
 wrong content type, an ambiguous duplicate JSON member - is unresolved.
 
-**The identifier deny-list.** The `in` values are written in the spec, which is published on
-`_tb.<env>.channels` and shown in the UI, so a filter on a patient-identifying field would put PHI in a
-spec. `field` may not point into `PID`, `PD1`, `NK1`, `GT1`, `IN1`, `IN2` or `MRG`, and a JSON pointer may
-not pass through `identifier`, `name`, `birthDate`, `telecom` or `address`. The contract says "end in";
-this checks **every** token, because `/identifier/0/value` ends in `value`. A deny-list, not a proof.
+**Which fields may be filtered on: an allow-list** (security review of W2-5, pending the architect's
+ratification in README 3.3.2). The `in` values are written in the spec, which is published on
+`_tb.<env>.channels` and shown in the UI, so a filter on an identifying field puts PHI in a spec. The
+decision of 2026-09-24 is that filter "may not filter on identifier fields", and a deny-list of
+segments could not deliver it: `PV1.19` (visit number), `ORC.3`/`OBR.3` (filler order numbers), `OBX.5`
+(a result value), any Z-segment and `json:/subject/reference` all passed. So `field` must be **exactly**
+one of `FILTER_FIELDS` - message typing and status codes, the same kind of field enrich may copy - and
+the ratified deny-list (identifying segments; every JSON token) is still checked as a second line.
 """
 
 from __future__ import annotations
@@ -49,6 +52,34 @@ FILTERED: Final = "FILTERED"
 #: `onUnresolved: drop`. Distinct from `FILTERED` so the browser shows *why* a message went nowhere.
 FILTERED_UNRESOLVED: Final = "FILTERED_UNRESOLVED"
 
+#: Exact locator text. Feed and message typing (as enrich's `attrFrom`), plus status-style codes with
+#: small, published vocabularies: patient class, admission type, order control and status, result
+#: status, value type; FHIR `status`, `intent` and Bundle `type`. Nothing here can hold an identifier.
+FILTER_FIELDS: Final = frozenset(
+    {
+        "hl7:MSH.3",
+        "hl7:MSH.4",
+        "hl7:MSH.5",
+        "hl7:MSH.6",
+        "hl7:MSH.9.1",
+        "hl7:MSH.9.2",
+        "hl7:MSH.9.3",
+        "hl7:MSH.11",
+        "hl7:MSH.12",
+        "hl7:EVN.1",
+        "hl7:PV1.2",
+        "hl7:PV1.4",
+        "hl7:ORC.1",
+        "hl7:ORC.5",
+        "hl7:OBR.25",
+        "hl7:OBX.2",
+        "hl7:OBX.11",
+        "json:/resourceType",
+        "json:/status",
+        "json:/intent",
+        "json:/type",
+    }
+)
 IDENTIFYING_SEGMENTS: Final = frozenset({"PID", "PD1", "NK1", "GT1", "IN1", "IN2", "MRG"})
 IDENTIFYING_JSON_TOKENS: Final = frozenset({"identifier", "name", "birthDate", "telecom", "address"})
 
@@ -61,7 +92,8 @@ OnUnresolved = Literal["drop", "keep", "reject"]
 
 
 def _check(step: str, values: Mapping[str, object]) -> None:
-    expression = parse_locator(step, "field", str(values.get("field", "")))
+    field = str(values.get("field", ""))
+    expression = parse_locator(step, "field", field)
     if expression.hl7_path is not None and expression.hl7_path[0] in IDENTIFYING_SEGMENTS:
         raise refuse(
             step,
@@ -72,6 +104,12 @@ def _check(step: str, values: Mapping[str, object]) -> None:
         denied = sorted(set(expression.json_path) & IDENTIFYING_JSON_TOKENS)
         if denied:
             raise refuse(step, f"`field` passes through {denied[0]}, which identifies a patient (README 3.3.2)")
+    if field not in FILTER_FIELDS:
+        raise refuse(
+            step,
+            "`field` may only be one of " + ", ".join(sorted(FILTER_FIELDS)) + ": filter values are published "
+            "in the spec, so other fields could put identifiers there",
+        )
     chosen = [key for key in ("in", "notIn", "present") if key in values]
     if len(chosen) != 1:
         raise refuse(step, "exactly one of `in`, `notIn`, `present` is required")
