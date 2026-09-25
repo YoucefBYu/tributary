@@ -4,6 +4,11 @@ One Kafka hop in, one per destination out, and everything between them in memory
 worker commits its input offset only after every `out.<dest>` record has a delivery callback, so a
 crash mid-flight replays rather than drops (invariants 1 and 4).
 
+`pipeline.transactional: true` (ADR-003 D6) makes each commit window one Kafka transaction: the
+`out.<dest>` and DLQ records and the `raw` offsets commit atomically (`transactions.py`). The flag is
+read at startup, because the producer's transactional identity is fixed at construction; a hot reload
+that flips it is logged and takes effect at the next restart.
+
 Hot reload without a control plane: the channel-spec cache is polled once per message, so a new
 `metadata.version` published to `_tb.<env>.channels` takes effect on the next record. PostgreSQL and
 the API can be down throughout (invariant 3).
@@ -38,6 +43,13 @@ from .records import RECORD_UNDECODABLE, ConsumedRecord, quarantine_blob
 from .spec import ChannelSpec, RetryPolicy
 from .steps import load_steps
 from .topics import channels_topic, consumer_group, dlq_topic, events_topic, out_topic, raw_topic
+from .transactions import (
+    GroupMetadataSource,
+    TransactionalCommitter,
+    TransactionalProducerLike,
+    transactional_id,
+    transactional_producer_config,
+)
 
 #: Retry policy for the produce half of the pipeline worker. The channel spec carries a policy per
 #: destination, which governs the loader; a failure to produce to `out.<dest>` is a Kafka-side failure
@@ -249,8 +261,11 @@ class PipelineHandler:
         instance: str,
         steps_override: tuple[Step, ...] | None = None,
         flush_timeout_s: float = 30.0,
+        transactional: bool = False,
     ) -> None:
         self._env = env
+        self._transactional = transactional
+        self._warned_version: int | None = None
         self._spec_provider = spec_provider
         self._producer = producer
         self._emitter = emitter
@@ -271,6 +286,15 @@ class PipelineHandler:
 
     def handle(self, record: ConsumedRecord) -> None:
         spec = self._spec_provider()
+        if spec.pipeline.transactional != self._transactional and self._warned_version != spec.version:
+            # The producer's transactional identity is fixed at construction: say so, once per version.
+            self._warned_version = spec.version
+            self._log.warning(
+                "transactional_change_needs_restart",
+                channel=spec.name,
+                channel_version=spec.version,
+                running_transactional=self._transactional,
+            )
         ctx = WorkerContext(
             channel=spec.name,
             channel_version=spec.version,
@@ -309,8 +333,10 @@ class PipelineHandler:
             )
 
         # Commit-after-delivery: the loop commits the input offset when this returns, so every
-        # destination record must be acknowledged by the broker first (invariants 1 and 4).
-        self._producer.flush_pending(self._flush_timeout_s)
+        # destination record must be acknowledged by the broker first (invariants 1 and 4). Inside a
+        # transaction the commit itself flushes and fails - then aborts - if any record did not land.
+        if not self._transactional:
+            self._producer.flush_pending(self._flush_timeout_s)
 
         for destination in spec.destinations:
             self._emit(spec, record, stage="routed", status="ok", ctx=ctx, destination=destination.name)
@@ -422,9 +448,18 @@ class PipelineWorker:
         )
         spec = self.specs.current()
 
-        data_producer = Producer(
-            producer_config(self.settings.kafka, defaults, client_id=f"tb-{env}-{channel}-{self.settings.instance_id}")
+        transactional = spec.pipeline.transactional
+        base_config = producer_config(
+            self.settings.kafka, defaults, client_id=f"tb-{env}-{channel}-{self.settings.instance_id}"
         )
+        if transactional:
+            base_config = transactional_producer_config(
+                base_config,
+                transactional_id_value=transactional_id(
+                    defaults.transactional_id_template, env=env, channel=channel, instance=self.settings.instance_id
+                ),
+            )
+        data_producer = Producer(base_config)
         producer = RecordProducer(cast("KafkaProducerLike", data_producer), log=self.log)
         check_partition_counts(data_producer, env, spec)
 
@@ -448,6 +483,7 @@ class PipelineWorker:
             instance=self.settings.instance,
             steps_override=self.steps_override,
             flush_timeout_s=self.settings.flush_timeout_s,
+            transactional=transactional,
         )
 
         consumer = cast(
@@ -462,9 +498,18 @@ class PipelineWorker:
                 )
             ),
         )
+        committer = None
+        if transactional:
+            committer = TransactionalCommitter(
+                cast("TransactionalProducerLike", data_producer),
+                cast("GroupMetadataSource", consumer),
+                log=self.log,
+            )
+            committer.initialise()  # fences a previous incarnation and aborts what it left open
         self.loop = ConsumerLoop(
             consumer,
             handler,
+            committer=committer,
             topics=[raw_topic(env, channel)],
             retry=PRODUCE_RETRY,
             settings=LoopSettings(
@@ -493,6 +538,7 @@ class PipelineWorker:
             commit_every=defaults.consumer.commit_every,
             session_timeout_ms=defaults.consumer.session_timeout_ms,
             destinations=len(spec.destinations),
+            transactional=transactional,
         )
         return self.loop
 

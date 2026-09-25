@@ -366,3 +366,40 @@ def test_the_worker_defaults_to_the_profile_that_needs_the_warning() -> None:
         instance_id="pipeline-1",
     )
     assert settings.profile == "lite"
+
+
+def test_a_transactional_handler_leaves_the_flush_to_the_transaction_commit() -> None:
+    """commit_transaction flushes and aborts on any failed record; a per-record flush would only cost."""
+    import dataclasses
+
+    producer, emitter = FakeProducer(), RecordingEmitter()
+    base = spec()
+    txn_spec = dataclasses.replace(base, pipeline=dataclasses.replace(base.pipeline, transactional=True))
+    stream = io.StringIO()
+    pipeline = PipelineHandler(
+        env="dev",
+        spec_provider=lambda: txn_spec,
+        producer=RecordProducer(producer, log=JsonLogger("test", stream=stream)),
+        emitter=emitter,
+        log=JsonLogger("worker", stream=stream),
+        instance="worker:test@localhost",
+        steps_override=(passthrough,),
+        transactional=True,
+    )
+    pipeline.handle(consumed())
+    assert producer.flushes == 0
+    assert "transactional_change_needs_restart" not in stream.getvalue()
+
+
+def test_a_hot_reload_that_flips_transactional_is_logged_once_per_version() -> None:
+    import dataclasses
+
+    producer, emitter = FakeProducer(), RecordingEmitter()
+    base = spec()
+    txn_spec = dataclasses.replace(base, pipeline=dataclasses.replace(base.pipeline, transactional=True))
+    stream = io.StringIO()
+    handler(producer, emitter, channel_spec=txn_spec, stream=stream).handle(consumed())
+    pipeline = handler(producer, emitter, channel_spec=txn_spec, stream=stream)
+    pipeline.handle(consumed())
+    pipeline.handle(consumed(offset=8))
+    assert stream.getvalue().count("transactional_change_needs_restart") == 2  # two handlers, once each

@@ -49,6 +49,8 @@ class TopicDefaults:
     consumer: ConsumerDefaults
     producer: Mapping[str, Any]
     profiles: Mapping[str, Mapping[str, Any]]
+    #: `clients.transactional_stage_producer.transactional.id`, e.g. `tb.<env>.<channel>.pipeline.<instance>`.
+    transactional_id_template: str = ""
 
     def startup_warning(self, profile: str) -> str | None:
         """The warning a profile requires at startup, or `None`.
@@ -152,8 +154,15 @@ def load_topic_defaults(contracts_dir: str | Path | None = None) -> TopicDefault
     if not isinstance(producer_block, dict):
         raise ConfigError("clients.receiver_producer is missing from the topics contract")
 
+    txn_block = clients.get("transactional_stage_producer")
+    txn_template = txn_block.get("transactional.id") if isinstance(txn_block, dict) else None
+    if not isinstance(txn_template, str) or "<instance>" not in txn_template:
+        # One id per worker, stable across restarts, is what lets init_transactions fence a zombie.
+        raise ConfigError("clients.transactional_stage_producer.transactional.id must be a template with <instance>")
+
     return TopicDefaults(
         source=path,
+        transactional_id_template=txn_template,
         partitions=partitions,
         class_configs=class_configs,
         consumer=ConsumerDefaults(

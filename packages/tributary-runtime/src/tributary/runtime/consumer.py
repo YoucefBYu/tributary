@@ -36,6 +36,14 @@ is not a failure of anything already delivered, so the offsets stay pending and 
 the revoke callback - carries them; the worst case is a replay, which at-least-once permits. Any other
 commit error still raises.
 
+**Transactions (ADR-003 D6, opt-in).** With a `TransactionalCommitter` the records between two commits
+are one Kafka transaction: their `out` and DLQ records and their input offsets commit together. A
+retryable failure that will be retried (or halts) aborts the whole window, so every partition in it is
+rewound to where the window began - not only the failed one - and the failed partition pauses there.
+A failure that exhausts into `dlq-and-continue` does not abort: the dead letter joins the open
+transaction, which is the same outcome the non-transactional path produces. `transactions.py` has the
+client-side rules.
+
 **A `TopicPartition` is never formatted into a log line.** Its `repr` crashes on Windows, and the
 record it is logging beside is then silently dropped.
 """
@@ -56,6 +64,7 @@ from .events import EventEmitter, MessageEvent, PartitionEvent, RecordEvent
 from .executor import StepFailure
 from .records import ConsumedRecord, DecodeContext, RecordDecodeError, RecordRejectError, decode_record
 from .spec import RetryPolicy
+from .transactions import Committer, OffsetCommitter, TransactionError
 
 #: librdkafka's "reached the end of this partition" signal. Informational, not an error.
 PARTITION_EOF = -191
@@ -124,6 +133,9 @@ class RetryState:
     attempt: int = 0
     resume_at: float = 0.0
     halted: bool = False
+    #: Where the partition is sought back to: the failed offset, or the start of an aborted
+    #: transactional window, whose earlier records were discarded along with it.
+    resume_from: int = -1
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,6 +162,7 @@ class LoopStats:
     pauses: int = 0
     resumes: int = 0
     halts: int = 0
+    aborts: int = 0
     pending: dict[Key, int] = field(default_factory=dict)
 
 
@@ -188,6 +201,7 @@ class ConsumerLoop:
         destination: str | None = None,
         read_stage: str = "queued",
         clock: Callable[[], float] = time.monotonic,
+        committer: Committer | None = None,
     ) -> None:
         self._consumer = consumer
         self._handler = handler
@@ -206,6 +220,10 @@ class ConsumerLoop:
         #: always `quarantined`, because that record never reached any stage.
         self._read_stage = read_stage
         self._clock = clock
+        self._committer: Committer = committer if committer is not None else OffsetCommitter(consumer)
+        #: Transactional mode: the first offset consumed per partition in the open window - where an
+        #: abort must rewind to.
+        self._window_start: dict[Key, int] = {}
         self._retry_state: dict[Key, RetryState] = {}
         self._since_commit = 0
         self._running = False
@@ -234,9 +252,11 @@ class ConsumerLoop:
                 iterations += 1
                 self._resume_due_partitions()
                 raw = self._consumer.poll(self.poll_timeout())
-                if raw is None:
-                    continue
-                self._consume_one(raw)
+                if raw is not None:
+                    self._consume_one(raw)
+                if self._committer.should_commit_now(idle=raw is None):
+                    # An open transaction blocks every read_committed reader downstream: never leave one.
+                    self._commit_pending(force=True)
         finally:
             self._drain()
         return self.stats
@@ -248,8 +268,9 @@ class ConsumerLoop:
         revoke callback during interpreter shutdown is where "it committed on my laptop" comes from.
         """
         try:
-            self._commit_pending(force=True)
+            self._commit_pending(force=True, rewind=False)
         finally:
+            self._committer.abort()  # a no-op unless nothing was pending and a transaction is open
             self._consumer.close()
             self._log.info(
                 "worker_stopped",
@@ -295,11 +316,17 @@ class ConsumerLoop:
             self._quarantine(raw, topic, partition, offset, exc)
             return
 
+        if self._committer.transactional:
+            self._window_start.setdefault((topic, partition), offset)
+        self._committer.before_record()
         try:
             self._handler.handle(record)
         except DeliveryError as exc:
             if exc.retryable:
-                self._begin_retry(record, error_code=exc.error_code)
+                resume_from = record.offset
+                if self._committer.transactional and not self._exhausts_to_dlq(record):
+                    resume_from = self._abort_window().get((topic, partition), record.offset)
+                self._begin_retry(record, error_code=exc.error_code, resume_from=resume_from)
             else:
                 self._dead_letter(record, error_code=exc.error_code, stage="pending")
             return
@@ -311,7 +338,12 @@ class ConsumerLoop:
 
     def _succeed(self, record: ConsumedRecord) -> None:
         key = (record.topic, record.partition)
-        self._retry_state.pop(key, None)
+        state = self._retry_state.get(key)
+        # After a transactional abort the partition replays from the window start, so records before
+        # the failed one succeed first. Only a success at or past the failed offset ends the retry;
+        # otherwise the attempt count would reset every cycle and never exhaust.
+        if state is not None and record.offset >= state.offset:
+            del self._retry_state[key]
         self.stats.handled += 1
         self._mark(key, record.offset)
 
@@ -321,14 +353,25 @@ class ConsumerLoop:
         if self._since_commit >= self._settings.commit_every:
             self._commit_pending()
 
-    def _commit_pending(self, *, force: bool = False) -> None:
+    def _commit_pending(self, *, force: bool = False, rewind: bool = True) -> None:
         if not self.stats.pending or (not force and self._since_commit == 0):
             return
         offsets = [
             TopicPartition(topic, partition, offset + 1) for (topic, partition), offset in self.stats.pending.items()
         ]
         try:
-            self._consumer.commit(offsets=offsets, asynchronous=False)
+            self._committer.commit(offsets)
+        except TransactionError as exc:
+            # The committer has already aborted: nothing in the window is durable, so re-consume it all.
+            self._log.warning("window_aborted", channel=self._channel, error_code=exc.error_code)
+            self.stats.aborts += 1
+            if rewind:
+                self._rewind_window()
+            else:
+                self._window_start.clear()
+                self.stats.pending.clear()
+            self._since_commit = 0
+            return
         except KafkaException as exc:
             error = exc.args[0] if exc.args else None
             code = error.code() if isinstance(error, KafkaError) else None
@@ -341,15 +384,41 @@ class ConsumerLoop:
         self.stats.commits += 1
         self._since_commit = 0
         self.stats.pending.clear()
+        self._window_start.clear()
+
+    def _exhausts_to_dlq(self, record: ConsumedRecord) -> bool:
+        """True when this failure is the last attempt and the policy dead-letters and moves on."""
+        state = self._retry_state.get((record.topic, record.partition))
+        attempts = state.attempt if state is not None and state.offset == record.offset else 0
+        return attempts + 1 >= self._retry.max_attempts and self._retry.on_exhaust == "dlq-and-continue"
+
+    def _abort_window(self) -> dict[Key, int]:
+        """Abort the open transaction and rewind every partition in it. Returns the window starts."""
+        starts = dict(self._window_start)
+        self._committer.abort()
+        self.stats.aborts += 1
+        self._rewind_window()
+        return starts
+
+    def _rewind_window(self) -> None:
+        """Seek every partition of an aborted window back to where the window began."""
+        for (topic, partition_number), start in self._window_start.items():
+            state = self._retry_state.get((topic, partition_number))
+            if state is not None and 0 <= start < state.resume_from:
+                state.resume_from = start
+            self._consumer.seek(TopicPartition(topic, partition_number, start))
+        self._window_start.clear()
+        self.stats.pending.clear()
 
     # -- blocking retry --------------------------------------------------------------------------
 
-    def _begin_retry(self, record: ConsumedRecord, *, error_code: str) -> None:
+    def _begin_retry(self, record: ConsumedRecord, *, error_code: str, resume_from: int | None = None) -> None:
         key = (record.topic, record.partition)
         state = self._retry_state.get(key)
         if state is None or state.offset != record.offset:
             state = RetryState(offset=record.offset)
             self._retry_state[key] = state
+        state.resume_from = record.offset if resume_from is None else min(resume_from, record.offset)
         state.attempt += 1
         self.stats.retried += 1
 
@@ -397,7 +466,10 @@ class ConsumerLoop:
         otherwise refetch from last-consumed + 1 and skip this record entirely — at-least-once turned
         into silent loss. Seeking before the resume also avoids racing an in-flight fetch.
         """
-        partition = TopicPartition(record.topic, record.partition, state.offset)
+        # `resume_from`, not the failed offset: after a transactional abort the records before the failed
+        # one in this window were discarded too, and seeking past them would skip them.
+        target = state.resume_from if state.resume_from >= 0 else state.offset
+        partition = TopicPartition(record.topic, record.partition, target)
         self._consumer.pause([partition])
         self._consumer.seek(partition)
 
@@ -613,7 +685,16 @@ class ConsumerLoop:
         self._log.info("partitions_revoked", channel=self._channel, count=len(partitions))
 
     def _on_lost(self, consumer: KafkaConsumerLike, partitions: list[TopicPartition]) -> None:
-        """The group moved on without us. **Do not commit** — another member owns these now."""
+        """The group moved on without us. **Do not commit** — another member owns these now.
+
+        A transaction open across these partitions cannot be committed either: its offsets would be for
+        partitions this member no longer owns, and the broker would reject them. It is aborted, and the
+        surviving partitions of the window are rewound.
+        """
+        if self._committer.transactional and self._window_start:
+            for partition in partitions:
+                self._window_start.pop((partition.topic, partition.partition), None)
+            self._abort_window()
         lost: Iterable[TopicPartition] = partitions
         for partition in lost:
             self.stats.pending.pop((partition.topic, partition.partition), None)
