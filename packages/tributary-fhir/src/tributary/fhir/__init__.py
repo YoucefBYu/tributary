@@ -29,11 +29,13 @@ from __future__ import annotations
 
 from .bundle import (
     TB_MESSAGE_SYSTEM,
+    Bundle,
     BundleEntry,
     BundleEntryRequest,
     Identifier,
     LocalFhir,
     Resource,
+    message_id_factory,
     message_identifier,
     sequential_id_factory,
     uuid_id_factory,
@@ -51,6 +53,7 @@ from .terminology import CodeLookup, LocalTerminology, load_table
 
 __all__ = [
     "TB_MESSAGE_SYSTEM",
+    "Bundle",
     "BundleEntry",
     "BundleEntryError",
     "BundleEntryRequest",
@@ -69,6 +72,7 @@ __all__ = [
     "attach",
     "fake_fhir_context",
     "load_table",
+    "message_id_factory",
     "message_identifier",
     "sequential_id_factory",
     "uuid_id_factory",

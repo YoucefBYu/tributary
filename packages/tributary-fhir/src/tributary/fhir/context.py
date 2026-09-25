@@ -157,7 +157,15 @@ class _Attached:
 def attach(base: Context, *, fhir: FhirInterface, terminology: Terminology) -> FhirContext:
     """Compose a base `Context` with `.fhir` and `.terminology`. Pure Python, no I/O of its own.
 
-    One `ctx` spans a whole pipeline (`tributary.sdk.testing.run_pipeline`'s docstring), so this is
-    meant to be called once, before the pipeline runs, and the same `FhirContext` passed to every step.
+    One `ctx` spans a whole pipeline (`tributary.sdk.testing.run_pipeline`'s docstring) -- one message's
+    trip through its steps, not every message a channel ever sees -- so this is meant to be called once
+    per message, before that message's pipeline runs, and the same `FhirContext` passed to every step.
+
+    **Production `fhir=` should be `LocalFhir(id_factory=message_id_factory(message.msg_id))`** (W2-2
+    open item 3, `bundle.py`), not `LocalFhir()`'s `uuid_id_factory` default: calling `attach` once per
+    message is exactly what makes a message-derived `fullUrl` possible, since the id factory closes over
+    that message's `tb-msg-id`. Wiring this call site into the running engine is `tributary-runtime`'s
+    (ADR-001 6.2); `tributary.fhir.fakes.fake_fhir_context` already does the test-time equivalent with
+    `sequential_id_factory`.
     """
     return _Attached(base, fhir, terminology)

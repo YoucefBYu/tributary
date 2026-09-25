@@ -9,6 +9,7 @@ from tributary.fhir.bundle import (
     TB_MESSAGE_SYSTEM,
     Identifier,
     LocalFhir,
+    message_id_factory,
     message_identifier,
     sequential_id_factory,
     uuid_id_factory,
@@ -94,3 +95,23 @@ def test_message_identifier_with_discriminator() -> None:
 def test_message_identifier_never_equals_a_patient_identifier_system() -> None:
     identifier = message_identifier("0199-abc-uuid")
     assert identifier.system != SYNTH_IDENTIFIER.system
+
+
+def test_message_id_factory_is_deterministic_and_not_uuid4() -> None:
+    """W2-2 open item 3: production `fullUrl`s come from `tb-msg-id`, so a reprocess of the same message
+    reproduces the same `fullUrl`s rather than a fresh `uuid4` each run."""
+    first_run = message_id_factory("0199036e-7a3e-7f00-8c21-abc123456789")
+    second_run = message_id_factory("0199036e-7a3e-7f00-8c21-abc123456789")
+    assert first_run() == second_run()
+    assert first_run() == second_run()  # the second call in each run also lines up (per-call sequence)
+
+
+def test_message_id_factory_differs_across_messages() -> None:
+    a = message_id_factory("0199036e-7a3e-7f00-8c21-abc123456789")
+    b = message_id_factory("0199036e-7a3e-7f00-8c21-000000000000")
+    assert a() != b()
+
+
+def test_message_id_factory_produces_a_urn_uuid() -> None:
+    factory = message_id_factory("0199036e-7a3e-7f00-8c21-abc123456789")
+    assert factory().startswith("urn:uuid:")

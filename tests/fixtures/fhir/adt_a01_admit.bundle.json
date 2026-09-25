@@ -1,0 +1,101 @@
+{
+  "entry": [
+    {
+      "fullUrl": "urn:uuid:test-1",
+      "request": {
+        "ifNoneExist": "identifier=urn:id:SYNTH-HOSPITAL|9000001",
+        "method": "PUT",
+        "url": "Patient?identifier=urn:id:SYNTH-HOSPITAL|9000001"
+      },
+      "resource": {
+        "address": [
+          {
+            "city": "SYNTHVILLE",
+            "country": "US",
+            "line": [
+              "100 SYNTH ST"
+            ],
+            "postalCode": "00000",
+            "state": "ZZ"
+          }
+        ],
+        "birthDate": "1980-01-15",
+        "gender": "male",
+        "identifier": [
+          {
+            "system": "urn:id:SYNTH-HOSPITAL",
+            "type": {
+              "coding": [
+                {
+                  "code": "MR",
+                  "display": "Medical record number",
+                  "system": "http://terminology.hl7.org/CodeSystem/v2-0203"
+                }
+              ]
+            },
+            "value": "9000001"
+          },
+          {
+            "system": "urn:id:SYNTH-HOSPITAL",
+            "value": "9000001-ACC"
+          }
+        ],
+        "name": [
+          {
+            "family": "SYNTHPATIENT",
+            "given": [
+              "ALPHA",
+              "Q"
+            ],
+            "use": "official"
+          }
+        ],
+        "resourceType": "Patient",
+        "telecom": [
+          {
+            "system": "phone",
+            "value": "(000)555-0100"
+          }
+        ]
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:test-2",
+      "request": {
+        "ifNoneExist": "identifier=https://tributary.dev/fhir/identifier/tb-msg-id|0199036e-7a3e-7f00-8c21-abc123456789:encounter",
+        "method": "PUT",
+        "url": "Encounter?identifier=https://tributary.dev/fhir/identifier/tb-msg-id|0199036e-7a3e-7f00-8c21-abc123456789:encounter"
+      },
+      "resource": {
+        "class": {
+          "code": "IMP",
+          "system": "http://terminology.hl7.org/CodeSystem/v3-ActCode"
+        },
+        "location": [
+          {
+            "location": {
+              "display": "SYNTHUNIT/101/A"
+            }
+          }
+        ],
+        "participant": [
+          {
+            "individual": {
+              "display": "SYNTHDOC ATTENDING"
+            }
+          }
+        ],
+        "period": {
+          "start": "2026-01-01T12:00:00Z"
+        },
+        "resourceType": "Encounter",
+        "status": "in-progress",
+        "subject": {
+          "reference": "urn:uuid:test-1"
+        }
+      }
+    }
+  ],
+  "resourceType": "Bundle",
+  "type": "transaction"
+}

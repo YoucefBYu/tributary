@@ -15,10 +15,11 @@ one thing.
 from __future__ import annotations
 
 import itertools
+import uuid
 from collections.abc import Callable, Iterator
 from uuid import uuid4
 
-from fhir.resources.R4B.bundle import BundleEntry, BundleEntryRequest
+from fhir.resources.R4B.bundle import Bundle, BundleEntry, BundleEntryRequest
 from fhir.resources.R4B.identifier import Identifier
 from fhir.resources.R4B.resource import Resource
 
@@ -26,11 +27,13 @@ from .errors import BundleEntryError
 
 __all__ = [
     "TB_MESSAGE_SYSTEM",
+    "Bundle",
     "BundleEntry",
     "BundleEntryRequest",
     "Identifier",
     "LocalFhir",
     "Resource",
+    "message_id_factory",
     "message_identifier",
     "sequential_id_factory",
     "uuid_id_factory",
@@ -71,10 +74,48 @@ def sequential_id_factory(prefix: str = "urn:uuid:test-") -> Callable[[], str]:
 
 
 def uuid_id_factory() -> Callable[[], str]:
-    """The production default `fullUrl` factory: a fresh random UUID per call."""
+    """A `fullUrl` factory of last resort: a fresh random UUID per call.
+
+    **Not the production default any more** (W2-2 open item 3): a `uuid4` `fullUrl` is unrelated to
+    `tb-msg-id`, so a shadow run of the same message, or a reprocess from the `dlq`, produces a Bundle
+    that differs from the original in every `fullUrl` even when every resource and every conditional
+    request is identical -- which makes a shadow or reprocess diff noisy for no reason. Kept for a caller
+    that genuinely has no message id yet (a unit test building a bare `Bundle` outside a pipeline, say);
+    a mapping step always has one and should use `message_id_factory` instead.
+    """
 
     def factory() -> str:
         return f"urn:uuid:{uuid4()}"
+
+    return factory
+
+
+def message_id_factory(msg_id: str) -> Callable[[], str]:
+    """The production `fullUrl` factory (W2-2 open item 3): deterministic, derived from `tb-msg-id`, never
+    `uuid4`.
+
+    Each call returns `urn:uuid:<a UUID derived from tb-msg-id and a per-call sequence number>`, so a
+    message that produces three Bundle entries gets three distinct, but always-the-same-on-redelivery,
+    `fullUrl` values. That makes a shadow run or a `dlq` reprocess of the *same* message produce a
+    byte-identical Bundle wherever the mapping itself is deterministic, which is exactly what those
+    comparisons need and a random `fullUrl` would silently defeat.
+
+    Deterministic, not reversible: `msg_id` (a UUIDv7, never sender data -- `tributary.sdk.ids.uuid7`) is
+    fed through `uuid.uuid5` with a fixed, package-private namespace, so the output cannot be mistaken for
+    another `tb-msg-id` or fed back through `tributary.sdk.headers.parse_uuid`'s version-7 check.
+
+    A caller attaches this once per message, not once per pipeline run across many messages:
+
+        ctx = attach(base, fhir=LocalFhir(id_factory=message_id_factory(message.msg_id)), terminology=...)
+
+    Wiring that call site into the running engine belongs to whatever attaches `ctx.fhir` at each hop
+    (`tributary-runtime`, `platform-engineer`'s side of ADR-001 6.2), not to this package.
+    """
+    namespace = uuid.UUID("6f6e6f6f-6873-6f6f-6e65-000000000001")  # package-private, never a public system URI
+    counter: Iterator[int] = itertools.count(1)
+
+    def factory() -> str:
+        return f"urn:uuid:{uuid.uuid5(namespace, f'{msg_id}:{next(counter)}')}"
 
     return factory
 
