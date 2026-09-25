@@ -8,7 +8,7 @@ for approval before implementing.
 
 | Contract | Version | Status | Spec | Machine-readable |
 |---|---|---|---|---|
-| Message envelope (`tb-*` headers, key, payload) | v0 | Draft | [`envelope/v0/README.md`](envelope/v0/README.md) | `envelope/v0/envelope.schema.json` |
+| Message envelope (`tb-*` headers, key, payload) | v0 | Draft | [`envelope/v0/README.md`](envelope/v0/README.md) | `envelope/v0/envelope.schema.json`, `envelope/v0/error-codes.json` (engine error-code registry, set 1.1) |
 | Topic naming, defaults, required config | v0 | Draft | [`topics/v0/README.md`](topics/v0/README.md) | `topics/v0/topic-name.schema.json`, `topics/v0/topic-defaults.json` |
 | Lifecycle events (`_tb.<env>.events`) | v0 | Draft | [`events/v0/README.md`](events/v0/README.md) | `events/v0/event.schema.json` |
 | Channel spec (source, steps, destinations, ordering, retry) | v0 | Draft | [`channel-spec/v0/README.md`](channel-spec/v0/README.md) | `channel-spec/v0/channel.schema.json` |
@@ -21,7 +21,7 @@ directory rename: set 1.0 is the four contracts above, frozen together at the wa
 | Set version | Members | Frozen |
 |---|---|---|
 | 1.0 | `envelope/v0`, `topics/v0`, `events/v0`, `channel-spec/v0` | at the Phase 1 wave 1 gate |
-| 1.1 | Same four directories. **Additive only**: wave 2 connector types, destination steps and key semantics in `channel-spec/v0`; consumer-group role `receiver` in `topics/v0` | Published 2026-09-24 at the start of wave 2; **verified** the same day (`validate.py` 122 / 0, 86 pairs matched, conformance 127 passed; `ffc1580`). Freezes at the wave 2 gate |
+| 1.1 | Same four directories. **Additive only**: wave 2 connector types, destination steps, key semantics, built-in step shapes and the derived child-id encoding in `channel-spec/v0`; consumer-group role `receiver` in `topics/v0`; the engine error-code registry in `envelope/v0` (2026-09-25) | Published 2026-09-24 at the start of wave 2; **verified** the same day (`validate.py` 122 / 0, 86 pairs matched, conformance 127 passed; `ffc1580`). Freezes at the wave 2 gate |
 
 A minor set version is additive by definition: every document valid under 1.0 is valid under 1.1.
 A change that would make a 1.0-valid document invalid is breaking, creates a `v1/` directory and needs

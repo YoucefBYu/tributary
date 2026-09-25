@@ -3,6 +3,44 @@
 Newest first. Each entry names the contract, the version, whether the change is additive or
 breaking, and the reason. Breaking changes reference an ADR.
 
+## 2026-09-25 (W2-5 follow-ups) — set 1.1: built-in shapes pinned, derived-id encoding, engine error-code registry
+
+Six proposals from `platform-engineer` with the W2-5 delivery (`74c9853` to `288903a`). **No schema
+change, no example file changed, no invalid example added**, so no `(json_path, validator)` pair moves.
+One new machine-readable file, and manifest `requires` edits. Set 1.1 is not frozen until the wave 2
+gate, and every item is additive or a correction to set 1.1 text. No set 1.0 document changes validity.
+
+| # | Change | Ruling and why |
+|---|---|---|
+| 1 | channel-spec 3.3: a `with` key that is a Python keyword binds to `key_` (`in` → `in_`). Writing `in_` in a spec is refused. `**kwargs` and `*args` are refused when the step is defined. Wrong-typed values are refused at bind | **Approved.** The spec keeps one spelling per option, and `**kwargs` would silently remove the unknown-key refusal |
+| 2 | channel-spec new 3.3.3: exact derived child id layout plus three known-answer vectors | **Approved with an amendment.** The proposal's wording ("version and variant bits set UUIDv7-style") also reads as overwrite-in-place, which yields different ids. The contract pins the layout the code implements: `D` = the first 80 bits of the digest, `rand_a = D[0:12]`, `rand_b = D[18:80]`, **bits 12-17 discarded**. The vectors come from the implementation and still need an independent recomputation. The `ids.py` docstring ("next 62 bits") is wrong and goes back to `platform-engineer` |
+| 3 | envelope new 2.3.2 plus `envelope/v0/error-codes.json`: the engine error-code registry | **Approved with amendments.** (a) The contract is the source; `codes.py` is **checked against it** by a `tributary-sdk` test in both directions, and is not generated from it. (b) Reserved prefixes grow from `KEY_`, `HTTP_`, `TB_` to include every loader family in channel-spec 3.4: `FHIR_`, `PG_`, `CH_`, `SFTP_`, `SSH_`, `S3_`, `MLLP_`, `KAFKA_`. Without them a step could raise `PG_23505` and pass for a loader failure. (c) **Drift found:** 2.3 names `TRANSFORM_ERROR` for exhausted step retries, but the executor emits `STEP_ERROR`. The contract wins, and `STEP_ERROR` stays registered as `reserved`. (d) `ENVELOPE_INVALID` is registered as `log_only`. The 2.3 sentence "deliberately no central registry" is replaced, with the reason |
+| 4 | channel-spec 3.3.2: built-in `with` shapes. `name=value` arrays; `hl7:` prefix required, and `MSH.9.x` spelled out as `hl7:MSH.9.1`-`.3`; `onUnresolved: drop` → `FILTERED_UNRESOLVED`; `present` defined; split's `by` and `pointer` | **Approved.** The filter's JSON deny-list now applies to **every pointer token**, not "ends in". The old wording missed `/identifier/0/value`, the most common shape. That is my defect, and the implementation was right |
+| 5 | channel-spec 3.3.2 split rules 5-6, ADR-003 follow-up 10: a dead-lettered child carries the child as split; reprocess refuses records with `tb-parent-id` | **Approved, as "refuse", not "refuse or scope".** Scoping needs a post-split re-entry point, and that is W3-3. The rule over-refuses reprocessed records, because D5 also sets `tb-parent-id`. That is stated, and the discriminator is left to W3-3 (section 9) |
+| 6 | Manifest: remove `per-destination steps (W2-5)` | **Approved; it was three examples, not two** (`adt-mllp-…`, `http-fhir-ingest-…`, `kafka-lab-events-…`). Also removed `record:key evaluator (W2-4)`, which `tributary.sdk.keys` now implements. **Added** the `tributary.hl7v2.parse` `with: {version}` gap to the two examples that pass `version` (`adt-to-fhir-per-key-mtls`, `adt-mllp-…`). Neither listed it, and the binder refuses the unknown key today. **Nothing flips to runnable**: every changed example still names a `ref` step (bundle-fetch is unscheduled), and three of the four still name unbuilt connectors |
+
+**Change requests to `platform-engineer`** that follow from these rulings:
+
+- the executor emits `TRANSFORM_ERROR`;
+- add the eight prefixes to `RESERVED_PREFIXES`;
+- add the registry cross-check test;
+- correct the `ids.py` docstring.
+
+None changes behaviour a test currently pins, except the `STEP_ERROR` literal.
+
+### Verification owed
+
+Not run by the architect, who has no shell.
+
+- `uv run --no-project --python 3.12 --with jsonschema python contracts/validate.py`: expected
+  **122 / 0, unchanged**. No example was added, and the manifest's `requires` lists stay non-empty.
+- `pytest tests/conformance`: expected **127 passed, unchanged**.
+- `--emit-expectations` is **not needed**, because no invalid example or schema changed.
+- The manifest edits are checked by the corpus test in `tributary-runtime`:
+  `uv run pytest packages/tributary-runtime/tests/test_core_steps.py`. Every `runnable: false` entry
+  must still fail to resolve.
+- The 3.3.3 vectors need one independent `hashlib` recomputation.
+
 ## 2026-09-24 (PostgreSQL loader built) — documentation only
 
 `connector-engineer` shipped the `postgresql` loader (`eca445a`) against `sqlSinkParams` exactly. The

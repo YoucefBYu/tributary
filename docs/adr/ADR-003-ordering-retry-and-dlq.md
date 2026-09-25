@@ -270,3 +270,13 @@ partition pause means; Kafka share groups for unordered destinations.
     to every destination under an id no loader has seen, and loader idempotency cannot absorb it. The
     gap already exists for wave 1 loader-exhaustion records. W3-3 implements destination-scoped
     re-entry. Until then, reprocess refuses these records. `contracts/channel-spec/v0/README.md` 3.5.
+    **Extended 2026-09-25 (W2-5, `platform-engineer`): the same applies to any `dlq` record carrying
+    `tb-parent-id`.** A dead-lettered split child's payload is the child as the splitter produced it.
+    Re-injecting that into `raw` re-runs the splitter on one child: a JSON element is refused as
+    `SPLIT_INPUT_INVALID`, and an HL7 message becomes a new identity that no loader has seen. So until
+    W3-3 builds a post-split re-entry point that keeps the child's derived `tb-msg-id`, reprocess
+    refuses these records too. **This over-refuses on purpose.** D5 also sets `tb-parent-id` on
+    reprocessed records, so a reprocessed message that fails again is refused as well, and the header
+    alone cannot tell the two cases apart. W3-3 picks the discriminator: a derivation check (no
+    contract change, but it fails once a child is itself reprocessed) or an additive origin header.
+    `contracts/channel-spec/v0/README.md` 3.3.2 split rules 5-6 and section 9.

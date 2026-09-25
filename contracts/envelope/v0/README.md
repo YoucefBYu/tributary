@@ -184,13 +184,13 @@ Reserved error codes the contracts themselves rely on:
 |---|---|
 | `HEADER_PARSE_ERROR` | One header was malformed on a record that could still be **identified**. The reject keeps the original `tb-msg-id` and the original identity, and `tb-stage` is the stage that read it. Usually a broken producer field. |
 | `RECORD_UNDECODABLE` | The record could not be identified at all, so no original identity is trustworthy. Produces a quarantine wrapper (section 5.2). Framing damage, corruption or an attack. |
-| `TRANSFORM_ERROR` | A pipeline step raised (ADR-001 6.4). |
+| `TRANSFORM_ERROR` | A pipeline or destination step raised on every attempt (`stepRetries` exhausted; ADR-001 6.4). |
 
 The first two are deliberately separate codes for one operational reason: they need different alerts.
 A rise in `HEADER_PARSE_ERROR` points at one producer's field; a rise in `RECORD_UNDECODABLE` points
 at framing, corruption or someone writing to the topic. Collapsing them hides the second behind the
-first. Other codes are chosen by the component that raises them, within `^[A-Z][A-Z0-9_]{0,63}$`;
-there is deliberately no central registry to keep in sync.
+first. Every code matches `^[A-Z][A-Z0-9_]{0,63}$`. The codes the engine emits are listed in the
+registry in 2.3.2. A channel's own `Reject` codes are chosen by the channel and are not registered.
 
 A component MAY keep a finer internal reason code (`HEADER_NOT_TEXT`, `ENVELOPE_INVALID`) for its own
 log line, below the contract code. Two limits: it MUST NOT appear in an envelope header or an event,
@@ -244,6 +244,57 @@ the closed set in section 3. The names are ours; the values are the sender's.
 an ordinary `dlq` record — which is exactly what normalising is for. It is a code rule needing a unit
 test per placeholder, in the same category as the rules in 5.2.1 and in the channel-spec contract's
 section 6.
+
+### 2.3.2 Engine error-code registry (set 1.1, 2026-09-25)
+
+**Machine-readable:** [`error-codes.json`](error-codes.json). This section is its rationale; the file
+is the list.
+
+**Why a registry now, when 2.3 used to say "deliberately no central registry".** That sentence was
+written when nothing consumed the list. Since W2-5, `Reject(code)` (channel-spec README 3.3.2)
+consumes it: a channel step may not raise an engine code, because an alert on `HEADER_PARSE_ERROR`
+must mean a broken producer, not a channel's validation rule. A deny-list needs a list, and the SDK
+had grown one (`tributary.sdk.codes`) with no contract behind it. The cost the old sentence avoided,
+keeping two lists in sync, is paid by a test instead of by review (below).
+
+**Direction: the contract is the source, and the code is checked against it.** The registry is not
+generated from `codes.py`. A contract generated from code is a contract nobody reviewed. That is the
+failure 2.3 names for a log-only taxonomy that operations comes to depend on.
+
+| Part | Meaning |
+|---|---|
+| `codes` | Every exact code the engine emits in `tb-error-code` or an event's `error_code`, with its emitter, its meaning and a status: `emitted`, or `reserved` (never emitted now, but kept so that a record from an older build stays attributable). Whether a code is retryable belongs to the emitter, not the registry. |
+| `reserved_prefixes` | Families whose members are minted at run time (`HTTP_503`, `PG_23505`, `KEY_FIELD_ABSENT`). A new member is reserved without editing the file. |
+| `log_only` | Finer reason codes a component uses in its own log line (2.3 last paragraph). They are reserved so a step cannot raise them, and they **must never appear** in a header or event. |
+
+**Rules**
+
+1. `Reject(code)` refuses every code in `codes` and `log_only`, and every code under a
+   `reserved_prefixes` entry. `Reject.engine(code)`, which only the built-ins use, refuses any code
+   that is **not** registered, so the engine cannot mint an unregistered code either.
+2. A component that emits a new exact code adds it here first, through the architect, as a contract
+   change. A member of a reserved family needs no change.
+3. **Checker:** a test in `tributary-sdk` loads `error-codes.json` and asserts that
+   `tributary.sdk.codes.ENGINE_CODES` equals the union of `codes` and `log_only`, and that
+   `RESERVED_PREFIXES` equals `reserved_prefixes`. Both directions are checked, so neither side can
+   gain an entry alone. `contracts/validate.py` cannot do this, because it runs on a clean clone with
+   no SDK installed (`contracts/README.md`, the two-checker split).
+4. `SPLIT_TOO_LARGE`, `SPLIT_INPUT_INVALID`, `FILTER_UNRESOLVED` and the three `VALIDATE_*` codes are
+   **engine codes raised by built-in steps**. They are registered, so a channel's own step cannot
+   borrow them. A channel can still write `VALIDATE_ORDER_MISSING`, because `VALIDATE_` is not a
+   reserved prefix. Only the exact codes are taken.
+
+**Drift found while writing it, and how it is resolved.** This section named `TRANSFORM_ERROR` for a
+step that exhausts its retries, and the envelope and events examples use it. The runtime executor
+has emitted `STEP_ERROR` since wave 1 (`tributary.runtime.executor.STEP_ERROR_CODE`). The contract came
+first and the examples depend on it, so **the executor changes to `TRANSFORM_ERROR`**
+(`platform-engineer`). `STEP_ERROR` stays in the registry as `reserved`, so no step can take it and a
+record from a pre-fix build stays attributable. No deployment exists, so nothing downstream keys on
+either code yet. The fix is cheaper now than after the first alert rule is written.
+
+**Not registered:** `Drop` reasons (`FILTERED`, `FILTERED_UNRESOLVED`, `EMPTY_SPLIT`). They are not
+error codes: they reach `_tb.events` as the `error_message` of a `status: dropped` event, and never
+reach `tb-error-code`.
 
 ### 2.4 Known envelope drift in Phase 0 code — do not reproduce
 

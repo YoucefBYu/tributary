@@ -13,7 +13,10 @@
     {
       "file": "valid/adt-to-fhir-per-key-mtls.json",
       "runnable": false,
-      "requires": ["bundle-fetch for ref steps (unscheduled)"],
+      "requires": [
+        "bundle-fetch for ref steps (unscheduled)",
+        "tributary.hl7v2.parse `with: {version}` keyword-only parameter (healthcare-standards-engineer, in progress 2026-09-25; until it lands the binder refuses the unknown key at load)"
+      ],
       "note": "Production shape: wildcard bind with mTLS, per-key ordering, byte-bounded queue, three steps, HTTPS destination with blocking retry and halt-partition"
     },
     {
@@ -33,7 +36,7 @@
       "runnable": false,
       "requires": [
         "bundle-fetch for ref steps (unscheduled)",
-        "per-destination steps (W2-5)",
+        "tributary.hl7v2.parse `with: {version}` keyword-only parameter (healthcare-standards-engineer, in progress 2026-09-25; until it lands the binder refuses the unknown key at load)",
         "connector:destination/fhir (W2-6)",
         "connector:destination/clickhouse (W2-6)",
         "connector:destination/mllp (W2-6)"
@@ -45,7 +48,6 @@
       "runnable": false,
       "requires": [
         "bundle-fetch for ref steps (unscheduled)",
-        "per-destination steps (W2-5)",
         "connector:source/http (W2-7)",
         "connector:destination/fhir (W2-6)"
       ],
@@ -67,8 +69,6 @@
       "runnable": false,
       "requires": [
         "bundle-fetch for ref steps (unscheduled)",
-        "per-destination steps (W2-5)",
-        "record:key evaluator (W2-4)",
         "connector:source/kafka (W2-7)",
         "connector:destination/clickhouse (W2-6)",
         "connector:destination/kafka (W2-6)"

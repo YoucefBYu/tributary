@@ -288,7 +288,20 @@ The runtime binds once, when it loads the step. The following are refused with a
 at load, loudly, and the previous spec keeps running:
 - an unknown key;
 - a key that is not a Python identifier (the schema admits `-`; the binder does not);
-- a required keyword-only parameter with no `with` value.
+- a required keyword-only parameter with no `with` value;
+- a value whose type does not match the parameter's annotation, where the binder understands that
+  annotation (`str`, `int`, `float`, `bool`, `Literal`, unions, and sequences of those). Other
+  annotations bind unchecked.
+
+**Python keywords (W2-5, 2026-09-25).** A `with` key that is a Python keyword binds to the parameter
+with one trailing underscore: `in` binds to `in_`, because `def f(*, in: ...)` is not valid Python.
+The spec always writes the keyword itself. Writing `in_` in a spec is refused, so each option has
+exactly one spelling. Soft keywords such as `type` and `match` are valid parameter names and bind
+unchanged.
+
+**A step may not declare `**kwargs` or `*args`.** The SDK refuses the definition when it decorates the
+function. A `**kwargs` parameter would accept any `with` key, which silently removes the unknown-key
+refusal above.
 
 `run_step` takes the same `with` values, so a step is unit-tested with its config. Rejected
 alternative: `ctx.params` as an untyped mapping, where a mistyped key is silently ignored, which is the
@@ -343,23 +356,56 @@ a `runnable: true` example whose steps stop resolving fails, and a `runnable: fa
 `requires` have **all** become resolvable also fails — it must then be promoted, so a stale exemption
 cannot quietly mask a real gap.
 
-#### 3.3.2 Built-in steps (W2-5, approved 2026-09-24)
+#### 3.3.2 Built-in steps (W2-5, approved 2026-09-24; shapes pinned 2026-09-25)
 
 Their `with` shapes are public surface, so they live here. Locators use the `partitionKey` grammar
-and the shared evaluator (4.3), so there is one locator language.
+and the shared evaluator (4.3), so there is one locator language. **A locator always carries its
+scheme prefix** (`hl7:MSH.3`, `json:/resourceType`); a bare `MSH.3` is refused. Built-ins accept
+`hl7:` and `json:` locators only. `header:` and `record:key` are refused, because they read metadata
+rather than the message.
+
+**Maps are written as `name=value` arrays.** `with` admits no nested objects (3.3), so a map such as
+enrich's `attrs` is a flat array: `attrs: ["feed=adt-main", "site=north"]`. Each entry splits on its
+**first** `=`, so a value may contain `=`. Both sides must be non-empty, and a name may appear once per
+key. All of this is refused at load.
 
 | Step | `with` | Rules |
 |---|---|---|
-| `tributary.core.filter` | `field` plus exactly one of `in`, `notIn`, `present`; **`onUnresolved: drop \| keep \| reject`, required, no default** | Emits `Drop(reason="FILTERED")`. Silently dropping a clinical message because a field was absent is a choice the author writes down. **`field` may not point at a patient-identifying segment** (`PID`, `PD1`, `NK1`, `GT1`, `IN1`, `IN2`, `MRG`), and a JSON `field` may not end in `identifier`, `name`, `birthDate`, `telecom` or `address`. The reason: the `in` values are written in the spec, which is published on `_tb.<env>.channels` and shown in the UI, and a spec must not carry PHI. This is a deny-list, not a proof |
-| `tributary.core.enrich` | `attrs` (static), `usr` (static), `attrFrom` (locator) | `attrFrom` is limited to an allow-list: `MSH.3`, `MSH.4`, `MSH.5`, `MSH.6`, `MSH.9.x`, `MSH.11`, `MSH.12`, `EVN.1`, `json:/resourceType`. Values still pass the `attrs` guard. `usr` is static only, because copying payload into a header launders PHI |
-| `tributary.core.validate` | `requireSegments`, `version` | Raises `Reject(code)` (below). JSON-schema validation comes later |
-| `tributary.core.split` | per splitter | See the split rules below |
+| `tributary.core.filter` | `field` (locator) plus exactly one of `in`, `notIn` (non-empty arrays of non-empty strings) or `present` (boolean); **`onUnresolved: drop \| keep \| reject`, required, no default** | A filtered message is `Drop(reason="FILTERED")`. `in`/`notIn` compare the located bytes exactly: case-sensitive, with no trimming. **`field` may not point into a patient-identifying segment** (`PID`, `PD1`, `NK1`, `GT1`, `IN1`, `IN2`, `MRG`), and **no token of a JSON `field` may be** `identifier`, `name`, `birthDate`, `telecom` or `address`. The reason: the `in` values are written in the spec, which is published on `_tb.<env>.channels` and shown in the UI, and a spec must not carry PHI. This is a deny-list, not a proof. See "unresolved" and `present` below |
+| `tributary.core.enrich` | `attrs` (static pairs), `usr` (static pairs), `attrFrom` (`name=locator` pairs); at least one | `attrFrom` locators must be **exactly** one of: `hl7:MSH.3`, `hl7:MSH.4`, `hl7:MSH.5`, `hl7:MSH.6`, `hl7:MSH.9.1`, `hl7:MSH.9.2`, `hl7:MSH.9.3`, `hl7:MSH.11`, `hl7:MSH.12`, `hl7:EVN.1`, `json:/resourceType`. `hl7:MSH.9` as a whole field is not on the list. Static values must pass the `attrs` or `tb-usr-*` guard at load. A derived value that fails the guard at run time is skipped and logged by attr name and reason, never by value. Enrichment never fails a message. An attr name may not appear in both `attrs` and `attrFrom`. At most 16 attrs (`events/v0` 3). `usr` is static only, because copying payload into a header launders PHI |
+| `tributary.core.validate` | `requireSegments` (segment ids), `version` (one HL7 version id or an array of them, written as strings); at least one | Raises `Reject` with `VALIDATE_NOT_HL7` (wrong content type, a claim-checked payload, or no leading `MSH`), `VALIDATE_SEGMENT_MISSING` or `VALIDATE_VERSION_MISMATCH` (`MSH-12.1` absent or not listed). JSON-schema validation comes later |
+| `tributary.core.split` | `by: hl7-batch \| json-array`, required; `pointer` (RFC 6901, `json-array` only, default empty = the document itself) | See the split rules below |
+
+**Filter: "unresolved" and `present`.** For `in` and `notIn`, a locator result that is not a value is
+unresolved. That covers an absent segment, field, repetition or pointer, a payload not in the
+locator's format, an empty value, and a value over the evaluator's 256-byte bound.
+
+`present: true` keeps a message whose field has a value, and drops the rest as `FILTERED`.
+`present: false` does the opposite. A value over 256 bytes, or a non-scalar JSON value, counts as
+present. Absent or empty counts as not present. For `present`, an absent field is therefore an answer,
+not an unresolved result. Only a payload the locator cannot read at all is unresolved: wrong format or
+content type, or an ambiguous duplicate JSON member.
+
+`onUnresolved` then decides:
+
+- `keep` passes the message on;
+- `drop` is `Drop(reason="FILTERED_UNRESOLVED")`, a separate reason from `FILTERED` so the browser
+  shows why a message went nowhere;
+- `reject` raises the engine code `FILTER_UNRESOLVED`.
+
+**Why every JSON token, not "ends in" (changed 2026-09-25).** The first text said a JSON `field` may
+not *end in* a denied name. That misses the most common shapes: `/identifier/0/value` ends in `value`,
+and `/name/0/family` ends in `family`. `platform-engineer` implemented the stricter rule, and this
+contract now states it. The change is not breaking: the rule arrived in set 1.1, which is not frozen
+yet, and schema validity is unchanged.
 
 **`Reject(code)`**, a new SDK exception: the step fails **non-retryably**. The executor dead-letters
 the message immediately with `tb-error-code` = the code (`^[A-Z][A-Z0-9_]{2,63}$`), skipping
-`stepRetries`. A step may not raise a code the engine reserves (`envelope/v0` 2.3: `HEADER_PARSE_ERROR`,
-`RECORD_UNDECODABLE`, and the engine's own), so an alert on an engine code stays meaningful. Any
-other exception is still retryable.
+`stepRetries`. A step may not raise any code in the engine's registry: `envelope/v0` 2.3.2 and
+[`error-codes.json`](../../envelope/v0/error-codes.json), including every code under a reserved
+prefix. `Reject` refuses such a code where it is raised, so an alert on an engine code stays
+meaningful. Any other exception is still retryable, and dead-letters as `TRANSFORM_ERROR` once
+`stepRetries` is exhausted.
 
 **Split rules.** Split is a separate node type, a `@splitter` decorator, not a widened return type
 for every step. Fan-out changes identity, commit and ordering, so it should be visible, not something
@@ -369,6 +415,8 @@ any step can do by returning a list.
    the parent therefore reproduces the same children, and loader idempotency absorbs them. A random id
    per run would make every replay a new set of messages, breaking invariant 4. This is deterministic
    id derivation from a random parent id, not a keyed construction; nothing secret is involved.
+   The exact encoding is pinned in 3.3.3, because a second implementation (the CLI, another language)
+   has to agree with it bit for bit.
 2. Children carry `tb-parent-id` = the parent's id, **and the parent's key**, and run through the
    remaining steps and destinations in list order. The `raw` offset commits once every child has been
    produced or dead-lettered.
@@ -379,6 +427,72 @@ any step can do by returning a list.
    A receiver-side batch option is a candidate for a later set.
 4. At most 10,000 children, otherwise `Reject("SPLIT_TOO_LARGE")`. An empty result is
    `Drop(reason="EMPTY_SPLIT")`.
+5. **What a dead-lettered child carries (2026-09-25).** A `dlq` record's payload is the input at the
+   point where the message would re-enter. For a child that fails in a pipeline step after the
+   splitter, that is **the child as the splitter produced it**, not the parent batch. For a child that
+   fails in a destination step, 3.5 applies: the destination step's input. Either record carries the
+   child's own `tb-msg-id` and `tb-parent-id`.
+6. **Reprocess refuses any `dlq` record carrying `tb-parent-id`** until W3-3 builds a re-entry point
+   for it. The general rule (ADR-003 D5) re-injects into `raw` under a new `tb-msg-id`. For a child,
+   that runs the splitter again on one child: a JSON element has no `/entry` array, so it is refused
+   as `SPLIT_INPUT_INVALID`, and a single HL7 message splits to itself under a new identity that no
+   loader has seen. This extends ADR-003 follow-up 10, which covers `tb-destination` in the same way.
+   **It over-refuses on purpose.** `tb-parent-id` is also set by reprocess and replay (`envelope/v0`
+   section 3), so a reprocessed message that fails again is refused as well. The header alone cannot
+   tell a split child from a reprocessed record, and W3-3 must settle how to tell them apart (see
+   section 9). Failing closed is the safe interim choice: nothing can reprocess before W3-3 anyway.
+
+**The built-in splitter, `tributary.core.split`.**
+
+- `by: hl7-batch` produces one child per `MSH` segment group. The batch envelope (`FHS`, `BHS`, `BTS`,
+  `FTS`) belongs to no child. Segments are re-joined with CR, the HL7 segment terminator. So a batch
+  delimited with LF or CRLF yields children delimited with CR, and empty lines are dropped. Field
+  bytes are unchanged. A segment before the first `MSH`, or a line that is not a segment, is
+  `Reject("SPLIT_INPUT_INVALID")`.
+- `by: json-array` produces one child per element of the array at `pointer`. **Each child is the
+  element's exact source text**, not a re-serialisation: re-dumping would turn `1.50` into `1.5`, and
+  significant figures are clinical data. In set 1.1, `pointer` tokens are limited to
+  `[A-Za-z0-9._:-]`, with no `~0`/`~1` escapes. A payload that is not strict JSON (`NaN` and
+  `Infinity` are refused), a missing pointer, a duplicated member name on the path, or a pointer that
+  does not name an array is `Reject("SPLIT_INPUT_INVALID")`.
+- Children keep the parent's `tb-content-type`.
+
+#### 3.3.3 Derived child id: the exact encoding (pinned 2026-09-25)
+
+Proposed by `platform-engineer` with W2-5, and pinned here because the code comment is the only other
+place it is written. All bit positions count from the most significant bit.
+
+```
+input   = parent.bytes (16 bytes, RFC 9562 network order) ‖ uint32_be(index)     # index is 0-based
+D       = the first 10 bytes of SHA-256(input), read as an 80-bit big-endian integer
+child   = unix_ts_ms(parent)   48 bits   # the parent's timestamp, unchanged
+        ‖ 0b0111                4 bits   # version 7
+        ‖ D[0:12]              12 bits   # rand_a = D >> 68
+        ‖ 0b10                  2 bits   # RFC 9562 variant
+        ‖ D[18:80]             62 bits   # rand_b = D mod 2^62
+```
+
+**Bits 12-17 of `D` are discarded.** This matters because the other reading of "set the version
+and variant bits UUIDv7-style" is to overwrite them in place, i.e. to place `D` across bits 48-127 and
+then force the version and variant. That gives a different `rand_a`, and so different ids. Only the
+layout above is conformant.
+
+The parent must be a UUIDv7. A child is one too, so a second splitter derives grandchildren from the
+child's id. The index is 0 to 9,999 under rule 4, although the encoding admits up to 2^32 - 1.
+
+Known-answer vectors, for parent `01923a7b-4c5d-7e6f-8a9b-0c1d2e3f4a5b`:
+
+| index | child `tb-msg-id` |
+|---|---|
+| 0 | `01923a7b-4c5d-7a07-9a78-dd094f20ee20` |
+| 1 | `01923a7b-4c5d-7075-b061-620e49e95a83` |
+| 9999 | `01923a7b-4c5d-780f-9067-11c550358874` |
+
+**Provenance of the vectors: produced by the SDK implementation**
+(`packages/tributary-sdk/tests/test_splitter.py`, `derived_uuid7`). The architect has no shell and did
+not recompute them. The test's own cross-check reuses the implementation's formula, so an **independent**
+recomputation (a few lines of `hashlib`) is part of verifying this section. If they disagree, the
+layout above wins, and both the table and the implementation are defects.
 
 ### 3.4 `spec.destinations`
 
@@ -886,6 +1000,16 @@ envelope and events manifests, so nothing else in the suite changed.
   source cannot name a channel topic (3.2.5). It needs its own design, because it crosses the
   per-channel ACL boundary.
 - **`retry-topic`**: section 4.1.1.
+- **Telling a split child from a reprocessed record (W3-3).** Both carry `tb-parent-id`, so the
+  interim rule in 3.3.2 (split rule 6) refuses both. Two candidates, not decided here:
+  (a) no contract change: a record is a split child if its `tb-msg-id` equals the 3.3.3 derivation
+  from its `tb-parent-id` for some index below 10,000. That is cheap, but it stops working once a
+  child is itself reprocessed;
+  (b) an additive header naming the origin.
+  W3-3 brings a proposal.
+- **JSON filter deny-list candidates.** `subject` and `patient` references carry a logical id that can
+  be an MRN. They are not on the 3.3.2 list in set 1.1. Add them if a real channel shows the need, or
+  if a reviewer finds one in use.
 
 ---
 

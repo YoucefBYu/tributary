@@ -1,0 +1,51 @@
+{
+  "contract": "tributary.envelope/v0",
+  "registry": "engine tb-error-code values",
+  "set": "1.1",
+  "published": "2026-09-25",
+  "note": "Rationale and rules: envelope/v0 README 2.3.2. The contract is the source; tributary.sdk.codes is checked against this file by a tributary-sdk test (ENGINE_CODES == codes + log_only; RESERVED_PREFIXES == reserved_prefixes). A channel's Reject(code) may not use any code listed here or any code under a reserved prefix. Codes only, never values: this file is PHI-free by construction.",
+  "grammar": {
+    "tb-error-code": "^[A-Z][A-Z0-9_]{0,63}$",
+    "reject": "^[A-Z][A-Z0-9_]{2,63}$"
+  },
+  "reserved_prefixes": [
+    { "prefix": "TB_", "owner": "engine namespace, unassigned" },
+    { "prefix": "KEY_", "owner": "key evaluator, tributary.sdk.keys (channel-spec README 4.3)" },
+    { "prefix": "HTTP_", "owner": "http and fhir loaders: HTTP_<status>, HTTP_REDIRECT_REFUSED (channel-spec README 3.4)" },
+    { "prefix": "FHIR_", "owner": "fhir loader: FHIR_BUNDLE_INVALID (channel-spec README 3.4.2)" },
+    { "prefix": "PG_", "owner": "postgresql loader: PG_<SQLSTATE class> (channel-spec README 3.4)" },
+    { "prefix": "CH_", "owner": "clickhouse loader: CH_<numeric code> (channel-spec README 3.4)" },
+    { "prefix": "SFTP_", "owner": "sftp loader and source: SFTP_<status> (channel-spec README 3.4)" },
+    { "prefix": "SSH_", "owner": "sftp loader and source: SSH_HOST_KEY_MISMATCH, SSH_AUTH_FAILED (channel-spec README 3.4)" },
+    { "prefix": "S3_", "owner": "s3 loader: S3_<ERROR_CODE> (channel-spec README 3.4)" },
+    { "prefix": "MLLP_", "owner": "mllp loader: MLLP_AE, MLLP_AR, MLLP_TIMEOUT, MLLP_NO_ACK (channel-spec README 3.4.6)" },
+    { "prefix": "KAFKA_", "owner": "kafka loader: KAFKA_<librdkafka error name> (channel-spec README 3.4.7)" }
+  ],
+  "codes": [
+    { "code": "HEADER_PARSE_ERROR", "status": "emitted", "emitter": "any record reader", "meaning": "One registered header malformed on an identifiable record (envelope 2.3, 2.3.1)" },
+    { "code": "RECORD_UNDECODABLE", "status": "emitted", "emitter": "any record reader", "meaning": "Record cannot be identified; quarantine wrapper (envelope 2.3.1, 5.2)" },
+    { "code": "TRANSFORM_ERROR", "status": "emitted", "emitter": "runtime executor", "meaning": "A pipeline or destination step raised on every attempt (stepRetries exhausted)" },
+    { "code": "STEP_ERROR", "status": "reserved", "emitter": "runtime executor, wave 1 to W2-5 builds only", "meaning": "Pre-fix spelling of TRANSFORM_ERROR (envelope 2.3.2). Not emitted once the executor is corrected" },
+    { "code": "PIPELINE_EMPTY_RESULT", "status": "emitted", "emitter": "runtime worker", "meaning": "The executor returned neither a message nor a drop" },
+    { "code": "PRODUCER_QUEUE_FULL", "status": "emitted", "emitter": "runtime producer", "meaning": "Local producer queue full; back-pressure" },
+    { "code": "PRODUCE_REFUSED", "status": "emitted", "emitter": "runtime producer", "meaning": "The Kafka client refused the produce call" },
+    { "code": "PRODUCE_TIMEOUT", "status": "emitted", "emitter": "runtime producer", "meaning": "Records still queued when the flush deadline passed" },
+    { "code": "PRODUCE_FAILED", "status": "emitted", "emitter": "runtime producer", "meaning": "A delivery callback reported failure" },
+    { "code": "TRANSACTION_ABORTED", "status": "emitted", "emitter": "runtime transactions", "meaning": "A Kafka transaction was aborted" },
+    { "code": "CIRCUIT_OPEN", "status": "emitted", "emitter": "loaders", "meaning": "The destination circuit breaker is open" },
+    { "code": "CONNECT_FAILED", "status": "emitted", "emitter": "loaders", "meaning": "Could not connect to the destination (channel-spec README 3.4)" },
+    { "code": "TLS_VERIFY_FAILED", "status": "emitted", "emitter": "loaders", "meaning": "Peer certificate verification failed (channel-spec README 3.4)" },
+    { "code": "TRANSPORT_ERROR", "status": "emitted", "emitter": "loaders", "meaning": "Transport failure after connecting" },
+    { "code": "TIMEOUT", "status": "emitted", "emitter": "loaders", "meaning": "timeoutMs elapsed (channel-spec README 3.4)" },
+    { "code": "PAYLOAD_SHAPE_INVALID", "status": "emitted", "emitter": "loaders", "meaning": "Payload is not the shape the destination type requires (channel-spec README 3.4.3)" },
+    { "code": "FILTER_UNRESOLVED", "status": "emitted", "emitter": "tributary.core.filter", "meaning": "onUnresolved: reject and the field did not resolve (channel-spec README 3.3.2)" },
+    { "code": "VALIDATE_NOT_HL7", "status": "emitted", "emitter": "tributary.core.validate", "meaning": "Not HL7 v2 ER7, claim-checked, or no leading MSH (channel-spec README 3.3.2)" },
+    { "code": "VALIDATE_SEGMENT_MISSING", "status": "emitted", "emitter": "tributary.core.validate", "meaning": "A segment in requireSegments does not occur (channel-spec README 3.3.2)" },
+    { "code": "VALIDATE_VERSION_MISMATCH", "status": "emitted", "emitter": "tributary.core.validate", "meaning": "MSH-12.1 absent or not listed in version (channel-spec README 3.3.2)" },
+    { "code": "SPLIT_TOO_LARGE", "status": "emitted", "emitter": "any splitter (SDK)", "meaning": "More than 10,000 children (channel-spec README 3.3.2 split rule 4)" },
+    { "code": "SPLIT_INPUT_INVALID", "status": "emitted", "emitter": "tributary.core.split", "meaning": "Input the splitter cannot read (channel-spec README 3.3.2)" }
+  ],
+  "log_only": [
+    { "code": "ENVELOPE_INVALID", "emitter": "runtime record decoder", "meaning": "Internal reason below RECORD_UNDECODABLE / HEADER_PARSE_ERROR (envelope 2.3). Never in a header or event" }
+  ]
+}

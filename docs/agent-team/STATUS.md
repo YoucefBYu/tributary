@@ -39,10 +39,47 @@ wave's exit criteria here.
   README 5.1 that does not count as a genuine redelivery. `qa-engineer` builds the redelivery harness
   (a real consumer loop with offset replay) in W2-9, coordinating the interface with
   `connector-engineer`.
-- **Nothing in wave 2 is blocked on a human.** SFTP was unblocked on 2026-09-24: the human approved
+- **Verification owed for the 2026-09-25 contract edits** (`qa-engineer`):
+  - `uv run --no-project --python 3.12 --with jsonschema python contracts/validate.py`: expect
+    **122 / 0**, unchanged;
+  - `uv run --no-project --python 3.12 --with pytest --with jsonschema python -m pytest tests/conformance`:
+    expect **127 passed**, unchanged;
+  - `uv run pytest packages/tributary-runtime/tests/test_core_steps.py`: the manifest `requires`
+    edits, where no `runnable: false` example may resolve completely;
+  - one independent `hashlib` recomputation of the three child-id vectors in channel-spec README
+    3.3.3.
+
+  `--emit-expectations` is not needed, because no schema or invalid example changed.
+- **Only one wave 2 item is blocked on a human: W2-2 item 4** (above). SFTP was unblocked on 2026-09-24: the human approved
   `paramiko` (see decisions log). The
   PostgreSQL *loader* is **not** blocked: it uses `asyncpg` (Apache-2.0 per the lead; `licence_check.py`
   confirms it when the dependency lands). `psycopg` matters only to the wave 3 control plane.
+- **W2-5 (built-in steps, splitter, destination steps; `platform-engineer`): DELIVERED, IN REVIEW.**
+  Commits `74c9853`, `290a553`, `2cabf4a`, `627f547`, `7849d1f`, `288903a`. `code-reviewer` and
+  `security-reviewer` are both running, so it is not done until any Critical or High they find is
+  closed. The architect ruled on its six contract proposals on 2026-09-25 (decisions log). That
+  produced four change requests back to `platform-engineer`:
+  - the executor emits `TRANSFORM_ERROR`, not `STEP_ERROR`;
+  - eight reserved prefixes;
+  - the registry cross-check test;
+  - the `ids.py` docstring.
+
+  **Open risk: a produce-time `EnvelopeError` crashes the worker.** Envelope 2.3 says a component
+  rejects and never crashes, and an unhandled exception in the consumer loop is a crash loop on one
+  record, which halts a partition. The reviewers are expected to rule on its severity. It touches
+  delivery, so it must be closed or explicitly accepted before W2-5 is marked done.
+- **W2-3 (HL7 v2 to FHIR content; `healthcare-standards-engineer`): Critical found, fix in
+  progress.** `code-reviewer` found that `Encounter` was keyed on `tb-msg-id` instead of PV1-19 (visit
+  number). One visit would then be a new Encounter per message, and conditional-update idempotency
+  (channel-spec 3.4.2) would hold per message but not per encounter, which is the wrong resource
+  identity. `security-reviewer` is running. Not done until both have cleared.
+- **W2-2 item 4 is blocked, and needs a human decision** (open questions). Validating the golden
+  files against the FHIR R4 JSON Schema could not be done: `hl7.org` is blocked by the proxy, and no
+  installed package ships the schema. That validation was a condition of the W2-2 approval: it
+  guards against the R4B models accepting R4-invalid output. So W2-2 stays approved with that
+  condition open, not closed.
+- **Contract edits 2026-09-25, not yet verified** (the architect has no shell). Commands and expected
+  results are in the verification note below.
 - **Waiting on teammates:** final W2-2 signatures after the conditions (`healthcare-standards-engineer`);
   the `retry-topic` spike report (`platform-engineer`). The first model result has pause-until-due at
   p50 lateness of about 515 s at production tiers, which is option (a)'s head-of-line cost made
@@ -243,6 +280,7 @@ All six filed and synthesised. Full threshold table with evidence ratings quoted
 | 2026-09-24 | **`postgresql` loader BUILT** (`eca445a`, `connector-engineer`), not yet "Implemented": its duplicate tests repeat `deliver()` in one process, so the 5.1 redelivery test waits for the W2-9 harness. Adopted from the build: all authentication material under `auth.secretRef`; the uniqueness check reads the catalog, because a bare unique index is invisible in `information_schema` | channel-spec README 3.0, 3.4.3 |
 | 2026-09-24 | **Manifest `runnable` checked against W2-1** (`9078982` registers `tributary.hl7v2.parse` only). No example flips: each one naming `parse` also names a `ref` step, and the fanout example needs the unregistered `tributary.hl7v2.to_json`. `requires` lists trimmed to what is still missing | `examples/manifest.json` |
 | 2026-09-25 | **Human (asked directly by the lead): the `clickhouse` loader uses ClickHouse's HTTP interface through the Python standard library**, built like the HTTP loader: redirects refused, no pooling, no hidden retries, auth in headers from `secretRef`, stdlib TLS. No new dependency. Found by `connector-engineer` on W2-6: `clickhouse-connect` (Apache-2.0) unconditionally requires `certifi` (MPL-2.0), approved dev-only, so `licence_check.py` failed when it entered `tributary-loaders`' runtime closure; the engineer stopped and reverted. Its defaults (`query_retries=2`, internal HTTP retries) also re-send silently on connection failure (`wave-2.md` 6.3). **`certifi`'s scope is unchanged: non-runtime only.** Rejected: approving `certifi` for the runtime; deferring the loader. **Deviates from the CLAUDE.md stack table** (Archive names `clickhouse-connect`) for the loader only; the table is human-owned and the proposed one-line change went to the lead. The wave 3 archiver's client is **not decided** (open questions) | ADR-001 2.3 |
+| 2026-09-25 | **W2-5 contract proposals ruled (six).** (1) A keyword-named `with` key binds to `key_`, and `**kwargs` is refused: **approved**. (2) Derived child-id encoding: **approved with the layout pinned exactly.** Bits 12-17 of the 80-bit digest prefix are discarded, and the "set version and variant bits" wording, which also reads as overwrite-in-place, is replaced. (3) Engine error-code registry: **approved with amendments.** The contract is the source and code is checked against it, not generated from it. Eight loader-family prefixes are added. **Drift found:** the executor emits `STEP_ERROR` where the contract says `TRANSFORM_ERROR`, and the contract wins. (4) Built-in `with` shapes: **approved.** The filter's JSON deny-list applies to every pointer token, which corrects my "ends in" wording. (5) Reprocess refuses `tb-parent-id` records until W3-3: **approved as refuse-only.** It over-refuses reprocessed records, on purpose. (6) Manifest: **approved.** It was three examples, not two. The `parse` `version` gap is added to two examples, and nothing flips to runnable. Rejected: generating the registry from `codes.py`, and "refuse or scope" for split children before a re-entry point exists | `contracts/CHANGELOG.md` 2026-09-25, channel-spec README 3.3-3.3.3, envelope README 2.3.2, ADR-003 follow-up 10 |
 
 ## Open questions for the human
 
@@ -254,6 +292,20 @@ struck through were decided and are kept for one revision so the change is visib
 on the human's approval (2026-09-24).
 
 **Open, new in wave 2:**
+
+- **FHIR R4 JSON Schema for W2-2 golden-file validation: vendor the file, or allow one-time network
+  access?** (Raised 2026-09-25.) This is a condition of the W2-2 approval: the `fhir.resources` models
+  are R4B, and validating the goldens against the R4 schema catches R4-invalid output they accept.
+  `hl7.org` is blocked by the proxy, and no installed package ships the schema.
+  - **Option 1, vendor `fhir.schema.json` into the repo.** Reproducible and offline. It is a
+    licensing question, because it is third-party content in the repo. The architect's
+    understanding is that HL7 publishes FHIR under CC0, but that is **unverified**, and CC0 is not
+    on invariant 10's list.
+  - **Option 2, allow one-time network access to fetch it.** No licensing change to the tree, but
+    the check is not reproducible offline or in CI unless the fetched file is cached somewhere.
+
+  Either way it is a human call (licensing, or environment access). Until then, W2-2 condition 4
+  stays open and the golden files are unchecked against R4.
 
 - ~~**SFTP client licence.**~~ **DECIDED 2026-09-24: `paramiko` approved**, unmodified and scoped
   (decisions log, ADR-001 2.3). Kept for one revision so the change is visible. The scope question is
@@ -376,3 +428,5 @@ version is `docs/spikes/PHASE-0-DECISION.md` section 9 and ADR-001 section 13.
 | **ClickHouse duplicate test passes falsely**, because deduplication is eventual | Medium | Medium | Assert a `FINAL` count (README 5.1) |
 | **Exit criterion 4 reported against laptop numbers only** | High | Medium | Run the Linux re-run, or say so in the report rather than compare as if the numbers were comparable |
 | **Claim-check is unscheduled** while file and HTTP sources make large inputs more common | Medium | Medium | Every source refuses input over 1 MB; the lead decides whether to schedule the spike (`wave-2.md` 5.2) |
+| **A produce-time `EnvelopeError` crashes the pipeline worker** (W2-5, open) | Unknown until review rules | High: a crash loop on one record halts the partition, which is the envelope 2.3 failure class | Handle it as a reject (dlq, event, commit), never an unhandled exception. `code-reviewer`/`security-reviewer` rule on it; must be closed or explicitly accepted before W2-5 is done |
+| **Contract and code drift on names nobody checks** (latest: `STEP_ERROR` vs `TRANSFORM_ERROR`, found only while writing the registry) | Medium | Medium | Registry plus a two-way cross-check test in `tributary-sdk`. The same shape as the wave 1 finding: a green conformance run says the contracts are self-consistent, not that they agree with the code |
