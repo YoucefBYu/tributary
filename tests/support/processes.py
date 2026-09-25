@@ -235,6 +235,44 @@ def spawn_postgresql_loader(
     return proc
 
 
+def spawn_kafka_loader(
+    *,
+    channel: str,
+    destination: str,
+    env: str,
+    bootstrap: str,
+    instance_id: str = "loader-e2e",
+    secrets_dir: Path | str | None = None,
+    timeout_s: float = 30.0,
+) -> ManagedProcess:
+    """Same shape as `spawn_postgresql_loader`, for `tributary.loaders.kafka`'s real entry point
+    (`packages/tributary-loaders/src/tributary/loaders/kafka/main.py`, connector-engineer, W2-6) --
+    added for a genuine-redelivery duplicate-delivery test in that package's own style. `--bootstrap`
+    is the ENGINE's cluster (the one this process reads `out.<dest>`/`_tb.<env>.channels` from); the
+    `kafka` destination's OWN bootstrap servers and credentials come from the deployed spec's
+    `with.connection` (ADR-007 D11), never from this helper's arguments."""
+    args = [
+        sys.executable,
+        "-m",
+        "tributary.loaders.kafka",
+        "--channel",
+        channel,
+        "--destination",
+        destination,
+        "--env",
+        env,
+        "--bootstrap",
+        bootstrap,
+        "--instance-id",
+        instance_id,
+    ]
+    if secrets_dir is not None:
+        args += ["--secrets-dir", str(secrets_dir)]
+    proc = ManagedProcess(args, env=dict(os.environ))
+    proc.wait_for_event("loader_started", timeout_s=timeout_s)
+    return proc
+
+
 WORKER_PROGRAM = """
 import sys
 from tributary.runtime.clients import KafkaSettings
