@@ -646,9 +646,20 @@ class PipelineHandler:
             self.stats.log_summary(self._log, channel=spec.name, channel_version=spec.version)
 
     def close(self) -> None:
-        """Log the step timing summary once more at shutdown."""
+        """Log the step timing summary once more at shutdown, and the branch-level outcomes.
+
+        The loop's `worker_stopped` line counts only records it dead-lettered itself; children and
+        destinations dead-lettered here are counted here, so the two lines together are the whole story.
+        """
         if self._plan_spec is not None:
             self.stats.log_summary(self._log, channel=self._plan_spec.name, channel_version=self._plan_spec.version)
+            self._log.info(
+                "pipeline_branches",
+                channel=self._plan_spec.name,
+                channel_version=self._plan_spec.version,
+                branch_dead_lettered=self.dead_lettered,
+                filtered=self.filtered,
+            )
 
 
 def check_partition_counts(client: Any, env: str, spec: ChannelSpec, *, timeout_s: float = 10.0) -> None:
