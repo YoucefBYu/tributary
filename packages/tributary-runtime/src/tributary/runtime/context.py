@@ -141,3 +141,28 @@ class WorkerContext:
 
     def usr_headers(self) -> Mapping[str, str]:
         return MappingProxyType(dict(self._usr))
+
+    def fork(self, *, destination: str | None = None, traceparent: str | None = None) -> WorkerContext:
+        """A copy for one branch of the executor tree: a split child, or one destination's steps.
+
+        `vars`, `attrs` and `tb-usr-*` are copied, not shared (README 3.5: each destination gets its own
+        copy of the pipeline output), so an attr one destination's step sets does not appear on another
+        destination's events, and a `tb-usr-*` header does not leak to another sink. `vars` is copied
+        shallowly: a parsed object a pipeline step stashed is shared, and a step that mutates one in
+        place rather than replacing it affects its siblings. Values are immutable by convention.
+        """
+        clone = WorkerContext(
+            channel=self.channel,
+            channel_version=self.channel_version,
+            instance=self.instance,
+            log=self._log,
+            secrets=self._secrets,
+            kv=self._kv,
+            destination=destination if destination is not None else self.destination,
+            attempt=self.attempt,
+            traceparent=traceparent if traceparent is not None else self.traceparent,
+        )
+        clone._vars = dict(self._vars)
+        clone._attrs = dict(self._attrs)
+        clone._usr = dict(self._usr)
+        return clone

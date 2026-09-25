@@ -59,15 +59,6 @@ class Idempotency:
 
 
 @dataclass(frozen=True, slots=True)
-class Destination:
-    name: str
-    type: str
-    params: Mapping[str, Any]
-    idempotency: Idempotency
-    retry: RetryPolicy
-
-
-@dataclass(frozen=True, slots=True)
 class StepRef:
     """A step to load: exactly one of `uses` (entry point) or `ref` (dotted path in the bundle)."""
 
@@ -75,6 +66,18 @@ class StepRef:
     uses: str | None = None
     ref: str | None = None
     params: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class Destination:
+    name: str
+    type: str
+    params: Mapping[str, Any]
+    idempotency: Idempotency
+    retry: RetryPolicy
+    #: Set 1.1 (README 3.5): steps run for this destination only, in the pipeline worker, before the
+    #: record is produced to `out.<dest>`. Empty means the destination gets the pipeline output as is.
+    steps: tuple[StepRef, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,12 +222,21 @@ def _destination(channel: str, block: Any) -> Destination:
     if not DESTINATION.match(name):
         raise ChannelSpecError(f"channel {safe_token(channel)}: destination name {safe_token(name)} is not topic-safe")
     params = block.get("with")
+    steps_block = block.get("steps")
+    if steps_block is not None and not isinstance(steps_block, list):
+        raise ChannelSpecError(f"{safe_token(channel)}/{safe_token(name)}: destination steps must be an array")
+    steps = tuple(_step(channel, item) for item in steps_block or [] if isinstance(item, dict))
+    if steps_block is not None and len(steps) != len(steps_block):
+        # A non-object entry would otherwise vanish, and the destination would run fewer steps than the
+        # author wrote. Lenient means ignoring unknown *fields*, not dropping known ones.
+        raise ChannelSpecError(f"{safe_token(channel)}/{safe_token(name)}: every destination step must be an object")
     return Destination(
         name=name,
         type=_text(block, "type", "destination"),
         params=params if isinstance(params, dict) else {},
         idempotency=_idempotency(channel, name, _object(block, "idempotency")),
         retry=_retry(channel, name, _object(block, "retry")),
+        steps=steps,
     )
 
 
