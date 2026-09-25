@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 from tributary.runtime.errors import ChannelSpecError
 from tributary.runtime.events import MessageEvent, RecordingEmitter, serialize
 from tributary.runtime.executor import PIPELINE_SCOPE, StepFailure
@@ -429,3 +431,58 @@ def test_the_shipping_loader_binds_with_and_refuses_an_unknown_key() -> None:
         load_step(StepRef(name="p", uses="tributary.core.passthrough", params={"version": "2.5.1"}))
     loaded = load_step(StepRef(name="p", uses="tributary.core.passthrough", params={}))
     assert loaded.bound == {}
+
+
+# -- properties: ordering and no loss across destination steps -----------------------------------
+
+
+@step
+def by_marker(msg: Message) -> Message | Drop:
+    """Drops on `d`, rejects on `r`, passes anything else: the payload's first byte chooses."""
+    marker = (msg.payload or b"-")[:1]
+    if marker == b"d":
+        return Drop(reason="marker d")
+    if marker == b"r":
+        raise Reject("MARKER_R")
+    return msg
+
+
+REGISTRY["t.by_marker"] = by_marker
+
+
+@given(st.lists(st.tuples(st.sampled_from(["k1", "k2", "k3"]), st.sampled_from(["-", "d", "r"])), max_size=30))
+@settings(max_examples=60, deadline=None)
+def test_destination_steps_never_reorder_or_lose_a_message(stream: list[tuple[str, str]]) -> None:
+    """Invariant 5 and invariant 4 on a per-key channel with destination steps.
+
+    For every destination, each consumed message ends as exactly one of: an `out` record, a `filtered`
+    event, or a destination-scoped dead letter - and the `out` records of one key appear in the order
+    the messages were consumed, with the key unchanged.
+    """
+    spec = channel(
+        pipeline=["t.passthrough"],
+        destinations={"plain": [], "gated": ["t.by_marker"]},
+        ordering="per-key",
+    )
+    harness = Harness(spec)
+    consumed_ids: list[tuple[str, str, str]] = []
+    for position, (key, marker) in enumerate(stream):
+        source = ConsumedRecord(
+            topic="dev.adt-passthrough.raw",
+            partition=0,
+            offset=position,
+            message=make_message(f"{marker}{position}".encode(), key=key.encode(), channel="adt-passthrough"),
+        )
+        harness.handler.handle(source)
+        consumed_ids.append((source.message.msg_id, key, marker))
+
+    plain = [(headers[h.TB_MSG_ID], out_key) for out_key, _v, headers in harness.out("plain")]
+    assert plain == [(msg_id, key.encode()) for msg_id, key, _m in consumed_ids], "plain gets every message in order"
+
+    gated_out = [headers[h.TB_MSG_ID] for _k, _v, headers in harness.out("gated")]
+    gated_dlq = [headers[h.TB_MSG_ID] for _k, _v, headers in harness.dlq()]
+    gated_filtered = [event.message_id for event in harness.events("filtered") if event.destination == "gated"]
+    assert gated_out == [msg_id for msg_id, _k, marker in consumed_ids if marker == "-"]
+    assert gated_dlq == [msg_id for msg_id, _k, marker in consumed_ids if marker == "r"]
+    assert gated_filtered == [msg_id for msg_id, _k, marker in consumed_ids if marker == "d"]
+    assert all(headers[h.TB_DESTINATION] == "gated" for _k, _v, headers in harness.dlq())

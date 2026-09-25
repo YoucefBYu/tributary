@@ -4,13 +4,19 @@ A channel names one of these with `uses:` (`contracts/channel-spec/v0` README 3.
 this process and needs no bundle fetch — unlike `ref:`, which imports a dotted path from the channel's
 own bundle and therefore waits on bundle-fetch (not in wave 1).
 
-Nothing here parses a payload or reaches the network. These are the steps whose behaviour is a property
-of the engine rather than of a channel, so they live with the runtime and are covered by its tests.
+Nothing here reaches the network. These are the steps whose behaviour is a property of the engine
+rather than of a channel, so they live with the runtime and are covered by its tests. The W2-5
+built-ins (`filter`, `enrich`, `validate`, `split`; README 3.3.2) live in `builtins/` and are
+re-exported here, where the entry points point.
 """
 
 from __future__ import annotations
 
 from tributary.sdk import Message, step
+
+from .builtins import enrich, filter_step, split, validate
+
+__all__ = ["enrich", "filter_step", "passthrough", "split", "validate"]
 
 
 @step
