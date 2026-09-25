@@ -68,8 +68,14 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 #: One opener, built once: `HTTPSHandler(context=...)` carries the same trust-store verification
 #: `urlopen`'s `context=` argument would have applied; `_NoRedirectHandler` replaces the default
 #: (redirect-following) handler because `build_opener` drops any default handler a passed-in one
-#: subclasses.
-_OPENER = urllib.request.build_opener(_NoRedirectHandler, urllib.request.HTTPSHandler(context=_SSL_CONTEXT))
+#: subclasses. `ProxyHandler({})` (code review, High, found on the clickhouse loader's identical
+#: opener): without it, `build_opener` installs a `ProxyHandler` that reads `HTTP_PROXY`/`HTTPS_PROXY`
+#: from the environment, so an operator's proxy configuration for this process's outbound internet
+#: traffic would silently also apply to this loader's credentialed, PHI-carrying destination requests.
+#: An empty mapping disables that environment lookup entirely.
+_OPENER = urllib.request.build_opener(
+    _NoRedirectHandler, urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=_SSL_CONTEXT)
+)
 
 
 def stdlib_send(request: Request) -> Response:
