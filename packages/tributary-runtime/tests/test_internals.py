@@ -229,7 +229,7 @@ def test_a_raising_step_is_retried_in_place_then_becomes_a_typed_failure() -> No
         executor.run(make_message(), context())
 
     assert counter.calls == 3, "step_retries=2 means three attempts in total (ADR-003 D4)"
-    assert caught.value.error_code == "STEP_ERROR"
+    assert caught.value.error_code == "TRANSFORM_ERROR"
     assert caught.value.exception_type == "ValueError"
     # The exception text is dropped on purpose: parser and validator messages quote the field value.
     assert "SYNTH" not in str(caught.value)

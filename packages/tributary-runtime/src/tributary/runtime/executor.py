@@ -25,10 +25,13 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from tributary.sdk import Context, Drop, Message, Reject, SplitResult, Splitter, Step
+from tributary.sdk.codes import TRANSFORM_ERROR
 from tributary.sdk.context import Logger
 from tributary.sdk.errors import TributaryError, safe_token
 
-STEP_ERROR_CODE = "STEP_ERROR"
+#: Envelope 2.3.2: a step that exhausts `stepRetries` dead-letters as `TRANSFORM_ERROR`. Wave 1 to the
+#: first W2-5 build emitted `STEP_ERROR`, which stays registered as reserved so old records stay readable.
+STEP_ERROR_CODE = TRANSFORM_ERROR
 
 StepOutcome = Literal["ok", "dropped", "failed", "rejected"]
 
@@ -36,7 +39,7 @@ StepOutcome = Literal["ok", "dropped", "failed", "rejected"]
 class StepFailure(TributaryError):
     """A step raised on every attempt, or raised `Reject`. The record is destined for the DLQ.
 
-    `error_code` is stable and machine-readable: `STEP_ERROR` after exhausted retries, or the step's own
+    `error_code` is stable and machine-readable: `TRANSFORM_ERROR` after exhausted retries, or the step's own
     `Reject` code. `exception_type` is a class name, which is code, not data. The exception's own message
     is deliberately dropped.
     """

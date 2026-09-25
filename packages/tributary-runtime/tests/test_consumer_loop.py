@@ -385,12 +385,12 @@ def test_a_step_failure_is_dead_lettered_without_retrying_the_partition() -> Non
     loop, _ = build(consumer, Failing(), dlq=dlq)
     loop.run(max_iterations=2)
 
-    assert dlq.dead == [("STEP_ERROR", "transformed")]
+    assert dlq.dead == [("TRANSFORM_ERROR", "transformed")]
     assert consumer.pause_calls == []
 
 
 def test_a_rejected_record_is_dead_lettered_with_the_step_s_own_code_and_no_pause() -> None:
-    """README 3.3.2: `Reject(code)` reaches `tb-error-code` as the step's code, not `STEP_ERROR`."""
+    """README 3.3.2: `Reject(code)` reaches `tb-error-code` as the step's code, not `TRANSFORM_ERROR`."""
     consumer = FakeConsumer()
     consumer.append(record(0))
     dlq = RecordingDlq()

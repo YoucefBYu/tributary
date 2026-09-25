@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import struct
 import uuid
 from collections.abc import Iterator
 
@@ -62,18 +63,39 @@ def test_derived_ids_are_valid_uuid7_with_the_parent_timestamp(index: int) -> No
     assert str(child) != parent_id
 
 
-def test_derived_id_is_pinned_so_a_second_implementation_can_check_itself() -> None:
-    """Known-answer vectors: the byte encoding (parent bytes ‖ 4-byte big-endian index, first 12 then 62
-    digest bits) is fixed, so the CLI or another language can verify its own derivation against these."""
-    parent_id = "01923a7b-4c5d-7e6f-8a9b-0c1d2e3f4a5b"
-    assert derived_uuid7(parent_id, 0) == "01923a7b-4c5d-7a07-9a78-dd094f20ee20"
-    assert derived_uuid7(parent_id, 1) == "01923a7b-4c5d-7075-b061-620e49e95a83"
-    assert derived_uuid7(parent_id, 9999) == "01923a7b-4c5d-780f-9067-11c550358874"
+def _independent_derivation(parent_id: str, index: int) -> str:
+    """README 3.3.3 written out as bit strings, sharing no code with `derived_uuid7`.
 
-    digest = int.from_bytes(hashlib.sha256(uuid.UUID(parent_id).bytes + (0).to_bytes(4, "big")).digest()[:10], "big")
-    expected = (uuid.UUID(parent_id).int >> 80) << 80 | 0x7 << 76 | ((digest >> 68) & 0xFFF) << 64 | 0b10 << 62
-    expected |= digest & ((1 << 62) - 1)
-    assert derived_uuid7(parent_id, 0) == str(uuid.UUID(int=expected))
+    Bits are counted from the most significant: rand_a = D[0:12], D[12:18] discarded, rand_b = D[18:80].
+    """
+    parent = uuid.UUID(parent_id)
+    digest = hashlib.sha256(parent.bytes + struct.pack(">I", index)).digest()[:10]
+    d_bits = "".join(f"{byte:08b}" for byte in digest)
+    parent_bits = f"{parent.int:0128b}"
+    child_bits = parent_bits[:48] + "0111" + d_bits[0:12] + "10" + d_bits[18:80]
+    assert len(child_bits) == 128
+    return str(uuid.UUID(int=int(child_bits, 2)))
+
+
+VECTORS = [
+    (0, "01923a7b-4c5d-7a07-9a78-dd094f20ee20"),
+    (1, "01923a7b-4c5d-7075-b061-620e49e95a83"),
+    (9999, "01923a7b-4c5d-780f-9067-11c550358874"),
+]
+
+
+@pytest.mark.parametrize(("index", "expected"), VECTORS)
+def test_the_readme_3_3_3_vectors_are_recomputed_independently(index: int, expected: str) -> None:
+    """The architect asked for an independent recomputation: the table was produced by this SDK."""
+    parent_id = "01923a7b-4c5d-7e6f-8a9b-0c1d2e3f4a5b"
+    assert _independent_derivation(parent_id, index) == expected
+    assert derived_uuid7(parent_id, index) == expected
+
+
+@given(st.integers(min_value=0, max_value=MAX_SPLIT_CHILDREN))
+def test_the_implementation_matches_the_independent_derivation(index: int) -> None:
+    parent_id = uuid7()
+    assert derived_uuid7(parent_id, index) == _independent_derivation(parent_id, index)
 
 
 @pytest.mark.parametrize("bad", ["not-a-uuid", str(uuid.uuid4())])

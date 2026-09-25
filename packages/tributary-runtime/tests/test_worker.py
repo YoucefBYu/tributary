@@ -196,11 +196,11 @@ def test_the_outgoing_record_gets_a_new_span_in_the_same_trace() -> None:
 
 def test_the_dlq_record_is_keyed_by_message_id_and_keeps_the_payload() -> None:
     original = make_message(b"synthetic-payload", key=b"SYNTH-KEY-1")
-    dead = dlq_message(original, error_code="STEP_ERROR", stage="transformed")
+    dead = dlq_message(original, error_code="TRANSFORM_ERROR", stage="transformed")
 
     assert dead.key == original.msg_id.encode("utf-8")
     assert dead.payload == b"synthetic-payload", "reprocess after a code fix needs the original payload"
-    assert dead.error_code == "STEP_ERROR"
+    assert dead.error_code == "TRANSFORM_ERROR"
     assert dead.stage == "transformed"
 
     validator = Draft202012Validator(json.loads(ENVELOPE_SCHEMA.read_text(encoding="utf-8")))
@@ -210,7 +210,7 @@ def test_the_dlq_record_is_keyed_by_message_id_and_keeps_the_payload() -> None:
 def test_the_dlq_record_carries_a_code_and_never_exception_text() -> None:
     """ADR-003 D4: parser messages quote the offending field value, which is PHI."""
     original = make_message(b"synthetic", key=b"K")
-    dead = dlq_message(original, error_code="STEP_ERROR", stage="transformed")
+    dead = dlq_message(original, error_code="TRANSFORM_ERROR", stage="transformed")
     rendered = " ".join(f"{name}={value}" for name, value in dead.headers.items())
     assert "SYNTH^JANE" not in rendered
     assert "ValueError" not in rendered

@@ -232,13 +232,13 @@ def test_a_failing_destination_step_is_retried_then_dead_lettered_for_that_desti
     assert len(harness.out("fhir")) == 1, "the other destination still gets its record"
     [(dlq_key, dlq_value, dlq_headers)] = harness.dlq()
     assert dlq_headers[h.TB_DESTINATION] == "rows", "destination-scoped reprocess needs tb-destination"
-    assert dlq_headers[h.TB_ERROR_CODE] == "STEP_ERROR"
+    assert dlq_headers[h.TB_ERROR_CODE] == "TRANSFORM_ERROR"
     assert dlq_value == b'{"row": true}', "the dlq payload is the destination step's input, not the raw payload"
     assert dlq_key == source.message.msg_id.encode()
     assert dlq_headers[h.TB_MSG_ID] == source.message.msg_id
     assert harness.producer.flushes == 1, "out and dlq records are flushed together before the commit"
     [dead] = harness.events("dlq")
-    assert (dead.destination, dead.error_code) == ("rows", "STEP_ERROR")
+    assert (dead.destination, dead.error_code) == ("rows", "TRANSFORM_ERROR")
 
 
 def test_reject_in_a_destination_step_skips_the_retries() -> None:
@@ -504,5 +504,5 @@ def test_an_exception_merely_named_reject_is_retried_like_any_other() -> None:
     with pytest.raises(StepFailure) as caught:
         harness.handler.handle(record())
     assert CALLS["impostor"] == 3
-    assert caught.value.error_code == "STEP_ERROR"
+    assert caught.value.error_code == "TRANSFORM_ERROR"
     assert not caught.value.rejected

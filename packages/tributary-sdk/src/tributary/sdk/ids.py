@@ -51,10 +51,12 @@ def derived_uuid7(parent_id: str, index: int) -> str:
     loader's `tb-msg-id` idempotency absorbs them. A random id per run would make each replay a new set of
     messages, which is invariant 4 broken.
 
-    Byte encoding, fixed here because two implementations must agree on it: the parent's 16 UUID bytes
-    (RFC 9562 network order) followed by the index as a 4-byte big-endian unsigned integer. The digest's
-    first 12 bits are `rand_a` and its next 62 bits are `rand_b`. Nothing secret is involved: this is a
-    derivation from a random parent id, not a keyed construction.
+    The exact layout is pinned in channel-spec README 3.3.3, because two implementations must agree on
+    it bit for bit. Input: the parent's 16 UUID bytes (RFC 9562 network order) followed by the index as
+    a 4-byte big-endian unsigned integer. `D` is the first 10 bytes of the SHA-256 digest, an 80-bit
+    big-endian integer, with bits counted from the most significant. `rand_a` is `D` bits 0-11
+    (`D >> 68`); **bits 12-17 are discarded**; `rand_b` is `D` bits 18-79 (`D mod 2^62`). Nothing secret
+    is involved: this is a derivation from a random parent id, not a keyed construction.
     """
     parent = uuid.UUID(parent_id)
     if parent.version != 7:
