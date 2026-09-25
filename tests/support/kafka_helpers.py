@@ -16,10 +16,110 @@ import time
 import uuid
 from typing import Any
 
-from confluent_kafka import Consumer, Producer
-from confluent_kafka.admin import AdminClient
+from confluent_kafka import Consumer, KafkaException, Producer
+from confluent_kafka.admin import AdminClient, NewTopic
 from tributary.sdk import Message
 from tributary.sdk import headers as h
+
+# Error substrings from a `CreateTopics` future that mean "the cluster has not finished settling yet,
+# try again" rather than "this request is wrong". `_DESTROY_BROKER`/`_TRANSPORT`/`_TIMED_OUT` are
+# librdkafka-local codes for a broker connection that reset mid-request (real on a freshly-started
+# multi-broker KRaft cluster: controller-quorum leader election bounces broker connections during the
+# same window `list_topics` first reports all N brokers present -- `await_broker` proves the brokers
+# exist, not that the controller has finished settling enough to serve `CreateTopics`).
+# `NOT_CONTROLLER`/`BROKER_NOT_AVAILABLE` are the broker-side equivalents. `INVALID_REPLICATION_FACTOR`
+# is only transient when the message says there are fewer live brokers than the requested RF (an RF=3
+# request racing the third broker still joining); any other `INVALID_REPLICATION_FACTOR` is a real
+# request error and must not be retried.
+_TRANSIENT_CREATE_TOPICS_ERRORS = (
+    "_DESTROY_BROKER",
+    "_TRANSPORT",
+    "_TIMED_OUT",
+    "NOT_CONTROLLER",
+    "BROKER_NOT_AVAILABLE",
+)
+
+
+def _is_transient_create_topics_error(exc: Exception) -> bool:
+    text = str(exc)
+    if any(code in text for code in _TRANSIENT_CREATE_TOPICS_ERRORS):
+        return True
+    return "INVALID_REPLICATION_FACTOR" in text and "fewer" in text.lower()
+
+
+def create_topics_with_retry(bootstrap: str, topics: list[NewTopic], *, deadline_s: float = 90.0) -> None:
+    """Create `topics`, retrying transient `CreateTopics` failures on a fresh `AdminClient` each attempt.
+
+    A single `create_topics` call proves nothing about whether the cluster can actually serve it: on a
+    multi-broker cluster, `await_broker` returning (metadata lists every broker) races the controller
+    quorum finishing leader election, and a `CreateTopics` sent into that window can see a broker
+    connection reset (`_DESTROY_BROKER`) instead of an answer. This retries only errors that mean "not
+    ready yet" (see `_is_transient_create_topics_error`); anything else, or `TOPIC_ALREADY_EXISTS`,
+    resolves immediately (success or re-raise). It then blocks until every partition of every requested
+    topic has a leader and as many in-sync replicas as the topic's replication factor, since a
+    `CreateTopics` future can resolve before the partitions it created are actually able to serve
+    produce/consume at the requested durability.
+    """
+    by_name = {topic.topic: topic for topic in topics}
+    deadline = time.monotonic() + deadline_s
+    last_exc: Exception | None = None
+    while time.monotonic() < deadline:
+        admin = AdminClient({"bootstrap.servers": bootstrap})
+        futures = admin.create_topics(topics)
+        pending: list[Exception] = []
+        for _topic, future in futures.items():
+            try:
+                future.result(timeout=30)
+            except Exception as exc:  # triaged below by message, not swallowed
+                if "TOPIC_ALREADY_EXISTS" in str(exc):
+                    continue
+                if not _is_transient_create_topics_error(exc):
+                    raise
+                pending.append(exc)
+        if not pending:
+            _await_topics_replicated(
+                bootstrap, list(by_name.values()), deadline_s=max(deadline - time.monotonic(), 5.0)
+            )
+            return
+        last_exc = pending[-1]
+        time.sleep(1.0)
+    raise KafkaException(f"CreateTopics did not succeed within {deadline_s}s: {last_exc}") from last_exc
+
+
+def _await_topics_replicated(bootstrap: str, topics: list[NewTopic], *, deadline_s: float) -> None:
+    """Block until every partition of `topics` has a leader and its full replica set in-sync.
+
+    A `CreateTopics` future resolving does not mean the partitions are ready: on a cluster still
+    settling, metadata can briefly show a partition with no leader or with fewer in-sync replicas than
+    its replication factor. A test that proceeds to produce/consume (or, worse, to kill a broker) before
+    this holds could observe the fault it thinks it is injecting for a reason that is really "the
+    cluster was never fully up," not the fault.
+    """
+    deadline = time.monotonic() + deadline_s
+    last_reason = "no metadata observed yet"
+    while time.monotonic() < deadline:
+        try:
+            metadata = AdminClient({"bootstrap.servers": bootstrap}).list_topics(timeout=5)
+            not_ready: list[str] = []
+            for topic in topics:
+                info = metadata.topics.get(topic.topic)
+                if info is None or info.error is not None:
+                    not_ready.append(f"{topic.topic}: missing from metadata")
+                    continue
+                for partition_id, partition in info.partitions.items():
+                    if partition.leader < 0:
+                        not_ready.append(f"{topic.topic}-{partition_id}: no leader")
+                    elif len(partition.isrs) < topic.replication_factor:
+                        not_ready.append(
+                            f"{topic.topic}-{partition_id}: {len(partition.isrs)}/{topic.replication_factor} ISR"
+                        )
+            if not not_ready:
+                return
+            last_reason = "; ".join(not_ready)
+        except Exception as exc:  # any failure here means the cluster is not ready yet
+            last_reason = str(exc)
+        time.sleep(1.0)
+    raise RuntimeError(f"topics did not reach full ISR within {deadline_s}s: {last_reason}")
 
 
 def free_port() -> int:

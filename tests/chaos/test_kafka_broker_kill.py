@@ -46,6 +46,7 @@ from tributary.runtime.topics import raw_topic
 
 from benchmarks.gen import generate
 from tests.support.channel_spec import walking_skeleton_document, write_channel_spec_file
+from tests.support.kafka_helpers import create_topics_with_retry
 from tests.support.mllp_client import is_application_accept, send_mllp
 from tests.support.processes import ManagedProcess, spawn_mllp_receiver
 
@@ -148,15 +149,13 @@ def kafka_cluster() -> Iterator[tuple[str, dict[int, Broker]]]:
 
 @pytest.fixture(scope="module")
 def topics(kafka_cluster: tuple[str, dict[int, Broker]]) -> tuple[str, dict[int, Broker]]:
+    """Create `raw` with a bounded retry: `_await_cluster` proves metadata lists all 3 brokers, not that
+    the controller quorum has finished settling enough to serve `CreateTopics` -- a single attempt right
+    after that gate can race a controller-quorum leader election and see a broker connection reset
+    (`_DESTROY_BROKER`) instead of an answer. See `create_topics_with_retry`."""
     bootstrap, brokers = kafka_cluster
-    admin = AdminClient({"bootstrap.servers": bootstrap})
     wanted = [NewTopic(raw_topic(ENV, CHANNEL), PARTITIONS, 3)]
-    for _topic, future in admin.create_topics(wanted).items():
-        try:
-            future.result(timeout=30)
-        except Exception as exc:  # pragma: no cover - already exists on a re-run
-            if "TOPIC_ALREADY_EXISTS" not in str(exc):
-                raise
+    create_topics_with_retry(bootstrap, wanted)
     return bootstrap, brokers
 
 
