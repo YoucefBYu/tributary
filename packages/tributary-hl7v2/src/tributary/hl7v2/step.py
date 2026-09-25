@@ -32,10 +32,25 @@ ENCODING_VARS_KEY = "hl7_encoding"
 #: is, a channel with a non-UTF-8 sender sets `ctx.vars["hl7_encoding"]` from an earlier step.
 DEFAULT_ENCODING = "utf-8"
 
+#: The `ctx.vars` key `version` (when given) is stashed under, for a step further down the same pipeline
+#: that wants the channel's *declared* version rather than re-deriving one from MSH-12.
+VERSION_VARS_KEY = "hl7_version"
+
 
 @step(name="tributary.hl7v2.parse")
-def parse(message: Message, ctx: Context) -> Message:
+def parse(message: Message, ctx: Context, *, version: str | None = None) -> Message:
     """Parse the message's HL7 v2 payload and stash it in `ctx.vars["hl7"]`. Returns `message` unchanged.
+
+    `version` (optional, bound from the channel spec's `with:`, e.g. `{"version": "2.5.1"}`) declares the
+    HL7 version the channel expects senders to use. **What it checks:** nothing about the message's
+    conformance -- it is stashed verbatim in `ctx.vars["hl7_version"]` (`VERSION_VARS_KEY`) so a step
+    further down the same pipeline (a mapping step choosing between v2.3-era and v2.8-era field layouts,
+    say) has a value to branch on that does not depend on MSH-12 being populated, which real senders
+    frequently leave blank or get wrong. If MSH-12 *is* present and differs from the declared `version`,
+    this is logged as a structural mismatch flag only (never the two version strings themselves, which
+    are sender-controlled MSH-9/MSH-12 text -- invariant 6 treats them the same as any other field) and
+    the message is **not** failed: this parameter is a declaration for downstream steps to use, not a
+    conformance-profile check (that is CLAUDE.md's separate, optional "validation" pipeline step).
 
     Raises `tributary.hl7v2.errors.Hl7Error` (a malformed message, or a claim-checked payload this step
     cannot yet fetch) rather than returning a `Drop`: a parse failure is a pipeline fault that the
@@ -56,5 +71,14 @@ def parse(message: Message, ctx: Context) -> Message:
         # review found the un-allowlisted version could still put close-to-arbitrary MSH-9 content into
         # an archived, searchable field; this closes that, not just the crash).
         ctx.set_attr("hl7_type", f"{msg_type}_{trigger_event}")
+
+    if version is not None:
+        ctx.vars[VERSION_VARS_KEY] = version
+        actual_version = hl7.version()
+        if actual_version and actual_version != version:
+            # Boolean only, never the two version strings (see the docstring above): a mismatch is
+            # visible without echoing sender-controlled MSH-12 text into a log line.
+            ctx.log.debug("hl7_version_mismatch", declared_version_matches_msh12=False)
+
     ctx.log.debug("hl7_parsed", segment_count=len(hl7))
     return message

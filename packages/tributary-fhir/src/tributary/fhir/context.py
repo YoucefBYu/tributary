@@ -9,8 +9,8 @@ parameter with `FhirContext` rather than the bare SDK `Context`:
     @step
     def to_fhir_bundle(msg: Message, ctx: FhirContext) -> Message: ...
 
-`@step`'s signature check (`tributary.sdk.step._takes_context`) only counts positional parameters, never
-their annotation, so this needs no SDK change -- the runtime hands the step whatever object it has, and
+`@step`'s signature check (`tributary.sdk.step._inspect`) only counts positional parameters, never their
+annotation, so this needs no SDK change -- the runtime hands the step whatever object it has, and
 Python's structural typing (`Protocol`, `runtime_checkable`) means it only has to have `.fhir` and
 `.terminology`, not literally be this class.
 
