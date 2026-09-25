@@ -64,10 +64,21 @@ wave's exit criteria here.
   - the registry cross-check test;
   - the `ids.py` docstring.
 
-  **Open risk: a produce-time `EnvelopeError` crashes the worker.** Envelope 2.3 says a component
-  rejects and never crashes, and an unhandled exception in the consumer loop is a crash loop on one
-  record, which halts a partition. The reviewers are expected to rule on its severity. It touches
-  delivery, so it must be closed or explicitly accepted before W2-5 is marked done.
+  **Risk: a produce-time `EnvelopeError` crashes the worker. Fix delivered, pending review.** In
+  `2a16e24`, `8af0d63` and `6daf4f4` the worker catches it, dead-letters the consumed record with
+  `TB_OUTPUT_ENVELOPE_INVALID` and produces nothing (`worker.py`, tests in
+  `test_envelope_limits_and_budget.py`). The architect has read this but not run it. It closes when
+  the reviewers clear it. A second round of rulings the same day covered the filter allow-list, the
+  split terminator, two `TB_` codes, `Reject` declarations and the `ref` scope (decisions log).
+- **Residual risk (W2-5, accepted for wave 2): a `raw` payload over 1 MB crash-loops the worker.**
+  This happens when a producer bypasses the receivers. Such a record cannot be dead-lettered, because
+  the `dlq` record would break the same size limit. So the partition halts; nothing is lost, and the
+  record stays on `raw`. The real fix is claim-check, which is not scheduled in wave 2.
+  - It needs WRITE on `raw`, which `topics/v0` 3.4 grants to the receiver principal only. So it
+    means a misconfigured ACL or a compromised receiver credential, not ordinary traffic.
+  - **Architect recommendation (not a ruling):** turn the crash loop into a controlled
+    `partition_halted` event and pause. The outcome is the same, but an operator gets an alert
+    instead of a restart storm.
 - **W2-3 (HL7 v2 to FHIR content; `healthcare-standards-engineer`): Critical found, fix in
   progress.** `code-reviewer` found that `Encounter` was keyed on `tb-msg-id` instead of PV1-19 (visit
   number). One visit would then be a new Encounter per message, and conditional-update idempotency
@@ -281,6 +292,7 @@ All six filed and synthesised. Full threshold table with evidence ratings quoted
 | 2026-09-24 | **Manifest `runnable` checked against W2-1** (`9078982` registers `tributary.hl7v2.parse` only). No example flips: each one naming `parse` also names a `ref` step, and the fanout example needs the unregistered `tributary.hl7v2.to_json`. `requires` lists trimmed to what is still missing | `examples/manifest.json` |
 | 2026-09-25 | **Human (asked directly by the lead): the `clickhouse` loader uses ClickHouse's HTTP interface through the Python standard library**, built like the HTTP loader: redirects refused, no pooling, no hidden retries, auth in headers from `secretRef`, stdlib TLS. No new dependency. Found by `connector-engineer` on W2-6: `clickhouse-connect` (Apache-2.0) unconditionally requires `certifi` (MPL-2.0), approved dev-only, so `licence_check.py` failed when it entered `tributary-loaders`' runtime closure; the engineer stopped and reverted. Its defaults (`query_retries=2`, internal HTTP retries) also re-send silently on connection failure (`wave-2.md` 6.3). **`certifi`'s scope is unchanged: non-runtime only.** Rejected: approving `certifi` for the runtime; deferring the loader. **Deviates from the CLAUDE.md stack table** (Archive names `clickhouse-connect`) for the loader only; the table is human-owned and the proposed one-line change went to the lead. The wave 3 archiver's client is **not decided** (open questions) | ADR-001 2.3 |
 | 2026-09-25 | **W2-5 contract proposals ruled (six).** (1) A keyword-named `with` key binds to `key_`, and `**kwargs` is refused: **approved**. (2) Derived child-id encoding: **approved with the layout pinned exactly.** Bits 12-17 of the 80-bit digest prefix are discarded, and the "set version and variant bits" wording, which also reads as overwrite-in-place, is replaced. (3) Engine error-code registry: **approved with amendments.** The contract is the source and code is checked against it, not generated from it. Eight loader-family prefixes are added. **Drift found:** the executor emits `STEP_ERROR` where the contract says `TRANSFORM_ERROR`, and the contract wins. (4) Built-in `with` shapes: **approved.** The filter's JSON deny-list applies to every pointer token, which corrects my "ends in" wording. (5) Reprocess refuses `tb-parent-id` records until W3-3: **approved as refuse-only.** It over-refuses reprocessed records, on purpose. (6) Manifest: **approved.** It was three examples, not two. The `parse` `version` gap is added to two examples, and nothing flips to runnable. Rejected: generating the registry from `codes.py`, and "refuse or scope" for split children before a re-entry point exists | `contracts/CHANGELOG.md` 2026-09-25, channel-spec README 3.3-3.3.3, envelope README 2.3.2, ADR-003 follow-up 10 |
+| 2026-09-25 | **W2-5 second round (five items).** (1) **Filter allow-list ratified** (21 fields; security MEDIUM 3), **with an amendment**: a repeated `ORC`/`OBR`/`OBX` (any repeated segment) is unresolved for the filter, so a first-occurrence read cannot silently drop a multi-result message. No example is refused. Rejected: a longer deny-list, because it fails open. (2) hl7-batch final CR only if the parent had it: **ratified**. (3) `TB_OUTPUT_ENVELOPE_INVALID` and `TB_PIPELINE_TIME_BUDGET` **registered by exact name**; fixed names under a reserved prefix are listed. (4) Bundle-declared `Reject` codes **deferred to bundle-fetch**; interim, codes are literals, and a data-built code is Critical in review. (5) `ref` restricted to the pinned bundle's own packages: **approved now**, enforced with bundle-fetch | `contracts/CHANGELOG.md` 2026-09-25 (later), channel-spec README 3.3.1, 3.3.2, 9 |
 
 ## Open questions for the human
 
@@ -428,5 +440,6 @@ version is `docs/spikes/PHASE-0-DECISION.md` section 9 and ADR-001 section 13.
 | **ClickHouse duplicate test passes falsely**, because deduplication is eventual | Medium | Medium | Assert a `FINAL` count (README 5.1) |
 | **Exit criterion 4 reported against laptop numbers only** | High | Medium | Run the Linux re-run, or say so in the report rather than compare as if the numbers were comparable |
 | **Claim-check is unscheduled** while file and HTTP sources make large inputs more common | Medium | Medium | Every source refuses input over 1 MB; the lead decides whether to schedule the spike (`wave-2.md` 5.2) |
-| **A produce-time `EnvelopeError` crashes the pipeline worker** (W2-5, open) | Unknown until review rules | High: a crash loop on one record halts the partition, which is the envelope 2.3 failure class | Handle it as a reject (dlq, event, commit), never an unhandled exception. `code-reviewer`/`security-reviewer` rule on it; must be closed or explicitly accepted before W2-5 is done |
+| **A produce-time `EnvelopeError` crashes the pipeline worker** (W2-5; **fix delivered, pending review**) | Low once reviewed | High: a crash loop on one record halts the partition, which is the envelope 2.3 failure class | Dead-letter the consumed record as `TB_OUTPUT_ENVELOPE_INVALID`, producing nothing (`2a16e24`, `8af0d63`, `6daf4f4`). Closes when the reviewers clear it |
+| **A `raw` payload over 1 MB crash-loops the worker** (W2-5 residual, accepted for wave 2) | Low: needs WRITE on `raw`, which is receiver-only (`topics/v0` 3.4) | Medium: the partition halts, nothing is lost | Claim-check (unscheduled). Recommended interim: a controlled `partition_halted` event instead of a crash loop |
 | **Contract and code drift on names nobody checks** (latest: `STEP_ERROR` vs `TRANSFORM_ERROR`, found only while writing the registry) | Medium | Medium | Registry plus a two-way cross-check test in `tributary-sdk`. The same shape as the wave 1 finding: a green conformance run says the contracts are self-consistent, not that they agree with the code |

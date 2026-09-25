@@ -331,6 +331,16 @@ ADR-001 6.1's own example uses it for two of three steps — so rejecting it wou
 authoring on bundle-fetch landing first. Loud-and-unimplemented gets a doc; silent-and-unmeasured gets
 a validator rule.
 
+**When bundle-fetch exists, `ref` resolves only inside the pinned bundle (approved 2026-09-25,
+`platform-engineer`).** The first dotted segment of a `ref` must be a top-level package that the
+bundle named by `pipeline.bundle` itself provides. A `ref` into the standard library, into the
+engine (`tributary.*`, which `uses` covers), or into any other package on the worker's import path is
+refused at load. Without this, `ref` is "import any callable the worker can reach", including engine
+internals and another channel's bundle, and the digest pin no longer answers "what code ran". The
+rule costs nothing today because `ref` is unimplemented. It is written now so that bundle-fetch is
+built to it, not retrofitted. No example changes: they reference `adt_flow`, `lab_flow` and
+`fhir_flow`, which are the bundles' own packages by construction.
+
 **`bundle` stays required even for a `uses`-only pipeline.** The digest then names the image whose
 entry points provide those steps, which is the worker or runtime image itself. That keeps the property
 digest-pinning exists for: "what code ran" is answerable from `tb-channel-version` alone, regardless of
@@ -371,10 +381,39 @@ key. All of this is refused at load.
 
 | Step | `with` | Rules |
 |---|---|---|
-| `tributary.core.filter` | `field` (locator) plus exactly one of `in`, `notIn` (non-empty arrays of non-empty strings) or `present` (boolean); **`onUnresolved: drop \| keep \| reject`, required, no default** | A filtered message is `Drop(reason="FILTERED")`. `in`/`notIn` compare the located bytes exactly: case-sensitive, with no trimming. **`field` may not point into a patient-identifying segment** (`PID`, `PD1`, `NK1`, `GT1`, `IN1`, `IN2`, `MRG`), and **no token of a JSON `field` may be** `identifier`, `name`, `birthDate`, `telecom` or `address`. The reason: the `in` values are written in the spec, which is published on `_tb.<env>.channels` and shown in the UI, and a spec must not carry PHI. This is a deny-list, not a proof. See "unresolved" and `present` below |
+| `tributary.core.filter` | `field` (locator) plus exactly one of `in`, `notIn` (non-empty arrays of non-empty strings) or `present` (boolean); **`onUnresolved: drop \| keep \| reject`, required, no default** | A filtered message is `Drop(reason="FILTERED")`. `in`/`notIn` compare the located bytes exactly: case-sensitive, with no trimming. **`field` must be exactly one of the filter allow-list below.** The deny-list is checked first, as a second line of defence: **`field` may not point into a patient-identifying segment** (`PID`, `PD1`, `NK1`, `GT1`, `IN1`, `IN2`, `MRG`), and **no token of a JSON `field` may be** `identifier`, `name`, `birthDate`, `telecom` or `address`. The reason: the `in` values are written in the spec, which is published on `_tb.<env>.channels` and shown in the UI, and a spec must not carry PHI. See "unresolved", `present` and repeated segments below |
 | `tributary.core.enrich` | `attrs` (static pairs), `usr` (static pairs), `attrFrom` (`name=locator` pairs); at least one | `attrFrom` locators must be **exactly** one of: `hl7:MSH.3`, `hl7:MSH.4`, `hl7:MSH.5`, `hl7:MSH.6`, `hl7:MSH.9.1`, `hl7:MSH.9.2`, `hl7:MSH.9.3`, `hl7:MSH.11`, `hl7:MSH.12`, `hl7:EVN.1`, `json:/resourceType`. `hl7:MSH.9` as a whole field is not on the list. Static values must pass the `attrs` or `tb-usr-*` guard at load. A derived value that fails the guard at run time is skipped and logged by attr name and reason, never by value. Enrichment never fails a message. An attr name may not appear in both `attrs` and `attrFrom`. At most 16 attrs (`events/v0` 3). `usr` is static only, because copying payload into a header launders PHI |
 | `tributary.core.validate` | `requireSegments` (segment ids), `version` (one HL7 version id or an array of them, written as strings); at least one | Raises `Reject` with `VALIDATE_NOT_HL7` (wrong content type, a claim-checked payload, or no leading `MSH`), `VALIDATE_SEGMENT_MISSING` or `VALIDATE_VERSION_MISMATCH` (`MSH-12.1` absent or not listed). JSON-schema validation comes later |
 | `tributary.core.split` | `by: hl7-batch \| json-array`, required; `pointer` (RFC 6901, `json-array` only, default empty = the document itself) | See the split rules below |
+
+**Filter allow-list (ratified 2026-09-25, with one amendment).** `field` must be exactly one of these
+locator texts:
+
+| Scheme | Fields | What they hold |
+|---|---|---|
+| `hl7:` | `MSH.3`, `MSH.4`, `MSH.5`, `MSH.6`, `MSH.9.1`, `MSH.9.2`, `MSH.9.3`, `MSH.11`, `MSH.12`, `EVN.1` | Feed and message typing, the same set as enrich's `attrFrom` |
+| `hl7:` | `PV1.2` (patient class), `PV1.4` (admission type), `ORC.1` (order control), `ORC.5` (order status), `OBR.25` (result status), `OBX.2` (value type), `OBX.11` (observation result status) | Status-style codes with small, published HL7 vocabularies |
+| `json:` | `/resourceType`, `/status`, `/intent`, `/type` | Top-level FHIR typing and status codes |
+
+**Why an allow-list and not a longer deny-list.** The decision of 2026-09-24 said the filter "may not
+filter on identifier fields", and the segment deny-list could not deliver that. The W2-5 security
+review found MEDIUM 3: `PV1.19` (visit number), `ORC.3`/`OBR.3` (order numbers), `OBX.5` (a result
+value), any Z-segment, `json:/subject/reference`, `/subject/display` and `/id` all passed. A deny-list
+fails open on every field nobody thought of. An allow-list fails closed. **Give up:** the built-in
+filter cannot route on anything else, and wider routing needs a channel step. A field is added to
+the list through the architect, and only if it holds a small coded vocabulary that cannot hold an
+identifier.
+
+**Amendment: a repeated segment is unresolved for the filter.** The shared evaluator reads the
+**first** occurrence of a segment (4.3). `ORC`, `OBR` and `OBX` repeat inside one message, so
+`field: hl7:OBX.11, in: [F]` would judge a whole multi-result message on its first observation. It
+would then drop a message whose later results are final, silently. For the filter only, an `hl7:`
+`field` whose segment occurs more than once in the payload is **unresolved**, and `onUnresolved`
+decides what happens, which the author wrote down. This is the same rule 4.3 applies to a repeated
+header: never "the first one". The key evaluator is unchanged. (Change request to `platform-engineer`.)
+
+**No example spec is affected.** No valid or invalid example, and nothing in `deploy/` or `docs/`,
+uses `tributary.core.filter`. The ADT examples filter through a `ref` step.
 
 **Filter: "unresolved" and `present`.** For `in` and `notIn`, a locator result that is not a value is
 unresolved. That covers an absent segment, field, repetition or pointer, a payload not in the
@@ -397,7 +436,8 @@ content type, or an ambiguous duplicate JSON member.
 not *end in* a denied name. That misses the most common shapes: `/identifier/0/value` ends in `value`,
 and `/name/0/family` ends in `family`. `platform-engineer` implemented the stricter rule, and this
 contract now states it. The change is not breaking: the rule arrived in set 1.1, which is not frozen
-yet, and schema validity is unchanged.
+yet, and schema validity is unchanged. Since the allow-list, the deny-list is the second line of
+defence, and it matters again only if the allow-list grows.
 
 **`Reject(code)`**, a new SDK exception: the step fails **non-retryably**. The executor dead-letters
 the message immediately with `tb-error-code` = the code (`^[A-Z][A-Z0-9_]{2,63}$`), skipping
@@ -447,7 +487,10 @@ any step can do by returning a list.
 - `by: hl7-batch` produces one child per `MSH` segment group. The batch envelope (`FHS`, `BHS`, `BTS`,
   `FTS`) belongs to no child. Segments are re-joined with CR, the HL7 segment terminator. So a batch
   delimited with LF or CRLF yields children delimited with CR, and empty lines are dropped. Field
-  bytes are unchanged. A segment before the first `MSH`, or a line that is not a segment, is
+  bytes are unchanged. **A child's final segment gets a CR only if the parent terminated that
+  segment.** A split therefore never adds a byte its parent did not have. Otherwise a
+  1,000,000-byte message with no final CR would become a 1,000,001-byte child that no topic accepts
+  (W2-5 security review). A segment before the first `MSH`, or a line that is not a segment, is
   `Reject("SPLIT_INPUT_INVALID")`.
 - `by: json-array` produces one child per element of the array at `pointer`. **Each child is the
   element's exact source text**, not a re-serialisation: re-dumping would turn `1.50` into `1.5`, and
@@ -1007,9 +1050,16 @@ envelope and events manifests, so nothing else in the suite changed.
   child is itself reprocessed;
   (b) an additive header naming the origin.
   W3-3 brings a proposal.
-- **JSON filter deny-list candidates.** `subject` and `patient` references carry a logical id that can
-  be an MRN. They are not on the 3.3.2 list in set 1.1. Add them if a real channel shows the need, or
-  if a reviewer finds one in use.
+- ~~JSON filter deny-list candidates (`subject`, `patient`).~~ **Superseded the same day** by the
+  filter allow-list (3.3.2), under which neither is reachable.
+- **Declared `Reject` codes: deferred to bundle-fetch, not wave 2** (`platform-engineer`'s proposal,
+  2026-09-25). The proposal: each bundle declares its codes in its manifest, and `Reject` refuses an
+  undeclared one at load, so `f"MRN_{pid3}"` fails. The PHI path is real: the code grammar admits
+  digits, and `tb-error-code` reaches headers, events and ClickHouse. **Why later:** the proposed home
+  is a bundle manifest, and no bundle format exists until bundle-fetch. In wave 2 every `uses` step
+  is engine or first-party code under `code-reviewer`. **Interim rule:** a `Reject` code is a literal
+  or a module constant, never built from message data. `code-reviewer` treats a violation as Critical
+  (invariant 6). Designed with bundle-fetch, together with the `ref` restriction in 3.3.1.
 
 ---
 

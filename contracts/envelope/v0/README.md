@@ -273,7 +273,9 @@ failure 2.3 names for a log-only taxonomy that operations comes to depend on.
    `reserved_prefixes` entry. `Reject.engine(code)`, which only the built-ins use, refuses any code
    that is **not** registered, so the engine cannot mint an unregistered code either.
 2. A component that emits a new exact code adds it here first, through the architect, as a contract
-   change. A member of a reserved family needs no change.
+   change. That includes a **fixed** name under a reserved prefix, such as `TB_PIPELINE_TIME_BUDGET`,
+   because alert rules key on fixed names and this file is where an operator looks them up. Only
+   family members minted at run time (`HTTP_503`, `PG_23505`, `KEY_FIELD_ABSENT`) need no entry.
 3. **Checker:** a test in `tributary-sdk` loads `error-codes.json` and asserts that
    `tributary.sdk.codes.ENGINE_CODES` equals the union of `codes` and `log_only`, and that
    `RESERVED_PREFIXES` equals `reserved_prefixes`. Both directions are checked, so neither side can

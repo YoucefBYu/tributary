@@ -3,6 +3,26 @@
 Newest first. Each entry names the contract, the version, whether the change is additive or
 breaking, and the reason. Breaking changes reference an ADR.
 
+## 2026-09-25 (later) — W2-5 security follow-ups: filter allow-list, split terminator, two engine codes
+
+From `platform-engineer`'s commits `2a16e24`, `8af0d63` and `6daf4f4`. As before, no schema, example
+or invalid-example change, so no expected-failure pair moves.
+
+| # | Change | Ruling and why |
+|---|---|---|
+| 1 | channel-spec 3.3.2: filter `field` must be exactly one of a 21-entry allow-list; the deny-list is still checked first | **Ratified with one amendment.** The review's security MEDIUM 3 showed the deny-list failing open (`PV1.19`, `ORC.3`, `OBR.3`, `OBX.5`, Z-segments, `/subject/reference`, `/id`). Every listed field holds a small coded vocabulary. **Amendment:** `ORC`, `OBR` and `OBX` repeat within a message, and the evaluator reads the first occurrence. So for the filter, a segment occurring more than once is **unresolved**, and `onUnresolved` decides. Otherwise `OBX.11 in [F]` silently drops a message whose later results are final. **No example spec is refused**: nothing in `contracts/`, `docs/` or `deploy/` uses `tributary.core.filter` |
+| 2 | channel-spec 3.3.2: an hl7-batch child's final CR only if the parent terminated that segment | **Ratified.** A split never adds a byte, so a child cannot exceed the inline limit its parent met |
+| 3 | `error-codes.json`: `TB_OUTPUT_ENVELOPE_INVALID`, `TB_PIPELINE_TIME_BUDGET` | **Registered by exact name.** envelope 2.3.2 rule 2 now says that fixed names under a reserved prefix are listed, because alerts key on them. `ENGINE_CODES` must include both for the cross-check test to pass |
+| 4 | Bundle-declared `Reject` codes | **Deferred to bundle-fetch** (channel-spec section 9). There is no bundle format to declare them in yet. Interim: codes are literals, and `code-reviewer` treats a data-built code as Critical |
+| 5 | `ref` restricted to the pinned bundle's own top-level packages | **Approved now**, enforced when bundle-fetch lands (channel-spec 3.3.1). Nothing runnable is affected |
+
+**Change requests to `platform-engineer`:** the filter treats a repeated segment as unresolved; add the
+two `TB_` codes to `ENGINE_CODES`.
+
+**Re-run:** `validate.py` (expect 122 / 0) and `pytest tests/conformance` (expect 127), because
+`error-codes.json` changed. That file is outside their scope, so the counts should not move. The
+`tributary-sdk` registry cross-check test, once it exists, is the one that exercises the change.
+
 ## 2026-09-25 (W2-5 follow-ups) — set 1.1: built-in shapes pinned, derived-id encoding, engine error-code registry
 
 Six proposals from `platform-engineer` with the W2-5 delivery (`74c9853` to `288903a`). **No schema
