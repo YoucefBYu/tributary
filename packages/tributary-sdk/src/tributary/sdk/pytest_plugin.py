@@ -1,4 +1,4 @@
-"""Pytest fixtures for channel bundles: `run_step`, `run_pipeline`, `make_message`, `fake_ctx`.
+"""Pytest fixtures for channel bundles: `run_step`, `run_splitter`, `run_pipeline`, `make_message`, `fake_ctx`.
 
 Registered through the `pytest11` entry point, so a bundle that depends on `tributary-sdk` gets the
 fixtures from ADR-001 6.2 without a conftest:
@@ -16,6 +16,7 @@ import pytest
 from .fakes import FakeContext
 from .testing import make_message as _make_message
 from .testing import run_pipeline as _run_pipeline
+from .testing import run_splitter as _run_splitter
 from .testing import run_step as _run_step
 
 
@@ -38,6 +39,17 @@ def run_step(fake_ctx: FakeContext) -> Callable[..., object]:
     def run(step: object, message: object, **kwargs: object) -> object:
         kwargs.setdefault("ctx", fake_ctx)
         return _run_step(step, message, **kwargs)  # type: ignore[arg-type]
+
+    return run
+
+
+@pytest.fixture
+def run_splitter(fake_ctx: FakeContext) -> Callable[..., object]:
+    """Runs one splitter and returns its stamped children, or a `Drop`."""
+
+    def run(node: object, message: object, **kwargs: object) -> object:
+        kwargs.setdefault("ctx", fake_ctx)
+        return _run_splitter(node, message, **kwargs)  # type: ignore[arg-type]
 
     return run
 

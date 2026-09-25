@@ -11,6 +11,7 @@ record and archive row (envelope contract 3.2).
 
 from __future__ import annotations
 
+import hashlib
 import secrets
 import time
 import uuid
@@ -35,6 +36,37 @@ def uuid7(*, unix_ts_ms: int | None = None) -> str:
     value |= secrets.randbits(_RAND_A_BITS) << 64
     value |= 0b10 << 62
     value |= secrets.randbits(_RAND_B_BITS)
+    return str(uuid.UUID(int=value))
+
+
+#: Split children per parent (channel-spec README 3.3.2 rule 4). The index is encoded in 4 bytes.
+MAX_CHILD_INDEX = (1 << 32) - 1
+
+
+def derived_uuid7(parent_id: str, index: int) -> str:
+    """The deterministic UUIDv7 of child `index` (0-based) of the message `parent_id`.
+
+    Channel-spec README 3.3.2 split rule 1: the timestamp is the parent's, and the remaining 74 bits come
+    from `SHA-256(parent ‖ index)`, so redelivering the parent reproduces the same children and every
+    loader's `tb-msg-id` idempotency absorbs them. A random id per run would make each replay a new set of
+    messages, which is invariant 4 broken.
+
+    Byte encoding, fixed here because two implementations must agree on it: the parent's 16 UUID bytes
+    (RFC 9562 network order) followed by the index as a 4-byte big-endian unsigned integer. The digest's
+    first 12 bits are `rand_a` and its next 62 bits are `rand_b`. Nothing secret is involved: this is a
+    derivation from a random parent id, not a keyed construction.
+    """
+    parent = uuid.UUID(parent_id)
+    if parent.version != 7:
+        raise ValueError("a derived id needs a UUIDv7 parent")
+    if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index <= MAX_CHILD_INDEX:
+        raise ValueError("child index must be an integer in [0, 2**32)")
+    digest = int.from_bytes(hashlib.sha256(parent.bytes + index.to_bytes(4, "big")).digest()[:10], "big")
+    value = (parent.int >> 80) << 80  # the parent's 48-bit timestamp
+    value |= 0x7 << 76
+    value |= ((digest >> 68) & 0xFFF) << 64
+    value |= 0b10 << 62
+    value |= digest & ((1 << _RAND_B_BITS) - 1)
     return str(uuid.UUID(int=value))
 
 

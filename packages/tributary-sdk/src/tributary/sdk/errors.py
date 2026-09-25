@@ -114,3 +114,14 @@ class SecretNotFoundError(TributaryError):
     def __init__(self, ref: str) -> None:
         super().__init__(f"no secret for ref {safe_token(ref)}")
         self.ref = ref
+
+
+class StepConfigError(StepDefinitionError):
+    """A step's `with` values do not bind to its keyword-only parameters (channel-spec README 3.3).
+
+    Raised once, when the step is bound, never per message. Names the offending key; never the value.
+    """
+
+
+class RejectCodeError(TributaryError):
+    """`Reject(code)` with a code that breaks the grammar or that the engine reserves."""
