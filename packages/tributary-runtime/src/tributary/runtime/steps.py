@@ -8,12 +8,25 @@ because inline source cannot be imported by pytest, reviewed in a diff or type-c
 Steps are trusted code (ADR-001 section 8). Importing a module executes it, so this is a
 remote-code-execution surface by design, and the controls are elsewhere: the bundle is digest-pinned,
 and no data-plane component may write to `_tb.<env>.channels` (`contracts/topics/v0` 3.4).
+
+**Any failure while importing is a refused spec, never a crashed worker.** An entry point or a `ref`
+module can raise anything at import time (`SyntaxError`, `RuntimeError`, a missing dependency). On a hot
+reload that would otherwise escape `handle` on every record; it is a `ChannelSpecError` instead, with
+the exception's type name only, and the previous plan keeps running.
+
+**What `ref` may name, until bundle-fetch exists.** A `ref` should resolve inside the bundle that
+`pipeline.bundle` pins, but nothing fetches a bundle yet (README 3.3.1), so there is no bundle namespace
+to check it against. Two namespaces are refused now because they are certainly not bundle code: the
+Python standard library (`ref: os.system` would import and then be refused only by the signature
+check, and an import alone can have side effects) and `tributary.*`, whose steps are named with `uses`.
+Restricting `ref` to the bundle's own top-level package is proposed to the architect for bundle-fetch.
 """
 
 from __future__ import annotations
 
 import copy
 import importlib
+import sys
 from collections.abc import Callable
 from importlib.metadata import entry_points
 
@@ -64,17 +77,26 @@ def _from_entry_point(name: str | None) -> object:
     matches = [point for point in entry_points(group=ENTRY_POINT_GROUP) if point.name == name]
     if not matches:
         raise ChannelSpecError(f"no step registered as {safe_token(name)} in {ENTRY_POINT_GROUP}")
-    return matches[0].load()
+    try:
+        return matches[0].load()
+    except Exception as exc:  # import-time code can raise anything; refuse the spec, keep the worker
+        raise ChannelSpecError(f"cannot load step {safe_token(name)}: {type(exc).__name__}") from None
 
 
 def _from_dotted_path(path: str | None) -> object:
     if not path or "." not in path:
         raise ChannelSpecError(f"step ref {safe_token(str(path))} must be a dotted path module.attribute")
     module_name, _, attribute = path.rpartition(".")
+    top = module_name.split(".", 1)[0]
+    if top in sys.stdlib_module_names or top == "tributary":
+        raise ChannelSpecError(
+            f"step ref {safe_token(path)} names the standard library or the engine; a ref names bundle code, "
+            "and an engine step is named with `uses`"
+        )
     try:
         module = importlib.import_module(module_name)
-    except ImportError as exc:
-        raise ChannelSpecError(f"cannot import {safe_token(module_name)} for step ref: {type(exc).__name__}") from exc
+    except Exception as exc:  # ImportError, or anything the module raises while it is imported
+        raise ChannelSpecError(f"cannot import {safe_token(module_name)} for step ref: {type(exc).__name__}") from None
     try:
         return getattr(module, attribute)
     except AttributeError as exc:
@@ -160,8 +182,14 @@ def _resolved(resolve: Resolver, reference: StepRef, channel: str) -> Node:
     """
     try:
         node = resolve(reference)
+    except ChannelSpecError:
+        raise
     except StepDefinitionError as exc:  # a resolver other than load_step, e.g. in a test harness
         raise ChannelSpecError(f"channel {safe_token(channel)}: step {safe_token(reference.name)}: {exc}") from None
+    except Exception as exc:  # anything else a resolver raises refuses the spec rather than the worker
+        raise ChannelSpecError(
+            f"channel {safe_token(channel)}: step {safe_token(reference.name)}: {type(exc).__name__}"
+        ) from None
     if node.name == reference.name:
         return node
     named = copy.copy(node)

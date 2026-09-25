@@ -506,3 +506,63 @@ def test_an_exception_merely_named_reject_is_retried_like_any_other() -> None:
     assert CALLS["impostor"] == 3
     assert caught.value.error_code == "TRANSFORM_ERROR"
     assert not caught.value.rejected
+
+
+# -- security review LOWs: import-time failures and what `ref` may name -----------------------------
+
+
+def test_a_resolver_that_raises_anything_on_hot_reload_keeps_the_previous_plan() -> None:
+    """A KeyError, RuntimeError or SyntaxError while resolving must refuse the spec, not escape
+    `handle` on every record."""
+    current = {"spec": channel(pipeline=["t.passthrough"], destinations={"fhir": []}, version=1)}
+    harness = Harness(lambda: current["spec"])
+    harness.handler.handle(record())
+    current["spec"] = channel(pipeline=["t.not-registered"], destinations={"fhir": []}, version=2)
+    harness.handler.handle(record())  # the test resolver raises KeyError for this name
+    assert len(harness.out("fhir")) == 2
+    assert "channel_spec_refused" in harness.stream.getvalue()
+
+
+@pytest.mark.parametrize(
+    ("source", "error"),
+    [("raise RuntimeError('SYNTH^JANE at import')\n", "RuntimeError"), ("def broken(:\n", "SyntaxError")],
+)
+def test_a_ref_module_that_fails_at_import_is_a_channel_spec_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str, error: str
+) -> None:
+    from tributary.runtime.steps import load_step
+
+    name = f"synth_bundle_{error.lower()}"  # one package per case: sys.modules caches packages
+    package = tmp_path / name
+    package.mkdir()
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "steps.py").write_text(source, encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    with pytest.raises(ChannelSpecError) as caught:
+        load_step(StepRef(name="s", ref=f"{name}.steps.step"))
+    assert error in str(caught.value)
+    assert PHI_MARKER not in str(caught.value), "only the exception's type name is kept"
+
+
+def test_an_entry_point_that_fails_at_import_is_a_channel_spec_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tributary.runtime import steps as steps_module
+
+    class Broken:
+        name = "t.broken"
+
+        def load(self) -> object:
+            raise RuntimeError("import-time failure")
+
+    monkeypatch.setattr(steps_module, "entry_points", lambda group: [Broken()])
+    with pytest.raises(ChannelSpecError, match="RuntimeError"):
+        steps_module.load_step(StepRef(name="s", uses="t.broken"))
+
+
+@pytest.mark.parametrize(
+    "ref", ["os.system", "subprocess.run", "json.loads", "tributary.runtime.core_steps.passthrough"]
+)
+def test_a_ref_into_the_standard_library_or_the_engine_is_refused_before_import(ref: str) -> None:
+    from tributary.runtime.steps import load_step
+
+    with pytest.raises(ChannelSpecError, match="standard library or the engine"):
+        load_step(StepRef(name="s", ref=ref))
