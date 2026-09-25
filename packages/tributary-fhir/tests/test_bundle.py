@@ -115,3 +115,52 @@ def test_message_id_factory_differs_across_messages() -> None:
 def test_message_id_factory_produces_a_urn_uuid() -> None:
     factory = message_id_factory("0199036e-7a3e-7f00-8c21-abc123456789")
     assert factory().startswith("urn:uuid:")
+
+
+# -- hostile identifier content (security review, 4998f33, MEDIUM) -----------------------------------
+
+
+def test_conditional_url_percent_encodes_unsafe_characters() -> None:
+    hostile = Identifier(system="urn:synth:auth with space", value="A&B#C?D")
+    fhir = LocalFhir(id_factory=sequential_id_factory())
+    entry = fhir.upsert(_patient(hostile))
+    assert "&B#C?D" not in entry.request.url
+    assert " " not in entry.request.url
+    assert entry.request.url.split("identifier=")[1] == "urn:synth:auth%20with%20space|A%26B%23C%3FD"
+
+
+def test_conditional_url_disambiguates_an_embedded_pipe_from_the_separator() -> None:
+    """A literal `|` inside the identifier's own value must not be readable as *the* system/value
+    separator -- that would let a crafted CX/HD value pick which system its own value is asserted
+    against, or make two different (system, value) pairs render as the same query string."""
+    hostile = Identifier(system="urn:synth:mrn", value="A|B")
+    plain = Identifier(system="urn:synth:mrn", value="A")
+    fhir = LocalFhir(id_factory=sequential_id_factory())
+    hostile_entry = fhir.upsert(_patient(hostile))
+    plain_entry = fhir.upsert(_patient(plain))
+    assert hostile_entry.request.url != "Patient?identifier=urn:synth:mrn|A|B"
+    assert hostile_entry.request.url != plain_entry.request.url
+    assert "%7C" in hostile_entry.request.url  # the embedded pipe, percent-encoded, not a bare "|"
+
+
+def test_if_none_exist_uses_the_same_escaped_token_as_the_url() -> None:
+    hostile = Identifier(system="urn:synth:mrn", value="A,B$C")
+    fhir = LocalFhir(id_factory=sequential_id_factory())
+    entry = fhir.upsert(_patient(hostile))
+    assert entry.request.ifNoneExist == f"identifier={entry.request.url.split('identifier=')[1]}"
+
+
+def test_delete_also_percent_encodes_hostile_values() -> None:
+    hostile = Identifier(system="urn:synth:mrn", value="A B")
+    fhir = LocalFhir(id_factory=sequential_id_factory())
+    entry = fhir.delete("Patient", identifier=hostile)
+    assert " " not in entry.request.url
+    assert "%20" in entry.request.url
+
+
+def test_conditional_url_leaves_ordinary_uri_shaped_systems_readable() -> None:
+    """Common, non-hostile FHIR system URIs (colons, slashes) stay literal -- this is a security fix for
+    injected content, not a blanket re-encoding of every identifier system in the codebase."""
+    fhir = LocalFhir(id_factory=sequential_id_factory())
+    entry = fhir.upsert(_patient(Identifier(system=TB_MESSAGE_SYSTEM, value="0199-msg:encounter")))
+    assert entry.request.url == f"Patient?identifier={TB_MESSAGE_SYSTEM}|0199-msg:encounter"

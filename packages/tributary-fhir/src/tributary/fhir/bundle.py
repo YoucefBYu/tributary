@@ -17,6 +17,7 @@ from __future__ import annotations
 import itertools
 import uuid
 from collections.abc import Callable, Iterator
+from urllib.parse import quote
 from uuid import uuid4
 
 from fhir.resources.R4B.bundle import Bundle, BundleEntry, BundleEntryRequest
@@ -128,8 +129,44 @@ def _first_identifier(resource: Resource) -> Identifier | None:
     return first if isinstance(first, Identifier) else None
 
 
+#: Characters a FHIR system/value never needs percent-encoded to stay readable as the URI-shaped strings
+#: this package's own identifier systems are (`urn:id:...`, `https://tributary.dev/...`). Anything else
+#: -- space, `&`, `#`, `?`, `|`, `$`, `,`, `%`, control characters -- is percent-encoded, because a CX or
+#: HD component is sender-controlled text (an assigning authority, a namespace id) that ends up in a
+#: request line or an `If-None-Exist` header (security review, `4998f33`, MEDIUM): unescaped, one of
+#: those characters could inject a second query parameter, terminate the URL early, or be read back as
+#: the `system|value` separator itself and silently match the wrong resource.
+_URL_SAFE_CHARS = ":/.-_~"
+
+
+def _escape_search_token(text: str) -> str:
+    """One FHIR search token component (a `system` or a `value`), safe to place either side of the
+    `identifier=<system>|<value>` separator.
+
+    Two passes, in the order the FHIR search spec requires (http://hl7.org/fhir/search.html#escaping):
+    first backslash-escape the token's own literal `\\`, `|`, `$` and `,` -- the characters FHIR search
+    itself treats as separators -- so an embedded `|` in, say, an assigning authority cannot be mistaken
+    for *the* system/value separator this function's caller inserts. Then percent-encode the result for
+    safe use in a URL or header value; the escaping backslashes get percent-encoded along with everything
+    else non-alphanumeric outside `_URL_SAFE_CHARS`, so the two passes never re-collide.
+    """
+    escaped = text.replace("\\", "\\\\").replace("|", "\\|").replace("$", "\\$").replace(",", "\\,")
+    return quote(escaped, safe=_URL_SAFE_CHARS)
+
+
+def _identifier_token(identifier: Identifier) -> str:
+    """`<system>|<value>`, each half independently escaped and percent-encoded. Used for both a
+    conditional `request.url`'s query string and its `ifNoneExist` header value -- the same token,
+    because both are "the search this request is conditional on" (channel-spec README 3.4.2), just
+    carried in two different places of the same Bundle entry.
+    """
+    system = _escape_search_token(identifier.system or "")
+    value = _escape_search_token(identifier.value or "")
+    return f"{system}|{value}"
+
+
 def _conditional_url(resource_type: str, identifier: Identifier) -> str:
-    return f"{resource_type}?identifier={identifier.system}|{identifier.value}"
+    return f"{resource_type}?identifier={_identifier_token(identifier)}"
 
 
 class LocalFhir:
@@ -157,7 +194,7 @@ class LocalFhir:
         return BundleEntry(
             fullUrl=self._id_factory(),
             resource=resource,
-            request=BundleEntryRequest(method="PUT", url=url, ifNoneExist=f"identifier={key.system}|{key.value}"),
+            request=BundleEntryRequest(method="PUT", url=url, ifNoneExist=f"identifier={_identifier_token(key)}"),
         )
 
     def create(self, resource: Resource, *, identifier: Identifier | None = None) -> BundleEntry:
@@ -170,7 +207,7 @@ class LocalFhir:
             fullUrl=self._id_factory(),
             resource=resource,
             request=BundleEntryRequest(
-                method="POST", url=resource_type, ifNoneExist=f"identifier={key.system}|{key.value}"
+                method="POST", url=resource_type, ifNoneExist=f"identifier={_identifier_token(key)}"
             ),
         )
 
