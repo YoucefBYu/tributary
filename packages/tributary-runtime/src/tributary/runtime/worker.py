@@ -16,6 +16,7 @@ the API can be down throughout (invariant 3).
 
 from __future__ import annotations
 
+import functools
 import os
 import signal
 import time
@@ -26,9 +27,11 @@ from typing import Any, cast
 
 from tributary.sdk import Drop, Message
 from tributary.sdk import headers as h
+from tributary.sdk.codes import TB_OUTPUT_ENVELOPE_INVALID, TB_PIPELINE_TIME_BUDGET
 from tributary.sdk.context import Logger
+from tributary.sdk.errors import EnvelopeError, HeaderError, UsrHeaderError
 from tributary.sdk.ids import child_traceparent, new_traceparent, uuid7
-from tributary.sdk.projection import Ordering, TopicClass
+from tributary.sdk.projection import Ordering, TopicClass, validate_for_produce
 
 from .channels import ChannelsConsumerLike, LiveSpecSource, open_spec_source
 from .clients import KafkaSettings, consumer_config, events_producer_config, max_poll_interval_ms, producer_config
@@ -133,7 +136,25 @@ class KafkaDlqWriter:
         self._flush_timeout_s = flush_timeout_s
 
     def dead_letter(self, record: ConsumedRecord, *, error_code: str, stage: str) -> None:
+        """Dead-letter the consumed record. Falls back to registered headers only when the full
+        projection does not fit the envelope.
+
+        The `dlq` projection adds `tb-stage` and `tb-error-code`, which the `raw` class forbids, so a raw
+        record at the 32-header cap (or near the header byte budget) cannot be dead-lettered as it
+        stands - and a dead letter that cannot be written would crash the worker into a replay loop, the
+        very failure dead-lettering exists to end (security review, W2-5). The fallback drops `tb-usr-*`
+        and unregistered headers, which are channel-defined or foreign and never interpreted by the
+        engine; the original record keeps them on `raw` at the logged offset. A payload over the inline
+        limit cannot be dead-lettered at all until claim-check exists; that still raises.
+        """
         message = dlq_message(record.message, error_code=error_code, stage=stage)
+        reduced = 0
+        try:
+            validate_for_produce(message, topic_class="dlq", ordering="none")
+        except EnvelopeError:
+            kept = {name: value for name, value in message.headers.items() if name in h.REGISTERED}
+            reduced = len(message.headers) - len(kept)
+            message = Message(headers=kept, payload=message.payload, key=message.key)
         self._producer.produce(self._topic, message, topic_class="dlq", ordering="none")
         self._producer.flush_pending(self._flush_timeout_s)
         self._log.warning(
@@ -144,6 +165,7 @@ class KafkaDlqWriter:
             offset=record.offset,
             error_code=error_code,
             stage=stage,
+            headers_dropped=reduced,
         )
 
     def quarantine(self, raw: Any, *, channel: str, channel_version: int) -> str:
@@ -249,20 +271,50 @@ def out_message(message: Message, destination: str, *, usr: dict[str, str]) -> M
 
 
 @dataclass(slots=True)
-class _Routed:
-    """One record produced to `out.<dest>`, remembered until the flush makes it true."""
-
-    subject: Message
-    destination: str
-    attrs: dict[str, str]
-
-
-@dataclass(slots=True)
 class _Pending:
-    """Events that describe what a flush made durable. Emitted only after the flush succeeds."""
+    """Everything one `handle` will produce and announce, held until it is known to be deliverable.
 
-    routed: list[_Routed] = field(default_factory=list)
-    dead: list[tuple[Message, str | None, str]] = field(default_factory=list)
+    Two phases, so a record that cannot be produced never leaves the others half-delivered: every `out`
+    and `dlq` record is computed and **validated against the envelope before any is produced**, and the
+    lifecycle events that describe them are emitted only after the flush has made them true.
+    """
+
+    records: list[tuple[str, Message, TopicClass, Ordering]] = field(default_factory=list)
+    events: list[Callable[[], None]] = field(default_factory=list)
+    dead: int = 0
+    filtered: int = 0
+
+
+class TimeBudget:
+    """The wall-clock budget for one `handle`, checked between units of work (MEDIUM 2, W2-5 review).
+
+    A 10,000-child split times destinations times in-place retries can outlast `max.poll.interval.ms`;
+    the consumer is then evicted, the record is redelivered, and the same fan-out evicts it again, for
+    ever. When the budget is spent, the consumed record is dead-lettered with `TB_PIPELINE_TIME_BUDGET` and
+    committed. Nothing has been produced by then (the produce phase comes after), so no branch is left
+    half-delivered. Checked between steps' units - a child, a destination - not inside a step: a single
+    step that hangs is not interrupted.
+    """
+
+    __slots__ = ("_clock", "_deadline", "budget_s")
+
+    def __init__(self, budget_s: float | None, *, clock: Callable[[], float] = time.monotonic) -> None:
+        self.budget_s = budget_s
+        self._deadline = None if budget_s is None else clock() + budget_s
+        self._clock = clock
+
+    def check(self) -> None:
+        if self._deadline is not None and self._clock() > self._deadline:
+            raise StepFailure("pipeline", 1, "TimeBudget", error_code=TB_PIPELINE_TIME_BUDGET, rejected=True)
+
+
+def handle_budget_s(max_poll_interval_ms: int, flush_timeout_s: float) -> float:
+    """Half the poll interval, less the flush that follows the compute phase, and never under 10 s.
+
+    Half, because the loop also polls, commits and retries around `handle`; the flush, because it runs
+    after the budget is checked for the last time.
+    """
+    return max(10.0, max_poll_interval_ms / 1000 / 2 - flush_timeout_s)
 
 
 class PipelineHandler:
@@ -277,6 +329,7 @@ class PipelineHandler:
     | head or splitter | the consumed record (by the loop) | the raw payload | none run |
     | tail, for one child | that child | the child as the splitter produced it | continue |
     | a destination's steps | that message for that destination, `tb-destination` set | the destination steps' input | continue |
+    | any record fails the envelope (`TB_OUTPUT_ENVELOPE_INVALID`) or the time budget runs out (`TB_PIPELINE_TIME_BUDGET`) | the consumed record (by the loop) | the raw payload | nothing was produced |
 
     `Reject` fails at once; any other exception after `pipeline.stepRetries` in-place retries. The
     consumed offset is committed by the loop only after this returns, and this returns only after every
@@ -298,6 +351,8 @@ class PipelineHandler:
         flush_timeout_s: float = 30.0,
         transactional: bool = False,
         stats_interval_s: float = 60.0,
+        time_budget_s: float | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._env = env
         self._transactional = transactional
@@ -310,6 +365,8 @@ class PipelineHandler:
         self._steps_override = steps_override
         self._resolve = resolve
         self._flush_timeout_s = flush_timeout_s
+        self._time_budget_s = time_budget_s
+        self._clock = clock
         self._plan: ChannelPlan | None = None
         self._plan_spec: ChannelSpec | None = None
         self._refused_version: int | None = None
@@ -368,6 +425,7 @@ class PipelineHandler:
                 channel_version=spec.version,
                 running_transactional=self._transactional,
             )
+        budget = TimeBudget(self._time_budget_s, clock=self._clock)
         message = record.message
         ctx = WorkerContext(
             channel=spec.name,
@@ -388,10 +446,11 @@ class PipelineHandler:
         transformed = result.message
         if transformed is None:  # pragma: no cover - ExecutionResult always carries one or the other
             raise DeliveryError("PIPELINE_EMPTY_RESULT", retryable=False)
+        budget.check()
 
-        branches: list[tuple[Message, WorkerContext]]
+        branches: tuple[Message, ...]
         if plan.splitter is None:
-            branches = [(transformed, ctx)]
+            branches = (transformed,)
             duration_ms = result.duration_ms
         else:
             started = time.perf_counter()
@@ -403,26 +462,45 @@ class PipelineHandler:
                     spec, record, message, stage="filtered", status="dropped", ctx=ctx, error_message=split.reason
                 )
                 return
-            branches = [(child, ctx.fork(traceparent=child.traceparent)) for child in split]
-        self._emit(
-            spec,
-            record,
-            message,
-            stage="transformed",
-            status="ok",
-            ctx=ctx,
-            duration_ms=duration_ms,
-            size_bytes=transformed.payload_size,
-        )
+            branches = split
+            budget.check()
 
         pending = _Pending()
-        for subject, branch_ctx in branches:
+        pending.events.append(
+            functools.partial(
+                self._emit,
+                spec,
+                record,
+                message,
+                stage="transformed",
+                status="ok",
+                ctx=ctx,
+                duration_ms=duration_ms,
+                size_bytes=transformed.payload_size,
+            )
+        )
+        for subject in branches:
+            budget.check()
+            branch_ctx = ctx if plan.splitter is None else ctx.fork(traceparent=subject.traceparent)
             if plan.splitter is not None:
                 child = self._run_child(spec, plan, record, subject, branch_ctx, pending)
                 if child is None:
                     continue
                 subject = child
-            self._route(spec, plan, record, subject, branch_ctx, pending)
+            self._route(spec, plan, record, subject, branch_ctx, pending, budget)
+
+        # Phase 2. Validate every record before producing any: one that cannot be produced (a child or a
+        # destination output over the envelope's limits) must not leave its siblings half-delivered, and
+        # must not crash the worker into a replay loop. The consumed record goes to the DLQ instead.
+        for _topic, outgoing, topic_class, ordering in pending.records:
+            try:
+                validate_for_produce(outgoing, topic_class=topic_class, ordering=ordering)
+            except EnvelopeError:
+                raise StepFailure(
+                    "pipeline", 1, "EnvelopeError", error_code=TB_OUTPUT_ENVELOPE_INVALID, rejected=True
+                ) from None
+        for topic, outgoing, topic_class, ordering in pending.records:
+            self._produce(topic, outgoing, topic_class=topic_class, ordering=ordering)
 
         # Commit-after-delivery: the loop commits the input offset when this returns, so every `out`
         # and `dlq` record must be acknowledged by the broker first (invariants 1 and 4). Inside a
@@ -430,19 +508,10 @@ class PipelineHandler:
         if not self._transactional:
             self._producer.flush_pending(self._flush_timeout_s)
 
-        for subject, destination, error_code in pending.dead:
-            self._emit_dead(spec, record, subject, destination=destination, error_code=error_code)
-        for routed in pending.routed:
-            self._emit(
-                spec,
-                record,
-                routed.subject,
-                stage="routed",
-                status="ok",
-                ctx=None,
-                attrs=routed.attrs,
-                destination=routed.destination,
-            )
+        self.dead_lettered += pending.dead
+        self.filtered += pending.filtered
+        for emit in pending.events:
+            emit()
         self._maybe_log_stats(spec)
 
     def _run_child(
@@ -459,25 +528,37 @@ class PipelineHandler:
             result = plan.tail.run(child, ctx)
         except StepFailure as exc:
             # The child as the splitter produced it: the input of the subtree that failed.
-            self._dead_letter(spec, child, error_code=exc.error_code, destination=None, pending=pending)
+            self._dead_letter(spec, record, child, error_code=exc.error_code, destination=None, pending=pending)
             return None
         if result.drop is not None:
-            self.filtered += 1
-            self._emit(
-                spec, record, child, stage="filtered", status="dropped", ctx=ctx, error_message=result.drop.reason
+            pending.filtered += 1
+            pending.events.append(
+                functools.partial(
+                    self._emit,
+                    spec,
+                    record,
+                    child,
+                    stage="filtered",
+                    status="dropped",
+                    ctx=ctx,
+                    error_message=result.drop.reason,
+                )
             )
             return None
         if result.message is None:  # pragma: no cover
             return None
-        self._emit(
-            spec,
-            record,
-            result.message,
-            stage="transformed",
-            status="ok",
-            ctx=ctx,
-            duration_ms=result.duration_ms,
-            size_bytes=result.message.payload_size,
+        pending.events.append(
+            functools.partial(
+                self._emit,
+                spec,
+                record,
+                result.message,
+                stage="transformed",
+                status="ok",
+                ctx=ctx,
+                duration_ms=result.duration_ms,
+                size_bytes=result.message.payload_size,
+            )
         )
         return result.message
 
@@ -489,64 +570,92 @@ class PipelineHandler:
         subject: Message,
         ctx: WorkerContext,
         pending: _Pending,
+        budget: TimeBudget,
     ) -> None:
-        """Produce one branch to every destination, running each destination's own steps first."""
+        """Plan one branch's record for every destination, running each destination's own steps first."""
         for destination in spec.destinations:
             executor = plan.destinations.get(destination.name)
             outgoing, usr, attrs = subject, ctx.usr_headers(), ctx.attrs()
             if executor is not None and len(executor):
+                budget.check()
                 destination_ctx = ctx.fork(destination=destination.name)
                 try:
                     result = executor.run(subject, destination_ctx)
                 except StepFailure as exc:
                     # README 3.5: the dlq payload is the destination step's input, not the raw payload.
                     self._dead_letter(
-                        spec, subject, error_code=exc.error_code, destination=destination.name, pending=pending
-                    )
-                    continue
-                if result.drop is not None:
-                    self.filtered += 1
-                    self._emit(
                         spec,
                         record,
                         subject,
-                        stage="filtered",
-                        status="dropped",
-                        ctx=destination_ctx,
+                        error_code=exc.error_code,
                         destination=destination.name,
-                        error_message=result.drop.reason,
+                        pending=pending,
+                    )
+                    continue
+                if result.drop is not None:
+                    pending.filtered += 1
+                    pending.events.append(
+                        functools.partial(
+                            self._emit,
+                            spec,
+                            record,
+                            subject,
+                            stage="filtered",
+                            status="dropped",
+                            ctx=destination_ctx,
+                            destination=destination.name,
+                            error_message=result.drop.reason,
+                        )
                     )
                     continue
                 if result.message is None:  # pragma: no cover
                     continue
                 outgoing, usr, attrs = result.message, destination_ctx.usr_headers(), destination_ctx.attrs()
-            self._produce(
-                out_topic(self._env, spec.name, destination.name),
-                out_message(outgoing, destination.name, usr=dict(usr)),
-                topic_class="out",
-                ordering=spec.ordering,
+            try:
+                projected = out_message(outgoing, destination.name, usr=dict(usr))
+            except (HeaderError, UsrHeaderError):
+                # The projection adds headers; one that breaks a header rule is an envelope failure.
+                raise StepFailure(
+                    "pipeline", 1, "HeaderError", error_code=TB_OUTPUT_ENVELOPE_INVALID, rejected=True
+                ) from None
+            pending.records.append((out_topic(self._env, spec.name, destination.name), projected, "out", spec.ordering))
+            pending.events.append(
+                functools.partial(
+                    self._emit,
+                    spec,
+                    record,
+                    subject,
+                    stage="routed",
+                    status="ok",
+                    ctx=None,
+                    attrs=dict(attrs),
+                    destination=destination.name,
+                )
             )
-            pending.routed.append(_Routed(subject=subject, destination=destination.name, attrs=dict(attrs)))
 
     def _dead_letter(
         self,
         spec: ChannelSpec,
+        record: ConsumedRecord,
         subject: Message,
         *,
         error_code: str,
         destination: str | None,
         pending: _Pending,
     ) -> None:
-        """Queue a branch-scoped dead letter. Joins the same flush (or transaction) as the `out` records."""
-        failed = subject if destination is None else subject.with_header(h.TB_DESTINATION, destination)
-        self._produce(
-            dlq_topic(self._env, spec.name),
-            dlq_message(failed, error_code=error_code, stage="transformed"),
-            topic_class="dlq",
-            ordering="none",
+        """Plan a branch-scoped dead letter. Joins the same flush (or transaction) as the `out` records."""
+        try:
+            failed = subject if destination is None else subject.with_header(h.TB_DESTINATION, destination)
+            projected = dlq_message(failed, error_code=error_code, stage="transformed")
+        except HeaderError:
+            raise StepFailure(
+                "pipeline", 1, "HeaderError", error_code=TB_OUTPUT_ENVELOPE_INVALID, rejected=True
+            ) from None
+        pending.records.append((dlq_topic(self._env, spec.name), projected, "dlq", "none"))
+        pending.dead += 1
+        pending.events.append(
+            functools.partial(self._emit_dead, spec, record, subject, destination=destination, error_code=error_code)
         )
-        pending.dead.append((subject, destination, error_code))
-        self.dead_lettered += 1
 
     def _produce(self, topic: str, message: Message, *, topic_class: TopicClass, ordering: Ordering) -> None:
         """Produce, draining the local queue once if a large fan-out filled it.
@@ -768,6 +877,8 @@ class PipelineWorker:
             steps_override=self.steps_override,
             flush_timeout_s=self.settings.flush_timeout_s,
             transactional=transactional,
+            # Sized from the same poll interval the consumer is built with (MEDIUM 2, W2-5 review).
+            time_budget_s=handle_budget_s(max_poll_interval_ms(spec), self.settings.flush_timeout_s),
         )
         # Resolve and bind every step now: a bad `with`, or a splitter on a per-key channel, stops the
         # worker before it consumes anything rather than on the first message (README 3.3, 3.3.2).
