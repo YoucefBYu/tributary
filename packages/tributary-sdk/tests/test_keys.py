@@ -283,7 +283,9 @@ def test_a_resolved_key_never_shows_its_value() -> None:
 
 @settings(max_examples=500, deadline=None)
 @given(
-    st.sampled_from(["hl7:PID.3.1", "hl7:PID.3[5:MR].1", "hl7:MSH.9.2", "hl7:MSH.2", "json:/a/0/b", "header:x-id", "record:key"]),
+    st.sampled_from(
+        ["hl7:PID.3.1", "hl7:PID.3[5:MR].1", "hl7:MSH.9.2", "hl7:MSH.2", "json:/a/0/b", "header:x-id", "record:key"]
+    ),
     st.binary(max_size=400) | st.builds(lambda tail: b"MSH" + tail, st.binary(max_size=200)),
     st.sampled_from([HL7, FHIR, "text/plain"]),
 )
