@@ -158,7 +158,15 @@ def test_tls_disable_is_accepted_for_loopback() -> None:
 
 @pytest.mark.parametrize(
     "bad_table",
-    ["Adt_Events", "1adt_events", "adt_events;drop table x", "a.b.c", "adt_events ", "'adt_events'"],
+    [
+        "Adt_Events",
+        "1adt_events",
+        "adt_events;drop table x",
+        "a.b.c",
+        "adt_events ",
+        "'adt_events'",
+        "adt_events\n",  # regression: `.match()` against a `$`-anchored pattern used to accept this
+    ],
 )
 def test_malformed_table_identifier_is_refused(bad_table: str) -> None:
     with pytest.raises(ConfigError, match="table"):

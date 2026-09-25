@@ -35,29 +35,34 @@ consulted first, same as `postgresql`.
   out establishing a connection. Retryable. (A query that ClickHouse itself judges too slow comes back
   as an ordinary HTTP error with `X-ClickHouse-Exception-Code: 159` — `CH_159` below, not this.)
 * `CONNECT_FAILED` — `client.py`'s `TransportError` from anything else (DNS failure, connection
-  refused). Retryable.
-* `TLS_VERIFY_FAILED` — `ssl.SSLError` raised while establishing the connection. Not retryable: a bad
-  CA or hostname mismatch fails identically every time.
+  refused, an I/O error reading a response). Retryable.
+* `TLS_VERIFY_FAILED` — `client.py`'s `TlsVerificationError`: the TLS handshake failed (certificate or
+  hostname verification). Not retryable: a bad CA or hostname mismatch fails identically every time.
+  **Kept as a distinct exception from `TransportError`** (code review, Low) so this classification is
+  reachable at all — folding a TLS failure into the generic transport case made it silently
+  `CONNECT_FAILED`/retryable instead.
 * `PAYLOAD_SHAPE_INVALID` — checked before any request is sent. Not retryable.
-* `CH_<code>` — a non-2xx response carrying `X-ClickHouse-Exception-Code` (or, failing that, the
-  `Code: <n>.` prefix `scrub`bed from the body — both read in `client.py`). Retryable only for a small,
-  named set of codes that are ClickHouse's own way of saying "try again", found by reading the server's
-  `ErrorCodes.cpp` naming rather than guessed: `159` `TIMEOUT_EXCEEDED`, `164` `READONLY` (a replica
-  temporarily demoted), `202` `TOO_MANY_SIMULTANEOUS_QUERIES`, `209` `SOCKET_TIMEOUT`, `210`
-  `NETWORK_ERROR`, `225` `NO_ZOOKEEPER`, `242` `TABLE_IS_READ_ONLY`, `279` `ALL_CONNECTION_TRIES_FAILED`,
-  `999` `KEEPER_EXCEPTION`. Every other code — `60` `UNKNOWN_TABLE`, `81` `UNKNOWN_DATABASE`, `117`
-  `BAD_ARGUMENTS`, an access-denied code, a type mismatch — repeats identically on retry and is not.
-* A response with no `X-ClickHouse-Exception-Code` header and no parseable `Code: <n>.` body prefix
-  (should not happen against a real server, but a proxy or load balancer between this loader and
+* `CH_<code>` — a response carrying `X-ClickHouse-Exception-Code` (or, failing that, the `Code: <n>.`
+  prefix — both read in `client.py`), **checked on every response regardless of HTTP status** (code
+  review, Critical: ClickHouse can send `200` and only fail once the body is written, so a `2xx` alone
+  is never sufficient — see `client.py`'s `wait_end_of_query=1` and this module's `_classify_response`).
+  Retryable only for a small, named set of codes that are ClickHouse's own way of saying "try again",
+  found by reading the server's `ErrorCodes.cpp` naming rather than guessed: `159` `TIMEOUT_EXCEEDED`,
+  `164` `READONLY` (a replica temporarily demoted), `202` `TOO_MANY_SIMULTANEOUS_QUERIES`, `209`
+  `SOCKET_TIMEOUT`, `210` `NETWORK_ERROR`, `225` `NO_ZOOKEEPER`, `242` `TABLE_IS_READ_ONLY`, `279`
+  `ALL_CONNECTION_TRIES_FAILED`, `999` `KEEPER_EXCEPTION`. Every other code — `60` `UNKNOWN_TABLE`, `81`
+  `UNKNOWN_DATABASE`, `117` `BAD_ARGUMENTS`, an access-denied code, a type mismatch — repeats identically
+  on retry and is not.
+* A non-2xx response with no `X-ClickHouse-Exception-Code` header and no parseable `Code: <n>.` body
+  prefix (should not happen against a real server, but a proxy or load balancer between this loader and
   ClickHouse could return its own error page) is `CH_UNKNOWN`, not retryable — the safe default, since
-  retrying a shape this loader cannot even classify is retrying blind.
+  retrying a shape this loader cannot even classify is retrying blind. A **2xx** with neither is success.
 """
 
 from __future__ import annotations
 
 import json
 import re
-import ssl
 from dataclasses import dataclass
 from typing import Any
 
@@ -66,13 +71,13 @@ from tributary.sdk import Message
 from tributary.sdk.context import Logger
 
 from ..common import CircuitBreaker, DeliveryOutcome, LoaderMetrics, NullLogger, State
-from .client import ClickhouseTransport, TransportError
+from .client import ClickhouseTransport, Response, TlsVerificationError, TransportError
 from .config import ClickhouseDestinationConfig
 
 DEFAULT_FAILURE_THRESHOLD = 5
 DEFAULT_OPEN_SECONDS = 30.0
 
-_COLUMN_RE = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
+_COLUMN_RE = re.compile(r"[a-z_][a-z0-9_]{0,62}")
 _SCALAR_TYPES = (str, int, float, bool)
 
 #: ClickHouse's own "try again" codes (loader.py module docstring). Every other `CH_<code>` is
@@ -113,10 +118,13 @@ def parse_row(payload: bytes | None, id_column: str) -> dict[str, Any]:
     if id_column in row:
         raise PayloadShapeError(f"payload sets {id_column!r} itself; this loader fills it from tb-msg-id")
     for key, value in row.items():
-        if not isinstance(key, str) or not _COLUMN_RE.match(key):
-            raise PayloadShapeError(f"payload key {key!r} is not a valid column name")
+        # Never interpolate `key` into the message (code review, Medium): a payload's JSON keys are
+        # sender-controlled and can themselves carry PHI, unlike `id_column` above (this loader's own
+        # config). Only a fixed phrase and the key's length are safe to say anything about.
+        if not isinstance(key, str) or not _COLUMN_RE.fullmatch(key):
+            raise PayloadShapeError(f"payload has a key that is not a valid column name (length {len(key)})")
         if value is not None and not isinstance(value, _SCALAR_TYPES):
-            raise PayloadShapeError(f"payload key {key!r} has a non-scalar value")
+            raise PayloadShapeError(f"payload key {len(key)} chars long has a non-scalar value")
     return row
 
 
@@ -139,15 +147,26 @@ def _verify_query(database: str, table_name: str, id_column: str) -> bytes:
     return query.encode()
 
 
-def _classify_exception_code(headers: dict[str, str], body: bytes) -> int | None:
-    for name, value in headers.items():
+def _classify_response(response: Response) -> tuple[str, bool] | None:
+    """`(reason, retryable)` if `response` is a ClickHouse exception, else `None` for a genuine
+    success. Checked the same way regardless of HTTP status (code review, Critical) — the header is
+    tried first, the `Code: <n>.` body prefix is the fallback, matching `client.py`'s module docstring
+    on why a `2xx` alone is never sufficient."""
+    code: int | None = None
+    for name, value in response.headers.items():
         if name.lower() == "x-clickhouse-exception-code":
             try:
-                return int(value)
+                code = int(value)
             except ValueError:
-                return None
-    match = _CODE_PREFIX_RE.match(body)
-    return int(match.group(1)) if match else None
+                code = None
+            break
+    if code is None:
+        match = _CODE_PREFIX_RE.match(response.body)
+        if match is not None:
+            code = int(match.group(1))
+    if code is None:
+        return ("CH_UNKNOWN", False) if response.status_code >= 300 else None
+    return f"CH_{code}", code in _RETRYABLE_EXCEPTION_CODES
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,10 +197,12 @@ class ClickhouseLoader:
         response = self._transport.send(
             _verify_query(schema, table_name, self.config.id_column), timeout_s=self.config.timeout_s
         )
-        if response.status_code >= 300:
+        failure = _classify_response(response)
+        if failure is not None:
+            reason, _ = failure
             raise IdempotencyConstraintError(
                 f"destination {self.config.destination!r}: could not read system.tables for "
-                f"{self.config.table!r} (HTTP {response.status_code}); cannot prove sink-native idempotency"
+                f"{self.config.table!r} ({reason}); cannot prove sink-native idempotency"
             )
         line = response.body.decode("utf-8", errors="replace").strip()
         if not line:
@@ -208,6 +229,8 @@ class ClickhouseLoader:
             row = parse_row(message.payload, self.config.id_column)
         except PayloadShapeError as exc:
             self.metrics.record("PAYLOAD_SHAPE_INVALID")
+            # `str(exc)` is safe to log: `parse_row` never interpolates a payload's own key or value
+            # into its message (code review, Medium — a JSON key is sender-controlled and can be PHI).
             self._log.warning(
                 "delivery_failed",
                 destination=self.config.destination,
@@ -222,15 +245,14 @@ class ClickhouseLoader:
             response = self._transport.send(statement, timeout_s=self.config.timeout_s)
         except TimeoutError:
             return self._record_failure(msg_id, "TIMEOUT", retryable=True)
-        except ssl.SSLError:
+        except TlsVerificationError:
             return self._record_failure(msg_id, "TLS_VERIFY_FAILED", retryable=False)
         except TransportError:
             return self._record_failure(msg_id, "CONNECT_FAILED", retryable=True)
 
-        if response.status_code >= 300:
-            code = _classify_exception_code(response.headers, response.body)
-            reason = f"CH_{code}" if code is not None else "CH_UNKNOWN"
-            retryable = code in _RETRYABLE_EXCEPTION_CODES
+        failure = _classify_response(response)
+        if failure is not None:
+            reason, retryable = failure
             return self._record_failure(msg_id, reason, retryable=retryable)
 
         was_half_open = self.breaker.state is State.HALF_OPEN

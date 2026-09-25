@@ -113,6 +113,25 @@ def test_parse_row_rejects_a_bad_column_name() -> None:
         parse_row(json.dumps({"Bad-Column": "x"}).encode(), "tb_msg_id")
 
 
+def test_parse_row_never_logs_a_sender_supplied_key_verbatim() -> None:
+    """Code review, Medium: a payload's JSON keys are sender-controlled and can themselves carry PHI
+    (unlike `id_column`, this loader's own config) -- the error message must say only a fixed phrase
+    and the key's length, never the key text itself."""
+    secret_looking_key = "PATIENT-JOHN-DOE-1980-01-01"  # noqa: S105 - a synthetic PHI-shaped JSON key, not a credential
+    with pytest.raises(Exception) as exc_info:
+        parse_row(json.dumps({secret_looking_key: "x"}).encode(), "tb_msg_id")
+    assert secret_looking_key not in str(exc_info.value)
+    assert str(len(secret_looking_key)) in str(exc_info.value)
+
+
+def test_parse_row_rejects_a_trailing_newline_column_name() -> None:
+    """Regression for the `^...$`/`.match()` gotcha (code review, Low): Python's `$` matches just
+    before a trailing newline even without `re.MULTILINE`, so `"tb_msg_id\\n"` used to pass. `fullmatch`
+    with no anchors closes it."""
+    with pytest.raises(Exception, match="column name"):
+        parse_row(json.dumps({"value\n": 1}).encode(), "tb_msg_id")
+
+
 def test_deliver_with_malformed_payload_is_payload_shape_invalid_and_not_retryable() -> None:
     loader = ClickhouseLoader(make_config(), FakeTransport(lambda sql: ok()))
     outcome = loader.deliver(make_message(payload=b"not json"))
@@ -166,11 +185,16 @@ def test_transport_error_is_connect_failed_and_retryable() -> None:
     assert outcome.retryable is True
 
 
-def test_ssl_error_is_tls_verify_failed_and_not_retryable() -> None:
-    import ssl
+def test_tls_verification_failure_is_tls_verify_failed_and_not_retryable() -> None:
+    """`TlsVerificationError`, not a bare `ssl.SSLError` (code review, Low): `client.py`'s real `send`
+    never lets `ssl.SSLError` escape -- it always wraps TLS handshake failures into
+    `TlsVerificationError` -- so a fake that raised `ssl.SSLError` directly here would pass even if
+    `loader.py`'s `except` clause named the wrong exception type and this classification were
+    unreachable against the real transport."""
+    from tributary.loaders.clickhouse.client import TlsVerificationError
 
     def raiser(sql: bytes) -> Response:
-        raise ssl.SSLError("certificate verify failed")
+        raise TlsVerificationError("certificate verify failed")
 
     loader = ClickhouseLoader(make_config(), FakeTransport(raiser))
     outcome = loader.deliver(make_message())
@@ -190,6 +214,43 @@ def test_unknown_table_exception_code_is_not_retryable() -> None:
     outcome = loader.deliver(make_message())
     assert outcome.reason == "CH_60"
     assert outcome.retryable is False
+
+
+def test_a_200_with_an_embedded_code_prefix_is_still_a_failure() -> None:
+    """Code review, Critical: ClickHouse can send the `200` status line and headers before the query
+    has actually finished, so a row that was never inserted must not be reported as a success just
+    because the HTTP status was 2xx. `client.py`'s `wait_end_of_query=1` asks the server not to do
+    this; this test proves `loader.py` does not rely on that alone."""
+    response = Response(200, {}, b"Code: 241. DB::Exception: Memory limit exceeded (MEMORY_LIMIT_EXCEEDED)")
+    loader = ClickhouseLoader(make_config(), FakeTransport(lambda sql: response))
+    outcome = loader.deliver(make_message())
+    assert outcome.success is False
+    assert outcome.reason == "CH_241"
+    assert outcome.retryable is False
+
+
+def test_a_200_with_an_embedded_retryable_code_prefix_is_retryable() -> None:
+    response = Response(200, {}, b"Code: 159. DB::Exception: Timeout exceeded (TIMEOUT_EXCEEDED)")
+    loader = ClickhouseLoader(make_config(), FakeTransport(lambda sql: response))
+    outcome = loader.deliver(make_message())
+    assert outcome.success is False
+    assert outcome.reason == "CH_159"
+    assert outcome.retryable is True
+
+
+def test_a_plain_200_with_no_code_prefix_is_success() -> None:
+    loader = ClickhouseLoader(make_config(), FakeTransport(lambda sql: ok(b"")))
+    outcome = loader.deliver(make_message())
+    assert outcome.success is True
+
+
+def test_verify_idempotency_constraint_refuses_a_200_with_an_embedded_code_prefix() -> None:
+    """Same Critical fix, the startup half: `verify_idempotency_constraint` must not treat a `200`
+    carrying an embedded ClickHouse exception as a readable `system.tables` row."""
+    response = Response(200, {}, b"Code: 60. DB::Exception: Table default.t does not exist (UNKNOWN_TABLE)")
+    loader = ClickhouseLoader(make_config(), FakeTransport(lambda sql: response))
+    with pytest.raises(IdempotencyConstraintError):
+        loader.verify_idempotency_constraint()
 
 
 def test_error_with_no_exception_code_header_falls_back_to_body_prefix() -> None:

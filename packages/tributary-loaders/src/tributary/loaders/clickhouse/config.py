@@ -57,8 +57,8 @@ SUPPORTED_IDEMPOTENCY_TECHNIQUES = frozenset({"sink-native"})
 #: `auth.type` values this loader can authenticate with — same enum as `postgresql`'s `sqlSinkParams.auth`.
 SUPPORTED_AUTH_TYPES = frozenset({"password", "client-certificate"})
 
-_TABLE_RE = re.compile(r"^[a-z_][a-z0-9_]{0,62}(\.[a-z][a-z0-9_]{0,62})?$")
-_IDENTIFIER_RE = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
+_TABLE_RE = re.compile(r"[a-z_][a-z0-9_]{0,62}(\.[a-z][a-z0-9_]{0,62})?")
+_IDENTIFIER_RE = re.compile(r"[a-z_][a-z0-9_]{0,62}")
 
 DEFAULT_PORT = 8123  # ClickHouse's HTTP interface; 8443 is the HTTPS convention but not assumed here
 DEFAULT_ID_COLUMN = "tb_msg_id"
@@ -111,7 +111,7 @@ def _require(mapping: Mapping[str, Any], key: str, where: str) -> Any:
 
 
 def _identifier(value: Any, field: str, destination: str) -> str:
-    if not isinstance(value, str) or not _IDENTIFIER_RE.match(value):
+    if not isinstance(value, str) or not _IDENTIFIER_RE.fullmatch(value):
         raise ConfigError(f"destination {destination!r}: with.{field} {value!r} is not a valid identifier")
     return value
 
@@ -136,7 +136,7 @@ def clickhouse_destination_config_from_destination(
     name = destination.name
 
     table = _require(params, "table", "with")
-    if not isinstance(table, str) or not _TABLE_RE.match(table):
+    if not isinstance(table, str) or not _TABLE_RE.fullmatch(table):
         raise ConfigError(f"destination {name!r}: with.table {table!r} is not a valid table identifier")
 
     database = _identifier(_require(params, "database", "with"), "database", name)
