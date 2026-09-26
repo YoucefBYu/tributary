@@ -1205,6 +1205,7 @@ name = "tributary-content-hl7-fhir"
 version = "0.0.0"
 source = { editable = "packages/tributary-content-hl7-fhir" }
 dependencies = [
+    { name = "fhir-resources" },
     { name = "tributary-fhir" },
     { name = "tributary-hl7v2" },
     { name = "tributary-sdk" },
@@ -1212,6 +1213,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "fhir-resources", specifier = ">=8.0" },
     { name = "tributary-fhir", editable = "packages/tributary-fhir" },
     { name = "tributary-hl7v2", editable = "packages/tributary-hl7v2" },
     { name = "tributary-sdk", editable = "packages/tributary-sdk" },

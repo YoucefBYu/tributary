@@ -3,7 +3,6 @@
     {
       "fullUrl": "urn:uuid:test-1",
       "request": {
-        "ifNoneExist": "identifier=urn:id:SYNTH-HOSPITAL|9000003",
         "method": "PUT",
         "url": "Patient?identifier=urn:id:SYNTH-HOSPITAL|9000003"
       },
@@ -41,8 +40,8 @@
       "fullUrl": "urn:uuid:test-2",
       "request": {
         "ifNoneExist": "identifier=https://tributary.dev/fhir/identifier/tb-msg-id|0199036e-7a3e-7f00-8c21-abc123456789:obx-1",
-        "method": "PUT",
-        "url": "Observation?identifier=https://tributary.dev/fhir/identifier/tb-msg-id|0199036e-7a3e-7f00-8c21-abc123456789:obx-1"
+        "method": "POST",
+        "url": "Observation"
       },
       "resource": {
         "code": {
@@ -54,6 +53,12 @@
             }
           ]
         },
+        "identifier": [
+          {
+            "system": "https://tributary.dev/fhir/identifier/tb-msg-id",
+            "value": "0199036e-7a3e-7f00-8c21-abc123456789:obx-1"
+          }
+        ],
         "referenceRange": [
           {
             "text": "60-100"
@@ -74,8 +79,8 @@
       "fullUrl": "urn:uuid:test-3",
       "request": {
         "ifNoneExist": "identifier=https://tributary.dev/fhir/identifier/tb-msg-id|0199036e-7a3e-7f00-8c21-abc123456789:obx-2",
-        "method": "PUT",
-        "url": "Observation?identifier=https://tributary.dev/fhir/identifier/tb-msg-id|0199036e-7a3e-7f00-8c21-abc123456789:obx-2"
+        "method": "POST",
+        "url": "Observation"
       },
       "resource": {
         "code": {
@@ -87,6 +92,12 @@
             }
           ]
         },
+        "identifier": [
+          {
+            "system": "https://tributary.dev/fhir/identifier/tb-msg-id",
+            "value": "0199036e-7a3e-7f00-8c21-abc123456789:obx-2"
+          }
+        ],
         "referenceRange": [
           {
             "text": "90-120"
@@ -107,8 +118,8 @@
       "fullUrl": "urn:uuid:test-4",
       "request": {
         "ifNoneExist": "identifier=https://tributary.dev/fhir/identifier/tb-msg-id|0199036e-7a3e-7f00-8c21-abc123456789:obx-3",
-        "method": "PUT",
-        "url": "Observation?identifier=https://tributary.dev/fhir/identifier/tb-msg-id|0199036e-7a3e-7f00-8c21-abc123456789:obx-3"
+        "method": "POST",
+        "url": "Observation"
       },
       "resource": {
         "code": {
@@ -120,6 +131,12 @@
             }
           ]
         },
+        "identifier": [
+          {
+            "system": "https://tributary.dev/fhir/identifier/tb-msg-id",
+            "value": "0199036e-7a3e-7f00-8c21-abc123456789:obx-3"
+          }
+        ],
         "referenceRange": [
           {
             "text": "60-80"
@@ -139,7 +156,6 @@
     {
       "fullUrl": "urn:uuid:test-5",
       "request": {
-        "ifNoneExist": "identifier=urn:id:SYNTH-LAB|SYNTHFILL0001",
         "method": "PUT",
         "url": "DiagnosticReport?identifier=urn:id:SYNTH-LAB|SYNTHFILL0001"
       },
@@ -153,6 +169,12 @@
           ]
         },
         "effectiveDateTime": "2026-01-05T10:00:00Z",
+        "identifier": [
+          {
+            "system": "urn:id:SYNTH-LAB",
+            "value": "SYNTHFILL0001"
+          }
+        ],
         "resourceType": "DiagnosticReport",
         "result": [
           {

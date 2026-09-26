@@ -185,6 +185,12 @@ class LocalFhir:
         Raises `BundleEntryError` if neither is available: an unconditional `PUT` would target a literal
         resource id this step never minted, and an unconditional `POST` would create a duplicate on
         every redelivery -- invariant 4 requires an idempotency technique, and "guess" is not one.
+
+        No `ifNoneExist` on this entry (security review, LOW): that header is FHIR's conditional-*create*
+        mechanism, meaningful only on `POST` (`create`, below); a `PUT`'s condition is entirely in its
+        own URL's query, and a server has nothing to do with an `ifNoneExist` alongside one -- it is
+        either ignored or, per the spec, may itself be a `400`. Carrying it here was dead weight, not a
+        second safety net.
         """
         resource_type = type(resource).__name__
         key = identifier or _first_identifier(resource)
@@ -192,9 +198,7 @@ class LocalFhir:
             raise BundleEntryError(resource_type, "no identifier given and the resource has none of its own")
         url = _conditional_url(resource_type, key)
         return BundleEntry(
-            fullUrl=self._id_factory(),
-            resource=resource,
-            request=BundleEntryRequest(method="PUT", url=url, ifNoneExist=f"identifier={_identifier_token(key)}"),
+            fullUrl=self._id_factory(), resource=resource, request=BundleEntryRequest(method="PUT", url=url)
         )
 
     def create(self, resource: Resource, *, identifier: Identifier | None = None) -> BundleEntry:

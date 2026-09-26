@@ -8,6 +8,10 @@ dependencies = [
     "tributary-sdk",
     "tributary-hl7v2",
     "tributary-fhir",
+    # Declared explicitly (security review, LOW), not left as a transitive pull-in through
+    # tributary-fhir: this package's own source imports fhir.resources.R4B.* directly (adt.py, oru.py,
+    # patient.py, datatypes.py). BSD; version pin matches tributary-fhir's own pyproject.toml.
+    "fhir.resources>=8.0",
 ]
 
 # Clean-room: built from the public HL7 v2-to-FHIR Implementation Guide's published mapping pages and

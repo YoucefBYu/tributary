@@ -3,7 +3,6 @@
     {
       "fullUrl": "urn:uuid:test-1",
       "request": {
-        "ifNoneExist": "identifier=urn:id:SYNTH-HOSPITAL|9000001",
         "method": "PUT",
         "url": "Patient?identifier=urn:id:SYNTH-HOSPITAL|9000001"
       },

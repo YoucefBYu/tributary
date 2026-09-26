@@ -28,16 +28,32 @@ about — the first version of this mapping gave `Encounter` only the weaker one
   resource that is supposed to be a new instance per message (an `Observation` is one result, not a
   running total), and a bug for one that is supposed to be a single, evolving record (an `Encounter`).
 
-| Resource | Built by | Conditional on | Convergence |
-|---|---|---|---|
-| `Patient` | `patient.map_patient` (shared by both steps) | PID-3's own identifier: `value` = PID-3.1, `system` = `urn:id:<PID-3.4>` (`datatypes.local_identifier_system`) | **Converges** — every message for the same patient (any PID-3), any trigger, any `tb-msg-id`. |
-| `Encounter` | `adt.adt_to_fhir` (`_encounter_identifier`) | PV1-19 (Visit Number, a CX), when present. With no PV1-19: ADT_A01 falls back to `message_identifier(message.msg_id, discriminator="encounter")`; ADT_A03/A08 **omit the `Encounter` entry entirely** rather than fall back. | **Converges** when PV1-19 is present — A01/A03/A08 for the same visit resolve the same conditional PUT, so the one `Encounter` is created once and then updated/finished. With no PV1-19, ADT_A01's own entry is redelivery-idempotent only (it cannot converge with a later message it has no shared key with); ADT_A03/A08 produce no `Encounter` at all rather than create a wrong, non-converging one. |
-| `DiagnosticReport` | `oru.oru_r01_to_fhir` | OBR-3 (Filler Order Number), else OBR-2 (Placer Order Number), else `message_identifier(message.msg_id, discriminator="obr-<OBR-1>")` | **Converges** when OBR-2/-3 is present — the lab's own order identifier, shared by every result for that order. The `tb-msg-id` fallback (no OBR-2/-3) is redelivery-idempotent only. |
-| `Observation` | `oru.oru_r01_to_fhir` (one per `OBX`) | `message_identifier(message.msg_id, discriminator=f"obx-{OBX-1}")` | **Redelivery-idempotent only, by design.** v2 gives an `OBX` no order-independent identifier of its own, and an `Observation` is meant to be a new instance per result, not a record that later messages update — so there is nothing for it *to* converge with. OBX-1 (Set ID) is stable across a redelivery of the *same* message, which is this reference mapping's actual idempotency need here. |
+| Resource | Built by | `PUT`/`POST` (README 3.4.2 state/event split) | Conditional on | Convergence |
+|---|---|---|---|---|
+| `Patient` | `patient.map_patient` (shared by both steps) | **State, `PUT`** | PID-3's own identifier: `value` = PID-3.1, `system` = `urn:id:<PID-3.4>` (`datatypes.local_identifier_system`) | **Converges** — every message for the same patient (any PID-3), any trigger, any `tb-msg-id`. |
+| `Encounter` | `adt.adt_to_fhir` (`_encounter_identifier`) | **State, `PUT`** | PV1-19 (Visit Number, a CX), when present. With no PV1-19: ADT_A01 falls back to `message_identifier(message.msg_id, discriminator="encounter")`; ADT_A03/A08 **omit the `Encounter` entry entirely** rather than fall back (logged at `warning`, trigger code and a fixed reason only). | **Converges** when PV1-19 is present — A01/A03/A08 for the same visit resolve the same conditional PUT, so the one `Encounter` is created once and then updated/finished. With no PV1-19, ADT_A01's own entry is redelivery-idempotent only (it cannot converge with a later message it has no shared key with); ADT_A03/A08 produce no `Encounter` at all rather than create a wrong, non-converging one. |
+| `DiagnosticReport` | `oru.oru_r01_to_fhir` | **State, `PUT`** | OBR-3 (Filler Order Number), else OBR-2 (Placer Order Number), else `message_identifier(message.msg_id, discriminator="obr-<OBR-1>")` | **Converges** when OBR-2/-3 is present — the lab's own order identifier, shared by every result for that order, so a corrected or amended report for the same order updates the one resource rather than sitting next to a duplicate. The `tb-msg-id` fallback (no OBR-2/-3) is redelivery-idempotent only. |
+| `Observation` | `oru.oru_r01_to_fhir` (one per `OBX`) | **Event, `POST` + `ifNoneExist`** | `message_identifier(message.msg_id, discriminator=f"obx-{OBX-1}")`. OBX-1 must be present and unique within the message — a blank or repeated Set ID raises a typed error instead of producing two entries with the same conditional URL. | **Redelivery-idempotent only, by design.** v2 gives an `OBX` no order-independent identifier of its own, and channel-spec README 3.4.2 is explicit that an event resource "must not be overwritten" — a result is a record of what was measured at the time, not something a later message should update in place, so there is nothing for it *to* converge with. |
+
+**Every resource body also carries the identifier its entry is conditional on, in its own
+`.identifier`** (security review MEDIUM 4): a `PUT`/`POST` whose *body* has no `.identifier` at all is
+not self-describing, and a redelivery's conditional search would have nothing of its own writing to
+match against. `Patient`'s own PID-3-derived identifier already qualifies for its `Patient` entry
+without any extra step; `Encounter`, `DiagnosticReport` and `Observation` each explicitly copy their
+conditional identifier onto `.identifier` before the entry is built.
 
 `Practitioner` (PV1-7) and `Location` (PV1-3) are **not** built as Bundle entries in this reference set —
 they appear only as display-only `Reference`s on `Encounter`. No resource, so no identifier question to
 answer; a natural extension, out of scope for the first ADT/ORU mapping.
+
+## MSH-9 is checked, not assumed
+
+Both steps check MSH-9.1 (message type) as well as the trigger event before mapping anything --
+`adt_to_fhir` requires `ADT`, `oru_r01_to_fhir` requires `ORU`^`R01` -- and raise `UnsupportedTriggerError`
+otherwise. If either component fails `tributary.hl7v2.message.STRUCTURAL_CODE` (three characters,
+`[A-Z0-9]`), the exception carries a fixed `"<non-structural>"` placeholder instead of the sender's own
+text (security review MEDIUM 2): `errors.UnsupportedTriggerError`'s docstring used to *claim* this
+without any code enforcing it.
 
 ## Trigger events and pages
 
@@ -59,8 +75,27 @@ answer; a natural extension, out of scope for the first ADT/ORU mapping.
 - v2 `TS` values with a time component get `+00:00` stamped on them (FHIR `dateTime` requires a
   timezone once a time is present; this reference set's fixtures carry none of their own). Treat this
   as "unknown, treated as UTC", not a real offset.
-- `Quantity.value` uses `Decimal(OBX-5)`; a value that does not parse as a decimal falls back to
-  `valueString` rather than raising.
+- Any v2 date or date-time field that is not calendar/clock-valid (`19800231`, a minute of 65, ...) is
+  treated as absent rather than handed to a FHIR model's own validator, which would otherwise embed the
+  rejected text verbatim in a `ValidationError` (security review HIGH 2, invariant 6).
+- A v2 field going into a FHIR `code` (PV1-2, OBX-3.1, OBR-4.1, CX.5) is stripped of surrounding
+  whitespace and checked against the `code` primitive's own grammar before use; one that still doesn't
+  fit gets a `Coding` with no `.code` at all (system/display only) rather than an invalid one (security
+  review HIGH 2).
+- `Quantity.value` uses `Decimal(OBX-5)`, capped at 30 significant digits and an exponent magnitude of
+  30 before it is ever handed to a FHIR model or its JSON serializer (security review HIGH 1: `fhir_core`
+  formats an integral `Decimal` as a plain base-10 integer, so an unbounded exponent is unbounded CPU
+  and memory at *serialization* time). A value that is not decimal-shaped, not finite (`NaN`/
+  `Infinity`), exceeds those caps, or whose exact decimal precision would not survive `fhir_core`'s
+  `Decimal`-through-`float` JSON encoding (`"72.10"` -> `72.1`, `"1.00000000000000001"` -> `1.0`) is
+  carried as `valueString` instead — the sender's own text, exactly, rather than a silently-lossy
+  `valueQuantity` (security review MEDIUM 4).
+- Every model-building call is wrapped in `errors.safe_build`: any exception `fhir.resources`' own
+  validation raises anyway (beyond what the checks above already prevent) becomes a typed
+  `InvalidFieldError(path)`, never the original `ValidationError` text, and never reachable through the
+  new exception's `__cause__` or `__context__` either (security review HIGH 2; see that function's own
+  docstring for exactly why the `__context__` half needs a specific coding pattern, not just `from
+  None`).
 
 ## FHIR model set
 

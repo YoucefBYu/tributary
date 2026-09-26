@@ -28,8 +28,15 @@ def test_upsert_builds_a_conditional_put() -> None:
     entry = fhir.upsert(_patient())
     assert entry.request.method == "PUT"
     assert entry.request.url == "Patient?identifier=urn:synth:mrn|9000001"
-    assert entry.request.ifNoneExist == "identifier=urn:synth:mrn|9000001"
     assert entry.resource is not None
+
+
+def test_upsert_does_not_set_if_none_exist() -> None:
+    """Security review, LOW: `ifNoneExist` is FHIR's conditional-*create* mechanism and is meaningless
+    on a `PUT`, whose condition already lives entirely in the URL -- a server ignores it at best."""
+    fhir = LocalFhir(id_factory=sequential_id_factory())
+    entry = fhir.upsert(_patient())
+    assert entry.request.ifNoneExist is None
 
 
 def test_upsert_uses_an_explicit_identifier_override() -> None:
@@ -143,11 +150,15 @@ def test_conditional_url_disambiguates_an_embedded_pipe_from_the_separator() -> 
     assert "%7C" in hostile_entry.request.url  # the embedded pipe, percent-encoded, not a bare "|"
 
 
-def test_if_none_exist_uses_the_same_escaped_token_as_the_url() -> None:
+def test_create_if_none_exist_uses_the_same_escaped_token_as_a_put_url_would() -> None:
+    """`create` (`POST`) is where `ifNoneExist` actually matters; it uses the same escaped token
+    `upsert`'s URL would, so the two conditional forms never disagree about what a hostile value escapes
+    to."""
     hostile = Identifier(system="urn:synth:mrn", value="A,B$C")
     fhir = LocalFhir(id_factory=sequential_id_factory())
-    entry = fhir.upsert(_patient(hostile))
-    assert entry.request.ifNoneExist == f"identifier={entry.request.url.split('identifier=')[1]}"
+    put_entry = fhir.upsert(_patient(hostile))
+    post_entry = fhir.create(_patient(hostile))
+    assert post_entry.request.ifNoneExist == f"identifier={put_entry.request.url.split('identifier=')[1]}"
 
 
 def test_delete_also_percent_encodes_hostile_values() -> None:

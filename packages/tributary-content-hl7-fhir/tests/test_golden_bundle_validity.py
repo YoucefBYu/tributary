@@ -39,8 +39,21 @@ def test_golden_bundle_is_a_structurally_valid_r4b_transaction_bundle(golden_pat
         assert entry.request is not None
         assert entry.request.method in ("PUT", "POST", "DELETE")
         # Channel-spec README 3.4.2: every entry conditional on exactly one identifier -- never an
-        # unconditional create (a bare `POST` with no `ifNoneExist`).
-        assert entry.request.ifNoneExist, f"{golden_path.name}: entry has no conditional ifNoneExist"
+        # unconditional create. A `PUT`'s condition lives entirely in its URL's query (`ifNoneExist` is
+        # meaningless there, and `LocalFhir.upsert` no longer sets it -- security review, LOW); a `POST`
+        # or `DELETE`'s condition is `ifNoneExist`/the URL's query respectively.
+        if entry.request.method == "PUT":
+            assert "?identifier=" in (entry.request.url or ""), f"{golden_path.name}: unconditional PUT"
+        elif entry.request.method == "POST":
+            assert entry.request.ifNoneExist, f"{golden_path.name}: entry has no conditional ifNoneExist"
+        else:
+            assert "?identifier=" in (entry.request.url or ""), f"{golden_path.name}: unconditional DELETE"
+
+        # Security review, MEDIUM 4: the resource body itself must carry the identifier its entry is
+        # conditional on (Patient's own PID-3-derived identifier already qualifies for that entry).
+        if entry.resource is not None:
+            identifiers = getattr(entry.resource, "identifier", None) or []
+            assert identifiers, f"{golden_path.name}: {type(entry.resource).__name__} has no .identifier"
 
 
 def test_at_least_one_golden_file_exists() -> None:

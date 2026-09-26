@@ -18,7 +18,7 @@ from tributary.hl7v2.step import parse
 from tributary.sdk import Message
 from tributary.sdk.testing import make_message, run_step
 
-from .conftest import GOLDEN_MSG_ID, load_golden, map_fixture
+from .conftest import GOLDEN_MSG_ID, HL7_FIXTURES, load_golden, map_fixture
 
 
 @pytest.mark.parametrize(
@@ -121,6 +121,108 @@ def test_a01_then_a03_then_a08_for_the_same_visit_converge_on_one_encounter_url(
     assert urls == {"Encounter?identifier=urn:id:SYNTH-HOSPITAL|VN20260109-00002"}
 
 
+def test_encounter_body_carries_its_own_conditional_identifier() -> None:
+    """Security review MEDIUM 4: every resource must include the identifier its entry is conditional
+    on, so a redelivery's conditional search actually matches what a previous delivery wrote."""
+    bundle = map_fixture("adt_a01_admit_with_visit_number.hl7", adt_to_fhir)
+    encounter_entry = bundle["entry"][1]  # type: ignore[index]
+    identifiers = encounter_entry["resource"]["identifier"]  # type: ignore[index]
+    assert len(identifiers) == 1
+    assert identifiers[0]["system"] == "urn:id:SYNTH-HOSPITAL"
+    assert identifiers[0]["value"] == "VN20260108-00001"
+
+
+def test_encounter_omission_is_logged_at_warning_with_no_values() -> None:
+    """Code review follow-up on e48d937/5c42b2f: an operator needs to see a sender that never populates
+    PV1-19, so this is `warning`, not `debug` -- and still carries only the trigger code (a structural
+    MSH-9 value) and a fixed reason string, never a value."""
+    from tributary.sdk.fakes import FakeContext
+
+    ctx = FakeContext()
+    hl7_step_ctx = fake_fhir_context(base=ctx)
+    raw = (HL7_FIXTURES / "adt_a03_discharge.hl7").read_bytes()
+    message = make_message(raw, content_type="application/hl7-v2+er7")
+    parsed = run_step(parse, message, ctx=hl7_step_ctx)
+    run_step(adt_to_fhir, parsed, ctx=hl7_step_ctx)
+    warnings = [record for record in ctx.log.records if record.level == "warning"]
+    assert len(warnings) == 1
+    assert warnings[0].event == "adt_encounter_omitted"
+    assert warnings[0].fields == {"trigger_event": "A03", "reason": "no_visit_number"}
+
+
+def test_message_type_must_be_adt() -> None:
+    """Security review, MEDIUM 2: the message *type* is checked, not only the trigger event -- an
+    ORU^A01 (a nonsensical combination) must not be accepted just because "A01" is in the trigger set."""
+    ctx = fake_fhir_context()
+    raw = (
+        b"MSH|^~\\&|TRIBUTARY-SYNTH|SYNTH-LAB|SYNTH-ORU-RECV|SYNTH-RECV-FACILITY|"
+        b"20260101120000||ORU^A01^ORU_R01|SYNTHMSG00095|P|2.5.1\r"
+        b"PID|1||9000095^^^SYNTH-HOSPITAL^MR||SYNTHPATIENT^X||19800101|M\r"
+    )
+    parsed = run_step(parse, make_message(raw, content_type="application/hl7-v2+er7"), ctx=ctx)
+    with pytest.raises(UnsupportedTriggerError):
+        run_step(adt_to_fhir, parsed, ctx=ctx)
+
+
+def test_non_structural_msh9_never_reaches_the_exception() -> None:
+    """Security review, MEDIUM 2: a malformed MSH-9 is replaced with a fixed placeholder, never echoed
+    -- `errors.py` previously *claimed* this was already true without any check enforcing it."""
+    ctx = fake_fhir_context()
+    raw = (
+        b"MSH|^~\\&|TRIBUTARY-SYNTH|SYNTH-HOSPITAL|SYNTH-ADT-RECV|SYNTH-RECV-FACILITY|"
+        b"20260101120000||not a valid code^A99^ADT_A99|SYNTHMSG00094|P|2.5.1\r"
+        b"PID|1||9000094^^^SYNTH-HOSPITAL^MR||SYNTHPATIENT^X||19800101|M\r"
+    )
+    parsed = run_step(parse, make_message(raw, content_type="application/hl7-v2+er7"), ctx=ctx)
+    with pytest.raises(UnsupportedTriggerError) as excinfo:
+        run_step(adt_to_fhir, parsed, ctx=ctx)
+    assert excinfo.value.message_type == "<non-structural>"
+    assert "not a valid code" not in str(excinfo.value)
+
+
+# -- HIGH 2: no PHI in an exception, even via __context__ ------------------------------------------------
+
+
+def _mapped_patient_resource_or_raise(pid_line: str) -> dict[str, object]:
+    raw = (
+        b"MSH|^~\\&|TRIBUTARY-SYNTH|SYNTH-HOSPITAL|SYNTH-ADT-RECV|SYNTH-RECV-FACILITY|"
+        b"20260101120000||ADT^A01^ADT_A01|SYNTHMSG00093|P|2.5.1\r" + pid_line.encode() + b"\r"
+    )
+    ctx = fake_fhir_context()
+    parsed = run_step(parse, make_message(raw, content_type="application/hl7-v2+er7"), ctx=ctx)
+    mapped = run_step(adt_to_fhir, parsed, ctx=ctx)
+    assert isinstance(mapped, Message)
+    assert mapped.payload is not None
+    bundle = json.loads(mapped.payload)
+    result: dict[str, object] = bundle["entry"][0]["resource"]
+    return result
+
+
+def test_invalid_dob_does_not_crash_and_omits_birth_date() -> None:
+    """Security review, HIGH 2: `19800231` (no 31st of February) must not reach `Patient.birthDate`'s
+    own validator, whose `ValidationError` embeds the value verbatim."""
+    patient = _mapped_patient_resource_or_raise("PID|1||9000093^^^SYNTH-HOSPITAL^MR||SYNTHPATIENT^X||19800231|M")
+    assert "birthDate" not in patient
+
+
+def test_no_phi_leak_anywhere_in_the_exception_chain() -> None:
+    """Security review, HIGH 2: `str(exc)` and the full chain (`__cause__`, `__context__`) must never
+    carry a field value -- checked directly, not just asserted in a docstring (`errors.safe_build`)."""
+    raw = (
+        b"MSH|^~\\&|TRIBUTARY-SYNTH|SYNTH-HOSPITAL|SYNTH-ADT-RECV|SYNTH-RECV-FACILITY|"
+        b"20260101120000||ADT^A01^ADT_A01|SYNTHMSG00092|P|2.5.1\r"
+        b"PID|1|||SYNTHVERYSECRETPATIENTNAME^X||19800101|M\r"
+    )
+    ctx = fake_fhir_context()
+    parsed = run_step(parse, make_message(raw, content_type="application/hl7-v2+er7"), ctx=ctx)
+    with pytest.raises(RequiredFieldMissingError) as excinfo:
+        run_step(adt_to_fhir, parsed, ctx=ctx)
+    exc = excinfo.value
+    assert "SYNTHVERYSECRETPATIENTNAME" not in str(exc)
+    assert exc.__cause__ is None
+    assert exc.__context__ is None
+
+
 def test_unsupported_trigger_raises_a_typed_error() -> None:
     raw = (
         b"MSH|^~\\&|TRIBUTARY-SYNTH|SYNTH-HOSPITAL|SYNTH-ADT-RECV|SYNTH-RECV-FACILITY|"
@@ -146,6 +248,16 @@ def test_missing_pid3_raises_a_typed_error_not_a_crash() -> None:
     with pytest.raises(RequiredFieldMissingError) as excinfo:
         run_step(adt_to_fhir, parsed, ctx=ctx)
     assert excinfo.value.path == "PID.3"
+
+
+def test_custom_delimiters_fixture_maps_without_misreading_data_as_components() -> None:
+    """Security review, MEDIUM 3: `custom_delimiters.hl7` uses `!`/`@`/`$`/`\\`/`*` as its five
+    delimiters, so the literal `^` characters inside its PID-3 are plain data, not four extra
+    components. This end-to-end run is what would have broken under the old hard-coded `"^".split()`."""
+    bundle = map_fixture("custom_delimiters.hl7", adt_to_fhir)
+    patient_identifier = bundle["entry"][0]["resource"]["identifier"][0]  # type: ignore[index]
+    assert patient_identifier["value"] == "9000004^^^SYNTH-HOSPITAL^MR"
+    assert "system" not in patient_identifier
 
 
 def test_repeated_run_produces_a_byte_identical_bundle() -> None:

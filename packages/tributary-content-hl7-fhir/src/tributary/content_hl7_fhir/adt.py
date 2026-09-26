@@ -10,7 +10,9 @@ ADT_A01.html and its A03/A08 siblings), read for interoperability and re-impleme
 (CLAUDE.md invariant 10). Field-level rules cite the IG page inline, next to the field they cover.
 
 **Resources produced, and the identifier each Bundle entry is conditional on** (channel-spec README
-3.4.2 -- every entry conditional on exactly one identifier system, never an unconditional create):
+3.4.2 -- every entry conditional on exactly one identifier system, never an unconditional create; every
+resource body also carries that same identifier in its own `.identifier`, security review MEDIUM 4, so a
+redelivery's conditional search actually matches what the previous delivery wrote):
 
 * `Patient` -- conditional on its own PID-3 identifier (`urn:id:<PID-3.4>`, `datatypes.
   local_identifier_system`), a real (synthetic, in these fixtures) business identifier the sending
@@ -29,7 +31,9 @@ ADT_A01.html and its A03/A08 siblings), read for interoperability and re-impleme
   an admit is establishing a *new* encounter and a lone, never-updated resource is at least
   redelivery-idempotent, which is strictly better than either failing the message or fabricating a
   visit number. ADT_A03/A08 with no PV1-19 instead **omit the `Encounter` entry** (`Patient` still
-  built) -- see `_encounter_identifier` for the reasoning and `docs/MAPPING.md` for the summary table.
+  built), logged at `warning` (trigger code and a fixed reason only, never a value) since an operator
+  needs to see a sender that never populates PV1-19 -- see `_encounter_identifier` for the reasoning and
+  `docs/MAPPING.md` for the summary table.
 
 Practitioner (PV1-7 attending doctor) and Location (PV1-3 assigned location) are **not** built as
 Bundle entries in this reference set -- they appear only as display-only `Reference`s on `Encounter`
@@ -43,17 +47,31 @@ from fhir.resources.R4B.encounter import Encounter, EncounterLocation, Encounter
 from fhir.resources.R4B.period import Period
 from fhir.resources.R4B.reference import Reference
 from tributary.fhir import Bundle, FhirContext, Identifier, message_identifier
-from tributary.hl7v2 import Hl7Message
+from tributary.hl7v2 import Hl7Message, Segment
+from tributary.hl7v2.message import STRUCTURAL_CODE
 from tributary.hl7v2.step import VARS_KEY
 from tributary.sdk import Message, step
 
-from .datatypes import cx_to_identifier, local_identifier_system, patient_class_to_encounter_class, ts_to_fhir_datetime
-from .errors import RequiredFieldMissingError, UnsupportedTriggerError
+from .datatypes import (
+    cx_identifier,
+    local_identifier_system,
+    patient_class_to_encounter_class,
+    pl_display,
+    ts_to_fhir_datetime,
+    xcn_display,
+)
+from .errors import RequiredFieldMissingError, UnsupportedTriggerError, safe_build
 from .patient import map_patient
 
 #: The three ADT trigger events this reference mapping supports (W2-3's stated scope). Anything else
 #: raises `UnsupportedTriggerError` rather than guessing.
 _SUPPORTED_TRIGGERS = frozenset({"A01", "A03", "A08"})
+
+#: A fixed, non-sender-controlled placeholder for `UnsupportedTriggerError` when MSH-9's own text fails
+#: `STRUCTURAL_CODE` (security review, MEDIUM 2: `errors.py` previously *claimed* MSH-9 was already
+#: allow-listed before reaching this error, but nothing here actually checked -- this placeholder, and
+#: the check right before it, is what makes that claim true).
+_NON_STRUCTURAL = "<non-structural>"
 
 #: PV1-2 (Patient Class) has no encounter-status implication of its own; the *trigger event* decides
 #: `Encounter.status` here (IG mapping "EVN.1 / message trigger informs Encounter.status" -- ADT_A01
@@ -63,67 +81,68 @@ _SUPPORTED_TRIGGERS = frozenset({"A01", "A03", "A08"})
 _STATUS_FOR_TRIGGER = {"A01": "in-progress", "A03": "finished", "A08": "in-progress"}
 
 
-def _map_encounter(hl7: Hl7Message, *, patient_ref: Reference, status: str, trigger_event: str) -> Encounter | None:
+def _safe_trigger_codes(message_type: str, trigger_event: str) -> tuple[str, str]:
+    """`(message_type, trigger_event)`, each replaced with `_NON_STRUCTURAL` if it fails
+    `STRUCTURAL_CODE` -- for use in an exception, which must never carry raw MSH-9 text (MEDIUM 2)."""
+    safe_type = message_type if STRUCTURAL_CODE.match(message_type) else _NON_STRUCTURAL
+    safe_trigger = trigger_event if STRUCTURAL_CODE.match(trigger_event) else _NON_STRUCTURAL
+    return safe_type, safe_trigger
+
+
+def _map_encounter(
+    hl7: Hl7Message, pv1: Segment | None, *, patient_ref: Reference, status: str, trigger_event: str
+) -> Encounter | None:
     """PV1 -> `Encounter`, or `None` if the message carries no PV1 at all (ADT_A08 fixtures may omit it
     -- a pure demographic update). IG: "PV1 to Encounter" (build.fhir.org/ig/HL7/v2-to-fhir, PV1.md)."""
-    if hl7.segment_count("PV1") == 0:
+    if pv1 is None:
         return None
 
-    patient_class = hl7.get("PV1.2") or ""
-    # `class_fhir` (the Python name for the wire-format, reserved-word field `class`) is a required
-    # field, but mypy's PEP 681 dataclass-transform reading of `fhir.resources`' models (no
-    # `pydantic.mypy` plugin configured) cannot resolve it as a constructor keyword -- a known friction
-    # point of these models under strict mypy, not a real type error; it is genuinely accepted at
-    # runtime (`fhir_core.fhirabstractmodel.FHIRAbstractModel.__init__` takes `**data: Any`).
-    encounter = Encounter(
-        status=status,
-        class_fhir=patient_class_to_encounter_class(patient_class),  # type: ignore[call-arg]
-        subject=patient_ref,
-    )
+    def build() -> Encounter:
+        patient_class = pv1.field(2)
+        # `class_fhir` (the Python name for the wire-format, reserved-word field `class`) is a required
+        # field, but mypy's PEP 681 dataclass-transform reading of `fhir.resources`' models (no
+        # `pydantic.mypy` plugin configured) cannot resolve it as a constructor keyword -- a known
+        # friction point of these models under strict mypy, not a real type error; it is genuinely
+        # accepted at runtime (`fhir_core.fhirabstractmodel.FHIRAbstractModel.__init__` takes `**data: Any`).
+        encounter = Encounter(
+            status=status,
+            class_fhir=patient_class_to_encounter_class(patient_class),  # type: ignore[call-arg]
+            subject=patient_ref,
+        )
 
-    location_text = hl7.get("PV1.3") or ""
-    if location_text:
-        parts = [part for part in location_text.split("^") if part]
-        display = "/".join(parts[:3]) if parts else None
-        if display:
-            encounter.location = [EncounterLocation(location=Reference(display=display))]
+        location_display = pl_display(pv1, 3)
+        if location_display is not None:
+            encounter.location = [EncounterLocation(location=Reference(display=location_display))]
 
-    attending_text = hl7.get("PV1.7") or ""
-    if attending_text:
-        components = attending_text.split("^")
-        display = " ".join(part for part in components[1:3] if part) or components[0]
-        encounter.participant = [EncounterParticipant(individual=Reference(display=display))]
+        attending_display = xcn_display(pv1, 7)
+        if attending_display is not None:
+            encounter.participant = [EncounterParticipant(individual=Reference(display=attending_display))]
 
-    hospital_service = hl7.get("PV1.10") or ""
-    if hospital_service:
-        # No Encounter.serviceType coding table ships here (invariant 10: no licensed code system);
-        # kept off the resource entirely rather than fabricating a display-only CodeableConcept the IG
-        # does not actually specify a system for at this trigger set.
-        pass
+        # IG: "the encounter period's bounds prefer the segment's own admit/discharge date-time (PV1-44
+        # for admission, PV1-45 for discharge); EVN-2 (Recorded Date/Time) is the fallback the ADT_A01/
+        # A03 mapping pages name for a sender that leaves PV1's own timestamp field blank" -- but only
+        # for *that* trigger's own end of the period: an A03 (discharge) using EVN-2 for `period.start`
+        # would wrongly stamp the *discharge* time as the *admission* time whenever PV1-44 is blank,
+        # which this reference set's fixtures deliberately exercise (PV1-44/-45 are both blank; EVN-2
+        # only ever answers "when did the event this message reports happen").
+        start = ts_to_fhir_datetime(pv1.field(44))
+        end = ts_to_fhir_datetime(pv1.field(45))
+        if start is None and trigger_event == "A01":
+            start = ts_to_fhir_datetime(hl7.get("EVN.2") or "")
+        if end is None and trigger_event == "A03":
+            end = ts_to_fhir_datetime(hl7.get("EVN.2") or "")
+        if start or end:
+            # `Period.start`/`.end` are typed as `datetime` for their parsed representation; the FHIR
+            # wire-format `str` `ts_to_fhir_datetime` returns (already calendar/clock-validated) is what
+            # the validator accepts.
+            encounter.period = Period(start=start, end=end)  # type: ignore[arg-type]
 
-    # IG: "the encounter period's bounds prefer the segment's own admit/discharge date-time (PV1-44 for
-    # admission, PV1-45 for discharge); EVN-2 (Recorded Date/Time) is the fallback the ADT_A01/A03
-    # mapping pages name for a sender that leaves PV1's own timestamp field blank" -- but only for
-    # *that* trigger's own end of the period: an A03 (discharge) using EVN-2 for `period.start` would
-    # wrongly stamp the *discharge* time as the *admission* time whenever PV1-44 is blank, which this
-    # reference set's fixtures deliberately exercise (PV1-44/-45 are both blank; EVN-2 only ever
-    # answers "when did the event this message reports happen").
-    start = ts_to_fhir_datetime(hl7.get("PV1.44") or "")
-    end = ts_to_fhir_datetime(hl7.get("PV1.45") or "")
-    if start is None and trigger_event == "A01":
-        start = ts_to_fhir_datetime(hl7.get("EVN.2") or "")
-    if end is None and trigger_event == "A03":
-        end = ts_to_fhir_datetime(hl7.get("EVN.2") or "")
-    if start or end:
-        # `Period.start`/`.end` are typed as `datetime` for their parsed representation; the FHIR
-        # wire-format `str` this reference set builds is what the validator actually accepts (same
-        # friction as `birthDate` above).
-        encounter.period = Period(start=start, end=end)  # type: ignore[arg-type]
+        return encounter
 
-    return encounter
+    return safe_build(build, path="PV1", reason="could not build a valid Encounter resource")
 
 
-def _encounter_identifier(hl7: Hl7Message, *, msg_id: str, trigger_event: str) -> Identifier | None:
+def _encounter_identifier(pv1: Segment, hl7: Hl7Message, *, msg_id: str, trigger_event: str) -> Identifier | None:
     """The identifier `Encounter`'s Bundle entry is conditional on, or `None` when this mapping should
     not emit an `Encounter` entry at all.
 
@@ -140,8 +159,7 @@ def _encounter_identifier(hl7: Hl7Message, *, msg_id: str, trigger_event: str) -
     whatever A01 already created (or nothing, if A01 never ran through this mapping) rather than
     updating the original -- silently worse than simply not producing an `Encounter` entry.
     """
-    visit_number = hl7.get("PV1.19") or ""
-    identifier = cx_to_identifier(visit_number, fallback_system=local_identifier_system(hl7["MSH.4"]))
+    identifier = cx_identifier(pv1, 19, fallback_system=local_identifier_system(hl7["MSH.4"]))
     if identifier is not None:
         return identifier
     if trigger_event == "A01":
@@ -154,8 +172,9 @@ def adt_to_fhir(message: Message, ctx: FhirContext) -> Message:
     """Map an ADT A01/A03/A08 message (already parsed by `tributary.hl7v2.parse`) to a FHIR transaction
     `Bundle`, replacing the message payload with the Bundle's JSON.
 
-    Raises `UnsupportedTriggerError` for any other ADT trigger, `RequiredFieldMissingError` if PID-3 is
-    absent (there is then nothing to key the `Patient` entry's conditional PUT on), and lets
+    Raises `UnsupportedTriggerError` if MSH-9 is not `ADT^{A01,A03,A08}` (security review, MEDIUM 2: the
+    message type itself is now checked, not only the trigger event), `RequiredFieldMissingError` if
+    PID-3 is absent (there is then nothing to key the `Patient` entry's conditional PUT on), and lets
     `tributary.fhir.errors.BundleEntryError` propagate unchanged for any other Bundle-construction
     failure -- all typed, none of them a bare crash, matching this role's parser and mapping conventions.
     """
@@ -165,9 +184,9 @@ def adt_to_fhir(message: Message, ctx: FhirContext) -> Message:
             "MSH", reason="no parsed HL7 message in ctx.vars; run tributary.hl7v2.parse first"
         )
 
-    _msg_type, trigger_event, _structure = hl7.message_type()
-    if trigger_event not in _SUPPORTED_TRIGGERS:
-        raise UnsupportedTriggerError(_msg_type, trigger_event)
+    msg_type, trigger_event, _structure = hl7.message_type()
+    if msg_type != "ADT" or trigger_event not in _SUPPORTED_TRIGGERS:
+        raise UnsupportedTriggerError(*_safe_trigger_codes(msg_type, trigger_event))
 
     patient = map_patient(hl7)
     patient_entry = ctx.fhir.upsert(patient)
@@ -175,19 +194,25 @@ def adt_to_fhir(message: Message, ctx: FhirContext) -> Message:
 
     entries = [patient_entry]
 
+    pv1 = hl7.segment("PV1") if hl7.segment_count("PV1") else None
     encounter = _map_encounter(
-        hl7, patient_ref=patient_ref, status=_STATUS_FOR_TRIGGER[trigger_event], trigger_event=trigger_event
+        hl7, pv1, patient_ref=patient_ref, status=_STATUS_FOR_TRIGGER[trigger_event], trigger_event=trigger_event
     )
     encounter_omitted = False
-    if encounter is not None:
-        encounter_identifier = _encounter_identifier(hl7, msg_id=message.msg_id, trigger_event=trigger_event)
+    if encounter is not None and pv1 is not None:
+        encounter_identifier = _encounter_identifier(pv1, hl7, msg_id=message.msg_id, trigger_event=trigger_event)
         if encounter_identifier is not None:
+            # Security review, MEDIUM 4: the resource body carries the same identifier its conditional
+            # entry is keyed on, so a redelivery's conditional search actually matches what the previous
+            # delivery wrote (a `PUT` whose body has no `.identifier` at all is not truly self-describing).
+            encounter.identifier = [encounter_identifier]
             entries.append(ctx.fhir.upsert(encounter, identifier=encounter_identifier))
         else:
             # No PV1-19 and this trigger cannot safely fall back to a message-scoped identifier (see
             # `_encounter_identifier`) -- omit the entry rather than create a wrong second Encounter.
-            # Count only, never a field value (invariant 6): there is nothing sender-controlled here
-            # beyond the trigger event, which is already an allow-listed structural code.
+            # `warning`, not `debug` (code-reviewer, e48d937/5c42b2f follow-up): an operator needs to see
+            # a sender that never populates PV1-19. Trigger code and a fixed reason only, never a value.
+            ctx.log.warning("adt_encounter_omitted", trigger_event=trigger_event, reason="no_visit_number")
             encounter_omitted = True
 
     bundle = Bundle(type="transaction", entry=entries)
