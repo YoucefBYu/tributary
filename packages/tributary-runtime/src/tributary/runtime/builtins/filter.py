@@ -45,12 +45,14 @@ from tributary.sdk.keys import (
     evaluate_key,
 )
 
-from .base import BuiltinStep, locator, parse_locator, refuse
+from .base import BuiltinStep, hl7_segments, is_hl7, locator, parse_locator, refuse, segment_id
 
 NAME: Final = "tributary.core.filter"
 FILTERED: Final = "FILTERED"
 #: `onUnresolved: drop`. Distinct from `FILTERED` so the browser shows *why* a message went nowhere.
 FILTERED_UNRESOLVED: Final = "FILTERED_UNRESOLVED"
+#: Log reason (not a `tb-error-code`): the field's segment occurs more than once in the message.
+SEGMENT_REPEATED: Final = "SEGMENT_REPEATED"
 
 #: Exact locator text. Feed and message typing (as enrich's `attrFrom`), plus status-style codes with
 #: small, published vocabularies: patient class, admission type, order control and status, result
@@ -133,11 +135,13 @@ def _filter(
     notIn: Sequence[str] = (),
     present: bool | None = None,
 ) -> Message | Drop:
-    result = evaluate_key(
-        locator(field),
-        payload=message.payload or b"",
-        content_type=message.get(h.TB_CONTENT_TYPE) or "",
-    )
+    expression = locator(field)
+    result = evaluate_key(expression, payload=message.payload or b"", content_type=message.get(h.TB_CONTENT_TYPE) or "")
+    if expression.hl7_path is not None and _repeats(message, expression.hl7_path[0]):
+        # ORC, OBR and OBX repeat, and the locator reads only the first occurrence: `OBX.11 in [F]`
+        # would judge a message by its first result. Which occurrence is meant is undefined, so the
+        # value is unresolved and `onUnresolved` decides (README 3.3.2, ratified 2026-09-25).
+        result = UnresolvedKey(SEGMENT_REPEATED)
     if present is not None:
         if isinstance(result, ResolvedKey) or result.reason in _PRESENT:
             found = True
@@ -151,6 +155,20 @@ def _filter(
     if in_:
         return message if result.key in _encoded(tuple(in_)) else Drop(reason=FILTERED)
     return Drop(reason=FILTERED) if result.key in _encoded(tuple(notIn)) else message
+
+
+def _repeats(message: Message, segment: str) -> bool:
+    """True when `segment` occurs more than once in an HL7 payload."""
+    if not is_hl7(message):
+        return False
+    wanted = segment.encode("ascii")
+    seen = 0
+    for line in hl7_segments(message.payload or b""):
+        if segment_id(line) == wanted:
+            seen += 1
+            if seen > 1:
+                return True
+    return False
 
 
 def _unresolved(message: Message, ctx: Context, result: UnresolvedKey, choice: OnUnresolved) -> Message | Drop:

@@ -28,7 +28,7 @@ RESERVED_PREFIXES: Final = ("TB_", "KEY_", "HTTP_", "FHIR_", "PG_", "CH_", "SFTP
 TRANSFORM_ERROR: Final = "TRANSFORM_ERROR"
 #: Log-only (error-codes.json `log_only`): never in a header or an event.
 ENVELOPE_INVALID: Final = "ENVELOPE_INVALID"
-#: Members of the engine's own `TB_` family (reserved prefix, so no registry change is needed).
+#: Members of the engine's `TB_` family, registered by name in error-codes.json (2026-09-25).
 #: A record the pipeline built fails the envelope at produce time (too large, too many headers).
 TB_OUTPUT_ENVELOPE_INVALID: Final = "TB_OUTPUT_ENVELOPE_INVALID"
 #: One `handle` outlasted its time budget, which is sized under `max.poll.interval.ms`.
@@ -64,6 +64,8 @@ ENGINE_CODES: Final = frozenset(
         "TIMEOUT",
         "PAYLOAD_SHAPE_INVALID",
         ENVELOPE_INVALID,  # log_only
+        TB_OUTPUT_ENVELOPE_INVALID,
+        TB_PIPELINE_TIME_BUDGET,
         # built-in steps (channel-spec README 3.3.2)
         FILTER_UNRESOLVED,
         VALIDATE_NOT_HL7,

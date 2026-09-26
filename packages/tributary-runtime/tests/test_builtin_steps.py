@@ -134,6 +134,50 @@ def test_every_allow_listed_filter_field_binds() -> None:
         filter_step.bind({"field": field, "in": ["X"], "onUnresolved": "drop"})
 
 
+TWO_RESULTS = (
+    b"MSH|^~\\&|TRIBUTARY-SYNTH|SYNTH-FAC|RCV|RCV-FAC|20260101000000||ORU^R01^ORU_R01|MSG0002|P|2.5.1\r"
+    b"PID|1||SYNTH-0001^^^SYNTH^MR\r"
+    b"OBR|1|||SYNTH-TEST\r"
+    b"OBX|1|NM|SYNTH-A||1.50|mmol/L|||||F\r"
+    b"OBX|2|NM|SYNTH-B||2.00|mmol/L|||||P\r"
+)
+
+
+@pytest.mark.parametrize(
+    ("with_", "expected"),
+    [
+        ({"field": "hl7:OBX.11", "in": ["F"], "onUnresolved": "drop"}, Drop(reason="FILTERED_UNRESOLVED")),
+        ({"field": "hl7:OBX.11", "notIn": ["P"], "onUnresolved": "drop"}, Drop(reason="FILTERED_UNRESOLVED")),
+        ({"field": "hl7:OBX.11", "present": True, "onUnresolved": "drop"}, Drop(reason="FILTERED_UNRESOLVED")),
+        ({"field": "hl7:OBX.11", "in": ["F"], "onUnresolved": "keep"}, Message),
+    ],
+)
+def test_a_field_in_a_repeating_segment_is_unresolved_not_judged_by_the_first(
+    with_: dict[str, object], expected: object
+) -> None:
+    """Two OBX with different result status (F, then P): `OBX.11 in [F]` must not pass the message on
+    the strength of the first result alone. `onUnresolved` decides."""
+    ctx = FakeContext()
+    outcome = run_step(filter_step, hl7(TWO_RESULTS), with_=with_, ctx=ctx)
+    if expected is Message:
+        assert isinstance(outcome, Message)
+    else:
+        assert outcome == expected
+    assert [record.fields["reason"] for record in ctx.log.records] == ["SEGMENT_REPEATED"]
+
+
+def test_a_repeating_segment_with_on_unresolved_reject_is_rejected() -> None:
+    with pytest.raises(Reject) as caught:
+        run_step(filter_step, hl7(TWO_RESULTS), with_={"field": "hl7:OBX.11", "in": ["F"], "onUnresolved": "reject"})
+    assert caught.value.code == "FILTER_UNRESOLVED"
+
+
+def test_a_single_occurrence_is_still_judged_normally() -> None:
+    one_result = TWO_RESULTS.split(b"OBX|2")[0]
+    with_ = {"field": "hl7:OBX.11", "in": ["F"], "onUnresolved": "reject"}
+    assert isinstance(run_step(filter_step, hl7(one_result), with_=with_), Message)
+
+
 def test_filter_reads_json_with_the_shared_evaluator() -> None:
     with_ = {"field": "json:/resourceType", "in": ["Observation"], "onUnresolved": "drop"}
     assert isinstance(run_step(filter_step, fhir({"resourceType": "Observation"}), with_=with_), Message)
