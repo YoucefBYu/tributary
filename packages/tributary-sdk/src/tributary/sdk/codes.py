@@ -34,6 +34,12 @@ TB_OUTPUT_ENVELOPE_INVALID: Final = "TB_OUTPUT_ENVELOPE_INVALID"
 #: One `handle` outlasted its time budget, which is sized under `max.poll.interval.ms`.
 TB_PIPELINE_TIME_BUDGET: Final = "TB_PIPELINE_TIME_BUDGET"
 
+#: A dead letter that cannot be written (its record exceeds the envelope even with registered headers
+#: only): the partition halts. A member of the reserved `TB_` family, so usable without a registry
+#: change (envelope 2.3.2 rule 2); registration by name is requested, and until then it is deliberately
+#: not in `ENGINE_CODES`, which mirrors the registry's exact names.
+TB_DLQ_UNWRITABLE: Final = "TB_DLQ_UNWRITABLE"
+
 # Built-in step codes. Named here so the built-ins and the reserved list cannot drift apart.
 FILTER_UNRESOLVED: Final = "FILTER_UNRESOLVED"
 VALIDATE_NOT_HL7: Final = "VALIDATE_NOT_HL7"

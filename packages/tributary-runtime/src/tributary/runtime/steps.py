@@ -10,7 +10,8 @@ remote-code-execution surface by design, and the controls are elsewhere: the bun
 and no data-plane component may write to `_tb.<env>.channels` (`contracts/topics/v0` 3.4).
 
 **Any failure while importing is a refused spec, never a crashed worker.** An entry point or a `ref`
-module can raise anything at import time (`SyntaxError`, `RuntimeError`, a missing dependency). On a hot
+module can raise anything at import time (`SyntaxError`, `RuntimeError`, a missing dependency, even
+`SystemExit`). `KeyboardInterrupt` is deliberately not caught: it is an operator's stop, not a spec. On a hot
 reload that would otherwise escape `handle` on every record; it is a `ChannelSpecError` instead, with
 the exception's type name only, and the previous plan keeps running.
 
@@ -79,7 +80,7 @@ def _from_entry_point(name: str | None) -> object:
         raise ChannelSpecError(f"no step registered as {safe_token(name)} in {ENTRY_POINT_GROUP}")
     try:
         return matches[0].load()
-    except Exception as exc:  # import-time code can raise anything; refuse the spec, keep the worker
+    except (Exception, SystemExit) as exc:  # import-time code can raise anything, even sys.exit()
         raise ChannelSpecError(f"cannot load step {safe_token(name)}: {type(exc).__name__}") from None
 
 
@@ -95,7 +96,7 @@ def _from_dotted_path(path: str | None) -> object:
         )
     try:
         module = importlib.import_module(module_name)
-    except Exception as exc:  # ImportError, or anything the module raises while it is imported
+    except (Exception, SystemExit) as exc:  # ImportError, anything raised at import, even sys.exit()
         raise ChannelSpecError(f"cannot import {safe_token(module_name)} for step ref: {type(exc).__name__}") from None
     try:
         return getattr(module, attribute)

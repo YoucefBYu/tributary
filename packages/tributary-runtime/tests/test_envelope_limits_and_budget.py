@@ -60,11 +60,14 @@ def hl7_of_size(size: int, *, terminated: bool) -> bytes:
 # -- harness -------------------------------------------------------------------------------------
 
 
-def spec_with(pipeline: list[dict[str, Any]], destinations: dict[str, list[dict[str, Any]]]) -> ChannelSpec:
+def spec_with(
+    pipeline: list[dict[str, Any]], destinations: dict[str, list[dict[str, Any]]], *, step_retries: int = 3
+) -> ChannelSpec:
     document = json.loads((EXAMPLES / "walking-skeleton-loopback.json").read_text(encoding="utf-8"))
     template = document["spec"]["destinations"][0]
     document["metadata"]["version"] = 1
     document["spec"]["pipeline"]["steps"] = pipeline
+    document["spec"]["pipeline"]["stepRetries"] = step_retries
     built = []
     for name, steps in destinations.items():
         destination = json.loads(json.dumps(template))
@@ -375,3 +378,110 @@ def test_the_budget_is_sized_under_the_poll_interval() -> None:
     assert handle_budget_s(300_000, 30.0) == 120.0
     assert handle_budget_s(600_000, 30.0) == 270.0
     assert handle_budget_s(10_000, 30.0) == 10.0, "never below 10 s"
+
+
+# -- a dead letter that cannot be written halts its partition, not the process -------------------
+
+
+def two_partition_loop(
+    first: FakeRecord, spec: ChannelSpec
+) -> tuple[FakeConsumer, FakeProducer, RecordingEmitter, str]:
+    """Partition 0 carries `first`; partition 1 carries an ordinary record."""
+    consumer, producer, stream, events = FakeConsumer(), FakeProducer(), io.StringIO(), RecordingEmitter()
+    consumer.append(first)
+    ordinary = make_message(b"synthetic", channel=CHANNEL)
+    consumer.append(FakeRecord(RAW, 1, 0, None, b"synthetic", to_kafka_headers(ordinary)))
+    log = JsonLogger("worker", stream=stream)
+    records = RecordProducer(producer, log=log)
+    pipeline = PipelineHandler(
+        env="dev",
+        spec_provider=lambda: spec,
+        producer=records,
+        emitter=events,
+        log=log,
+        instance="worker:test@localhost",
+        resolve=resolve_custom,
+    )
+    pipeline.prepare(spec)
+    loop = ConsumerLoop(
+        consumer,
+        pipeline,
+        topics=[RAW],
+        retry=RetryPolicy(policy="blocking", max_attempts=3, on_exhaust="halt-partition"),
+        settings=LoopSettings(commit_every=1, poll_timeout_s=0.0),
+        emitter=events,
+        log=log,
+        channel=CHANNEL,
+        channel_version=1,
+        instance="worker:test@localhost",
+        dlq=KafkaDlqWriter(records, f"dev.{CHANNEL}.dlq", log=log, source="worker:test@localhost"),
+    )
+    loop.run(max_iterations=6)  # returns: the process did not die
+    return consumer, producer, events, stream.getvalue()
+
+
+def halted(events: RecordingEmitter) -> list[Any]:
+    return [event for event in events.events if event.stage == "partition_halted"]
+
+
+def test_a_raw_record_over_the_inline_limit_halts_its_partition_and_the_others_flow() -> None:
+    """Security review (reproduced): 1,000,001 bytes through a passthrough. The broker accepts it
+    (`max.message.bytes` 1,048,576), no `out` or `dlq` projection fits, and the worker crash-looped."""
+    spec = spec_with([{"name": "p", "uses": "tributary.core.passthrough"}], {"fhir": []})
+    oversized = make_message(b"x" * (MAX_INLINE_PAYLOAD_BYTES + 1), channel=CHANNEL)
+    consumer, producer, events, logged = two_partition_loop(raw_record(oversized), spec)
+
+    [event] = halted(events)
+    assert (event.partition, event.offset, event.error_code) == (0, 0, "TB_DLQ_UNWRITABLE")
+    assert event.error_message == "dead letter exceeds the envelope; partition halted, operator action required"
+    assert (RAW, 0) in consumer.paused and (RAW, 0, 0) in consumer.seek_calls, "held at the record"
+    assert not any(partition == 0 for batch in consumer.committed for _t, partition, _o in batch), "not dropped"
+    assert produced(producer, ".dlq") == []
+    assert len(produced(producer, ".out.fhir")) == 1, "partition 1 still flows"
+    assert any(partition == 1 for batch in consumer.committed for _t, partition, _o in batch)
+    assert "x" * 64 not in logged
+
+
+def test_an_undecodable_record_too_large_to_quarantine_halts_instead_of_crashing() -> None:
+    blob = b"x" * MAX_INLINE_PAYLOAD_BYTES
+    undecodable = FakeRecord(RAW, 0, 0, None, blob, [("tb-channel", b"\xff\xfe")])
+    spec = spec_with([{"name": "p", "uses": "tributary.core.passthrough"}], {"fhir": []})
+    _consumer, producer, events, _logged = two_partition_loop(undecodable, spec)
+    [event] = halted(events)
+    assert event.error_code == "TB_DLQ_UNWRITABLE"
+    assert event.message_id is None, "nothing from the undecodable record is used"
+    assert len(produced(producer, ".out.fhir")) == 1
+
+
+# -- the time budget is checked between step retries ---------------------------------------------
+
+
+@step
+def always_fails_slowly(msg: Message) -> None:
+    CLOCK.now += 2.0
+    CALLS.append("attempt")
+    raise ValueError("synthetic failure")
+
+
+CALLS: list[str] = []
+CUSTOM["t.always_fails_slowly"] = always_fails_slowly
+
+
+@pytest.mark.parametrize("where", ["pipeline", "destination"])
+def test_the_budget_stops_in_place_retries_and_is_not_swallowed_by_a_branch(where: str) -> None:
+    CLOCK.now = 0.0
+    CALLS.clear()
+    failing = [{"name": "fail", "uses": "t.always_fails_slowly"}]
+    spec = spec_with(
+        failing if where == "pipeline" else [{"name": "p", "uses": "tributary.core.passthrough"}],
+        {"fhir": [] if where == "pipeline" else failing},
+        step_retries=8,
+    )
+    producer = FakeProducer()
+    with pytest.raises(StepFailure) as caught:
+        handler(spec, producer, time_budget_s=3.0, clock=CLOCK).handle(
+            ConsumedRecord(RAW, 0, 0, make_message(b"x", channel=CHANNEL))
+        )
+    assert caught.value.error_code == TB_PIPELINE_TIME_BUDGET, "the whole record, not a destination dead letter"
+    assert len(CALLS) == 2, "stopped between retries, not after all nine attempts"
+    assert producer.produced == []

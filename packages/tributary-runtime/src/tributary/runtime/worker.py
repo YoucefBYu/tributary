@@ -38,9 +38,16 @@ from .clients import KafkaSettings, consumer_config, events_producer_config, max
 from .config import TopicDefaults, load_topic_defaults
 from .consumer import ConsumerLoop, KafkaConsumerLike, LoopSettings, LoopStats
 from .context import WorkerContext
-from .errors import ChannelSpecError, DeliveryError, PartitionMismatchError, RuntimeConfigurationError, safe_token
+from .errors import (
+    ChannelSpecError,
+    DeliveryError,
+    DlqUnwritableError,
+    PartitionMismatchError,
+    RuntimeConfigurationError,
+    safe_token,
+)
 from .events import EventEmitter, MessageEvent, NullEmitter
-from .executor import ChannelPlan, StepFailure, StepStats, run_splitter
+from .executor import ChannelPlan, PipelineAbort, StepFailure, StepStats, run_splitter
 from .logs import JsonLogger
 from .producer import KafkaEventEmitter, KafkaProducerLike, RecordProducer
 from .records import RECORD_UNDECODABLE, ConsumedRecord, quarantine_blob
@@ -155,6 +162,11 @@ class KafkaDlqWriter:
             kept = {name: value for name, value in message.headers.items() if name in h.REGISTERED}
             reduced = len(message.headers) - len(kept)
             message = Message(headers=kept, payload=message.payload, key=message.key)
+            try:
+                validate_for_produce(message, topic_class="dlq", ordering="none")
+            except EnvelopeError as exc:
+                # The envelope's messages name a header or a size, never a value.
+                raise DlqUnwritableError(f"dead letter for {safe_token(record.msg_id)} does not fit: {exc}") from None
         self._producer.produce(self._topic, message, topic_class="dlq", ordering="none")
         self._producer.flush_pending(self._flush_timeout_s)
         self._log.warning(
@@ -185,6 +197,11 @@ class KafkaDlqWriter:
             channel_version=channel_version,
             source=self._source,
         )
+        try:
+            validate_for_produce(wrapper, topic_class="dlq", ordering="none")
+        except EnvelopeError as exc:
+            # A near-limit undecodable record wraps to a blob over the inline limit.
+            raise DlqUnwritableError(f"quarantine wrapper does not fit: {exc}") from None
         self._producer.produce(self._topic, wrapper, topic_class="dlq", ordering="none")
         self._producer.flush_pending(self._flush_timeout_s)
         return wrapper.require(h.TB_MSG_ID)
@@ -292,8 +309,8 @@ class TimeBudget:
     the consumer is then evicted, the record is redelivered, and the same fan-out evicts it again, for
     ever. When the budget is spent, the consumed record is dead-lettered with `TB_PIPELINE_TIME_BUDGET` and
     committed. Nothing has been produced by then (the produce phase comes after), so no branch is left
-    half-delivered. Checked between steps' units - a child, a destination - not inside a step: a single
-    step that hangs is not interrupted.
+    half-delivered. Checked before every step attempt (so in-place retries count against it) and
+    between children and destinations - not inside a step: a single step that hangs is not interrupted.
     """
 
     __slots__ = ("_clock", "_deadline", "budget_s")
@@ -305,7 +322,7 @@ class TimeBudget:
 
     def check(self) -> None:
         if self._deadline is not None and self._clock() > self._deadline:
-            raise StepFailure("pipeline", 1, "TimeBudget", error_code=TB_PIPELINE_TIME_BUDGET, rejected=True)
+            raise PipelineAbort("pipeline", 1, "TimeBudget", error_code=TB_PIPELINE_TIME_BUDGET, rejected=True)
 
 
 def handle_budget_s(max_poll_interval_ms: int, flush_timeout_s: float) -> float:
@@ -436,7 +453,7 @@ class PipelineHandler:
             traceparent=message.traceparent,
         )
         # A StepFailure here propagates: the loop dead-letters the consumed record (stage transformed).
-        result = plan.head.run(message, ctx)
+        result = plan.head.run(message, ctx, before_attempt=budget.check)
         if result.drop is not None:
             self.filtered += 1
             self._emit(
@@ -454,7 +471,14 @@ class PipelineHandler:
             duration_ms = result.duration_ms
         else:
             started = time.perf_counter()
-            split = run_splitter(plan.splitter, transformed, ctx, step_retries=plan.step_retries, stats=plan.stats)
+            split = run_splitter(
+                plan.splitter,
+                transformed,
+                ctx,
+                step_retries=plan.step_retries,
+                stats=plan.stats,
+                before_attempt=budget.check,
+            )
             duration_ms = result.duration_ms + (time.perf_counter() - started) * 1000
             if isinstance(split, Drop):
                 self.filtered += 1
@@ -483,7 +507,7 @@ class PipelineHandler:
             budget.check()
             branch_ctx = ctx if plan.splitter is None else ctx.fork(traceparent=subject.traceparent)
             if plan.splitter is not None:
-                child = self._run_child(spec, plan, record, subject, branch_ctx, pending)
+                child = self._run_child(spec, plan, record, subject, branch_ctx, pending, budget)
                 if child is None:
                     continue
                 subject = child
@@ -496,7 +520,7 @@ class PipelineHandler:
             try:
                 validate_for_produce(outgoing, topic_class=topic_class, ordering=ordering)
             except EnvelopeError:
-                raise StepFailure(
+                raise PipelineAbort(
                     "pipeline", 1, "EnvelopeError", error_code=TB_OUTPUT_ENVELOPE_INVALID, rejected=True
                 ) from None
         for topic, outgoing, topic_class, ordering in pending.records:
@@ -522,10 +546,13 @@ class PipelineHandler:
         child: Message,
         ctx: WorkerContext,
         pending: _Pending,
+        budget: TimeBudget,
     ) -> Message | None:
         """Run the post-split steps on one child. `None` when the child was filtered or dead-lettered."""
         try:
-            result = plan.tail.run(child, ctx)
+            result = plan.tail.run(child, ctx, before_attempt=budget.check)
+        except PipelineAbort:
+            raise  # the whole record, not this child
         except StepFailure as exc:
             # The child as the splitter produced it: the input of the subtree that failed.
             self._dead_letter(spec, record, child, error_code=exc.error_code, destination=None, pending=pending)
@@ -580,7 +607,9 @@ class PipelineHandler:
                 budget.check()
                 destination_ctx = ctx.fork(destination=destination.name)
                 try:
-                    result = executor.run(subject, destination_ctx)
+                    result = executor.run(subject, destination_ctx, before_attempt=budget.check)
+                except PipelineAbort:
+                    raise  # the whole record, not this destination
                 except StepFailure as exc:
                     # README 3.5: the dlq payload is the destination step's input, not the raw payload.
                     self._dead_letter(
@@ -615,7 +644,7 @@ class PipelineHandler:
                 projected = out_message(outgoing, destination.name, usr=dict(usr))
             except (HeaderError, UsrHeaderError):
                 # The projection adds headers; one that breaks a header rule is an envelope failure.
-                raise StepFailure(
+                raise PipelineAbort(
                     "pipeline", 1, "HeaderError", error_code=TB_OUTPUT_ENVELOPE_INVALID, rejected=True
                 ) from None
             pending.records.append((out_topic(self._env, spec.name, destination.name), projected, "out", spec.ordering))
@@ -648,7 +677,7 @@ class PipelineHandler:
             failed = subject if destination is None else subject.with_header(h.TB_DESTINATION, destination)
             projected = dlq_message(failed, error_code=error_code, stage="transformed")
         except HeaderError:
-            raise StepFailure(
+            raise PipelineAbort(
                 "pipeline", 1, "HeaderError", error_code=TB_OUTPUT_ENVELOPE_INVALID, rejected=True
             ) from None
         pending.records.append((dlq_topic(self._env, spec.name), projected, "dlq", "none"))

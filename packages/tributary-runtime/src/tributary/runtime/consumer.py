@@ -57,7 +57,10 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from confluent_kafka import KafkaError, KafkaException, TopicPartition
+from tributary.sdk import Message
+from tributary.sdk.codes import TB_DLQ_UNWRITABLE
 from tributary.sdk.context import Logger
+from tributary.sdk.errors import EnvelopeError
 
 from .errors import DeliveryError
 from .events import EventEmitter, MessageEvent, PartitionEvent, RecordEvent
@@ -507,10 +510,15 @@ class ConsumerLoop:
     def _exhausted(self, record: ConsumedRecord, state: RetryState, *, error_code: str) -> None:
         """`maxAttempts` reached. ADR-003 D3 decides what happens, per destination, in the spec."""
         if self._retry.on_exhaust == "dlq-and-continue":
-            self._dead_letter(record, error_code=error_code, stage="pending")
-            self._retry_state.pop((record.topic, record.partition), None)
+            if self._dead_letter(record, error_code=error_code, stage="pending"):
+                self._retry_state.pop((record.topic, record.partition), None)
             return
+        self._halt(
+            record, state, error_code=error_code, reason="retries exhausted; partition halted, operator action required"
+        )
 
+    def _halt(self, record: ConsumedRecord, state: RetryState, *, error_code: str, reason: str) -> None:
+        """Pause the partition at this record until an operator acts. `reason` is static text."""
         state.halted = True
         self._pause_and_rewind(record, state)
         self.stats.halts += 1
@@ -528,7 +536,7 @@ class ConsumerLoop:
                 destination=self._destination,
                 attempt=state.attempt,
                 error_code=error_code,
-                error_message="retries exhausted; partition halted, operator action required",
+                error_message=reason,
             )
         )
         self._log.error(
@@ -541,13 +549,38 @@ class ConsumerLoop:
             error_code=error_code,
         )
 
+    def _halt_unwritable(self, record: ConsumedRecord) -> None:
+        """A dead letter that cannot be written halts its partition instead of crashing the process.
+
+        Crashing replays the same record for ever, taking every other partition down with it; committing
+        would drop the record. Halting keeps it on `raw` at this offset, lets the other partitions flow,
+        and says so with a fixed code and no values (security review of W2-5).
+        """
+        key = (record.topic, record.partition)
+        state = self._retry_state.get(key)
+        if state is None or state.offset != record.offset:
+            state = RetryState(offset=record.offset)
+            self._retry_state[key] = state
+        self._halt(
+            record,
+            state,
+            error_code=TB_DLQ_UNWRITABLE,
+            reason="dead letter exceeds the envelope; partition halted, operator action required",
+        )
+
     # -- dead letters ----------------------------------------------------------------------------
 
-    def _dead_letter(self, record: ConsumedRecord, *, error_code: str, stage: str) -> None:
+    def _dead_letter(self, record: ConsumedRecord, *, error_code: str, stage: str) -> bool:
+        """Dead-letter and mark the record. False when the dead letter could not be written and the
+        partition was halted instead."""
         if self._dlq is None:
             # Without a DLQ the only correct behaviour is to stop: committing would drop the message.
             raise DeliveryError(error_code, retryable=False, detail="no DLQ configured")
-        self._dlq.dead_letter(record, error_code=error_code, stage=stage)
+        try:
+            self._dlq.dead_letter(record, error_code=error_code, stage=stage)
+        except EnvelopeError:
+            self._halt_unwritable(record)
+            return False
         self.stats.dead_lettered += 1
         self._emitter.emit(
             MessageEvent(
@@ -568,6 +601,7 @@ class ConsumerLoop:
         )
         self._retry_state.pop((record.topic, record.partition), None)
         self._mark((record.topic, record.partition), record.offset)
+        return True
 
     def _reject(self, exc: RecordRejectError) -> None:
         """An ordinary reject: identity intact, one or more other registered headers malformed.
@@ -584,7 +618,11 @@ class ConsumerLoop:
         record = exc.record
         if self._dlq is None:
             raise DeliveryError(exc.error_code, retryable=False, detail="no DLQ configured")
-        self._dlq.dead_letter(record, error_code=exc.error_code, stage=self._read_stage)
+        try:
+            self._dlq.dead_letter(record, error_code=exc.error_code, stage=self._read_stage)
+        except EnvelopeError:
+            self._halt_unwritable(record)
+            return
         self.stats.rejected += 1
         self.stats.dead_lettered += 1
         self._emitter.emit(
@@ -631,7 +669,14 @@ class ConsumerLoop:
         """
         minted: str | None = None
         if self._dlq is not None:
-            minted = self._dlq.quarantine(raw, channel=self._channel, channel_version=self._channel_version)
+            try:
+                minted = self._dlq.quarantine(raw, channel=self._channel, channel_version=self._channel_version)
+            except EnvelopeError:
+                # Coordinates only: nothing from the undecodable record goes into the halt.
+                self._halt_unwritable(
+                    ConsumedRecord(topic=topic, partition=partition, offset=offset, message=Message())
+                )
+                return
         self.stats.quarantined += 1
         value = raw.value()
         self._emitter.emit(

@@ -65,6 +65,19 @@ class StepFailure(TributaryError):
         self.rejected = rejected
 
 
+class PipelineAbort(StepFailure):
+    """The whole consumed record must be dead-lettered, whichever branch was running.
+
+    Raised for a spent time budget or an unproducible record. A subclass of `StepFailure` so the loop
+    dead-letters the consumed record as it does for any pipeline failure; distinct so the handler's
+    branch-level `except StepFailure` (a child, a destination) never mistakes it for that branch's own
+    failure and swallows it.
+    """
+
+
+Check = Callable[[], None]
+
+
 @dataclass(slots=True)
 class StepStat:
     """Counters and timing for one step in one scope. Durations are wall-clock milliseconds."""
@@ -154,11 +167,18 @@ def _attempts(
     retries: int,
     stats: StepStats | None,
     scope: str | None,
+    before_attempt: Check | None = None,
 ) -> object:
-    """Run one node with in-place retries. `Reject` fails at once; anything else after `retries + 1`."""
+    """Run one node with in-place retries. `Reject` fails at once; anything else after `retries + 1`.
+
+    `before_attempt` runs before every attempt, outside the step's own `try`, so a time budget raised
+    there stops the retries instead of being counted as one more step failure.
+    """
     attempts = retries + 1
     last_type = "Exception"
     for attempt in range(attempts):
+        if before_attempt is not None:
+            before_attempt()
         started = time.perf_counter()
         try:
             outcome = call()
@@ -206,12 +226,12 @@ class PipelineExecutor:
     def __len__(self) -> int:
         return len(self._steps)
 
-    def run(self, message: Message, ctx: Context) -> ExecutionResult:
+    def run(self, message: Message, ctx: Context, *, before_attempt: Check | None = None) -> ExecutionResult:
         """Run every step in order. Raises `StepFailure` when one keeps raising or rejects."""
         started = time.perf_counter()
         current = message
         for index, step in enumerate(self._steps):
-            outcome = self._run_one(step, current, ctx)
+            outcome = self._run_one(step, current, ctx, before_attempt)
             if isinstance(outcome, Drop):
                 return ExecutionResult(
                     message=None,
@@ -227,9 +247,14 @@ class PipelineExecutor:
             steps_run=len(self._steps),
         )
 
-    def _run_one(self, step: Step, message: Message, ctx: Context) -> Message | Drop:
+    def _run_one(self, step: Step, message: Message, ctx: Context, before_attempt: Check | None) -> Message | Drop:
         outcome = _attempts(
-            lambda: step(message, ctx), name=step.name, retries=self._retries, stats=self._stats, scope=self._scope
+            lambda: step(message, ctx),
+            name=step.name,
+            retries=self._retries,
+            stats=self._stats,
+            scope=self._scope,
+            before_attempt=before_attempt,
         )
         if not isinstance(outcome, Message | Drop):  # pragma: no cover - Step.__call__ normalises or raises
             raise StepFailure(step.name, 1, type(outcome).__name__)
@@ -243,9 +268,17 @@ def run_splitter(
     *,
     step_retries: int,
     stats: StepStats | None = None,
+    before_attempt: Check | None = None,
 ) -> SplitResult:
     """Run a splitter with the same retry and `Reject` rules as a step. Raises `StepFailure`."""
-    outcome = _attempts(lambda: node(message, ctx), name=node.name, retries=step_retries, stats=stats, scope=None)
+    outcome = _attempts(
+        lambda: node(message, ctx),
+        name=node.name,
+        retries=step_retries,
+        stats=stats,
+        scope=None,
+        before_attempt=before_attempt,
+    )
     if not isinstance(outcome, tuple | Drop):  # pragma: no cover - Splitter.__call__ normalises or raises
         raise StepFailure(node.name, 1, type(outcome).__name__)
     return outcome

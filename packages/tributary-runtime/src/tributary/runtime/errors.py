@@ -7,12 +7,13 @@ operator needs; everything else is a size or a code.
 
 from __future__ import annotations
 
-from tributary.sdk.errors import TributaryError, safe_token
+from tributary.sdk.errors import EnvelopeError, TributaryError, safe_token
 
 __all__ = [
     "ChannelSpecError",
     "ConfigError",
     "DeliveryError",
+    "DlqUnwritableError",
     "PartitionMismatchError",
     "RuntimeConfigurationError",
     "TopicNameError",
@@ -53,3 +54,12 @@ class DeliveryError(TributaryError):
         self.error_code = error_code
         self.retryable = retryable
         self.detail = detail
+
+
+class DlqUnwritableError(EnvelopeError):
+    """A dead letter cannot be written because its record breaks the envelope even when reduced.
+
+    A raw record may exceed the envelope's 1,000,000-byte inline limit and still be accepted by the
+    broker (`max.message.bytes` is 1,048,576), and no `dlq` projection of it fits. The loop halts the
+    partition rather than crash: a crash replays the same record for ever, and committing would drop it.
+    """

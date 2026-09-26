@@ -566,3 +566,33 @@ def test_a_ref_into_the_standard_library_or_the_engine_is_refused_before_import(
 
     with pytest.raises(ChannelSpecError, match="standard library or the engine"):
         load_step(StepRef(name="s", ref=ref))
+
+
+def test_sys_exit_at_import_refuses_the_spec(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from tributary.runtime.steps import load_step
+
+    package = tmp_path / "synth_bundle_exits"
+    package.mkdir()
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "steps.py").write_text("import sys\nsys.exit(3)\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    with pytest.raises(ChannelSpecError, match="SystemExit"):
+        load_step(StepRef(name="s", ref="synth_bundle_exits.steps.step"))
+
+
+@pytest.mark.parametrize(("raised", "refused"), [(SystemExit(3), True), (KeyboardInterrupt(), False)])
+def test_an_entry_point_exiting_is_refused_but_an_interrupt_propagates(
+    monkeypatch: pytest.MonkeyPatch, raised: BaseException, refused: bool
+) -> None:
+    from tributary.runtime import steps as steps_module
+
+    class Exiting:
+        name = "t.exiting"
+
+        def load(self) -> object:
+            raise raised
+
+    monkeypatch.setattr(steps_module, "entry_points", lambda group: [Exiting()])
+    expected: type[BaseException] = ChannelSpecError if refused else KeyboardInterrupt
+    with pytest.raises(expected):
+        steps_module.load_step(StepRef(name="s", uses="t.exiting"))
