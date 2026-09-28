@@ -16,6 +16,7 @@ import pytest
 from tributary.loaders.http.config import CircuitBreakerSpec
 from tributary.loaders.sftp.config import SftpDestinationConfig
 from tributary.loaders.sftp.session import (
+    WEAK_ALGORITHMS,
     AuthFailedError,
     ConnectionLostError,
     Credentials,
@@ -53,7 +54,7 @@ class Listener:
         return sum(s.auth_attempts for s in self.servers)
 
 
-def _serve(keys: list[paramiko.PKey]) -> Iterator[Listener]:
+def _serve(keys: list[paramiko.PKey], disabled_algorithms: dict[str, list[str]] | None = None) -> Iterator[Listener]:
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
     sock.listen(8)
@@ -68,7 +69,7 @@ def _serve(keys: list[paramiko.PKey]) -> Iterator[Listener]:
                 client, _ = sock.accept()
             except (TimeoutError, OSError):
                 continue
-            transport = paramiko.Transport(client)
+            transport = paramiko.Transport(client, disabled_algorithms=disabled_algorithms)
             for key in keys:
                 transport.add_server_key(key)
             server = _Server()
@@ -234,3 +235,62 @@ def test_a_bare_oserror_on_an_inactive_transport_is_a_lost_connection_not_an_sft
     with pytest.raises(RemoteError) as exc_info:
         live.size("/x")  # the same exception on a live transport is a genuine server-side failure
     assert exc_info.value.status == 4
+
+
+def _only(kind: str, allowed: str) -> dict[str, list[str]]:
+    """Server-side `disabled_algorithms` leaving exactly one algorithm of `kind` on offer."""
+    preferred: tuple[str, ...] = getattr(paramiko.Transport, f"_preferred_{kind}")
+    return {kind: [a for a in preferred if a != allowed]}
+
+
+@pytest.mark.parametrize(
+    ("kind", "weak"),
+    [
+        ("ciphers", "aes128-cbc"),
+        ("ciphers", "3des-cbc"),
+        ("macs", "hmac-sha1"),
+        ("macs", "hmac-md5"),
+        ("kex", "diffie-hellman-group14-sha1"),
+        ("kex", "diffie-hellman-group-exchange-sha1"),
+        ("kex", "diffie-hellman-group1-sha1"),
+    ],
+)
+def test_a_server_offering_only_a_weak_algorithm_is_refused_before_any_credential(
+    ecdsa_key: paramiko.PKey, kind: str, weak: str
+) -> None:
+    for listener in _serve([ecdsa_key], _only(kind, weak)):
+        config = config_for(listener.port, [fingerprint(ecdsa_key.asbytes())])
+        with pytest.raises(ConnectionLostError):
+            connect(config, Credentials("user", "wrong", None))
+        assert listener.auth_attempts == 0
+
+
+def test_the_control_a_strong_only_server_still_connects(ecdsa_key: paramiko.PKey) -> None:
+    """Control for the refusals above: pinning the same key against a server offering a strong algorithm of
+    the same kind reaches authentication, so those refusals are about the algorithm and nothing else."""
+    for listener in _serve([ecdsa_key], _only("ciphers", "aes256-ctr")):
+        with pytest.raises(AuthFailedError):
+            connect(config_for(listener.port, [fingerprint(ecdsa_key.asbytes())]), Credentials("u", "wrong", None))
+        assert listener.auth_attempts == 1
+
+
+def test_the_negotiated_algorithms_are_strong(ecdsa_key: paramiko.PKey) -> None:
+    from tributary.loaders.sftp.session import _handshake
+
+    for listener in _serve([ecdsa_key]):
+        transport = _handshake(config_for(listener.port, [fingerprint(ecdsa_key.asbytes())]), [])
+        try:
+            assert transport.local_cipher not in WEAK_ALGORITHMS["ciphers"]
+            assert transport.local_cipher.endswith("-ctr") or "gcm" in transport.local_cipher
+            assert transport.local_mac not in WEAK_ALGORITHMS["macs"]
+        finally:
+            transport.close()
+
+
+def test_the_paramiko_logger_is_capped_at_warning(ecdsa_server: Listener, ecdsa_key: paramiko.PKey) -> None:
+    import logging
+
+    logging.getLogger("paramiko").setLevel(logging.DEBUG)
+    with pytest.raises(AuthFailedError):
+        connect(config_for(ecdsa_server.port, [fingerprint(ecdsa_key.asbytes())]), Credentials("u", "wrong", None))
+    assert logging.getLogger("paramiko").level == logging.WARNING

@@ -29,6 +29,7 @@ import contextlib
 import errno
 import hashlib
 import hmac
+import logging
 import socket
 import threading
 from collections.abc import Collection
@@ -41,6 +42,7 @@ from ..secrets import SecretResolver
 from .config import SftpDestinationConfig
 
 __all__ = [
+    "WEAK_ALGORITHMS",
     "AuthFailedError",
     "ConnectionLostError",
     "HostKeyMismatchError",
@@ -53,6 +55,18 @@ __all__ = [
     "fingerprint",
     "verify_host_key",
 ]
+
+#: Algorithms paramiko still offers by default and this loader never negotiates (receivers review):
+#: CBC and 3DES ciphers, SHA-1 and MD5 MACs, SHA-1 and group1 key exchange, and SHA-1 RSA (`ssh-rsa`, for
+#: both the server host key and client public-key auth; `rsa-sha2-256/512` stay enabled). A server that
+#: offers nothing else is refused at the handshake, before any credential is sent.
+WEAK_ALGORITHMS: dict[str, tuple[str, ...]] = {
+    "ciphers": ("3des-cbc", "aes128-cbc", "aes192-cbc", "aes256-cbc"),
+    "kex": ("diffie-hellman-group1-sha1", "diffie-hellman-group14-sha1", "diffie-hellman-group-exchange-sha1"),
+    "macs": ("hmac-md5", "hmac-md5-96", "hmac-sha1", "hmac-sha1-96"),
+    "keys": ("ssh-rsa",),
+    "pubkeys": ("ssh-rsa",),
+}
 
 _MAX_HANDSHAKE_ATTEMPTS = 6
 _RSA_ALGORITHMS = ("ssh-rsa", "rsa-sha2-256", "rsa-sha2-512")
@@ -234,7 +248,9 @@ def resolve_credentials(config: SftpDestinationConfig, resolver: SecretResolver)
 def _handshake(config: SftpDestinationConfig, disabled_keys: list[str]) -> paramiko.Transport:
     sock = socket.create_connection((config.host, config.port), timeout=config.timeout_s)
     try:
-        transport = paramiko.Transport(sock, disabled_algorithms={"keys": disabled_keys} if disabled_keys else None)
+        disabled = {name: list(algorithms) for name, algorithms in WEAK_ALGORITHMS.items()}
+        disabled["keys"] += disabled_keys  # host-key types already tried and not pinned (see below)
+        transport = paramiko.Transport(sock, disabled_algorithms=disabled)
         transport.banner_timeout = config.timeout_s
         transport.handshake_timeout = config.timeout_s
         transport.auth_timeout = config.timeout_s
@@ -270,6 +286,8 @@ def _verified_transport(config: SftpDestinationConfig) -> paramiko.Transport:
 
 def connect(config: SftpDestinationConfig, credentials: Credentials) -> ParamikoSession:
     """Connect, verify the host key against the pins, only then authenticate."""
+    # paramiko logs the negotiated peer software version and authentication outcomes at INFO/DEBUG.
+    logging.getLogger("paramiko").setLevel(logging.WARNING)
     transport: paramiko.Transport | None = None
     try:
         transport = _verified_transport(config)
