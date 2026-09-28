@@ -1,0 +1,25 @@
+{
+  "spike": "S2 (Phase 1 re-run against the real tributary.receivers.mllp)",
+  "environment": {
+    "python": "3.12.3",
+    "implementation": "CPython",
+    "platform": "Linux-6.18.44-fc-v37-x86_64-with-glibc2.39",
+    "machine": "x86_64",
+    "processor": "x86_64",
+    "cpu_count": 4
+  },
+  "kafka_image": "apache/kafka:4.0.0",
+  "topology": "single-node lite (RF=1) -- NOT the RF=3 production floor PHASE-0-DECISION.md's S2 used",
+  "methodology": "closed-loop per connection (send, await ACK, repeat) -- see module docstring for how this differs from Phase 0's open-loop fixed-rate loadgen.py",
+  "count": 3000,
+  "conns": 1,
+  "wall_s": 22.621278727000004,
+  "acks_per_s": 132.61849766341015,
+  "ack_latency_ms": {
+    "p50": 6.976439999959894,
+    "p90": 7.737163000001601,
+    "p99": 9.612683000000288,
+    "mean": 7.532608588666544,
+    "max": 1174.6110770000087
+  }
+}

@@ -1,0 +1,83 @@
+{
+  "spike": "S1 (Phase 1 re-run against the real tributary-hl7v2 package)",
+  "environment": {
+    "python": "3.12.3",
+    "implementation": "CPython",
+    "platform": "Linux-6.18.44-fc-v37-x86_64-with-glibc2.39",
+    "machine": "x86_64",
+    "processor": "x86_64",
+    "cpu_count": 4
+  },
+  "versions": {
+    "tributary-hl7v2": "0.0.0"
+  },
+  "count": 10000,
+  "repeats": 5,
+  "note": "parse+extract is not 'parse plus transform': no HL7-to-FHIR mapping step exists yet (W2-3). Do not compare 'parse+extract' msg/s directly against the 200 msg/s/core threshold as if it included a transform -- it does not.",
+  "single": [
+    {
+      "name": "parse",
+      "msgs_per_s": 46485.813794044196,
+      "p50_us": 18.203,
+      "p99_us": 56.78,
+      "rates": [
+        55454.601070469,
+        54789.287195318415,
+        46485.813794044196,
+        42034.11718456979,
+        40531.39742409188
+      ]
+    },
+    {
+      "name": "parse+extract",
+      "msgs_per_s": 14001.196354624435,
+      "p50_us": 51.463,
+      "p99_us": 223.184,
+      "rates": [
+        14001.196354624435,
+        11666.902063916159,
+        11338.867355233297,
+        15796.995490126816,
+        15620.715725823773
+      ]
+    }
+  ],
+  "multi": [
+    {
+      "mode": "parse",
+      "procs": 1,
+      "msgs_per_s_total": 54915.73778618526,
+      "per_proc": 54915.73778618526
+    },
+    {
+      "mode": "parse",
+      "procs": 2,
+      "msgs_per_s_total": 91705.99306230497,
+      "per_proc": 45852.99653115249
+    },
+    {
+      "mode": "parse",
+      "procs": 4,
+      "msgs_per_s_total": 126729.17845301128,
+      "per_proc": 31682.29461325282
+    },
+    {
+      "mode": "parse+extract",
+      "procs": 1,
+      "msgs_per_s_total": 13850.901828755483,
+      "per_proc": 13850.901828755483
+    },
+    {
+      "mode": "parse+extract",
+      "procs": 2,
+      "msgs_per_s_total": 29176.294375773512,
+      "per_proc": 14588.147187886756
+    },
+    {
+      "mode": "parse+extract",
+      "procs": 4,
+      "msgs_per_s_total": 34202.0781167274,
+      "per_proc": 8550.51952918185
+    }
+  ]
+}
