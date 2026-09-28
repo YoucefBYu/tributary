@@ -57,7 +57,10 @@ hands the message straight to `retry.onExhaust`").
 
 ## Error codes (README 3.4 table)
 
-* `TIMEOUT` -- `client.py` raised `TimeoutError`: no ACK within `timeoutMs`. Retryable.
+* `MLLP_TIMEOUT` -- `client.py` raised `TimeoutError`: no ACK within `timeoutMs` (README 3.4.6: "No ACK
+  in time is `MLLP_TIMEOUT`, retryable, never success" -- the MLLP-specific code, not the generic
+  cross-type `TIMEOUT` the "all" row of README 3.4's table lists for every other destination type).
+  Retryable.
 * `CONNECT_FAILED` -- `client.py`'s `TransportError`: the connection could not be made or was lost.
   Retryable.
 * `TLS_VERIFY_FAILED` -- `client.py`'s `TlsVerificationError`: certificate or hostname verification
@@ -124,7 +127,7 @@ class MllpLoader:
         try:
             ack_bytes = self._connection.send_and_receive_ack(payload, timeout_s=self.config.timeout_s)
         except TimeoutError:
-            return self._record_failure(msg_id, "TIMEOUT", retryable=True)
+            return self._record_failure(msg_id, "MLLP_TIMEOUT", retryable=True)
         except TlsVerificationError:
             return self._record_failure(msg_id, "TLS_VERIFY_FAILED", retryable=False)
         except NoAckError:

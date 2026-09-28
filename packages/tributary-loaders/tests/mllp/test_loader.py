@@ -200,7 +200,7 @@ def test_timeout_is_mllp_timeout_and_retryable(
     loader = MllpLoader(fast_config, MllpConnection("127.0.0.1", server.port, ssl_context=None))
     outcome = loader.deliver(make_message())
     assert outcome.success is False
-    assert outcome.reason == "TIMEOUT"
+    assert outcome.reason == "MLLP_TIMEOUT"
     assert outcome.retryable is True
     loader.close()
 
