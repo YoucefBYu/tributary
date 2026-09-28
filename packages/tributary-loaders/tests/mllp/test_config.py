@@ -89,6 +89,18 @@ def test_tls_is_optional_for_a_loopback_host(host: str) -> None:
     assert cfg.tls is None
 
 
+def test_empty_tls_block_on_a_non_loopback_host_is_still_tls_not_none() -> None:
+    """Security review, High: `with.tls: {}` ($defs/clientTls's own comment: "use the platform trust
+    store") must not be silently read the same as `tls` being absent -- that would build `cfg.tls =
+    None`, and `client.py`'s `connection_from_config` skips `_build_ssl_context` entirely whenever
+    `config.tls is None`, opening a **plaintext** socket to a real, non-loopback receiver."""
+    params = {"host": "lis.example.org", "port": 2575, "timeoutMs": 10000, "onNegativeAck": "retry", "tls": {}}
+    cfg = mllp_destination_config_from_destination("c", make_destination(params=params))
+    assert cfg.tls is not None
+    assert cfg.tls.secret_ref is None
+    assert cfg.tls.min_version == "1.2"
+
+
 def test_on_negative_ack_must_be_retry_or_fail() -> None:
     params = {
         "host": "localhost",

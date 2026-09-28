@@ -122,7 +122,23 @@ def mllp_settings_from_channel_spec(
         )
 
     tls_obj = source.get("tls")
-    tls = TlsSpec(tls_obj["secretRef"], tls_obj["clientAuth"], tls_obj.get("minVersion", "1.2")) if tls_obj else None
+    # `tls_obj is not None`, never a truthiness check (security review; the same class of bug as the
+    # mllp LOADER's `with.tls: {}` finding, `tributary.loaders.mllp.config`): a present-but-empty
+    # `source.tls: {}` must not be silently read as `tls` being absent. `net.require_safe_bind`
+    # (`server.py`) already refuses to start a non-loopback listener whose `cfg.tls is None`, so this
+    # specific shape could not previously reach a running plaintext listener off-box -- but it produced
+    # a confusing `BindError` there instead of the clear `ConfigError` a malformed `tls` object should
+    # raise right here, and a *loopback* bind with `tls: {}` would have silently accepted a listener
+    # with no TLS at all, papering over an operator's clearly-intended (if malformed) request for one.
+    tls = (
+        TlsSpec(
+            _require(tls_obj, "secretRef", "source.tls"),
+            _require(tls_obj, "clientAuth", "source.tls"),
+            tls_obj.get("minVersion", "1.2"),
+        )
+        if tls_obj is not None
+        else None
+    )
 
     queue = source.get("queue") or {}
     queue_max_bytes = queue.get("maxBytes", DEFAULT_MAX_BYTES)

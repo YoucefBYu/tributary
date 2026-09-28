@@ -69,6 +69,16 @@ def test_mtls_spec_produces_a_tls_spec_with_required_client_auth() -> None:
     assert cfg.tls.min_version == "1.3"
 
 
+def test_empty_tls_block_is_a_config_error_not_a_silent_none() -> None:
+    """Security review: `source.tls: {}` must not be silently read the same as `tls` being absent
+    (`config.py`'s truthiness-bug fix) -- it is a malformed `tls` object (missing the required
+    `secretRef`/`clientAuth`), not an intentional "no TLS" request, and must fail loudly."""
+    spec = load("walking-skeleton-loopback.json")
+    spec["spec"]["source"]["tls"] = {}
+    with pytest.raises(ConfigError, match="secretRef"):
+        mllp_settings_from_channel_spec(spec, env="dev", bootstrap_servers="k:9092")
+
+
 def test_queue_max_bytes_defaults_when_queue_object_absent() -> None:
     from tributary.receivers.backpressure import DEFAULT_MAX_BYTES
 

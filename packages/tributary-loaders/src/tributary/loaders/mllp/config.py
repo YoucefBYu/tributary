@@ -114,7 +114,18 @@ def mllp_destination_config_from_destination(channel: str, destination: Destinat
             f"destination {name!r}: with.tls is required for a non-loopback host {host!r} "
             "(README 3.4.6, $defs/mllpParams.allOf)"
         )
-    tls = MllpTlsSpec(tls_obj.get("secretRef"), tls_obj.get("minVersion", DEFAULT_MIN_TLS_VERSION)) if tls_obj else None
+    # `tls_obj is not None`, never a truthiness check (security review, High): `with.tls: {}` is a
+    # present-but-empty object -- "use the platform trust store" ($defs/clientTls's own comment) -- and
+    # `if tls_obj` treated it exactly like `tls` being absent. The check two lines up already lets `{}`
+    # through for a non-loopback host (`{} is None` is `False`), but `if tls_obj else None` then built
+    # `tls = None` anyway, so `client.py`'s `connection_from_config` skipped `_build_ssl_context`
+    # entirely and opened a **plaintext** socket to a real, non-loopback receiver -- PHI on the wire in
+    # the clear, for exactly the shape `mllpParams.allOf`'s required-`tls` rule exists to prevent.
+    tls = (
+        MllpTlsSpec(tls_obj.get("secretRef"), tls_obj.get("minVersion", DEFAULT_MIN_TLS_VERSION))
+        if tls_obj is not None
+        else None
+    )
 
     on_negative_ack = _require(params, "onNegativeAck", "with")
     if on_negative_ack not in ("retry", "fail"):
