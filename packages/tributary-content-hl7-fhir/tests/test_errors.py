@@ -10,7 +10,7 @@ from __future__ import annotations
 import pytest
 from tributary.content_hl7_fhir.errors import InvalidFieldError, safe_build
 
-SECRET = "SYNTHVERYSECRETVALUE"  # noqa: S105 -- a marker string, not a real credential
+PHI_MARKER = "SYNTH-PHI-MARKER-7Q"
 
 
 def test_safe_build_returns_the_factory_result_on_success() -> None:
@@ -19,7 +19,7 @@ def test_safe_build_returns_the_factory_result_on_success() -> None:
 
 def test_safe_build_raises_invalid_field_error_on_any_exception() -> None:
     def factory() -> None:
-        raise ValueError(SECRET)
+        raise ValueError(PHI_MARKER)
 
     with pytest.raises(InvalidFieldError) as excinfo:
         safe_build(factory, path="PID.7")
@@ -28,11 +28,11 @@ def test_safe_build_raises_invalid_field_error_on_any_exception() -> None:
 
 def test_safe_build_never_includes_the_original_message_text() -> None:
     def factory() -> None:
-        raise ValueError(f"input_value={SECRET!r}")
+        raise ValueError(f"input_value={PHI_MARKER!r}")
 
     with pytest.raises(InvalidFieldError) as excinfo:
         safe_build(factory, path="PID.7")
-    assert SECRET not in str(excinfo.value)
+    assert PHI_MARKER not in str(excinfo.value)
 
 
 def test_safe_build_clears_cause_and_context() -> None:
@@ -41,14 +41,14 @@ def test_safe_build_clears_cause_and_context() -> None:
     exception is not reachable through `__context__` either, not just through `__cause__`."""
 
     def factory() -> None:
-        raise ValueError(SECRET)
+        raise ValueError(PHI_MARKER)
 
     with pytest.raises(InvalidFieldError) as excinfo:
         safe_build(factory, path="PID.7")
     exc = excinfo.value
     assert exc.__cause__ is None
     assert exc.__context__ is None
-    assert SECRET not in repr(exc.__traceback__)
+    assert PHI_MARKER not in repr(exc.__traceback__)
 
 
 def test_safe_build_a_falsy_result_is_not_mistaken_for_failure() -> None:
