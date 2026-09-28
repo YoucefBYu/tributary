@@ -32,6 +32,8 @@ class Metrics:
     nacked_oversize: int = 0
     nacked_queue_full: int = 0
     nacked_unavailable: int = 0
+    rejected_auth: int = 0
+    rejected_content_type: int = 0
     publish_failures: int = 0
     _ack_latency_ms: list[float] = field(default_factory=list, repr=False)
 
@@ -52,6 +54,8 @@ class Metrics:
             "nacked_oversize": self.nacked_oversize,
             "nacked_queue_full": self.nacked_queue_full,
             "nacked_unavailable": self.nacked_unavailable,
+            "rejected_auth": self.rejected_auth,
+            "rejected_content_type": self.rejected_content_type,
             "publish_failures": self.publish_failures,
             "ack_latency_ms_count": len(samples),
         }

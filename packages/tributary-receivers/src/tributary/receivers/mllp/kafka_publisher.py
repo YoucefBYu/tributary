@@ -34,7 +34,7 @@ from tributary.runtime.config import TopicDefaults, load_topic_defaults
 from tributary.sdk import Message, ids
 from tributary.sdk import headers as h
 from tributary.sdk.errors import EnvelopeError
-from tributary.sdk.projection import validate_for_produce
+from tributary.sdk.projection import Ordering, validate_for_produce
 
 _ENV = re.compile(r"^[a-z][a-z0-9-]{0,15}$")
 _CHANNEL = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
@@ -106,13 +106,16 @@ class RawPublisher:
         queue_max_messages: int = 100_000,
         security: dict[str, object] | None = None,
         topic_defaults: TopicDefaults | None = None,
+        ordering: Ordering = "none",
+        client_id_prefix: str = "mllp-receiver",
     ) -> None:
         from confluent_kafka import Producer  # lazy: unit tests need no broker client
 
         self.topic = topic
+        self._ordering: Ordering = ordering
         defaults = topic_defaults if topic_defaults is not None else _cached_topic_defaults()
         settings = KafkaSettings(bootstrap_servers=bootstrap_servers, security=security or {})
-        config = producer_config(settings, defaults, client_id=f"mllp-receiver-{topic}")
+        config = producer_config(settings, defaults, client_id=f"{client_id_prefix}-{topic}")
         if linger_ms is not None:
             config["linger.ms"] = linger_ms  # not in the contract's must_not_hardcode list
         config["queue.buffering.max.messages"] = queue_max_messages
@@ -142,9 +145,9 @@ class RawPublisher:
         if loop is None:
             raise RuntimeError("RawPublisher.start() must run before publish() is awaited")
         try:
-            # ordering: none is the only mode this wave's receiver builds (config.py); a null key
-            # is the correct, contract-conformant shape for it, not a thing to special-case away.
-            validate_for_produce(message, topic_class="raw", ordering="none")
+            # `ordering` is the channel's, fixed at construction: `none` (the MLLP receiver's only mode)
+            # takes a null key, `per-key` refuses a record whose key did not resolve (invariant 5).
+            validate_for_produce(message, topic_class="raw", ordering=self._ordering)
         except EnvelopeError:
             return False  # never produce a record that would fail the envelope contract
         future: asyncio.Future[bool] = loop.create_future()
