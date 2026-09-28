@@ -10,6 +10,14 @@ that must happen before the `ConsumerLoop` starts, both needing an event loop th
 does not otherwise have: opening the PostgreSQL pool (`client.create_pool`), and README 3.4.3's startup
 proof that the destination can actually be idempotent (`PostgresqlLoader.verify_idempotency_constraint`)
 — a channel whose table has no unique index on `idColumn` must not start silently producing duplicates.
+
+**That loop must not be thrown away (bug fix).** `asyncpg.Pool` binds internal state to the event loop
+it was created on; `build_loop` creates one `asyncio.new_event_loop()` and hands it to both `_prepare()`
+(pool creation plus the idempotency check) and `PostgresqlRecordHandler`, which reuses the same loop for
+every later `deliver()` call, instead of building the pool on a throwaway `asyncio.run()` loop that
+closes as soon as `_prepare()` returns while delivery ran on a second, unrelated loop of its own — the
+shape that used to crash the process with `RuntimeError: Event loop is closed` the first time the pool
+needed to open a new physical connection after a dropped one. See `handler.py`'s module docstring.
 """
 
 from __future__ import annotations
@@ -97,8 +105,15 @@ def build_loop(a: argparse.Namespace) -> tuple[ConsumerLoop, PostgresqlRecordHan
         await loader.verify_idempotency_constraint()  # README 3.4.3: refuse to start, not to deliver
         return loader
 
-    pg_loader = asyncio.run(_prepare())
-    handler = PostgresqlRecordHandler(pg_loader, spec_source=spec_source, destination=a.destination)
+    # The pool must be built on the SAME loop that later drives every `deliver()` call (bug fix,
+    # `handler.py`'s module docstring): `asyncio.run(_prepare())` used to build it on a throwaway loop
+    # that `asyncio.run` closes as soon as it returns, while `PostgresqlRecordHandler` drove delivery on
+    # a second, separate loop of its own — `asyncpg` remembers the loop a pool was created on, and
+    # reopening a dropped physical connection on the wrong (closed) one crashed the process with
+    # `RuntimeError: Event loop is closed`. One loop, created here, used for both.
+    pg_loop = asyncio.new_event_loop()
+    pg_loader = pg_loop.run_until_complete(_prepare())
+    handler = PostgresqlRecordHandler(pg_loader, spec_source=spec_source, destination=a.destination, loop=pg_loop)
 
     data_producer = Producer(
         producer_config(kafka_settings, defaults, client_id=f"tb-{a.env}-{a.channel}-{a.destination}-{instance}")

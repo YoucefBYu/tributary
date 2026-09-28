@@ -245,3 +245,95 @@ def test_asyncpg_error_hierarchy_matches_the_loader_classification() -> None:
     assert issubclass(asyncpg.exceptions.UndefinedTableError, asyncpg.exceptions.PostgresError)
     assert issubclass(asyncpg.exceptions.DeadlockDetectedError, asyncpg.exceptions.TransactionRollbackError)
     assert issubclass(asyncpg.exceptions.UniqueViolationError, asyncpg.exceptions.IntegrityConstraintViolationError)
+
+
+class _FakeSpecSource:
+    """Just enough of `tributary.runtime.channels.LiveSpecSource` for `PostgresqlRecordHandler.handle`'s
+    `self._spec_source.current()` call (observability only, `handler.py`'s module docstring)."""
+
+    def current(self) -> _FakeSpecSource:
+        return self
+
+    def close(self) -> None:
+        pass
+
+
+def _make_record(message: Message) -> Any:
+    from tributary.runtime.records import ConsumedRecord
+
+    return ConsumedRecord(topic="dev.c.out.warehouse", partition=0, offset=1, message=message)
+
+
+def test_a_dropped_connection_is_retried_without_crashing_the_shared_loop() -> None:
+    """Regression for the bug `main.py`/`handler.py`'s module docstrings now describe:
+    `PostgresqlRecordHandler` used to run `deliver()` on a loop different from the one the pool was
+    built on (`asyncio.run(_prepare())` in `main.py`, a fresh `asyncio.new_event_loop()` in the
+    handler's own `__init__`). This builds the pool and the handler on one explicit, shared loop --
+    the way `main.py`'s `build_loop` does since the fix -- forces every one of the pool's connections
+    to die from a real server-side termination (not a mock), and then delivers again through the same
+    handler. Before the fix this reproduced `RuntimeError: Event loop is closed` the moment `asyncpg`
+    tried to open a replacement physical connection on the (closed) loop it remembered from
+    `create_pool`; after the fix the same call either reconnects transparently or fails with one of
+    this loader's own classified, retryable errors -- never an uncaught `RuntimeError`.
+    """
+    from tributary.loaders.postgresql.handler import PostgresqlRecordHandler
+
+    with PostgresContainer("postgres:16", driver=None) as container:
+        settings = PgConnectionSettings(
+            host=container.get_container_host_ip(),
+            port=int(container.get_exposed_port(container.port)),
+            database=container.dbname,
+            user=container.username,
+            password=container.password,
+            ssl_context=None,
+        )
+
+        loop = asyncio.new_event_loop()
+        try:
+            pool = loop.run_until_complete(create_pool(settings, min_size=1, max_size=2, command_timeout=5.0))
+            loop.run_until_complete(
+                pool.execute("CREATE TABLE observations (tb_msg_id TEXT PRIMARY KEY, value INTEGER NOT NULL)")
+            )
+            loader = PostgresqlLoader(make_config(), pool)
+            handler = PostgresqlRecordHandler(loader, spec_source=_FakeSpecSource(), destination="warehouse", loop=loop)
+
+            first_message = make_message({"value": 1})
+            handler.handle(_make_record(first_message))  # must not raise: a normal delivery first
+
+            async def _terminate_other_backends() -> None:
+                # A second, independent connection kills every backend this pool holds open -- the
+                # real fault (module docstring), not a mock: the pool's next `execute` must open a
+                # brand new physical connection, which is exactly the step that needs the loop
+                # `create_pool` remembers to still be open.
+                admin = await asyncpg.connect(
+                    host=settings.host,
+                    port=settings.port,
+                    database=settings.database,
+                    user=settings.user,
+                    password=settings.password,
+                )
+                try:
+                    await admin.execute(
+                        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                        "WHERE datname = $1 AND pid <> pg_backend_pid()",
+                        settings.database,
+                    )
+                finally:
+                    await admin.close()
+
+            loop.run_until_complete(_terminate_other_backends())
+
+            second_message = make_message({"value": 2})
+            # The assertion is simply that this does not raise `RuntimeError: Event loop is closed`
+            # (or anything else the loader does not itself classify) -- whether the pool reconnects in
+            # time for a `success` outcome or reports a classified, retryable failure is secondary to
+            # not crashing the process.
+            try:
+                handler.handle(_make_record(second_message))
+            except Exception as exc:
+                assert not isinstance(exc, RuntimeError), f"the shared-loop fix regressed: {exc!r}"
+                from tributary.runtime.errors import DeliveryError
+
+                assert isinstance(exc, DeliveryError), f"unexpected uncaught exception type: {exc!r}"
+        finally:
+            handler.close()  # closes both the pool and the loop
