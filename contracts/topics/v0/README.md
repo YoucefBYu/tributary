@@ -192,7 +192,7 @@ These are not tuning knobs. Invariant 1 (never ACK and drop) is false without th
 | `replication.factor` | 3 (production), 1 (lite) | Survive one broker loss. |
 | `min.insync.replicas` | 2 (production), 1 (lite) | With `acks=all`, a write is durable on two brokers before the receiver ACKs. |
 | `unclean.leader.election.enable` | `false` | A leader elected from a stale replica silently loses acknowledged records. |
-| `max.message.bytes` | 1048576 | Matches the envelope's 1 MB inline limit plus header headroom. |
+| `max.message.bytes` | 1048576 | The envelope's 1 MB inline limit plus header headroom. **Not an envelope control:** Kafka checks it against the compressed batch, so a compressible oversize payload passes. See `max.message.bytes_source` in `topic-defaults.json`. |
 | `compression.type` | `producer` | Do not recompress on the broker. |
 
 **`min.insync.replicas` and `unclean.leader.election.enable` are set per topic, in every class in

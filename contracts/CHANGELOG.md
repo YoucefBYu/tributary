@@ -3,6 +3,19 @@
 Newest first. Each entry names the contract, the version, whether the change is additive or
 breaking, and the reason. Breaking changes reference an ADR.
 
+## 2026-09-26 — `TB_DLQ_UNWRITABLE` registered; `raw` `max.message.bytes` ruled not an envelope control
+
+Both **additive**. No schema, example or invalid-example change, so no expected-failure pair moves.
+
+| # | Contract | Change | Ruling and why |
+|---|---|---|---|
+| 1 | `envelope/v0` `error-codes.json` | `TB_DLQ_UNWRITABLE`, status `emitted`, emitter the runtime worker loop | **Registered by exact name** (2.3.2 rule 2). A dead letter that breaks the envelope even when reduced (a `raw` payload over 1,000,000 bytes) now halts the partition with a `partition_halted` event carrying this code, instead of crash-looping the worker (`361935e`). It is never on a record: nothing is committed or lost, and the record stays on `raw` |
+| 2 | `topics/v0` `topic-defaults.json`, README 3.1 | `raw` gains `max.message.bytes_source`; the value **stays 1,048,576** | Kafka checks `max.message.bytes` against the record batch **after compression**, and `raw` is `compression.type: producer` with receivers producing `lz4` (`clients.receiver_producer`). No broker value can refuse a compressible payload over the 1,000,000-byte inline limit. Lowering it to the envelope-derived bound (1,019,105) would refuse only incompressible oversize records and read as a guarantee it does not give. **Rejected** for that reason. The controls that hold: WRITE on `raw` for receivers only (3.4), receivers refuse input over 1,000,000 bytes (channel-spec 3.2.2), and the worker halts the partition with `TB_DLQ_UNWRITABLE`. The real fix is claim-check. README 3.1's "matches the envelope's 1 MB inline limit" is corrected so the prose no longer implies enforcement |
+
+**Re-run:** `validate.py` (expect 122 / 0) and `pytest tests/conformance` (expect 127). Neither file is
+in their scope, so the counts should not move. The `tributary-sdk` registry cross-check test exercises
+change 1: `ENGINE_CODES` already includes `TB_DLQ_UNWRITABLE` (`codes.py`).
+
 ## 2026-09-25 (later) — W2-5 security follow-ups: filter allow-list, split terminator, two engine codes
 
 From `platform-engineer`'s commits `2a16e24`, `8af0d63` and `6daf4f4`. As before, no schema, example
