@@ -53,6 +53,7 @@
     "raw": {
       "partitions": 3,
       "partitions_source": "MEASURED (S4, ADR-002 D5): 1,000 channels at 3 partitions per topic = 12,009 partitions, healthy on 3 brokers with 1 GB heap. At the former default of 12 the cluster was lost at about 425-450 channels, failing the 500-channel threshold. Override per channel where throughput needs more.",
+      "max.message.bytes_source": "DECIDED 2026-09-26, kept at 1,048,576; NOT an envelope control. Kafka checks max.message.bytes against the record BATCH AFTER COMPRESSION, and raw is compression.type=producer (receivers send lz4). So no value here can make the broker refuse a payload over the envelope's 1,000,000-byte inline limit: a compressible 5 MB HL7 payload passes as a small lz4 batch. The gap above 1,000,000 is therefore not 48,576 bytes but unbounded for compressible data. Lowering to the envelope-derived bound (conservative upper bound 1,019,105 = 61 batch header + 36 worst-case record varints and attributes + 256 key + 1,000,000 payload + 32 x 10 header-length varints + 32 x 64 header names + 16,384 header values) would refuse only uncompressed or incompressible oversize records, and would read as a guarantee it does not give. The controls that do hold: WRITE on raw only for the receiver principal (README 3.4); receivers refuse input over 1,000,000 bytes (channel-spec 3.2.2); a worker that cannot dead-letter halts the partition with TB_DLQ_UNWRITABLE (envelope 2.3.2). Real fix: claim-check.",
       "configs": {
         "cleanup.policy": "delete",
         "retention.ms": 604800000,
