@@ -4,7 +4,15 @@ docstring calls out as a second, independently tested copy of `tributary.receive
 from __future__ import annotations
 
 import pytest
-from tributary.loaders.mllp.framing import EB_CR, SB, FrameParser, control_id, frame
+from tributary.loaders.mllp.framing import (
+    EB_CR,
+    SB,
+    FrameParser,
+    PayloadFramingError,
+    contains_frame_bytes,
+    control_id,
+    frame,
+)
 
 MSH = b"MSH|^~\\&|TRIBUTARY-SYNTH|FAC|RECV|FAC2|20260101000000||ADT^A01|CTRL-123|P|2.5"
 
@@ -17,6 +25,19 @@ def test_frame_wraps_with_start_block_and_end_block_cr() -> None:
 def test_frame_never_touches_the_payload_itself() -> None:
     payload = MSH + b"\rPID|1||123"
     assert frame(payload)[1:-2] == payload
+
+
+@pytest.mark.parametrize("bad_payload", [SB + b"rest", b"rest" + EB_CR, b"a" + SB + b"b"])
+def test_frame_refuses_a_payload_carrying_its_own_frame_bytes(bad_payload: bytes) -> None:
+    """Security review, Medium: a payload could otherwise smuggle a second, framed message into the
+    receiving EHR under this one delivery's identity."""
+    assert contains_frame_bytes(bad_payload) is True
+    with pytest.raises(PayloadFramingError):
+        frame(bad_payload)
+
+
+def test_contains_frame_bytes_is_false_for_an_ordinary_hl7_message() -> None:
+    assert contains_frame_bytes(MSH) is False
 
 
 def test_control_id_reads_msh_10() -> None:
@@ -65,3 +86,16 @@ class TestFrameParser:
     def test_ignores_bytes_before_the_start_block(self) -> None:
         parser = FrameParser(max_size=1024)
         assert parser.feed(b"garbage" + SB + b"MSA|AA|CTRL-123" + EB_CR) == b"MSA|AA|CTRL-123"
+
+    def test_raises_value_error_for_a_second_frame_in_the_same_read(self) -> None:
+        """Security review, Medium: bytes following the terminator in the same read are a protocol
+        error, not silently discarded -- a second frame arriving here could otherwise smuggle an
+        unacknowledged message onto the connection with no record of it ever having arrived."""
+        parser = FrameParser(max_size=1024)
+        with pytest.raises(ValueError, match="followed"):
+            parser.feed(SB + b"MSA|AA|CTRL-123" + EB_CR + SB + b"MSA|AA|CTRL-999" + EB_CR)
+
+    def test_raises_value_error_for_one_trailing_byte_after_the_terminator(self) -> None:
+        parser = FrameParser(max_size=1024)
+        with pytest.raises(ValueError, match="followed"):
+            parser.feed(SB + b"MSA|AA|CTRL-123" + EB_CR + b"\x00")

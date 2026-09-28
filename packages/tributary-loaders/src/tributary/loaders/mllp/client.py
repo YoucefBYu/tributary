@@ -29,6 +29,15 @@ same `secretRef` (schema comment on `clientTls`: "optionally a client certificat
 Every log call in this package passes `message_id`, byte lengths, and fixed reason/result tokens
 (`ack_code`, `match`/`mismatch`) — never `message.payload`, the raw ACK bytes, or `AckResult.control_id`
 as text. `control_id` only ever reaches a log as a boolean (matched the sent `MSH-10` or not).
+
+## A reused connection is checked for stale data first (security review, Medium)
+
+`send_and_receive_ack` peeks (`_is_stale`) before reusing a persistent connection from a prior
+`deliver()` call: a byte, or a clean EOF, already waiting on the socket means either a stale or
+duplicate reply this loader never read, or a peer that hung up after the last ACK — either way, not a
+connection safe to hand a fresh request/reply pair, since a leftover byte would be misread as the start
+of the NEXT message's own ACK. A brand-new connection from `_connect` is never checked (nothing has had
+a chance to arrive on it yet).
 """
 
 from __future__ import annotations
@@ -102,22 +111,79 @@ class MllpConnection:
             self._sock = None
 
     def _connect(self, deadline: float) -> None:
+        # `remaining`/`timeout=` below bounds `socket.create_connection`'s own `connect()` call, but
+        # NOT the `getaddrinfo()` DNS resolution it performs first (security review, Low): the stdlib
+        # has no built-in way to bound that half without a second thread and its own timeout (`socket`
+        # exposes a single blocking `getaddrinfo`, no async or cancellable variant), which is more
+        # machinery than this loader's one-connection-per-destination shape can justify for a resolver
+        # that is, in practice, either fast (a cache hit, a resolv.conf entry) or already a wider
+        # infrastructure outage this timeout alone would not meaningfully protect against. Documented
+        # rather than silently assumed bounded: a hung or very slow DNS resolution here can make one
+        # `deliver()` attempt take longer than `timeoutMs` before `_connect` even starts its own
+        # `remaining`-bounded connect phase.
         remaining = max(0.001, deadline - time.monotonic())
         try:
             raw = socket.create_connection((self.host, self.port), timeout=remaining)
-        except (TimeoutError, OSError) as exc:
+        except TimeoutError as exc:
+            # The one shared connect+send+ACK deadline (class docstring): a stall connecting is not
+            # operationally different from a stall waiting for the reply, so both are `MLLP_TIMEOUT`
+            # (`loader.py`), not `CONNECT_FAILED` (security review, Low -- found alongside the
+            # handshake-timeout case just below).
+            raise TimeoutError("no ACK within timeoutMs (connect phase)") from exc
+        except OSError as exc:
             raise TransportError(str(exc)) from exc
         if self.ssl_context is None:
             self._sock = raw
             return
         try:
+            # Re-read the deadline rather than reusing `remaining`: `create_connection` above may have
+            # used part of the budget, and the handshake must still respect what is left of it, not a
+            # stale value computed before connecting.
+            raw.settimeout(max(0.001, deadline - time.monotonic()))
             self._sock = self.ssl_context.wrap_socket(raw, server_hostname=self.host)
-        except ssl.SSLError as exc:
+        except TimeoutError as exc:
+            raw.close()
+            raise TimeoutError("no ACK within timeoutMs (TLS handshake)") from exc
+        except ssl.SSLCertVerificationError as exc:
+            # Only a certificate/hostname verification failure is `TlsVerificationError` (security
+            # review, Low, the same rule `7ed8343` applied to the HTTP and ClickHouse loaders): every
+            # other `ssl.SSLError` (a reset mid-handshake, `SSLEOFError`, ...) is transient and stays
+            # retryable.
             raw.close()
             raise TlsVerificationError(str(exc)) from exc
+        except ssl.SSLError as exc:
+            raw.close()
+            raise TransportError(str(exc)) from exc
         except OSError as exc:
             raw.close()
             raise TransportError(str(exc)) from exc
+
+    def _is_stale(self, sock: socket.socket | ssl.SSLSocket) -> bool:
+        """Non-blocking check for a byte or an EOF already waiting on a socket this loader is about to
+        **reuse** (security review, Medium): a cleanly finished request/reply cycle leaves nothing
+        pending, so anything readable here — a leftover byte, or a clean close — means either a
+        stale/duplicate reply this loader never consumed, or a peer that hung up after the last ACK.
+        Either way the socket is not safe to hand to a fresh request/reply pair, since a leftover byte
+        sitting first in the stream would be misread as part of the NEXT message's ACK frame.
+
+        Plain non-blocking `recv()`, not `MSG_PEEK`: `ssl.SSLSocket.recv()` raises `ValueError` for any
+        non-zero `flags` (the stdlib `ssl` module does not support peeking at the TLS record layer), so
+        a check that works identically for the plaintext and the TLS-wrapped case has to be
+        non-destructive by discarding the *socket* on a positive result rather than by leaving the byte
+        unread — which is exactly what happens here, since every positive result leads to `close()`.
+        """
+        previous_timeout = sock.gettimeout()
+        sock.settimeout(0.0)
+        try:
+            pending = sock.recv(1)
+        except (BlockingIOError, ssl.SSLWantReadError, ssl.SSLWantWriteError):
+            return False  # nothing pending: safe to reuse
+        except OSError:
+            return True  # some other read error: do not trust this socket either
+        finally:
+            sock.settimeout(previous_timeout)
+        del pending  # b"" (EOF) or an actual leftover byte: either way, never safe to reuse
+        return True
 
     def send_and_receive_ack(self, payload: bytes, *, timeout_s: float) -> bytes:
         """One request/reply cycle: connect if needed, send the framed payload, read until a complete
@@ -126,6 +192,8 @@ class MllpConnection:
         mid-protocol cannot be trusted to still be in a clean request/reply state for the next attempt —
         the caller reconnects on the next `deliver()` call)."""
         deadline = time.monotonic() + timeout_s
+        if self._sock is not None and self._is_stale(self._sock):
+            self.close()  # security review, Medium: a half-open or stale connection is never reused
         if self._sock is None:
             self._connect(deadline)
         sock = self._sock

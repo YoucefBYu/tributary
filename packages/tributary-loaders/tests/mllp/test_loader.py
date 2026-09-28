@@ -188,6 +188,73 @@ def test_msa_2_mismatch_against_sent_msh_10_is_mllp_no_ack(
     loader.close()
 
 
+def test_empty_msh_10_is_refused_before_any_connection_is_made() -> None:
+    """Security review, Medium: an empty sent control id would make the MSA-2-vs-sent-MSH-10 check
+    read `"" == ""` as a match against a reply with no MSA-2 at all (or no MSA segment at all,
+    `ack.py`'s own `""` sentinel) -- refused outright instead."""
+    payload = b"MSH|^~\\&|TRIBUTARY-SYNTH|FAC|RECV|FAC2|20260101000000||ADT^A01||P|2.5"  # MSH-10 empty
+    assert control_id(payload) == ""
+    loader = MllpLoader(make_config(port=1), MllpConnection("127.0.0.1", 1, ssl_context=None))
+    outcome = loader.deliver(make_message(payload=payload))
+    assert outcome.success is False
+    assert outcome.reason == "PAYLOAD_SHAPE_INVALID"
+    assert outcome.retryable is False
+
+
+@pytest.mark.parametrize("bad_payload", [SB_ + MSH, MSH + EB_CR, MSH[:20] + SB_ + MSH[20:]])
+def test_a_payload_containing_frame_bytes_is_refused(bad_payload: bytes) -> None:
+    """Security review, Medium: a payload carrying its own MLLP start/end-block bytes could smuggle a
+    second message into the receiving EHR under this one delivery's identity -- refused before any
+    connection is made, same as the empty-MSH-10 case."""
+    loader = MllpLoader(make_config(port=1), MllpConnection("127.0.0.1", 1, ssl_context=None))
+    outcome = loader.deliver(make_message(payload=bad_payload))
+    assert outcome.success is False
+    assert outcome.reason == "PAYLOAD_SHAPE_INVALID"
+    assert outcome.retryable is False
+
+
+def test_an_unrecognized_ack_code_is_never_logged_verbatim(
+    scripted_server: Callable[[Callable[[bytes], bytes | None]], FakeMllpServer],
+) -> None:
+    """Security review, Medium: `MSA-1` is peer-controlled, unbounded wire text -- a log line must
+    never carry it verbatim, only one of the six known codes or the fixed token `"other"`."""
+
+    class RecordingLogger:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, dict[str, object]]] = []
+
+        def debug(self, event: str, /, **fields: object) -> None:
+            self.events.append((event, fields))
+
+        def info(self, event: str, /, **fields: object) -> None:
+            self.events.append((event, fields))
+
+        def warning(self, event: str, /, **fields: object) -> None:
+            self.events.append((event, fields))
+
+        def error(self, event: str, /, **fields: object) -> None:
+            self.events.append((event, fields))
+
+    def respond(message: bytes) -> bytes:
+        ctrl = control_id(message)
+        # A made-up MSA-1 value carrying free text a hostile or misbehaving peer might smuggle in.
+        return frame(f"MSH|^~\\&\rMSA|AA; DROP EVERYTHING|{ctrl}".encode())
+
+    server = scripted_server(respond)
+    log = RecordingLogger()
+    loader = MllpLoader(
+        make_config(port=server.port), MllpConnection("127.0.0.1", server.port, ssl_context=None), log=log
+    )
+    outcome = loader.deliver(make_message())
+    assert outcome.success is False  # not one of the six known codes: not a success (README 3.4's rule 1)
+    assert outcome.ack_code == "AA; DROP EVERYTHING"  # the outcome dataclass keeps the raw value...
+    for _event, fields in log.events:
+        for value in fields.values():
+            # ...but no logged field, under any key, ever carries it.
+            assert value != "AA; DROP EVERYTHING"
+    loader.close()
+
+
 def test_timeout_is_mllp_timeout_and_retryable(
     scripted_server: Callable[[Callable[[bytes], bytes | None]], FakeMllpServer],
 ) -> None:

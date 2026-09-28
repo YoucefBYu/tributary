@@ -23,7 +23,11 @@ def parse_ack(msg: bytes) -> AckResult:
     `MLLP_NO_ACK` — a malformed reply is not this loader's payload to log (invariant 6), only its
     absence of an MSA."""
     for segment in msg.split(b"\r"):
-        if segment[:3] != b"MSA":
+        # `segment[:4] != b"MSA|"`, not `segment[:3] != b"MSA"` (security review, Low): the latter also
+        # matched a segment like `MSAX|AA|...` -- any segment merely STARTING with the three bytes
+        # `MSA`, not the real `MSA` segment (whose HL7 field separator makes the fourth byte `|`
+        # exactly) -- letting a made-up, look-alike segment be read as the actual acknowledgement.
+        if segment[:4] != b"MSA|":
             continue
         fields = segment.split(b"|")
         code = fields[1].decode("ascii", "replace").strip() if len(fields) > 1 else ""

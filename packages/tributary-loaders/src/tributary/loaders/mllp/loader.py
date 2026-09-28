@@ -4,10 +4,23 @@ one persistent connection. `contracts/channel-spec/v0/README.md` section 3.4.6 i
 ## The payload is sent as-is
 
 README 3.4.6: "the loader does not rewrite `MSH`". `client.py`'s `frame()` only adds the MLLP envelope
-bytes; nothing in this module inspects, reshapes or re-encodes the payload. There is no
+bytes; nothing in this module inspects, reshapes or re-encodes the payload. There is no general
 `PAYLOAD_SHAPE_INVALID` for this destination type — a step upstream is responsible for handing this
 loader well-formed HL7 v2, and this loader has no v2 parser to check that with anyway (`ack.py`'s
-module docstring: not general HL7 v2 parsing, `tributary-hl7v2` owns that).
+module docstring: not general HL7 v2 parsing, `tributary-hl7v2` owns that). **Two exceptions (security review, Medium), both checked before this
+loader ever opens a connection:**
+
+1. A payload containing its own MLLP start (`0x0B`) or end-block (`0x1C 0x0D`) bytes is refused
+   (`framing.contains_frame_bytes`) — accepting it as-is would let a sender smuggle a second, framed
+   message into the receiving EHR under this one delivery's identity.
+2. A payload whose `MSH-10` is empty is refused — not because this loader parses HL7, but because ""
+   is also what `ack.parse_ack` returns for a reply with no `MSA-2` field at all, and the
+   MSA-2-vs-sent-MSH-10 comparison below (`ack.control_id != sent_control_id`) would then read
+   `"" == ""` as a match: a stale or malformed ack that names no control id at all would be silently
+   accepted as this message's own answer. Refusing an empty `MSH-10` outright means that comparison
+   can never degenerate into "both sides are unknown, so call it equal".
+
+Both are `PAYLOAD_SHAPE_INVALID`, non-retryable: the payload is what it is on every attempt.
 
 ## Idempotency (README 5.1) — only `sink-native` or `none`
 
@@ -70,6 +83,9 @@ hands the message straight to `retry.onExhaust`").
   Retryable.
 * `MLLP_AE` -- `MSA-1` is `AE` or `CE`. Retryable iff `onNegativeAck: "retry"`.
 * `MLLP_AR` -- `MSA-1` is `AR` or `CR`. Retryable iff `onNegativeAck: "retry"`.
+* `PAYLOAD_SHAPE_INVALID` -- the payload contains its own MLLP start/end-block bytes, or its `MSH-10`
+  is empty (module docstring: the two payload checks this loader makes). Checked before any connection
+  is made. Not retryable.
 
 No payload or ACK text ever reaches a log line (invariant 6): only `message_id`, byte lengths, and
 fixed reason/result tokens (`ack_code`, `match`/`mismatch`).
@@ -86,7 +102,7 @@ from ..common import CircuitBreaker, DeliveryOutcome, LoaderMetrics, NullLogger,
 from .ack import parse_ack
 from .client import MllpConnection, NoAckError, TlsVerificationError, TransportError
 from .config import MllpDestinationConfig
-from .framing import control_id
+from .framing import contains_frame_bytes, control_id
 
 DEFAULT_FAILURE_THRESHOLD = 5
 DEFAULT_OPEN_SECONDS = 30.0
@@ -96,6 +112,19 @@ DEFAULT_OPEN_SECONDS = 30.0
 _SUCCESS_CODES = frozenset({"AA", "CA"})
 _AE_CODES = frozenset({"AE", "CE"})
 _AR_CODES = frozenset({"AR", "CR"})
+_KNOWN_ACK_CODES = _SUCCESS_CODES | _AE_CODES | _AR_CODES
+
+
+def _loggable_ack_code(ack_code: str) -> str:
+    """`MSA-1` is peer-controlled, unbounded wire text -- `ack.py`'s own parsing only strips it, it
+    does not validate it against HL7's enumeration. Security review, Medium: logging it verbatim let a
+    misbehaving or hostile peer put arbitrary text (or, worse, patient data smuggled into that field)
+    straight into a log line. Every log call in this module goes through this first: one of the six
+    known codes, the fixed token `"other"` for anything else, or `""` when there was no ack code at all
+    (a timeout, a transport failure) -- never the raw value."""
+    if not ack_code:
+        return ""
+    return ack_code if ack_code in _KNOWN_ACK_CODES else "other"
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,7 +151,17 @@ class MllpLoader:
             return MllpDeliveryOutcome(success=False, reason="circuit-open", retryable=True)
 
         payload = message.payload or b""
+        if contains_frame_bytes(payload):
+            # Module docstring: a payload carrying its own MLLP start/end-block bytes could smuggle a
+            # second message into the receiving EHR under this one delivery's identity. Refused before
+            # this loader ever sends it, same as the empty-MSH-10 check below.
+            return self._record_failure(msg_id, "PAYLOAD_SHAPE_INVALID", retryable=False)
         sent_control_id = control_id(payload)
+        if not sent_control_id:
+            # Module docstring: refused before this loader ever sends it, so the MSA-2-vs-sent-MSH-10
+            # comparison below can never read an empty sent id as matching an equally-empty (or
+            # missing) MSA-2 on the reply.
+            return self._record_failure(msg_id, "PAYLOAD_SHAPE_INVALID", retryable=False)
 
         try:
             ack_bytes = self._connection.send_and_receive_ack(payload, timeout_s=self.config.timeout_s)
@@ -167,7 +206,12 @@ class MllpLoader:
             self.metrics.circuit_closes += 1
             self._log.info("circuit_closed", destination=self.config.destination)
         self.metrics.record("success")
-        self._log.info("delivery_succeeded", destination=self.config.destination, message_id=msg_id, ack_code=ack_code)
+        self._log.info(
+            "delivery_succeeded",
+            destination=self.config.destination,
+            message_id=msg_id,
+            ack_code=_loggable_ack_code(ack_code),
+        )
         return MllpDeliveryOutcome(success=True, reason="success", retryable=False, ack_code=ack_code)
 
     def _record_failure(self, msg_id: str, reason: str, *, retryable: bool, ack_code: str = "") -> MllpDeliveryOutcome:
@@ -178,7 +222,11 @@ class MllpLoader:
             self._log.warning("circuit_open", destination=self.config.destination, reason=reason)
         self.metrics.record(reason)
         self._log.warning(
-            "delivery_failed", destination=self.config.destination, message_id=msg_id, reason=reason, ack_code=ack_code
+            "delivery_failed",
+            destination=self.config.destination,
+            message_id=msg_id,
+            reason=reason,
+            ack_code=_loggable_ack_code(ack_code),
         )
         return MllpDeliveryOutcome(success=False, reason=reason, retryable=retryable, ack_code=ack_code)
 

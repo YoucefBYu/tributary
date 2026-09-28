@@ -20,10 +20,31 @@ SB, EB, CR = b"\x0b", b"\x1c", b"\x0d"
 EB_CR = EB + CR
 
 
+class PayloadFramingError(ValueError):
+    """`payload` itself contains an MLLP control byte sequence (security review, Medium): accepting it
+    as-is would let a sender smuggle a second, framed message inside what the channel spec calls one
+    logical delivery — `0x0B` opens a second frame before this one's terminator, and `0x1C 0x0D` closes
+    this one early and starts a new message right after it, either way something the receiving EHR
+    reads as two HL7 messages from one `tb-msg-id`. Never retryable: the payload is what it is on every
+    attempt."""
+
+
 def frame(payload: bytes) -> bytes:
     """Wrap `payload` for the wire. The loader never rewrites the payload itself (README 3.4.6:
-    "the loader does not rewrite MSH") — this only adds the MLLP envelope bytes."""
+    "the loader does not rewrite MSH") — this only adds the MLLP envelope bytes. Raises
+    `PayloadFramingError` if `payload` itself contains `0x0B` or the `0x1C 0x0D` terminator sequence;
+    callers should check `contains_frame_bytes` before ever reaching a connection (`loader.py`), but
+    this function refuses it too, as the actual serialization boundary."""
+    if contains_frame_bytes(payload):
+        raise PayloadFramingError("payload contains an MLLP start or end block byte sequence")
     return SB + payload + EB_CR
+
+
+def contains_frame_bytes(payload: bytes) -> bool:
+    """True if `payload` contains `0x0B` or `0x1C 0x0D` anywhere in it — `frame()`'s own check, exposed
+    so `loader.py` can classify this as `PAYLOAD_SHAPE_INVALID` before ever touching the connection,
+    the same way it checks for an empty `MSH-10`."""
+    return SB in payload or EB_CR in payload
 
 
 def control_id(msg: bytes) -> str:
@@ -58,7 +79,17 @@ class FrameParser:
 
     def feed(self, data: bytes) -> bytes | None:
         """Returns the complete frame's payload once one has arrived, else `None`. Raises `ValueError`
-        if the buffer exceeds `max_size` before a frame terminates — the caller closes the connection."""
+        if the buffer exceeds `max_size` before a frame terminates, or if any byte follows the
+        terminator in the same read — either way, the caller closes the connection.
+
+        **Trailing bytes after `0x1C 0x0D` are a protocol error, not silently discarded (security
+        review, Medium).** This loader sends one message and expects exactly one ACK back before
+        sending the next (class docstring: no pipelining) — a second frame, or any other byte, arriving
+        in the same read as the first frame's terminator is not a shape a well-behaved peer produces
+        for a single request. Reading only the first frame and quietly dropping whatever follows would
+        let a misbehaving or hostile peer (or a MITM performing response splitting) smuggle a second,
+        unacknowledged message payload onto this connection with no record of it ever having arrived,
+        and would leave the connection in a state neither this loader nor the peer agree on."""
         self._buf += data
         if len(self._buf) > self._max:
             raise ValueError("ACK frame exceeded max_size before terminating")
@@ -68,4 +99,6 @@ class FrameParser:
         end = self._buf.find(EB_CR, start + 1)
         if end == -1:
             return None
+        if len(self._buf) > end + len(EB_CR):
+            raise ValueError("bytes followed the ACK frame's terminator in the same read")
         return bytes(self._buf[start + 1 : end])

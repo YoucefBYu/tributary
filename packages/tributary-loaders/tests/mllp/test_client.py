@@ -122,6 +122,55 @@ def test_reuses_one_connection_across_multiple_sends(ack_server: FakeMllpServer)
     conn.close()
 
 
+def test_a_stale_byte_arriving_after_the_last_ack_forces_a_reconnect() -> None:
+    """Security review, Medium: `_is_stale` must catch a byte the peer pushes onto the connection
+    AFTER this loader stopped reading (it stops as soon as one complete ACK frame arrives) -- a real
+    peer here answers normally, then writes one extra, unsolicited byte a moment later, standing in for
+    a stale/duplicate reply or a chatty peer. The next `send_and_receive_ack` call must discard that
+    connection and open a fresh one rather than try to read the stray byte as part of the next ACK."""
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(2)
+    port = listener.getsockname()[1]
+    accepted = 0
+    lock = threading.Lock()
+
+    def handle(conn: socket.socket) -> None:
+        nonlocal accepted
+        with lock:
+            accepted += 1
+        conn.settimeout(5)
+        buf = bytearray()
+        while SB_ not in buf or EB_CR not in buf:
+            buf += conn.recv(4096)
+        start, end = buf.index(SB_), buf.index(EB_CR)
+        ctrl = control_id(bytes(buf[start + 1 : end]))
+        conn.sendall(frame(f"MSH|^~\\&\rMSA|AA|{ctrl}".encode()))
+        time.sleep(0.1)
+        with contextlib.suppress(OSError):
+            conn.sendall(b"\x00")  # unsolicited: arrives after the client already stopped reading
+
+    def server_thread() -> None:
+        for _ in range(2):
+            conn, _ = listener.accept()
+            threading.Thread(target=handle, args=(conn,), daemon=True).start()
+
+    thread = threading.Thread(target=server_thread, daemon=True)
+    thread.start()
+    try:
+        conn = MllpConnection("127.0.0.1", port, ssl_context=None)
+        ack1 = conn.send_and_receive_ack(MSH, timeout_s=2.0)
+        assert b"MSA|AA" in ack1
+        time.sleep(0.3)  # let the stray byte actually arrive before this loader reuses the connection
+        ack2 = conn.send_and_receive_ack(MSH, timeout_s=2.0)
+        assert b"MSA|AA" in ack2
+        assert accepted == 2  # the stale connection was discarded; a fresh one was accepted
+        conn.close()
+    finally:
+        thread.join(2)
+        listener.close()
+
+
 def test_connection_refused_is_a_transport_error() -> None:
     conn = MllpConnection("127.0.0.1", 1, ssl_context=None)
     with pytest.raises(TransportError):
@@ -312,6 +361,59 @@ def test_tls_hostname_mismatch_is_a_tls_verification_error(tmp_path: Path) -> No
             conn.send_and_receive_ack(MSH, timeout_s=3.0)
     finally:
         thread.join(2)
+        listener.close()
+
+
+def test_a_non_certificate_ssl_error_during_handshake_stays_retryable() -> None:
+    """Security review, Low, the same rule `7ed8343` applied to the HTTP and ClickHouse loaders: only
+    `ssl.SSLCertVerificationError` is `TlsVerificationError`/non-retryable. A peer that accepts the TCP
+    connection and then closes it before completing any TLS handshake at all raises a non-certificate
+    `ssl.SSLError` (`SSLEOFError`, in practice) -- transient, and must stay `TransportError`/retryable."""
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+
+    def server_thread() -> None:
+        raw, _ = listener.accept()
+        raw.close()  # no TLS handshake at all: the client's wrap_socket sees a bare connection reset
+
+    thread = threading.Thread(target=server_thread, daemon=True)
+    thread.start()
+    try:
+        client_ctx = ssl.create_default_context()
+        conn = MllpConnection("127.0.0.1", port, ssl_context=client_ctx)
+        with pytest.raises(TransportError):
+            conn.send_and_receive_ack(MSH, timeout_s=3.0)
+    finally:
+        thread.join(2)
+        listener.close()
+
+
+def test_a_handshake_that_never_completes_is_a_timeout_error() -> None:
+    """Security review, Low: a stalled TLS handshake shares `MLLP_TIMEOUT`'s budget the same way a
+    stalled connect or a stalled ACK wait does (`client.py`'s "one shared deadline" design), not
+    `CONNECT_FAILED`."""
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+
+    def server_thread() -> None:
+        raw, _ = listener.accept()
+        time.sleep(2)  # accepts the TCP connection but never sends a single TLS record
+        with contextlib.suppress(OSError):
+            raw.close()
+
+    thread = threading.Thread(target=server_thread, daemon=True)
+    thread.start()
+    try:
+        client_ctx = ssl.create_default_context()
+        conn = MllpConnection("127.0.0.1", port, ssl_context=client_ctx)
+        with pytest.raises(TimeoutError):
+            conn.send_and_receive_ack(MSH, timeout_s=0.3)
+    finally:
+        thread.join(3)
         listener.close()
 
 
