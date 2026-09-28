@@ -1521,6 +1521,7 @@ source = { editable = "packages/tributary-loaders" }
 dependencies = [
     { name = "asyncpg" },
     { name = "confluent-kafka" },
+    { name = "paramiko" },
     { name = "tributary-runtime" },
     { name = "tributary-sdk" },
 ]
@@ -1529,6 +1530,7 @@ dependencies = [
 requires-dist = [
     { name = "asyncpg", specifier = ">=0.30.0" },
     { name = "confluent-kafka", specifier = ">=2.6.0" },
+    { name = "paramiko", specifier = ">=3.4,<5" },
     { name = "tributary-runtime", editable = "packages/tributary-runtime" },
     { name = "tributary-sdk", editable = "packages/tributary-sdk" },
 ]
