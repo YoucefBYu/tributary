@@ -50,7 +50,12 @@ SUPPORTED_SECURITY_PROTOCOLS = frozenset({"PLAINTEXT", "SSL", "SASL_SSL"})
 #: alone on having actually run against this exact document. Without this check here, a `kafka`
 #: destination's `bootstrapServers` pointed at a real, non-loopback broker with `protocol: PLAINTEXT`
 #: builds a config this loader would happily send PHI through in the clear (security review, High).
-_LOOPBACK_HOST_PORT_RE = re.compile(r"^(localhost|127\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}|\[::1\]):[0-9]{2,5}$")
+#: No `^`/`$` anchors: matched with `.fullmatch()` (security review, Low), not `.match()` -- `.match()`
+#: only anchors the *start*, and `$` alone (without `re.MULTILINE`) matches just before a trailing
+#: newline as well as the true end of string, so `.match()` plus a `$`-terminated pattern would have
+#: accepted `"127.0.0.1:9092\n"` as loopback. `.fullmatch()` requires the entire string to match with no
+#: such gap, so the anchors would be redundant.
+_LOOPBACK_HOST_PORT_RE = re.compile(r"(localhost|127\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}|\[::1\]):[0-9]{2,5}")
 
 #: `$defs/externalTopic`: not `_tb.*`, not channel-shaped. Duplicated from the schema pattern rather
 #: than imported (there is no shared home for JSON-Schema-derived constants yet — same situation
@@ -134,6 +139,17 @@ def _security_from_params(security: Mapping[str, Any], destination: str) -> Kafk
         if tls_obj is not None
         else None
     )
+    if tls is not None and tls.min_version != DEFAULT_MIN_TLS_VERSION:
+        # Security review, High: `client.py`'s module docstring -- there is no librdkafka configuration
+        # property that enforces a TLS minimum version (confirmed by actually constructing a
+        # `confluent_kafka.Producer`, `tests/kafka/test_client.py`, not assumed), so a `minVersion` this
+        # loader cannot honour is refused outright rather than silently accepted and then never enforced.
+        raise ConfigError(
+            f"destination {destination!r}: with.connection.security.tls.minVersion {tls.min_version!r} "
+            f"is not supported by this loader; librdkafka has no property to enforce a TLS minimum "
+            f"version, so only the default ({DEFAULT_MIN_TLS_VERSION!r}) may be declared here "
+            "(client.py's module docstring)"
+        )
     if protocol == "SASL_SSL":
         mechanism = security.get("saslMechanism")
         if mechanism != "SCRAM-SHA-512":
@@ -160,7 +176,7 @@ def _connection_from_params(params: Mapping[str, Any], destination: str) -> Kafk
         raise ConfigError(f"destination {destination!r}: with.connection.bootstrapServers must be a non-empty list")
     security = _require(connection, "security", "with.connection")
     security_spec = _security_from_params(security, destination)
-    if security_spec.protocol == "PLAINTEXT" and not all(_LOOPBACK_HOST_PORT_RE.match(b) for b in bootstrap):
+    if security_spec.protocol == "PLAINTEXT" and not all(_LOOPBACK_HOST_PORT_RE.fullmatch(b) for b in bootstrap):
         # Defence in depth for `$defs/kafkaConnection.allOf`'s "PLAINTEXT only when every bootstrap
         # server is this host" (module constant's docstring, security review, High): this runtime-side
         # parser must refuse the same shape the schema refuses at deploy time, not trust that every

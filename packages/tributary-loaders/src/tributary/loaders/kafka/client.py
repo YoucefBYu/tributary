@@ -24,11 +24,27 @@ validated into librdkafka properties. `secretRef` on `kafkaSecurity` resolves to
 client certificate (mTLS) — the same `resolve_file`/`resolve_text` split `postgresql/client.py` uses,
 so a credential passes through this process only as a file path handed to librdkafka, never read into a
 Python string this module could accidentally log.
+
+**`minVersion` is not enforceable here (security review, High).** `ssl.min.version` is not a real
+librdkafka configuration property — `confluent_kafka.Producer({"ssl.min.version": "1.2", ...})` raises
+`KafkaError{code=_INVALID_ARG, ..., "No such configuration property: \"ssl.min.version\""}` against this
+package's pinned `confluent-kafka` (2.15.1 / bundled librdkafka), confirmed by actually constructing one
+(`tests/kafka/test_client.py`), not assumed from documentation. Grepping the linked librdkafka's own
+exported `ssl.*` property names turns up nothing that maps to a minimum-protocol-version knob either
+(`ssl.cipher.suites` selects cipher suites, not a protocol floor; `ssl.providers` is an OpenSSL 3.x
+provider list, unrelated). Since `$defs/clientTls.minVersion` is deploy-time-authored and this loader
+has no property to hand it to, `config.py`'s `_security_from_params` refuses any `minVersion` other than
+`DEFAULT_MIN_TLS_VERSION` ("1.2") at config-build time — accepting the default is a statement that the
+operator does not require anything above whatever this librdkafka build's linked OpenSSL negotiates on
+its own (in practice, TLS 1.2 or newer on any OpenSSL built in the last several years), while refusing
+"1.3" outright rather than silently failing to enforce a promise this loader cannot keep. This is a
+narrower guarantee than the Python-`ssl`-based loaders (`mllp`, `http`, `postgresql`, `clickhouse`) give,
+where `ssl.SSLContext.minimum_version` really is enforced; documented here rather than implied.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from ..secrets import SecretResolver
@@ -44,7 +60,11 @@ class TransportError(Exception):
 
 @dataclass(frozen=True, slots=True)
 class ProducerSettings:
-    config: dict[str, Any]
+    #: `repr=False` (security review, Low): this dict carries `sasl.password` in the clear whenever
+    #: `security.protocol` is `SASL_SSL` -- the default dataclass `repr` would otherwise print it
+    #: verbatim, e.g. from an uncaught exception's traceback locals (same reasoning as
+    #: `clickhouse.client.ClickhouseTransport.auth_headers`'s identical `repr=False`).
+    config: dict[str, Any] = field(repr=False)
 
 
 def _security_config(security: KafkaSecuritySpec, resolver: SecretResolver) -> dict[str, Any]:
@@ -53,7 +73,8 @@ def _security_config(security: KafkaSecuritySpec, resolver: SecretResolver) -> d
         return config
     if security.tls is not None:
         config["ssl.endpoint.identification.algorithm"] = "https"  # hostname verification stays on
-        config["ssl.min.version"] = security.tls.min_version
+        # No `ssl.min.version` here: not a real librdkafka property (module docstring). `config.py`
+        # already refused any `minVersion` other than the default before this function ever runs.
         if security.tls.secret_ref is not None:
             config["ssl.ca.location"] = str(resolver.resolve_file(security.tls.secret_ref, "ca.crt"))
     if security.protocol == "SASL_SSL":

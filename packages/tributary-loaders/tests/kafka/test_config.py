@@ -206,6 +206,27 @@ def test_plaintext_is_refused_if_any_one_bootstrap_server_is_not_loopback() -> N
         )
 
 
+def test_plaintext_is_refused_for_a_bootstrap_server_with_a_trailing_newline() -> None:
+    """Security review, Low: `_LOOPBACK_HOST_PORT_RE` is matched with `.fullmatch()`, not `.match()` --
+    with `.match()`, an unescaped trailing `$` in the pattern matches just before a trailing newline as
+    well as the true end of string, so `"127.0.0.1:9092\\n"` would have been accepted as loopback."""
+    with pytest.raises(ConfigError, match="PLAINTEXT"):
+        kafka_destination_config_from_destination(
+            "c",
+            make_destination(
+                params={
+                    "connection": {
+                        "bootstrapServers": ["127.0.0.1:9092\n"],
+                        "security": {"protocol": "PLAINTEXT"},
+                    },
+                    "topic": "partner.events",
+                    "key": "none",
+                    "timeoutMs": 5000,
+                }
+            ),
+        )
+
+
 def test_empty_tls_block_is_not_treated_as_absent() -> None:
     """Security review, High, the same class of bug as the mllp `with.tls: {}` finding: `tls: {}` is
     present-but-empty -- `$defs/clientTls`'s own comment reads it as "use the platform trust store" --
@@ -249,6 +270,46 @@ def test_plaintext_with_an_empty_tls_block_is_still_refused() -> None:
                 }
             ),
         )
+
+
+def test_non_default_min_version_is_refused() -> None:
+    """Security review, High: librdkafka has no property to enforce a TLS minimum version
+    (`client.py`'s module docstring) -- a `minVersion` other than the default is refused at config-build
+    time rather than silently accepted and never actually enforced."""
+    with pytest.raises(ConfigError, match="minVersion"):
+        kafka_destination_config_from_destination(
+            "c",
+            make_destination(
+                params={
+                    "connection": {
+                        "bootstrapServers": ["kafka.partner.example.org:9093"],
+                        "security": {"protocol": "SSL", "tls": {"minVersion": "1.3"}},
+                    },
+                    "topic": "partner.events",
+                    "key": "none",
+                    "timeoutMs": 5000,
+                }
+            ),
+        )
+
+
+def test_default_min_version_is_accepted() -> None:
+    cfg = kafka_destination_config_from_destination(
+        "c",
+        make_destination(
+            params={
+                "connection": {
+                    "bootstrapServers": ["kafka.partner.example.org:9093"],
+                    "security": {"protocol": "SSL", "tls": {"minVersion": "1.2"}},
+                },
+                "topic": "partner.events",
+                "key": "none",
+                "timeoutMs": 5000,
+            }
+        ),
+    )
+    assert cfg.connection.security.tls is not None
+    assert cfg.connection.security.tls.min_version == "1.2"
 
 
 def test_unsupported_protocol_is_refused() -> None:

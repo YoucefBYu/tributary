@@ -75,7 +75,10 @@ def test_ssl_loads_a_trust_bundle_when_a_tls_secret_ref_is_given(tmp_path: Path)
     settings = producer_settings_from_config(config, resolver)
     assert settings.config["ssl.ca.location"] == str(ca)
     assert settings.config["ssl.endpoint.identification.algorithm"] == "https"
-    assert settings.config["ssl.min.version"] == "1.2"
+    # No `ssl.min.version`: not a real librdkafka property (security review, High, client.py's module
+    # docstring) -- `config.py` refuses any non-default minVersion long before this function runs, so
+    # this dict never claims an enforcement this loader cannot actually perform.
+    assert "ssl.min.version" not in settings.config
 
 
 def test_ssl_with_no_tls_block_does_not_load_a_trust_bundle() -> None:
@@ -130,6 +133,45 @@ def test_bootstrap_servers_join_the_destinations_own_list_not_the_engines() -> N
 def test_message_timeout_is_derived_from_the_destinations_timeout() -> None:
     settings = producer_settings_from_config(make_config(timeout_s=8.0), FakeSecretResolver({}))
     assert settings.config["message.timeout.ms"] == 8000
+
+
+def test_producer_settings_repr_never_shows_the_config_dict() -> None:
+    """Security review, Low: the default dataclass `repr` would otherwise print `config` verbatim,
+    including `sasl.password` in the clear for a SASL_SSL destination."""
+    settings = producer_settings_from_config(
+        make_config(
+            connection=KafkaConnectionSpec(
+                ("kafka.example.org:9093",),
+                KafkaSecuritySpec("SASL_SSL", sasl_mechanism="SCRAM-SHA-512", secret_ref="partner-sasl"),  # noqa: S106
+            )
+        ),
+        FakeSecretResolver({("partner-sasl", "username"): "svc", ("partner-sasl", "password"): "s3cret!"}),
+    )
+    assert "s3cret" not in repr(settings)
+    assert "config=" not in repr(settings)
+
+
+@pytest.mark.parametrize(
+    "security",
+    [
+        KafkaSecuritySpec("SSL"),
+        KafkaSecuritySpec("SASL_SSL", sasl_mechanism="SCRAM-SHA-512", secret_ref="partner-sasl"),  # noqa: S106
+    ],
+)
+def test_settings_construct_a_real_producer_with_no_broker_needed(security: KafkaSecuritySpec) -> None:
+    """Security review, High: a fake opener or a plain dict assertion (the shape this suite's other
+    tests use) cannot catch a property librdkafka itself rejects at construction time -- `ssl.min.
+    version` (dropped by this loader's own fix) passed every existing test here while making every real
+    `confluent_kafka.Producer(...)` call for an SSL/SASL_SSL destination fail outright. Constructing a
+    real `Producer` needs no broker: librdkafka validates configuration synchronously and connects to
+    the (here, unreachable) broker asynchronously in the background."""
+    from confluent_kafka import Producer
+
+    resolver = FakeSecretResolver({("partner-sasl", "username"): "svc", ("partner-sasl", "password"): "s3cret!"})
+    settings = producer_settings_from_config(
+        make_config(connection=KafkaConnectionSpec(("127.0.0.1:1",), security)), resolver
+    )
+    Producer(settings.config)  # raises if librdkafka rejects any property in `settings.config`
 
 
 def test_missing_sasl_secret_ref_raises_when_used_without_config_validation() -> None:
