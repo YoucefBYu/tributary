@@ -50,7 +50,18 @@ confirmed against a real, deliberately weakened `OPENSSL_CONF` (`tests/kafka/tes
 TLS 1.0 and TLS 1.1 fail the handshake with "no shared cipher", TLS 1.2 and TLS 1.3 still connect. This
 is a *cipher-suite* floor, not a `ssl.min.version` property, but it is the actually-enforceable
 mechanism this loader has, and unlike relying on OpenSSL's own default, an operator cannot silently
-disable it via environment. `main.py`/`producer_settings_from_config` also logs a startup warning
+disable it via environment.
+
+**Known gap (code review, Low): a broker offering only DHE, not ECDHE, AEAD suites will not negotiate.**
+`ECDHE+AESGCM:ECDHE+CHACHA20` only selects elliptic-curve (EC) Diffie-Hellman key exchange; a broker
+configured to offer plain (non-EC) `DHE` AEAD suites (`DHE-RSA-AES128-GCM-SHA256` and similar) and no
+`ECDHE` suite at all will fail the handshake against this pin exactly the way an old-protocol broker
+does, even though `DHE+AESGCM` is itself TLS 1.2+-only and would not have let TLS 1.0/1.1 through
+either. This is rare in practice — Kafka brokers overwhelmingly default to ECDHE — but an operator
+pointing this loader at a broker whose cipher list was hand-restricted to DHE-only suites should widen
+`ssl.cipher.suites` at the fork/config level (this loader has no per-destination override, by design:
+"refuses to let a caller override it", above) rather than assume the failure is a stale-TLS-version one.
+`main.py`/`producer_settings_from_config` also logs a startup warning
 (`openssl_conf_env_set`) if `OPENSSL_CONF` is set in this process's own environment, since that is the
 one thing that could otherwise weaken TLS 1.2/1.3 itself (not just below it) — deliberately not unset,
 since this process may not own that variable's other uses. This is still a narrower guarantee than the

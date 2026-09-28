@@ -67,6 +67,24 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
+def _wait_until_connectable(port: int, *, timeout: float = 10.0) -> None:
+    """Bounded poll-until-connectable, replacing a fixed `time.sleep()` (code review, Low): `openssl
+    s_server` has no readiness signal on stdout worth parsing, but a bare TCP connect succeeding is
+    enough to know the listener is up -- this test never sends bytes here, only accepts or refuses the
+    handshake later, so a successful plain `connect()` says nothing about the *TLS* config, only that
+    the process has bound and is accepting."""
+    deadline = time.monotonic() + timeout
+    last_error: OSError | None = None
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                return
+        except OSError as exc:
+            last_error = exc
+            time.sleep(0.05)
+    raise TimeoutError(f"openssl s_server on port {port} never accepted a connection") from last_error
+
+
 def _make_config(port: int) -> KafkaDestinationConfig:
     return KafkaDestinationConfig(
         channel="c",
@@ -166,7 +184,7 @@ def _run_probe(port: int, tls_flag: str, tmp_path: Path) -> list[str]:
         stderr=subprocess.DEVNULL,
     )
     try:
-        time.sleep(1.0)  # s_server has no readiness signal on stdout worth parsing
+        _wait_until_connectable(port)
         settings = producer_settings_from_config(_make_config(port), _NoSecretResolver())
         assert settings.config["ssl.cipher.suites"] == PINNED_CIPHER_SUITES
         errors: list[str] = []
