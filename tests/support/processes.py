@@ -273,6 +273,45 @@ def spawn_kafka_loader(
     return proc
 
 
+def spawn_clickhouse_loader(
+    *,
+    channel: str,
+    destination: str,
+    env: str,
+    bootstrap: str,
+    instance_id: str = "loader-e2e",
+    secrets_dir: Path | str | None = None,
+    timeout_s: float = 30.0,
+) -> ManagedProcess:
+    """Same shape as `spawn_postgresql_loader`, for `tributary.loaders.clickhouse`'s real entry point
+    (`packages/tributary-loaders/src/tributary/loaders/clickhouse/main.py`, connector-engineer, `a31f91a`)
+    -- added for a genuine-redelivery duplicate-delivery test in that package's own style
+    (`tests.integration.test_postgresql_loader_duplicate_delivery_uncommitted_redelivery` is the sibling
+    reference for a real sink this suite controls). `--secrets-dir` needs a `DirSecretResolver`-shaped
+    directory, `<secrets_dir>/<secretRef>/<key>`, for the destination's `auth.secretRef` -- there is no
+    default that works against a testcontainers ClickHouse instance."""
+    args = [
+        sys.executable,
+        "-m",
+        "tributary.loaders.clickhouse",
+        "--channel",
+        channel,
+        "--destination",
+        destination,
+        "--env",
+        env,
+        "--bootstrap",
+        bootstrap,
+        "--instance-id",
+        instance_id,
+    ]
+    if secrets_dir is not None:
+        args += ["--secrets-dir", str(secrets_dir)]
+    proc = ManagedProcess(args, env=dict(os.environ))
+    proc.wait_for_event("loader_started", timeout_s=timeout_s)
+    return proc
+
+
 WORKER_PROGRAM = """
 import sys
 from tributary.runtime.clients import KafkaSettings
