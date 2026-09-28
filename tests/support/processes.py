@@ -312,6 +312,44 @@ def spawn_clickhouse_loader(
     return proc
 
 
+def spawn_mllp_loader(
+    *,
+    channel: str,
+    destination: str,
+    env: str,
+    bootstrap: str,
+    instance_id: str = "loader-e2e",
+    secrets_dir: Path | str | None = None,
+    timeout_s: float = 30.0,
+) -> ManagedProcess:
+    """Same shape as `spawn_clickhouse_loader`, for `tributary.loaders.mllp`'s real entry point
+    (`packages/tributary-loaders/src/tributary/loaders/mllp/main.py`, connector-engineer, W2-6) -- added
+    for a genuine-redelivery duplicate-delivery test in that package's own style
+    (`tests.integration.test_postgresql_loader_duplicate_delivery_uncommitted_redelivery` is the sibling
+    reference for a real sink this suite controls). `--secrets-dir` is only needed when the destination's
+    `with.tls.secretRef` names a trust bundle; a loopback destination with no `with.tls` never reads it."""
+    args = [
+        sys.executable,
+        "-m",
+        "tributary.loaders.mllp",
+        "--channel",
+        channel,
+        "--destination",
+        destination,
+        "--env",
+        env,
+        "--bootstrap",
+        bootstrap,
+        "--instance-id",
+        instance_id,
+    ]
+    if secrets_dir is not None:
+        args += ["--secrets-dir", str(secrets_dir)]
+    proc = ManagedProcess(args, env=dict(os.environ))
+    proc.wait_for_event("loader_started", timeout_s=timeout_s)
+    return proc
+
+
 WORKER_PROGRAM = """
 import sys
 from tributary.runtime.clients import KafkaSettings
