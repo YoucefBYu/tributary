@@ -148,6 +148,109 @@ def test_plaintext_with_a_secret_ref_is_refused() -> None:
         )
 
 
+def test_plaintext_to_a_non_loopback_broker_is_refused() -> None:
+    """Security review, High: `$defs/kafkaConnection.allOf`'s "PLAINTEXT only when every bootstrap
+    server is this host" is a deploy-time-only schema rule; `tributary.runtime.spec.ChannelSpec.
+    from_document` (invariant 3: the data plane does not depend on the control plane) never runs the
+    full JSON Schema, so this loader's own config builder must refuse the same shape on its own or a
+    `kafka` destination could send PHI to a real, non-loopback broker in the clear."""
+    with pytest.raises(ConfigError, match="PLAINTEXT"):
+        kafka_destination_config_from_destination(
+            "c",
+            make_destination(
+                params={
+                    "connection": {
+                        "bootstrapServers": ["kafka.partner.example.org:9092"],
+                        "security": {"protocol": "PLAINTEXT"},
+                    },
+                    "topic": "partner.events",
+                    "key": "none",
+                    "timeoutMs": 5000,
+                }
+            ),
+        )
+
+
+@pytest.mark.parametrize("loopback", ["localhost:9092", "127.0.0.1:9092", "[::1]:9092"])
+def test_plaintext_to_a_loopback_broker_is_accepted(loopback: str) -> None:
+    cfg = kafka_destination_config_from_destination(
+        "c",
+        make_destination(
+            params={
+                "connection": {"bootstrapServers": [loopback], "security": {"protocol": "PLAINTEXT"}},
+                "topic": "partner.events",
+                "key": "none",
+                "timeoutMs": 5000,
+            }
+        ),
+    )
+    assert cfg.connection.security.protocol == "PLAINTEXT"
+
+
+def test_plaintext_is_refused_if_any_one_bootstrap_server_is_not_loopback() -> None:
+    """A mixed list must not let one loopback entry vouch for the rest."""
+    with pytest.raises(ConfigError, match="PLAINTEXT"):
+        kafka_destination_config_from_destination(
+            "c",
+            make_destination(
+                params={
+                    "connection": {
+                        "bootstrapServers": ["127.0.0.1:9092", "kafka.partner.example.org:9092"],
+                        "security": {"protocol": "PLAINTEXT"},
+                    },
+                    "topic": "partner.events",
+                    "key": "none",
+                    "timeoutMs": 5000,
+                }
+            ),
+        )
+
+
+def test_empty_tls_block_is_not_treated_as_absent() -> None:
+    """Security review, High, the same class of bug as the mllp `with.tls: {}` finding: `tls: {}` is
+    present-but-empty -- `$defs/clientTls`'s own comment reads it as "use the platform trust store" --
+    and must still produce a `KafkaTlsSpec` (so `client.py` sets
+    `ssl.endpoint.identification.algorithm=https` explicitly), not `None` the way an absent `tls` key
+    does for a `PLAINTEXT` destination."""
+    cfg = kafka_destination_config_from_destination(
+        "c",
+        make_destination(
+            params={
+                "connection": {
+                    "bootstrapServers": ["kafka.partner.example.org:9093"],
+                    "security": {"protocol": "SSL", "tls": {}},
+                },
+                "topic": "partner.events",
+                "key": "none",
+                "timeoutMs": 5000,
+            }
+        ),
+    )
+    assert cfg.connection.security.tls is not None
+    assert cfg.connection.security.tls.secret_ref is None
+    assert cfg.connection.security.tls.min_version == "1.2"
+
+
+def test_plaintext_with_an_empty_tls_block_is_still_refused() -> None:
+    """The truthiness fix must not accidentally let `tls: {}` slip past the PLAINTEXT-cannot-carry-tls
+    check the way it used to slip past `tls_obj else None`."""
+    with pytest.raises(ConfigError, match="PLAINTEXT"):
+        kafka_destination_config_from_destination(
+            "c",
+            make_destination(
+                params={
+                    "connection": {
+                        "bootstrapServers": ["127.0.0.1:9092"],
+                        "security": {"protocol": "PLAINTEXT", "tls": {}},
+                    },
+                    "topic": "partner.events",
+                    "key": "none",
+                    "timeoutMs": 5000,
+                }
+            ),
+        )
+
+
 def test_unsupported_protocol_is_refused() -> None:
     with pytest.raises(ConfigError, match="protocol"):
         kafka_destination_config_from_destination(

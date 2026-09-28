@@ -41,6 +41,17 @@ SUPPORTED_IDEMPOTENCY_TECHNIQUES = frozenset({"idempotency-key-header", "none"})
 #: `$defs/kafkaSecurity.protocol`.
 SUPPORTED_SECURITY_PROTOCOLS = frozenset({"PLAINTEXT", "SSL", "SASL_SSL"})
 
+#: `$defs/loopbackHostPort`, duplicated from the schema (defence in depth, same situation
+#: `postgresql/config.py`'s `_is_loopback` and `mllp/config.py`'s `_is_loopback` document): this
+#: runtime-side parser (`tributary.runtime.spec.ChannelSpec.from_document`) never runs the full JSON
+#: Schema, only its own hand-written field checks — the schema's "PLAINTEXT only when every bootstrap
+#: server is this host" rule (`$defs/kafkaConnection.allOf`) is otherwise enforced *only* at deploy
+#: time, by the control plane, which invariant 3 says the data plane must not depend on being up, let
+#: alone on having actually run against this exact document. Without this check here, a `kafka`
+#: destination's `bootstrapServers` pointed at a real, non-loopback broker with `protocol: PLAINTEXT`
+#: builds a config this loader would happily send PHI through in the clear (security review, High).
+_LOOPBACK_HOST_PORT_RE = re.compile(r"^(localhost|127\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}|\[::1\]):[0-9]{2,5}$")
+
 #: `$defs/externalTopic`: not `_tb.*`, not channel-shaped. Duplicated from the schema pattern rather
 #: than imported (there is no shared home for JSON-Schema-derived constants yet — same situation
 #: `postgresql/config.py`'s `_TABLE_RE` documents), so this is defence in depth: the control plane
@@ -112,8 +123,16 @@ def _security_from_params(security: Mapping[str, Any], destination: str) -> Kafk
             f"supported (supported: {sorted(SUPPORTED_SECURITY_PROTOCOLS)})"
         )
     tls_obj = security.get("tls")
+    # `tls_obj is not None`, never a truthiness check (security review, High, the same class of bug as
+    # `7ed8343`'s TLS-failure classification and the `mllp` empty-`tls`-block finding): `tls: {}` is a
+    # present-but-empty object -- "use the platform trust store" ($defs/clientTls's own comment) -- and
+    # `if tls_obj` treats it exactly like `tls` being absent, silently dropping the explicit
+    # `ssl.endpoint.identification.algorithm=https` this loader's `client.py` only sets when
+    # `security.tls is not None`.
     tls = (
-        KafkaTlsSpec(tls_obj.get("secretRef"), tls_obj.get("minVersion", DEFAULT_MIN_TLS_VERSION)) if tls_obj else None
+        KafkaTlsSpec(tls_obj.get("secretRef"), tls_obj.get("minVersion", DEFAULT_MIN_TLS_VERSION))
+        if tls_obj is not None
+        else None
     )
     if protocol == "SASL_SSL":
         mechanism = security.get("saslMechanism")
@@ -140,7 +159,17 @@ def _connection_from_params(params: Mapping[str, Any], destination: str) -> Kafk
     if not isinstance(bootstrap, list) or not bootstrap or not all(isinstance(b, str) for b in bootstrap):
         raise ConfigError(f"destination {destination!r}: with.connection.bootstrapServers must be a non-empty list")
     security = _require(connection, "security", "with.connection")
-    return KafkaConnectionSpec(tuple(bootstrap), _security_from_params(security, destination))
+    security_spec = _security_from_params(security, destination)
+    if security_spec.protocol == "PLAINTEXT" and not all(_LOOPBACK_HOST_PORT_RE.match(b) for b in bootstrap):
+        # Defence in depth for `$defs/kafkaConnection.allOf`'s "PLAINTEXT only when every bootstrap
+        # server is this host" (module constant's docstring, security review, High): this runtime-side
+        # parser must refuse the same shape the schema refuses at deploy time, not trust that every
+        # document it is ever handed already passed that check.
+        raise ConfigError(
+            f"destination {destination!r}: with.connection.security.protocol PLAINTEXT is only allowed "
+            "when every bootstrapServers entry is loopback (README 3.4.7 / $defs/kafkaConnection.allOf)"
+        )
+    return KafkaConnectionSpec(tuple(bootstrap), security_spec)
 
 
 def _validate_topic(topic: Any, destination: str) -> str:
