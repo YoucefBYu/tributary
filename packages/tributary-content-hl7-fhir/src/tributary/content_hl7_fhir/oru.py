@@ -255,4 +255,9 @@ def _diagnostic_report_identifier(obr: Segment, *, msg_id: str, fallback_system:
     placer = cx_identifier(obr, 2, fallback_system=fallback_system)
     if placer is not None:
         return placer
-    return message_identifier(msg_id, discriminator=f"obr-{obr.field(1)}")
+    obr_1 = obr.field(1)
+
+    def build() -> Identifier:
+        return message_identifier(msg_id, discriminator=f"obr-{obr_1}")
+
+    return safe_build(build, path="OBR", reason="could not build the DiagnosticReport identifier")

@@ -10,6 +10,8 @@ import json
 
 import pytest
 from tributary.content_hl7_fhir import UnsupportedTriggerError, oru_r01_to_fhir
+from tributary.content_hl7_fhir.errors import InvalidFieldError
+from tributary.content_hl7_fhir.oru import _diagnostic_report_identifier
 from tributary.fhir.fakes import fake_fhir_context
 from tributary.hl7v2.step import parse
 from tributary.sdk import Message
@@ -272,6 +274,41 @@ def test_msh4_hd_value_uses_only_the_namespace_id_component_for_diagnostic_repor
     bundle = json.loads(mapped.payload)
     report_entry = bundle["entry"][-1]
     assert report_entry["resource"]["identifier"] == [{"system": "urn:id:SYNTH-LAB", "value": "SYNTHFILL0086"}]
+
+
+# -- LOW, security: the OBR-1 fallback discriminator is sender text, built through safe_build ------------
+
+
+class _FakeSegment:
+    """A minimal stand-in for `tributary.hl7v2.Segment`: `_diagnostic_report_identifier` and
+    `cx_identifier` only ever call `.field(...)` on the segment they are given, so a bare object with
+    that one method is enough to drive `_diagnostic_report_identifier` directly, without a real parsed
+    message -- including with a value (a lone UTF-16 surrogate) `tributary.hl7v2` itself would never
+    hand back from a real wire message, to prove the `safe_build` wrapping holds even so."""
+
+    def __init__(self, obr_1: str) -> None:
+        self._obr_1 = obr_1
+
+    def field(self, field: int, *, component: int | None = None, repetition: int = 1) -> str:
+        if field == 1 and component is None:
+            return self._obr_1
+        return ""
+
+
+def test_obr1_fallback_discriminator_failure_raises_a_clean_invalid_field_error() -> None:
+    """Security review LOW: OBR-1 (the fallback discriminator when OBR-2 and OBR-3 are both absent) is
+    sender text, so `_diagnostic_report_identifier` builds it through `safe_build` -- a lone surrogate is
+    the only known value `fhir.resources`' own `Identifier.value` validator rejects, and is not reachable
+    through today's HL7 parsing, but the wrapping must hold regardless of how the failure happens."""
+    obr = _FakeSegment("\ud800")
+    with pytest.raises(InvalidFieldError) as excinfo:
+        _diagnostic_report_identifier(
+            obr, msg_id="01a0e729-0000-7000-8000-000000000000", fallback_system="urn:id:SYNTH-LAB"
+        )  # type: ignore[arg-type]
+    exc = excinfo.value
+    assert exc.path == "OBR"
+    assert exc.__cause__ is None
+    assert exc.__context__ is None
 
 
 # -- LOW: fhir.resources is an explicit dependency of this package (checked in test_import.py's sibling) -
