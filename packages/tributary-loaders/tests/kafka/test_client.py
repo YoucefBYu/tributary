@@ -5,16 +5,54 @@ split `postgresql/client.py`'s tests use."""
 
 from __future__ import annotations
 
+import functools
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
-from tributary.loaders.kafka.client import TransportError, producer_settings_from_config
+from tributary.loaders.kafka.client import PINNED_CIPHER_SUITES, TransportError, producer_settings_from_config
 from tributary.loaders.kafka.config import (
     KafkaConnectionSpec,
     KafkaDestinationConfig,
     KafkaSecuritySpec,
     KafkaTlsSpec,
 )
+
+
+@functools.lru_cache(maxsize=1)
+def _self_signed_pem() -> str:
+    """A real (self-signed, throwaway) certificate PEM -- `ssl.ca.location` is parsed by librdkafka's
+    linked OpenSSL at `Producer(...)`-construction time (`test_settings_construct_a_real_producer_
+    with_no_broker_needed`), so a placeholder string is not enough; generated once per test run and
+    cached, since this test suite never actually connects anywhere with it."""
+    if shutil.which("openssl") is None:
+        pytest.skip("openssl binary not available to generate a throwaway certificate")
+    with tempfile.TemporaryDirectory() as d:
+        key, cert = Path(d) / "key.pem", Path(d) / "cert.pem"
+        subprocess.run(  # noqa: S603 - fixed argv, test fixture only
+            [
+                shutil.which("openssl"),
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-keyout",
+                str(key),
+                "-out",
+                str(cert),
+                "-days",
+                "1",
+                "-subj",
+                "/CN=test-only",
+            ],
+            check=True,
+            capture_output=True,
+            timeout=30,
+        )
+        return cert.read_text()
 
 
 class FakeSecretResolver:
@@ -155,23 +193,127 @@ def test_producer_settings_repr_never_shows_the_config_dict() -> None:
     "security",
     [
         KafkaSecuritySpec("SSL"),
+        KafkaSecuritySpec("SSL", tls=KafkaTlsSpec()),
+        KafkaSecuritySpec("SSL", tls=KafkaTlsSpec("partner-ca")),
         KafkaSecuritySpec("SASL_SSL", sasl_mechanism="SCRAM-SHA-512", secret_ref="partner-sasl"),  # noqa: S106
+        KafkaSecuritySpec(
+            "SASL_SSL",
+            sasl_mechanism="SCRAM-SHA-512",
+            secret_ref="partner-sasl",  # noqa: S106
+            tls=KafkaTlsSpec("partner-ca"),
+        ),
     ],
 )
-def test_settings_construct_a_real_producer_with_no_broker_needed(security: KafkaSecuritySpec) -> None:
+def test_settings_construct_a_real_producer_with_no_broker_needed(security: KafkaSecuritySpec, tmp_path: Path) -> None:
     """Security review, High: a fake opener or a plain dict assertion (the shape this suite's other
     tests use) cannot catch a property librdkafka itself rejects at construction time -- `ssl.min.
     version` (dropped by this loader's own fix) passed every existing test here while making every real
     `confluent_kafka.Producer(...)` call for an SSL/SASL_SSL destination fail outright. Constructing a
     real `Producer` needs no broker: librdkafka validates configuration synchronously and connects to
-    the (here, unreachable) broker asynchronously in the background."""
+    the (here, unreachable) broker asynchronously in the background.
+
+    Security review, Medium: the original version of this test only ever exercised `tls=None` -- it
+    never actually built a `Producer` through the branch (`security.tls is not None`) that used to set
+    the offending `ssl.min.version`, so it could not have caught that bug in the shape it actually
+    shipped in. `KafkaTlsSpec()`/`KafkaTlsSpec("partner-ca")` cover both the no-secretRef and
+    with-secretRef TLS shapes."""
     from confluent_kafka import Producer
 
-    resolver = FakeSecretResolver({("partner-sasl", "username"): "svc", ("partner-sasl", "password"): "s3cret!"})
+    ca = tmp_path / "ca.crt"
+    ca.write_text(_self_signed_pem())  # ssl.ca.location is parsed at Producer-construction time
+    resolver = FakeSecretResolver(
+        {("partner-sasl", "username"): "svc", ("partner-sasl", "password"): "s3cret!"},
+        {("partner-ca", "ca.crt"): ca},
+    )
     settings = producer_settings_from_config(
         make_config(connection=KafkaConnectionSpec(("127.0.0.1:1",), security)), resolver
     )
     Producer(settings.config)  # raises if librdkafka rejects any property in `settings.config`
+
+
+def test_ssl_and_sasl_ssl_always_pin_the_cipher_floor() -> None:
+    """Security review, Medium: `ssl.cipher.suites` is the actually-enforceable TLS floor (module
+    docstring) -- set whenever the protocol is TLS, not only when an explicit `tls` block is present
+    (SASL_SSL negotiates TLS either way). `tests/kafka/test_integration_kafka_cipher_floor.py` proves
+    this pin genuinely rejects a TLS 1.1 handshake even under a weakened `OPENSSL_CONF`."""
+    ssl_settings = producer_settings_from_config(
+        make_config(connection=KafkaConnectionSpec(("kafka.example.org:9093",), KafkaSecuritySpec("SSL"))),
+        FakeSecretResolver({}),
+    )
+    assert ssl_settings.config["ssl.cipher.suites"] == PINNED_CIPHER_SUITES
+
+    sasl_settings = producer_settings_from_config(
+        make_config(
+            connection=KafkaConnectionSpec(
+                ("kafka.example.org:9093",),
+                KafkaSecuritySpec("SASL_SSL", sasl_mechanism="SCRAM-SHA-512", secret_ref="partner-sasl"),  # noqa: S106
+            )
+        ),
+        FakeSecretResolver({("partner-sasl", "username"): "svc", ("partner-sasl", "password"): "s3cret!"}),
+    )
+    assert sasl_settings.config["ssl.cipher.suites"] == PINNED_CIPHER_SUITES
+
+
+def test_plaintext_never_pins_a_cipher_suite() -> None:
+    config = make_config(connection=KafkaConnectionSpec(("127.0.0.1:9092",), KafkaSecuritySpec("PLAINTEXT")))
+    settings = producer_settings_from_config(config, FakeSecretResolver({}))
+    assert "ssl.cipher.suites" not in settings.config
+
+
+def test_a_caller_supplied_cipher_override_is_refused() -> None:
+    """Security review, Medium: the pinned floor is not a caller-configurable knob -- a destination's
+    own `extra_producer_config` cannot widen it back out to include a pre-TLS-1.2 cipher suite."""
+    config = make_config(
+        connection=KafkaConnectionSpec(("kafka.example.org:9093",), KafkaSecuritySpec("SSL")),
+        extra_producer_config={"ssl.cipher.suites": "DEFAULT:@SECLEVEL=0"},
+    )
+    with pytest.raises(TransportError, match=r"ssl\.cipher\.suites"):
+        producer_settings_from_config(config, FakeSecretResolver({}))
+
+
+def test_openssl_conf_in_the_environment_logs_a_startup_warning(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Security review, Medium: `ssl.cipher.suites` cannot compensate for `OPENSSL_CONF` weakening
+    TLS 1.2/1.3 itself (only for it weakening the protocol floor below the pinned suites) -- flagged at
+    startup, not unset, since this process does not own whatever else set that variable."""
+    monkeypatch.setenv("OPENSSL_CONF", "/etc/example/weakened.cnf")
+    events: list[tuple[str, dict[str, object]]] = []
+
+    class RecordingLogger:
+        def debug(self, event: str, /, **fields: object) -> None:
+            pass
+
+        def info(self, event: str, /, **fields: object) -> None:
+            pass
+
+        def warning(self, event: str, /, **fields: object) -> None:
+            events.append((event, fields))
+
+        def error(self, event: str, /, **fields: object) -> None:
+            pass
+
+    producer_settings_from_config(make_config(), FakeSecretResolver({}), log=RecordingLogger())
+    assert events and events[0][0] == "openssl_conf_env_set"
+
+
+def test_no_openssl_conf_in_the_environment_logs_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("OPENSSL_CONF", raising=False)
+    events: list[str] = []
+
+    class RecordingLogger:
+        def debug(self, event: str, /, **fields: object) -> None:
+            pass
+
+        def info(self, event: str, /, **fields: object) -> None:
+            pass
+
+        def warning(self, event: str, /, **fields: object) -> None:
+            events.append(event)
+
+        def error(self, event: str, /, **fields: object) -> None:
+            pass
+
+    producer_settings_from_config(make_config(), FakeSecretResolver({}), log=RecordingLogger())
+    assert events == []
 
 
 def test_missing_sasl_secret_ref_raises_when_used_without_config_validation() -> None:

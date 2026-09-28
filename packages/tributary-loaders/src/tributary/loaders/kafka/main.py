@@ -84,7 +84,7 @@ def build_loop(a: argparse.Namespace) -> tuple[ConsumerLoop, KafkaRecordHandler]
     config = kafka_destination_config_from_destination(spec.name, destination)
 
     resolver = DirSecretResolver(a.secrets_dir) if a.secrets_dir else DirSecretResolver()
-    settings = producer_settings_from_config(config, resolver)
+    settings = producer_settings_from_config(config, resolver, log=log)
     error_sink = LastErrorSink()
     destination_producer = cast("KafkaProducerLike", Producer({**settings.config, "error_cb": error_sink}))
     kafka_loader = KafkaLoader(config, destination_producer, error_sink=error_sink, log=log)
