@@ -35,9 +35,8 @@ TB_OUTPUT_ENVELOPE_INVALID: Final = "TB_OUTPUT_ENVELOPE_INVALID"
 TB_PIPELINE_TIME_BUDGET: Final = "TB_PIPELINE_TIME_BUDGET"
 
 #: A dead letter that cannot be written (its record exceeds the envelope even with registered headers
-#: only): the partition halts. A member of the reserved `TB_` family, so usable without a registry
-#: change (envelope 2.3.2 rule 2); registration by name is requested, and until then it is deliberately
-#: not in `ENGINE_CODES`, which mirrors the registry's exact names.
+#: only): the partition halts. A member of the reserved `TB_` family, registered by name in
+#: error-codes.json (2026-09-28).
 TB_DLQ_UNWRITABLE: Final = "TB_DLQ_UNWRITABLE"
 
 # Built-in step codes. Named here so the built-ins and the reserved list cannot drift apart.
@@ -72,6 +71,7 @@ ENGINE_CODES: Final = frozenset(
         ENVELOPE_INVALID,  # log_only
         TB_OUTPUT_ENVELOPE_INVALID,
         TB_PIPELINE_TIME_BUDGET,
+        TB_DLQ_UNWRITABLE,
         # built-in steps (channel-spec README 3.3.2)
         FILTER_UNRESOLVED,
         VALIDATE_NOT_HL7,
