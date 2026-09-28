@@ -33,6 +33,7 @@ import time
 from typing import Any
 
 from ..backpressure import ByteBudget
+from ..engine_kafka import engine_security_properties
 from ..metrics import Metrics
 from ..net import require_safe_bind
 from ..secrets import DirSecretResolver, SecretResolver
@@ -185,14 +186,19 @@ async def serve_from_channel_spec(
     instance: str = "mllp-0",
     secret_resolver: SecretResolver | None = None,
     metrics_file: str | None = None,
+    engine_security_file: str | None = None,
 ) -> None:
     """Load, bind and serve forever. The coroutine to run from `python -m tributary.receivers.mllp`
     and the one an integration test drives with a real Kafka cluster."""
     cfg = mllp_settings_from_channel_spec(spec, env=env, bootstrap_servers=bootstrap_servers, instance=instance)
+    engine_security = engine_security_properties(
+        cfg.bootstrap_servers, engine_security_file, secret_resolver or DirSecretResolver()
+    )
     topic = topic_name(cfg.env, cfg.channel)
     publisher = RawPublisher(
         cfg.bootstrap_servers,
         topic,
+        security=engine_security,
         linger_ms=cfg.linger_ms,
         queue_max_messages=cfg.max_inflight * 2,
     )
@@ -253,6 +259,11 @@ def main() -> None:
     p.add_argument("--secrets-dir", help="overrides TB_SECRETS_DIR / the default secrets mount")
     p.add_argument("--metrics-file")
     p.add_argument(
+        "--engine-security",
+        help="JSON file (channel-spec $defs/kafkaSecurity shape) for the engine Kafka link; absent means "
+        "plaintext, which is refused unless every --bootstrap host is loopback (PROVISIONAL, engine_kafka.py)",
+    )
+    p.add_argument(
         "--profile",
         default=os.environ.get("TB_PROFILE", "lite"),
         choices=["lite", "production"],
@@ -270,6 +281,7 @@ def main() -> None:
         instance=a.instance,
         secret_resolver=resolver,
         metrics_file=a.metrics_file,
+        engine_security_file=a.engine_security,
     )
     try:
         import uvloop  # type: ignore[import-not-found]  # no Windows wheel; optional on this platform

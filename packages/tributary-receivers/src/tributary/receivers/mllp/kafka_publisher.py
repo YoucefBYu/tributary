@@ -111,6 +111,10 @@ class RawPublisher:
     ) -> None:
         from confluent_kafka import Producer  # lazy: unit tests need no broker client
 
+        from ..engine_kafka import require_secure_link
+
+        require_secure_link(bootstrap_servers, security)  # before anything is built or connected
+
         self.topic = topic
         self._ordering: Ordering = ordering
         defaults = topic_defaults if topic_defaults is not None else _cached_topic_defaults()

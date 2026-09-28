@@ -30,7 +30,7 @@ DEFAULT_MAX_MESSAGE_BYTES = 1_000_000  # envelope inline limit, invariant 8
 DEFAULT_MIN_TLS_VERSION = "1.2"
 SUPPORTED_NACK_ON = frozenset({"parse-error"})
 
-_LOOPBACK_HOST_PORT = re.compile(r"(localhost|127\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}|\[::1\]):[0-9]{2,5}")
+LOOPBACK_HOST_PORT = re.compile(r"(localhost|127\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}|\[::1\]):[0-9]{2,5}")
 _HOST_PORT = re.compile(r"^(\[::1\]|[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?):[0-9]{2,5}$")
 _EXTERNAL_TOPIC = re.compile(r"^[A-Za-z0-9._-]{1,249}$")
 _CHANNEL_SHAPED = re.compile(r"^[a-z][a-z0-9-]{0,15}\.[a-z][a-z0-9-]{0,63}\.(raw|retry|dlq|reply|out\..+)$")
@@ -90,7 +90,7 @@ class KafkaSourceSettings:
         if not all(_HOST_PORT.match(b) for b in self.source_bootstrap):
             raise ConfigError(f"channel {self.channel!r}: kafka.connection.bootstrapServers entry is not host:port")
         if self.security.protocol == "PLAINTEXT" and not all(
-            _LOOPBACK_HOST_PORT.fullmatch(b) for b in self.source_bootstrap
+            LOOPBACK_HOST_PORT.fullmatch(b) for b in self.source_bootstrap
         ):
             raise ConfigError(
                 f"channel {self.channel!r}: PLAINTEXT is only allowed when every bootstrap server is loopback"
@@ -114,7 +114,7 @@ def _require(mapping: Mapping[str, Any], key: str, where: str) -> Any:
         raise ConfigError(f"{where}: missing required field {key!r}") from None
 
 
-def _security(obj: Mapping[str, Any], channel: str) -> SourceSecurity:
+def parse_security(obj: Mapping[str, Any], channel: str) -> SourceSecurity:
     protocol = obj.get("protocol")
     if protocol not in ("PLAINTEXT", "SSL", "SASL_SSL"):
         raise ConfigError(f"channel {channel!r}: kafka.connection.security.protocol is not supported")
@@ -183,7 +183,7 @@ def kafka_source_settings_from_channel_spec(
         channel_version=int(metadata.get("version", 0)),
         content_type=content_type,
         source_bootstrap=tuple(_require(connection, "bootstrapServers", "source.kafka.connection")),
-        security=_security(_require(connection, "security", "source.kafka.connection"), channel),
+        security=parse_security(_require(connection, "security", "source.kafka.connection"), channel),
         topic=_require(kafka, "topic", "source.kafka"),
         start_from=_require(kafka, "startFrom", "source.kafka"),
         nack_on=nack_on,

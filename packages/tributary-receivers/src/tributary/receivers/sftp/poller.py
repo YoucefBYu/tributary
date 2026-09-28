@@ -48,6 +48,7 @@ from typing import Any, Protocol
 from tributary.sdk import Message
 from tributary.sdk import headers as h
 
+from ..engine_kafka import engine_security_properties
 from ..envelope import build_raw_envelope
 from ..errors import ConfigError
 from ..keys import resolve_key
@@ -272,13 +273,16 @@ async def serve_from_channel_spec(
     instance: str = "sftp-0",
     secret_resolver: SecretResolver | None = None,
     metrics_file: str | None = None,
+    engine_security_file: str | None = None,
 ) -> None:
     cfg = sftp_settings_from_channel_spec(spec, env=env, bootstrap_servers=bootstrap_servers, instance=instance)
-    topic = topic_name(cfg.env, cfg.channel)
     resolver = secret_resolver or DirSecretResolver()
+    engine_security = engine_security_properties(cfg.bootstrap_servers, engine_security_file, resolver)
+    topic = topic_name(cfg.env, cfg.channel)
     publisher = RawPublisher(
         cfg.bootstrap_servers,
         topic,
+        security=engine_security,
         ordering="per-key" if cfg.key_expression is not None else "none",
         client_id_prefix="sftp-receiver",
     )
@@ -310,6 +314,11 @@ def main() -> None:
     p.add_argument("--instance", default="sftp-0")
     p.add_argument("--secrets-dir")
     p.add_argument("--metrics-file")
+    p.add_argument(
+        "--engine-security",
+        help="JSON file (channel-spec $defs/kafkaSecurity shape) for the engine Kafka link; absent means "
+        "plaintext, which is refused unless every --bootstrap host is loopback (PROVISIONAL, engine_kafka.py)",
+    )
     a = p.parse_args()
     logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(message)s")
     with open(a.channel_spec, encoding="utf-8") as f:
@@ -322,6 +331,7 @@ def main() -> None:
         instance=a.instance,
         secret_resolver=resolver,
         metrics_file=a.metrics_file,
+        engine_security_file=a.engine_security,
     )
     try:
         import uvloop  # type: ignore[import-not-found]
