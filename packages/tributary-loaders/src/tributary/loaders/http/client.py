@@ -49,8 +49,17 @@ class Response:
 
 
 class TransportError(Exception):
-    """The request never got a response at all: DNS failure, connection refused, TLS failure, a
-    timeout. Always retryable (`loader.py`'s classification), never a destination's own answer."""
+    """The request never got a response at all: DNS failure, connection refused, a non-certificate TLS
+    failure (a reset mid-handshake, `SSLEOFError`, ...), a timeout. Always retryable (`loader.py`'s
+    classification), never a destination's own answer."""
+
+
+class TlsVerificationError(Exception):
+    """The TLS **certificate verification** failed: an unknown CA or a hostname mismatch
+    (`ssl.SSLCertVerificationError`, matching the `clickhouse` loader's identical split, security
+    review). Never retryable — a bad CA or hostname mismatch fails identically on every attempt, unlike
+    other `ssl.SSLError` subclasses (a reset connection mid-handshake), which stay a retryable
+    `TransportError`."""
 
 
 _SSL_CONTEXT = ssl.create_default_context()  # verifies against the OS trust store; TLS on by default
@@ -78,18 +87,37 @@ _OPENER = urllib.request.build_opener(
 )
 
 
-def stdlib_send(request: Request) -> Response:
-    """Synchronous; callers on an event loop must run this via `asyncio.to_thread`."""
+def stdlib_send(request: Request, *, opener: urllib.request.OpenerDirector = _OPENER) -> Response:
+    """Synchronous; callers on an event loop must run this via `asyncio.to_thread`.
+
+    `opener` defaults to the module-level singleton but is overridable — for a test that needs a
+    different `SSLContext` (a throwaway CA, to prove the TLS failure classification against a real
+    handshake: `tests/http/test_tls_failures.py`), not for production code, which should never build a
+    second opener per call the way `stdlib_send`'s docstring already explains `_OPENER` avoids."""
     urllib_request = urllib.request.Request(  # noqa: S310 - url is channel-spec-authored, not from the message
         request.url, data=request.body or None, headers=request.headers, method=request.method
     )
     try:
-        with _OPENER.open(urllib_request, timeout=request.timeout_s) as resp:
+        with opener.open(urllib_request, timeout=request.timeout_s) as resp:
             return Response(resp.status, dict(resp.headers), resp.read())
     except urllib.error.HTTPError as exc:
         # a non-2xx (or, now, non-redirected 3xx) response IS a response: read it (for status/body
         # classification) rather than let it surface as an exception, which is what urllib does by
         # default for anything outside 200-299 that no handler resolves.
         return Response(exc.code, dict(exc.headers or {}), exc.read())
-    except (urllib.error.URLError, TimeoutError, OSError, ssl.SSLError) as exc:
+    except urllib.error.URLError as exc:
+        # `urlopen` wraps a handshake failure in `URLError(reason=...)` rather than letting the
+        # `ssl.SSLError` escape directly (security review, Low, found on the clickhouse loader's
+        # identical pattern): a bare `except ssl.SSLError` here would never actually run against a
+        # real connection, silently misclassifying a hostname mismatch or an unknown CA as
+        # `TransportError`/retryable. Only `SSLCertVerificationError` (an unknown CA or a hostname
+        # mismatch, both) is `TlsVerificationError`/non-retryable.
+        if isinstance(exc.reason, ssl.SSLCertVerificationError):
+            raise TlsVerificationError(str(exc.reason)) from exc
+        raise TransportError(str(exc)) from exc
+    except ssl.SSLCertVerificationError as exc:
+        # In case a certificate failure is ever raised directly rather than wrapped in URLError (not
+        # observed against a real connection, but cheap defence in depth).
+        raise TlsVerificationError(str(exc)) from exc
+    except (ssl.SSLError, TimeoutError, OSError) as exc:
         raise TransportError(str(exc)) from exc

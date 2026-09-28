@@ -188,15 +188,18 @@ def test_no_tls_secret_ref_uses_the_stdlib_default_context(monkeypatch: pytest.M
 
 
 def test_tls_verification_failure_is_a_distinct_exception_from_transport_error() -> None:
-    """Code review, Low: folding `ssl.SSLError` into `TransportError` made `loader.py` classify a TLS
-    failure as `CONNECT_FAILED`/retryable instead of `TLS_VERIFY_FAILED`/not-retryable."""
+    """Code review, Low: folding a certificate failure into `TransportError` made `loader.py` classify
+    it `CONNECT_FAILED`/retryable instead of `TLS_VERIFY_FAILED`/not-retryable. `SSLCertVerificationError`
+    raised directly (not wrapped in `URLError`, security review's later refinement covers that real-world
+    path in `tests/clickhouse/test_tls_failures.py`) still reaches `TlsVerificationError` as a defensive
+    fallback."""
     import ssl
 
     from tributary.loaders.clickhouse.client import ClickhouseTransport, TlsVerificationError, TransportError
 
     class RaisingOpener:
         def open(self, request: object, timeout: float) -> object:
-            raise ssl.SSLError("certificate verify failed")
+            raise ssl.SSLCertVerificationError("certificate verify failed")
 
     transport = ClickhouseTransport("https://example.org/?database=d", {}, RaisingOpener())  # type: ignore[arg-type]
     with pytest.raises(TlsVerificationError):

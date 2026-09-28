@@ -162,9 +162,24 @@ class ClickhouseTransport:
             except OSError as read_exc:
                 raise TransportError(str(read_exc)) from read_exc
             return Response(exc.code, dict(exc.headers or {}), body)
-        except ssl.SSLError as exc:
+        except urllib.error.URLError as exc:
+            # `urlopen` wraps a handshake failure in `URLError(reason=...)` rather than letting the
+            # `ssl.SSLError` escape directly (security review, Low — the `except ssl.SSLError` below
+            # never actually ran against a real connection, so a hostname mismatch or an unknown CA
+            # was misclassified `CONNECT_FAILED`/retryable). Only a **certificate-verification**
+            # failure is `TlsVerificationError`/non-retryable: `SSLCertVerificationError` covers both
+            # an unknown CA and a hostname mismatch (both confirmed against a real listener,
+            # `tests/clickhouse/test_tls_failures.py`).
+            # Every other `ssl.SSLError` (`SSLEOFError`, `SSLZeroReturnError`, ...), raised mid-read on
+            # a reset connection, is transient and stays a retryable `TransportError`.
+            if isinstance(exc.reason, ssl.SSLCertVerificationError):
+                raise TlsVerificationError(str(exc.reason)) from exc
+            raise TransportError(str(exc)) from exc
+        except ssl.SSLCertVerificationError as exc:
+            # In case a certificate failure is ever raised directly rather than wrapped in URLError
+            # (not observed against a real connection, but cheap defence in depth).
             raise TlsVerificationError(str(exc)) from exc
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        except (ssl.SSLError, TimeoutError, OSError) as exc:
             raise TransportError(str(exc)) from exc
 
 

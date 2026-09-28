@@ -64,12 +64,20 @@ from tributary.sdk.context import Logger
 
 from ..secrets import SecretResolver
 from .circuit_breaker import CircuitBreaker, State
-from .client import Request, Response, TransportError, stdlib_send
+from .client import Request, Response, TlsVerificationError, TransportError, stdlib_send
 from .config import AuthSpec, HttpDestinationConfig
 from .metrics import LoaderMetrics
 
 Reason = Literal[
-    "success", "circuit-open", "timeout", "transport-error", "http-5xx", "http-429", "http-4xx", "http-3xx"
+    "success",
+    "circuit-open",
+    "timeout",
+    "transport-error",
+    "tls-verify-failed",
+    "http-5xx",
+    "http-429",
+    "http-4xx",
+    "http-3xx",
 ]
 
 DEFAULT_MAX_CONCURRENT_REQUESTS = 8
@@ -100,7 +108,7 @@ class DeliveryOutcome:
 
     @property
     def retryable(self) -> bool:
-        return not self.success and self.reason not in ("http-4xx", "http-3xx")
+        return not self.success and self.reason not in ("http-4xx", "http-3xx", "tls-verify-failed")
 
 
 def classify_status(status_code: int) -> Reason:
@@ -218,6 +226,8 @@ class HttpLoader:
             # not "late" and not worth a log line.
             inner.add_done_callback(self._log_late_completion)
             return self._record_failure(msg_id, "timeout")
+        except TlsVerificationError:
+            return self._record_failure(msg_id, "tls-verify-failed")
         except TransportError:
             return self._record_failure(msg_id, "transport-error")
         reason = classify_status(response.status_code)

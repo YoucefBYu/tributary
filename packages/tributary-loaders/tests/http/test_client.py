@@ -115,25 +115,21 @@ def test_connection_refused_raises_transport_error() -> None:
         stdlib_send(Request("POST", "http://127.0.0.1:1", headers={}, body=b"", timeout_s=1))
 
 
-def test_ignores_an_environment_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_ignores_an_environment_proxy() -> None:
     """Code review, High (found on the clickhouse loader's identical opener pattern): `build_opener`
     otherwise installs a `ProxyHandler` that reads `HTTP_PROXY`/`HTTPS_PROXY`, which would send this
     loader's credentialed, PHI-carrying requests through an operator's outbound-internet proxy instead
-    of straight to the destination. `_OPENER` is a module-level singleton built once at import time, so
-    this reloads the module under a controlled, proxy-set environment rather than relying on whatever
-    the test process's own ambient environment happens to be."""
-    import importlib
+    of straight to the destination. `ProxyHandler({})` (an explicit empty mapping, not the `None` that
+    would fall back to reading the environment) registers no proxy handler at all regardless of what the
+    environment holds -- confirmed against `urllib.request.OpenerDirector.add_handler`, which only wires
+    up a handler's `<scheme>_open` methods when its `proxies` mapping is non-empty -- so this checks the
+    already-built singleton structurally rather than reloading the module under a mutated environment
+    (which would mutate `sys.modules` for the rest of the test session; `TlsVerificationError`, defined
+    in the same module and imported elsewhere by identity, is exactly the kind of thing a reload would
+    silently break -- see `tests/http/test_tls_failures.py`'s docstring)."""
+    from tributary.loaders.http.client import _OPENER
 
-    from tributary.loaders.http import client as client_module
-
-    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:1")
-    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:1")
-    importlib.reload(client_module)
-    try:
-        assert not any(getattr(h, "proxies", None) for h in client_module._OPENER.handlers)
-    finally:
-        monkeypatch.undo()
-        importlib.reload(client_module)  # restore the normal, un-proxied opener for later tests
+    assert not any(getattr(h, "proxies", None) for h in _OPENER.handlers)
 
 
 @pytest.mark.parametrize("method", ["POST", "PUT", "PATCH"])
