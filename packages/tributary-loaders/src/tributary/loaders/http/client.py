@@ -27,9 +27,15 @@ as an ordinary, classified response (`loader.classify_status`'s `http-3xx`) inst
 from __future__ import annotations
 
 import ssl
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+
+#: Default cap on how much of a response body `stdlib_send` reads (`Request.max_response_bytes`). A
+#: destination's answer is a status line plus, at most, a small acknowledgement; nothing here needs
+#: an unbounded read, and a hostile or broken peer must not be able to make this process buffer one.
+DEFAULT_MAX_RESPONSE_BYTES = 1 << 20
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +45,8 @@ class Request:
     headers: dict[str, str]
     body: bytes
     timeout_s: float
+    #: Stop reading the response body here (`Response.truncated` says whether the cap was hit).
+    max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,12 +54,21 @@ class Response:
     status_code: int
     headers: dict[str, str] = field(default_factory=dict)
     body: bytes = b""
+    #: True if the body was longer than `Request.max_response_bytes` (or the overall deadline passed
+    #: before it ended) and `body` is only a prefix. A caller that must inspect the whole body has to
+    #: treat this as "cannot verify".
+    truncated: bool = False
 
 
 class TransportError(Exception):
     """The request never got a response at all: DNS failure, connection refused, a non-certificate TLS
     failure (a reset mid-handshake, `SSLEOFError`, ...), a timeout. Always retryable (`loader.py`'s
     classification), never a destination's own answer."""
+
+
+class TransportTimeout(TransportError):
+    """`TransportError` whose cause was a timeout (connect, read, or the overall deadline). Still
+    retryable; a subclass so existing `except TransportError` call sites are unchanged."""
 
 
 class TlsVerificationError(Exception):
@@ -99,14 +116,22 @@ def stdlib_send(request: Request, *, opener: urllib.request.OpenerDirector = _OP
     urllib_request = urllib.request.Request(  # noqa: S310 - url is channel-spec-authored, not from the message
         request.url, data=request.body or None, headers=request.headers, method=request.method
     )
+    # `timeout_s` is a per-socket-operation bound in urllib (connect, each recv); the deadline makes it
+    # an overall bound on reading the body too, so a peer trickling bytes cannot hold a delivery open.
+    deadline = time.monotonic() + request.timeout_s
     try:
         with opener.open(urllib_request, timeout=request.timeout_s) as resp:
-            return Response(resp.status, dict(resp.headers), resp.read())
+            body, truncated = _read_capped(resp, limit=request.max_response_bytes, deadline=deadline)
+            return Response(resp.status, dict(resp.headers), body, truncated)
     except urllib.error.HTTPError as exc:
         # a non-2xx (or, now, non-redirected 3xx) response IS a response: read it (for status/body
         # classification) rather than let it surface as an exception, which is what urllib does by
         # default for anything outside 200-299 that no handler resolves.
-        return Response(exc.code, dict(exc.headers or {}), exc.read())
+        try:
+            body, truncated = _read_capped(exc, limit=request.max_response_bytes, deadline=deadline)
+        except (ssl.SSLError, TimeoutError, OSError) as read_exc:
+            raise _transport_error(read_exc) from read_exc
+        return Response(exc.code, dict(exc.headers or {}), body, truncated)
     except urllib.error.URLError as exc:
         # `urlopen` wraps a handshake failure in `URLError(reason=...)` rather than letting the
         # `ssl.SSLError` escape directly (security review, Low, found on the clickhouse loader's
@@ -116,10 +141,41 @@ def stdlib_send(request: Request, *, opener: urllib.request.OpenerDirector = _OP
         # mismatch, both) is `TlsVerificationError`/non-retryable.
         if isinstance(exc.reason, ssl.SSLCertVerificationError):
             raise TlsVerificationError(str(exc.reason)) from exc
-        raise TransportError(str(exc)) from exc
+        raise _transport_error(exc.reason if isinstance(exc.reason, BaseException) else exc) from exc
     except ssl.SSLCertVerificationError as exc:
         # In case a certificate failure is ever raised directly rather than wrapped in URLError (not
         # observed against a real connection, but cheap defence in depth).
         raise TlsVerificationError(str(exc)) from exc
     except (ssl.SSLError, TimeoutError, OSError) as exc:
-        raise TransportError(str(exc)) from exc
+        raise _transport_error(exc) from exc
+
+
+def _read_capped(readable: object, *, limit: int, deadline: float) -> tuple[bytes, bool]:
+    """At most `limit` bytes, stopping at `deadline` even if the peer keeps trickling. Returns the
+    bytes and whether more was (or may have been) left unread."""
+    # `read1`, not `read`: `HTTPResponse.read(n)` keeps reading until it has `n` bytes or EOF, so one
+    # trickling peer would sit inside a single call for as long as it liked and the deadline below would
+    # never be looked at. `read1(n)` returns after one underlying socket read (itself bounded by the
+    # socket timeout), so the overall bound is the deadline plus at most one socket timeout.
+    read = getattr(readable, "read1", None) or readable.read  # type: ignore[attr-defined]
+    chunks: list[bytes] = []
+    total = 0
+    while total < limit:
+        if time.monotonic() > deadline:
+            return b"".join(chunks), True
+        chunk = read(min(65536, limit - total))
+        if not chunk:
+            return b"".join(chunks), False
+        chunks.append(chunk)
+        total += len(chunk)
+    # cap reached: is there anything after it?
+    more = read(1)
+    return b"".join(chunks), bool(more)
+
+
+def _transport_error(cause: BaseException) -> TransportError:
+    """A fixed-phrase error naming only the exception *class*: an `OSError`'s text can carry the peer
+    address or a path, and a `URLError`'s carries the URL (invariant 6: no peer text in exceptions)."""
+    if isinstance(cause, TimeoutError):
+        return TransportTimeout("timed out")
+    return TransportError(f"transport failure ({type(cause).__name__})")

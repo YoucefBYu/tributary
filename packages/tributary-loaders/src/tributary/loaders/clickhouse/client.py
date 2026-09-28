@@ -119,12 +119,15 @@ def _build_ssl_context(tls: ChTlsSpec, auth: ChAuthSpec, resolver: SecretResolve
 def _read_capped(readable: object, *, limit: int, deadline: float) -> bytes:
     """Reads at most `limit` bytes, stopping early once `deadline` (a `time.monotonic()` value) has
     passed even if the peer keeps trickling data (module docstring)."""
+    # `read1`, not `read`: `HTTPResponse.read(n)` loops until it has `n` bytes or EOF, so a trickling
+    # peer would hold one call open and the deadline check below would never run.
+    read = getattr(readable, "read1", None) or readable.read  # type: ignore[attr-defined]
     chunks: list[bytes] = []
     total = 0
     while total < limit:
         if time.monotonic() > deadline:
             break
-        chunk = readable.read(min(65536, limit - total))  # type: ignore[attr-defined]
+        chunk = read(min(65536, limit - total))
         if not chunk:
             break
         chunks.append(chunk)
