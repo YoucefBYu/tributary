@@ -250,6 +250,12 @@ class HttpLoader:
             return
         exc = future.exception()
         if exc is not None:
-            self._log.warning("delayed_request_failed", destination=self.config.destination, error=repr(exc))
+            # A fixed reason code only (invariant 6, matching every other failure log in this module):
+            # `repr(exc)` could quote a driver's exception message, which can embed the destination's
+            # URL, a header value or the response body -- exactly the free text this loader's own
+            # error-code family (`ERROR_CODES`) exists to avoid ever logging.
+            self._log.warning(
+                "delayed_request_failed", destination=self.config.destination, error_type=type(exc).__name__
+            )
         else:
             self._log.info("delayed_request_completed", destination=self.config.destination)

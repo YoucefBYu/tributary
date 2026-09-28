@@ -90,10 +90,12 @@ _OPENER = urllib.request.build_opener(
 def stdlib_send(request: Request, *, opener: urllib.request.OpenerDirector = _OPENER) -> Response:
     """Synchronous; callers on an event loop must run this via `asyncio.to_thread`.
 
-    `opener` defaults to the module-level singleton but is overridable — for a test that needs a
+    `opener` is **test-only** (code review): it defaults to the module-level `_OPENER` singleton, and
+    no production call site ever passes a different one. It exists solely so a test can inject a
     different `SSLContext` (a throwaway CA, to prove the TLS failure classification against a real
-    handshake: `tests/http/test_tls_failures.py`), not for production code, which should never build a
-    second opener per call the way `stdlib_send`'s docstring already explains `_OPENER` avoids."""
+    handshake: `tests/http/test_tls_failures.py`) without reloading this module — production code must
+    never build a second opener per call, exactly what `_OPENER` being a module-level singleton is
+    for."""
     urllib_request = urllib.request.Request(  # noqa: S310 - url is channel-spec-authored, not from the message
         request.url, data=request.body or None, headers=request.headers, method=request.method
     )
