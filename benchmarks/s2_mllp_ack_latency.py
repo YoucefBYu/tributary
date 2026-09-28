@@ -95,9 +95,7 @@ class ConnResult:
         self.first_ack_done_ms = 0.0  # when the first ACK arrived, relative to the run's start
 
 
-async def _run_connection(
-    host: str, port: int, messages: list[str], timeout_s: float, run_start: float
-) -> ConnResult:
+async def _run_connection(host: str, port: int, messages: list[str], timeout_s: float, run_start: float) -> ConnResult:
     res = ConnResult()
     t_conn = time.perf_counter()
     reader, writer = await asyncio.open_connection(host, port)
