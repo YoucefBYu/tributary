@@ -6,11 +6,10 @@ validator is cached per session. Failure messages carry JSON paths only, never f
 
 from __future__ import annotations
 
-import copy
 import hashlib
 import json
 import re
-from functools import lru_cache
+from functools import cache, lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -33,18 +32,27 @@ def _schema() -> dict[str, Any]:
     return loaded
 
 
-@lru_cache(maxsize=1)
-def _validator() -> Validator:
+@cache
+def _validator(resource_type: str) -> Validator:
+    """Validator pinned to `#/definitions/<resourceType>`. The schema's root `oneOf` would collapse every
+    failure into an opaque `/: oneOf`, so a wrong type or any other error could not be told apart."""
     schema = _schema()
-    cls = validator_for(schema)  # honours the declared "$schema" (draft-06)
-    cls.check_schema(schema)
-    return cls(schema, format_checker=FormatChecker())
+    assert resource_type in schema["definitions"], "unknown resourceType (not an R4 resource)"
+    root = {
+        "$schema": schema["$schema"],
+        "$ref": f"#/definitions/{resource_type}",
+        "definitions": schema["definitions"],
+    }
+    cls = validator_for(root)  # honours the declared "$schema" (draft-06)
+    cls.check_schema(root)
+    return cls(root, format_checker=FormatChecker())
 
 
-def _errors(instance: object) -> list[str]:
-    """Error descriptions with JSON path and validator keyword only, no instance values."""
-    found = sorted(_validator().iter_errors(instance), key=lambda e: list(map(str, e.absolute_path)))
-    return [f"/{'/'.join(map(str, e.absolute_path))}: {e.validator}" for e in found]
+def _errors(instance: dict[str, Any]) -> list[tuple[str, str]]:
+    """(JSON path, keyword) pairs only, never instance values (invariant 6)."""
+    validator = _validator(str(instance["resourceType"]))
+    found = [("/" + "/".join(map(str, e.absolute_path)), str(e.validator)) for e in validator.iter_errors(instance)]
+    return sorted(found)
 
 
 def _load(path: Path) -> dict[str, Any]:
@@ -55,8 +63,11 @@ def _load(path: Path) -> dict[str, Any]:
 def test_vendored_schema_is_r4_4_0_1_and_draft06() -> None:
     schema = _schema()
     assert schema["$schema"] == "http://json-schema.org/draft-06/schema#"
+    # The schema's id carries only the minor version; the patch level is not in `id` or `description`.
     assert schema["id"] == "http://hl7.org/fhir/json-schema/4.0"
-    assert "4.0.1" in schema["description"] or "4.0.1" in SCHEMA_PATH.read_text(encoding="utf-8")
+    # CapabilityStatement.fhirVersion enumerates released versions: R4 ends at 4.0.1 (R4B would add 4.3.0).
+    versions = schema["definitions"]["CapabilityStatement"]["properties"]["fhirVersion"]["enum"]
+    assert versions[-1] == "4.0.1"
 
 
 def test_vendored_schema_sha256_matches_provenance() -> None:
@@ -79,14 +90,31 @@ def test_golden_bundle_and_each_resource_validate_against_r4_schema(golden_path:
         assert _errors(resource) == [], f"entry[{index}] ({resource['resourceType']})"
 
 
-def test_negative_control_r4b_only_element_is_rejected() -> None:
-    """A valid Observation passes; adding `instantiatesCanonical` (an R4B addition, absent from R4) or an
-    invalid status code must fail. The schema sets additionalProperties=false on every resource."""
-    good = {"resourceType": "Observation", "status": "final", "code": {"text": "x"}}
-    assert _errors(good) == []
-    bad = copy.deepcopy(good)
-    bad["instantiatesCanonical"] = "http://example.org/x"  # not an R4 element
-    errors = _errors(bad)
-    assert errors, "R4-invalid resource unexpectedly passed the R4 schema"
-    bad2 = {"resourceType": "Observation", "status": "not-a-real-status", "code": {"text": "x"}}
-    assert _errors(bad2), "invalid status code passed"
+def test_control_valid_observation_passes() -> None:
+    assert _errors({"resourceType": "Observation", "status": "final", "code": {"text": "x"}}) == []
+
+
+def test_negative_control_r4b_only_element_is_rejected_as_additional_property() -> None:
+    """`instantiatesCanonical` was added in R4B and is absent from R4."""
+    bad = {
+        "resourceType": "Observation",
+        "status": "final",
+        "code": {"text": "x"},
+        "instantiatesCanonical": "http://example.org/x",
+    }
+    assert _errors(bad) == [("/", "additionalProperties")]
+
+
+def test_negative_control_invalid_status_code_is_rejected_as_enum() -> None:
+    bad = {"resourceType": "Observation", "status": "not-a-real-status", "code": {"text": "x"}}
+    assert _errors(bad) == [("/status", "enum")]
+
+
+def test_mutation_control_patient_gender_banana_fails_enum() -> None:
+    assert _errors({"resourceType": "Patient", "gender": "male"}) == []
+    assert _errors({"resourceType": "Patient", "gender": "banana"}) == [("/gender", "enum")]
+
+
+def test_unknown_resource_type_cannot_pass_silently() -> None:
+    with pytest.raises(AssertionError):
+        _errors({"resourceType": "NotAResource"})
