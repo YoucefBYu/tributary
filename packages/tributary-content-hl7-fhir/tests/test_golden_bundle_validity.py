@@ -1,21 +1,7 @@
-"""W2-2 open item 4: "golden files validated against the FHIR R4 JSON schema."
+"""Structural and conditional-write checks on every golden Bundle via the R4B pydantic models.
 
-**What this actually does, and what it does not.** The literal HL7-published `fhir.schema.json` (R4)
-is not available to this test: it is not vendored in this repository (CLAUDE.md invariant 10 concerns
-aside, no such file exists in the tree), it does not ship inside `fhir.resources`/`fhir_core` (checked --
-neither package bundles a JSON Schema, only pydantic models), and this sandbox's egress proxy refuses
-`hl7.org` (`agent-proxy: connect_rejected`), so it cannot be fetched at test-collection time either.
-`jsonschema` itself is already a dev dependency (`pyproject.toml`, for the conformance suite), so *if* a
-schema file becomes available -- vendored by a human/architect decision, or once network policy allows
-fetching it once and committing it -- this test is exactly where `jsonschema.validate` against it belongs.
-
-**What this validates instead, as the closest available proxy:** every golden Bundle round-trips through
-`fhir.resources.R4B.bundle.Bundle.model_validate_json`, which rejects anything that is not
-structurally a valid FHIR resource of the declared type per the R4B pydantic models (required fields,
-value types, cardinalities) -- the same models `adt.py`/`oru.py` construct these Bundles from in the
-first place. It is **not** a substitute for the literal FHIR R4 JSON Schema (R4B is a technical-correction
-superset of R4, not byte-identical to it), which is why this item is reported, not silently closed, in
-the W2-3 handoff.
+Validation against HL7's official FHIR R4 JSON Schema lives in `test_golden_fhir_r4_schema.py`
+(W2-2 condition 4, closed 2026-09-28). This file keeps the conditional-request invariants.
 """
 
 from __future__ import annotations

@@ -86,9 +86,23 @@ def _split(corpus: list[str], conns: int) -> Iterator[list[str]]:
         yield corpus[i : i + per]
 
 
-async def _run_connection(host: str, port: int, messages: list[str], timeout_s: float) -> list[float]:
+class ConnResult:
+    """One connection's raw record, kept in send order so the first ACK is never lost to sorting."""
+
+    def __init__(self) -> None:
+        self.connect_ms = 0.0
+        self.latencies: list[float] = []
+        self.first_ack_done_ms = 0.0  # when the first ACK arrived, relative to the run's start
+
+
+async def _run_connection(
+    host: str, port: int, messages: list[str], timeout_s: float, run_start: float
+) -> ConnResult:
+    res = ConnResult()
+    t_conn = time.perf_counter()
     reader, writer = await asyncio.open_connection(host, port)
-    latencies: list[float] = []
+    res.connect_ms = (time.perf_counter() - t_conn) * 1000
+    latencies = res.latencies
     try:
         for message in messages:
             frame = SB + message.encode("ascii") + EB + CR
@@ -105,22 +119,37 @@ async def _run_connection(host: str, port: int, messages: list[str], timeout_s: 
                         buf += chunk
             except TimeoutError:
                 pass
-            latencies.append((time.perf_counter() - start) * 1000)  # ms
+            done = time.perf_counter()
+            latencies.append((done - start) * 1000)  # ms
+            if len(latencies) == 1:
+                res.first_ack_done_ms = (done - run_start) * 1000
             if b"MSA|AA" not in buf:
                 raise RuntimeError(f"expected MSA|AA, got {buf!r}")
     finally:
         writer.close()
         with contextlib.suppress(Exception):
             await writer.wait_closed()
-    return latencies
+    return res
 
 
-async def _run_all(host: str, port: int, slices: list[list[str]], timeout_s: float) -> list[float]:
-    results = await asyncio.gather(*(_run_connection(host, port, s, timeout_s) for s in slices))
-    combined: list[float] = []
-    for latencies in results:
-        combined.extend(latencies)
-    return combined
+async def _run_all(
+    host: str, port: int, slices: list[list[str]], timeout_s: float, prewarm: list[str]
+) -> list[ConnResult]:
+    if prewarm:  # one throwaway message on its own connection, before the clock starts
+        await _run_connection(host, port, prewarm, timeout_s, time.perf_counter())
+    run_start = time.perf_counter()
+    return list(await asyncio.gather(*(_run_connection(host, port, s, timeout_s, run_start) for s in slices)))
+
+
+def _stats(sorted_ms: list[float]) -> dict[str, float]:
+    return {
+        "n": float(len(sorted_ms)),
+        "p50": percentile(sorted_ms, 0.5),
+        "p90": percentile(sorted_ms, 0.9),
+        "p99": percentile(sorted_ms, 0.99),
+        "mean": statistics.fmean(sorted_ms),
+        "max": sorted_ms[-1],
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -128,11 +157,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--count", type=int, default=2000)
     ap.add_argument("--conns", type=int, default=10)
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--prewarm", action="store_true", help="send one message on a separate connection first")
     ap.add_argument("--timeout-s", type=float, default=20.0)
     ap.add_argument("--out", type=Path, default=ROOT / "benchmarks" / "results" / "s2-mllp-ack-latency.json")
     a = ap.parse_args(argv)
 
-    corpus = list(generate(a.count, seed=a.seed))
+    corpus = list(generate(a.count + (1 if a.prewarm else 0), seed=a.seed))
+    prewarm = [corpus.pop()] if a.prewarm else []
     slices = list(_split(corpus, a.conns))
 
     kafka_port = free_port()
@@ -164,14 +195,18 @@ def main(argv: list[str] | None = None) -> int:
         receiver = spawn_mllp_receiver(channel_spec=spec_path, env=ENV, bootstrap=bootstrap, instance="bench-s2")
 
         started = time.perf_counter()
-        latencies_ms = asyncio.run(_run_all("127.0.0.1", mllp_port, slices, a.timeout_s))
+        conn_results = asyncio.run(_run_all("127.0.0.1", mllp_port, slices, a.timeout_s, prewarm))
         wall_s = time.perf_counter() - started
     finally:
         if receiver is not None:
             receiver.terminate_and_wait()
         container.stop()
 
-    latencies_ms.sort()
+    latencies_ms = sorted(x for r in conn_results for x in r.latencies)
+    first_acks = sorted(r.latencies[0] for r in conn_results if r.latencies)
+    rest = sorted(x for r in conn_results for x in r.latencies[1:])
+    done_at = sorted(r.first_ack_done_ms for r in conn_results if r.latencies)
+    connect = sorted(r.connect_ms for r in conn_results)
     out: dict[str, Any] = {
         "spike": "S2 (Phase 1 re-run against the real tributary.receivers.mllp)",
         "environment": environment(),
@@ -181,15 +216,16 @@ def main(argv: list[str] | None = None) -> int:
         "how this differs from Phase 0's open-loop fixed-rate loadgen.py",
         "count": a.count,
         "conns": a.conns,
+        "prewarm": a.prewarm,
         "wall_s": wall_s,
         "acks_per_s": len(latencies_ms) / wall_s if wall_s > 0 else 0.0,
-        "ack_latency_ms": {
-            "p50": percentile(latencies_ms, 0.5),
-            "p90": percentile(latencies_ms, 0.9),
-            "p99": percentile(latencies_ms, 0.99),
-            "mean": statistics.fmean(latencies_ms) if latencies_ms else 0.0,
-            "max": latencies_ms[-1] if latencies_ms else 0.0,
-        },
+        # every ACK, warm-up included: this is the number compared against the threshold
+        "ack_latency_ms": _stats(latencies_ms),
+        # diagnostics: the first ACK on each connection reported separately, and the rest without it
+        "first_ack_per_conn_ms": _stats(first_acks),
+        "excluding_first_ack_per_conn_ms": _stats(rest) if rest else None,
+        "first_ack_completed_at_ms_since_start": {"min": done_at[0], "max": done_at[-1]},
+        "connect_ms": {"p50": percentile(connect, 0.5), "max": connect[-1]},
     }
     a.out.parent.mkdir(parents=True, exist_ok=True)
     a.out.write_text(json.dumps(out, indent=2, default=str))
