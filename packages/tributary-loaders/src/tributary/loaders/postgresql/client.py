@@ -28,6 +28,7 @@ wire shape of `auth`), documented here the way `http.loader._auth_header`'s key 
 
 from __future__ import annotations
 
+import asyncio
 import ssl
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -96,23 +97,49 @@ class PgPoolLike(Protocol):
     async def close(self) -> None: ...
 
 
+#: `asyncpg.create_pool` has no timeout of its own (it opens `min_size` physical connections before
+#: returning); `main.py` passes the destination's own `with.timeoutMs`-derived `config.timeout_s` as
+#: `connect_timeout` instead, so this default only applies to a caller (a test, `__main__.py`'s own
+#: direct use) that does not have a destination config's timeout to hand.
+DEFAULT_CONNECT_TIMEOUT_S = 10.0
+
+
 async def create_pool(
-    settings: PgConnectionSettings, *, min_size: int, max_size: int, command_timeout: float
+    settings: PgConnectionSettings,
+    *,
+    min_size: int,
+    max_size: int,
+    command_timeout: float,
+    connect_timeout: float = DEFAULT_CONNECT_TIMEOUT_S,
 ) -> PgPoolLike:
     """One connection pool per `PostgresqlLoader` instance, opened once at startup — like `HttpLoader`'s
     dedicated thread pool, not shared process-wide, and not reopened per message. A destination whose
     connection settings are repointed by a hot-reloaded spec needs a loader restart until the runtime
     grows a way to hot-reload a stateful connection resource (`http/handler.py`'s docstring notes the
-    same limit for `retry`)."""
-    pool = await asyncpg.create_pool(
-        host=settings.host,
-        port=settings.port,
-        database=settings.database,
-        user=settings.user,
-        password=settings.password,
-        ssl=settings.ssl_context,
-        min_size=min_size,
-        max_size=max_size,
-        command_timeout=command_timeout,
-    )
+    same limit for `retry`).
+
+    `connect_timeout` bounds this call: an unreachable host, a firewall dropping the SYN, or a server
+    that accepts the TCP connection but never completes the Postgres startup handshake would otherwise
+    hang loader startup forever -- `asyncpg.create_pool` has no timeout parameter of its own, unlike
+    `asyncpg.connect`'s `timeout=60` default. Raises `TransportError` on timeout (`CONNECT_FAILED`,
+    retryable, the same classification `loader.py` already gives every other connection-establishment
+    failure) with a message that names only the configured timeout, never host, credentials or any
+    part of the connection string -- README 3.4.3 / invariant 6."""
+    try:
+        pool = await asyncio.wait_for(
+            asyncpg.create_pool(
+                host=settings.host,
+                port=settings.port,
+                database=settings.database,
+                user=settings.user,
+                password=settings.password,
+                ssl=settings.ssl_context,
+                min_size=min_size,
+                max_size=max_size,
+                command_timeout=command_timeout,
+            ),
+            connect_timeout,
+        )
+    except TimeoutError as exc:
+        raise TransportError(f"connection pool did not open within {connect_timeout}s") from exc
     return pool  # type: ignore[no-any-return]  # asyncpg.Pool has no stubs; PgPoolLike is the checked shape

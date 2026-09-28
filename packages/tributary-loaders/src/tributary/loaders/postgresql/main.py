@@ -100,6 +100,7 @@ def build_loop(a: argparse.Namespace) -> tuple[ConsumerLoop, PostgresqlRecordHan
             min_size=DEFAULT_MIN_POOL_SIZE,
             max_size=DEFAULT_MAX_POOL_SIZE,
             command_timeout=config.timeout_s,
+            connect_timeout=config.timeout_s,
         )
         loader = PostgresqlLoader(config, pool, log=log)
         await loader.verify_idempotency_constraint()  # README 3.4.3: refuse to start, not to deliver

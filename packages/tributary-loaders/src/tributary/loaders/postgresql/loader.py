@@ -262,6 +262,9 @@ class PostgresqlLoader:
             # state N; another operation is in progress") rather than raising a normal connection error.
             # Same shape as any other transport loss from this loader's point of view: retryable, and
             # the next attempt gets a connection the pool has had a chance to notice is unusable.
+            # Safe to retry even if THIS attempt's INSERT actually committed before the connection
+            # broke: module docstring's Idempotency section -- `ON CONFLICT (idColumn) DO NOTHING`
+            # absorbs the redelivery into a no-op rather than a second row.
             return self._record_failure(msg_id, "CONNECT_FAILED", retryable=True)
         except ssl.SSLError:  # before OSError: ssl.SSLError is one
             return self._record_failure(msg_id, "TLS_VERIFY_FAILED", retryable=False)

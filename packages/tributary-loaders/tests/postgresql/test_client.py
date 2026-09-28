@@ -5,11 +5,18 @@ a plaintext `http://` URL, applied here to the loader's outbound database connec
 
 from __future__ import annotations
 
+import asyncio
 import ssl
 from pathlib import Path
 
 import pytest
-from tributary.loaders.postgresql.client import connection_settings_from_config
+from tributary.loaders.postgresql import client as client_module
+from tributary.loaders.postgresql.client import (
+    PgConnectionSettings,
+    TransportError,
+    connection_settings_from_config,
+    create_pool,
+)
 from tributary.loaders.postgresql.config import (
     CircuitBreakerSpec,
     PgAuthSpec,
@@ -128,3 +135,36 @@ def test_circuit_breaker_spec_round_trips_through_config() -> None:
     cfg = make_config(circuit_breaker=CircuitBreakerSpec(failure_threshold=3, open_seconds=15.0))
     assert cfg.circuit_breaker is not None
     assert cfg.circuit_breaker.failure_threshold == 3
+
+
+def test_create_pool_does_not_hang_forever_against_an_unreachable_server(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression: `create_pool` used to await `asyncpg.create_pool(...)` with no bound at all, so an
+    unreachable host (or one that accepts the TCP connection but never finishes the Postgres startup
+    handshake) hung loader startup forever. No real network needed to prove the bound: a fake
+    `asyncpg.create_pool` that never returns stands in for "unreachable", the same way
+    `test_a_dropped_connection_is_retried_without_crashing_the_shared_loop`
+    (`test_integration_postgresql_loader.py`) needs a real server to prove the *query*-level timeouts
+    but this one does not need a real server to prove the *connect*-level one."""
+
+    async def hangs_forever(**kwargs: object) -> None:
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(client_module.asyncpg, "create_pool", hangs_forever)
+    settings = PgConnectionSettings(
+        host="192.0.2.1",  # TEST-NET-1 (RFC 5737): guaranteed non-routable, not a real host
+        port=5432,
+        database="d",
+        user="u",
+        password="p",  # noqa: S106 - a fake pool never connects; there is no real credential here
+        ssl_context=None,
+    )
+
+    async def run() -> None:
+        await create_pool(settings, min_size=1, max_size=1, command_timeout=1.0, connect_timeout=0.05)
+
+    with pytest.raises(TransportError) as exc_info:
+        asyncio.run(run())
+    # Value-free (README 3.4.3 / invariant 6): the message names the timeout, never the host or
+    # credentials `settings` carries.
+    assert "0.05" in str(exc_info.value)
+    assert "192.0.2.1" not in str(exc_info.value)
