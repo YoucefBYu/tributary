@@ -1,6 +1,6 @@
 # Wave 2 exit criterion 4: Linux re-run of S1 and S2
 
-Date: 2026-09-28. Branch wave/1-2. Owner: `qa-engineer`. Raw JSON is on disk in `benchmarks/results/linux-wave2-rerun/` (git-ignored on purpose, not committed); the tables below summarise it. Every number is regenerable with the commands in "Reproduce".
+Date: 2026-09-28. Branch wave/1-2. Owner: `qa-engineer`. **The raw JSON is local-only**: it exists only on the machine that ran this, in `benchmarks/results/linux-wave2-rerun/`, and is not in the repo because `benchmarks/results/` is git-ignored by design. The tables below are the durable record. Every number is regenerable with the commands in "Reproduce".
 
 ## Evidence rating (read first)
 
@@ -26,7 +26,7 @@ Extra rows from the earlier synthetic-mix corpus (`--corpus synth`, `benchmarks.
 
 **Against the threshold: 565 to 617 msg/s/core versus at least 200: PASS by 2.8x to 3.1x, the worst run included.**
 
-**Against the Phase 0 baseline (36,322 msg/s, solo Windows laptop, `docs/spikes/S1-hl7-throughput.md`): 565 to 617 is about 1.6% of it, 59x to 64x lower. This is not a like-for-like regression.** Phase 0's "lazy parse+extract+fhir" built a plain dict and serialised it with `orjson`. The real mapping constructs validated `fhir.resources` pydantic models and serialises them with the model serialiser. A `cProfile` pass over the same corpus (profiler overhead inflates absolute times, so read the shares only): model serialisation (`model_dump_json`) is about 41% of cumulative time, model construction (`safe_build`) about 37%, and HL7 parsing is negligible. So the Phase 0 36k figure was an optimistic upper bound on what a Bundle-producing transform costs; the Phase 0 python-hl7 figure (2,446, same "fhir" step in dict form) is likewise not comparable. The hardware differs too (laptop vs shared 2.1 GHz Xeon vNCPU), and that share is not separable here.
+**Against the Phase 0 baseline (36,322 msg/s, solo Windows laptop, `docs/spikes/S1-hl7-throughput.md`): 565 to 617 is about 1.6% of it, 59x to 64x lower. This is not a like-for-like regression.** Phase 0's "lazy parse+extract+fhir" built a plain dict and serialised it with `orjson`. The real mapping constructs validated `fhir.resources` pydantic models and serialises them with the model serialiser. A `cProfile` pass over the same corpus (an unarchived observation: the profile output was not saved, so the 41% and 37% shares cannot be re-audited from the repo, only re-run; profiler overhead inflates absolute times, so read the shares only): model serialisation (`model_dump_json`) is about 41% of cumulative time, model construction (`safe_build`) about 37%, and HL7 parsing is negligible. So the Phase 0 36k figure was an optimistic upper bound on what a Bundle-producing transform costs; the Phase 0 python-hl7 figure (2,446, same "fhir" step in dict form) is likewise not comparable. The hardware differs too (laptop vs shared 2.1 GHz Xeon vNCPU), and that share is not separable here.
 
 Consequence for planning: a single-core Bundle-producing mapping is about 600 msg/s, roughly 3x the threshold, not 180x. That is still adequate for the plan's target, but the margin is far thinner than the Phase 0 report implied, and a shared host makes it a lower-confidence figure. Pydantic model dump is the obvious first optimisation target if headroom is needed (a finding for the owner of `tributary-fhir`, not acted on here).
 
@@ -42,7 +42,7 @@ Command: `uv run python -m benchmarks.s2_mllp_ack_latency --count N --conns C --
 | 100 | 5000 | 2,791 to 3,136 | 19.8 to 21.8 | 586.5 / 587.4 / 595.7 (runs A); 580.7 / 587.5 / 585.3 (runs B) | 585 to 612 |
 | 100 | 20000 | 4,073 to 4,406 | 19.3 to 21.0 | 35.1 / 34.5 / 52.9 | 585 to 592 |
 
-At the 1k msg/s point (C=10): p99 12.9 to 24.8 ms across 6 runs, **PASS against 50 ms**, best-to-worst margin 2.0x to 3.9x, on an RF=1 single broker. Runs A and B differ by up to 2x on the same code and host, which is the shared-host noise. C=100 at 5000 messages **fails on p99 (about 590 ms, all ACKs)**, and at 20000 messages one of three runs (52.9 ms) is over 50 ms; but C=100 runs at 2.5k to 4.4k msg/s, so it is not the 1k msg/s threshold condition.
+At the 1k msg/s point (C=10): runs A delivered 1,043 to 1,064 ACKs/s, but **runs B delivered 893 to 926 ACKs/s, which is below 1k**, so those three runs are near, not at, the plan's rate. p99 was 12.9 to 24.8 ms across the 6 runs, **PASS against 50 ms**. The PASS holds partly because the 10 cold-start outliers (one first ACK per connection, 0.6 to 1.05 s) are 0.2% of 5000 samples, under the 1% that would reach p99; with fewer messages, or an outlier per message, p99 would fail, best-to-worst margin 2.0x to 3.9x, on an RF=1 single broker. Runs A and B differ by up to 2x on the same code and host, which is the shared-host noise. C=100 at 5000 messages **fails on p99 (about 590 ms, all ACKs)**, and at 20000 messages one of three runs (52.9 ms) is over 50 ms; but C=100 runs at 2.5k to 4.4k msg/s, so it is not the 1k msg/s threshold condition.
 
 ### The first-ACK outlier: what it is (measured, with one part still open)
 
