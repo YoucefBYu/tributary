@@ -12,6 +12,7 @@ dependency reaches this package for that.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -92,7 +93,13 @@ async def _open_pool(container: PostgresContainer) -> AsyncIterator[PgPoolLike]:
     try:
         yield pool
     finally:
-        await pool.close()
+        # Bounded the same way `PostgresqlLoader.close()` now is (its docstring): a connection this
+        # test itself broke (`test_a_dropped_connection_is_retried_without_crashing_the_shared_loop`)
+        # or left mid-reconnect must not make teardown -- and every later test in the same process --
+        # wait forever. `asyncpg.pool.Pool.close()` calls `Pool.terminate()` itself once
+        # `asyncio.wait_for` cancels it, so the pool is still torn down on timeout.
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(pool.close(), 10.0)
 
 
 def test_duplicate_delivery_produces_one_row() -> None:

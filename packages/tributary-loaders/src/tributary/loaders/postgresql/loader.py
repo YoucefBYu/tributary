@@ -52,8 +52,10 @@ destination and there is little reason to ever let it retry with no circuit at a
 
 * `TIMEOUT` — the query did not finish within `timeoutMs`. Retryable.
 * `CONNECT_FAILED` — the connection could not be made or was lost: `postgresql.client.TransportError`,
-  `asyncpg.exceptions.PostgresConnectionError`, `asyncpg.exceptions.InterfaceError`, `OSError`.
-  Retryable.
+  `asyncpg.exceptions.PostgresConnectionError`, `asyncpg.exceptions.InterfaceError`,
+  `asyncpg.exceptions.InternalClientError` (asyncpg's own protocol state machine, not the server, is
+  confused — for example a connection the outer `asyncio.wait_for` timeout above cut off mid-operation
+  against a backend a peer already killed), `OSError`. Retryable.
 * `TLS_VERIFY_FAILED` — `ssl.SSLError` (checked before the broader `OSError`, which it subclasses): the
   server's certificate or hostname failed verification. Not retryable — a bad CA or hostname mismatch
   fails identically on every attempt.
@@ -68,6 +70,7 @@ destination and there is little reason to ever let it retry with no circuit at a
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import re
 import ssl
@@ -194,7 +197,19 @@ class PostgresqlLoader:
         schema, _, table_name = self.config.table.partition(".")
         if not table_name:
             schema, table_name = "public", schema
-        exists = await self._pool.fetchval(_UNIQUE_ID_COLUMN_QUERY, schema, table_name, self.config.id_column)
+        # Bounded the same way `deliver()`'s query is (asyncio.wait_for around the call, not just the
+        # `timeout=` kwarg): `asyncpg.pool.Pool.fetchval`'s `timeout=` only bounds the query once a
+        # connection is acquired, never the `pool.acquire()` wait itself (`Pool.execute`/`fetchval`'s
+        # own source: `async with self.acquire() as con:` with no timeout on that `acquire()`) -- a
+        # pool with every connection checked out (or stuck reconnecting) would otherwise hang this
+        # startup check forever. Root cause of the intermittent 6-hour CI hang (b36b740 follow-up):
+        # this was the one call in the module with no bound at all.
+        exists = await asyncio.wait_for(
+            self._pool.fetchval(
+                _UNIQUE_ID_COLUMN_QUERY, schema, table_name, self.config.id_column, timeout=self.config.timeout_s
+            ),
+            self.config.timeout_s + 1,
+        )
         if not exists:
             raise IdempotencyConstraintError(
                 f"destination {self.config.destination!r}: table {self.config.table!r} has no unique "
@@ -238,6 +253,16 @@ class PostgresqlLoader:
             return self._record_failure(msg_id, "CONNECT_FAILED", retryable=True)
         except asyncpg.exceptions.InterfaceError:
             return self._record_failure(msg_id, "CONNECT_FAILED", retryable=True)
+        except asyncpg.exceptions.InternalClientError:
+            # Not a `PostgresError` (server never gets to answer) and not one of the connection classes
+            # above either: the outer `asyncio.wait_for` above cancelling `execute()` mid-flight on a
+            # connection whose backend a peer already killed (`test_a_dropped_connection_is_retried_
+            # without_crashing_the_shared_loop`'s `pg_terminate_backend`) can leave asyncpg's own
+            # protocol state machine unable to tell what state the connection is in ("cannot switch to
+            # state N; another operation is in progress") rather than raising a normal connection error.
+            # Same shape as any other transport loss from this loader's point of view: retryable, and
+            # the next attempt gets a connection the pool has had a chance to notice is unusable.
+            return self._record_failure(msg_id, "CONNECT_FAILED", retryable=True)
         except ssl.SSLError:  # before OSError: ssl.SSLError is one
             return self._record_failure(msg_id, "TLS_VERIFY_FAILED", retryable=False)
         except OSError:
@@ -269,4 +294,15 @@ class PostgresqlLoader:
         return PgDeliveryOutcome(success=False, reason=reason, retryable=retryable)
 
     async def close(self) -> None:
-        await self._pool.close()
+        """Bounded: `asyncpg.pool.Pool.close()`'s own docstring says "It is advisable to use
+        `asyncio.wait_for()` to set a timeout" -- `close()` waits for every checked-out connection to
+        be released before it closes anything, with no timeout of its own. A connection left stuck
+        (for example the one `test_a_dropped_connection_is_retried_without_crashing_the_shared_loop`
+        deliberately kills server-side, or one still mid-reconnect) would otherwise hang this forever,
+        the second half of the same root cause as `verify_idempotency_constraint`'s fix above. On
+        timeout, `Pool.close()` has *already* called `Pool.terminate()` itself -- its own
+        `except (Exception, asyncio.CancelledError)` branch, triggered by the cancellation
+        `asyncio.wait_for` raises into it on timeout -- so the pool is forcefully torn down rather than
+        left half-closed; nothing further to do here."""
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(self._pool.close(), self.config.timeout_s + 1)
