@@ -40,6 +40,7 @@ from ..keys import resolve_key
 from ..metrics import Metrics
 from ..mllp.kafka_publisher import RawPublisher, topic_name
 from ..net import is_loopback, require_safe_bind
+from ..payload import well_formed
 from ..secrets import DirSecretResolver, SecretResolver
 from ..tls import build_ssl_context
 from .config import HttpSettings, http_settings_from_channel_spec
@@ -97,21 +98,6 @@ def _tb_content_type(header_value: str, accepted: frozenset[str]) -> str | None:
             if _CHARSET.match(value):
                 return f"{media}; charset={value.lower()}"
     return media
-
-
-_JSON_TYPES = frozenset({"application/json", "application/fhir+json"})
-
-
-def _well_formed(content_type: str, body: bytes) -> bool:
-    """Only JSON is checked (`json.loads`, in-process, bounded by `maxMessageBytes`); other accepted
-    types pass, because a receiver that does not know their grammar must not guess at it."""
-    if content_type.split(";", 1)[0] not in _JSON_TYPES:
-        return True
-    try:
-        json.loads(body)
-    except (ValueError, RecursionError):
-        return False
-    return True
 
 
 class HttpServer:
@@ -275,7 +261,7 @@ class HttpServer:
             body = await self._read_body(r, rest, content_length, request_deadline)
             ctx["bytes"] = len(body)
             self.metrics.messages_received += 1
-            if "parse-error" in self.cfg.nack_on and not _well_formed(content_type, body):
+            if "parse-error" in self.cfg.nack_on and not well_formed(content_type, body):
                 self.metrics.nacked_parse_error += 1
                 raise _HttpError(400, "Bad Request")
             outcome = resolve_key(
