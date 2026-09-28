@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from fhir.resources.R4B.identifier import Identifier
 from fhir.resources.R4B.patient import Patient
+from tributary.fhir import FhirContext
 from tributary.hl7v2 import Hl7Message, SegmentNotFoundError
 
 from .datatypes import (
@@ -21,7 +22,7 @@ from .datatypes import (
 from .errors import RequiredFieldMissingError, safe_build
 
 
-def map_patient(hl7: Hl7Message) -> Patient:
+def map_patient(hl7: Hl7Message, ctx: FhirContext) -> Patient:
     """PID -> `Patient`. Raises `RequiredFieldMissingError` if there is no PID segment at all, or if
     PID-3 is absent: with no identifier at all, there is nothing to key the `Patient` Bundle entry's
     conditional PUT on (channel-spec README 3.4.2).
@@ -29,7 +30,9 @@ def map_patient(hl7: Hl7Message) -> Patient:
     Every field assignment below is a single `safe_build` call (`errors.py`): if `fhir.resources`' own
     validation rejects something this module's datatype conversions did not already catch, the caller
     gets a typed `InvalidFieldError("PID")`, never the pydantic `ValidationError` text underneath it
-    (invariant 6 -- that text embeds the rejected value verbatim).
+    (invariant 6 -- that text embeds the rejected value verbatim). `ctx` is used for exactly one thing:
+    a `warning` log (path and a fixed reason only, never the value) if PID-7 was present but not a valid
+    calendar date -- mirrors `adt.py`'s `Encounter`-omission and invalid-date warnings.
     """
     try:
         pid = hl7.segment("PID")
@@ -41,7 +44,7 @@ def map_patient(hl7: Hl7Message) -> Patient:
         raise RequiredFieldMissingError("PID.3", reason="no patient identifier to key the Patient entry on")
 
     identifiers: list[Identifier] = [identifier]
-    account = cx_identifier(pid, 18, fallback_system=local_identifier_system(hl7["MSH.4"]))
+    account = cx_identifier(pid, 18, fallback_system=local_identifier_system(hl7["MSH.4.1"]))
     if account is not None:
         identifiers.append(account)
 
@@ -56,11 +59,17 @@ def map_patient(hl7: Hl7Message) -> Patient:
         if gender is not None:
             patient.gender = gender
 
-        birth_date = dt8_to_fhir_date(pid.field(7))
+        raw_dob = pid.field(7)
+        birth_date = dt8_to_fhir_date(raw_dob)
         if birth_date is not None:
             # `birthDate` is typed as `date` for its parsed representation; the FHIR wire-format `str`
             # `dt8_to_fhir_date` returns (already calendar-validated) is what the validator accepts.
             patient.birthDate = birth_date  # type: ignore[assignment]
+        elif raw_dob:
+            # Present but not a valid calendar date -- omitted, not passed to `birthDate`'s own
+            # validator (security review HIGH 2). Logged so an operator can see the sender is doing
+            # this (code-reviewer follow-up on 1aba292): path and a fixed reason only, never the value.
+            ctx.log.warning("field_invalid_omitted", path="PID.7", reason="invalid_value")
 
         address = xad_address(pid, 11)
         if address is not None:

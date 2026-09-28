@@ -22,15 +22,15 @@ previous delivery wrote:
   result for the *same* order should update the one `DiagnosticReport`, not sit next to a duplicate --
   the same convergence reasoning as `Encounter`.
 * `Observation` (one per `OBX`) -- these have no order-independent identifier of their own in v2, so
-  each is keyed on `message_identifier(message.msg_id, discriminator=f"obx-{OBX-1}")` -- exactly the
-  case that function's own docstring names as its motivating example (one identifier per repeating OBX,
-  stable across a redelivery of the *same* message because OBX-1's Set ID does not change on retry).
-  **Treated as an event resource, `POST` + `ifNoneExist`** (channel-spec README 3.4.2): an `Observation`
-  is a record of one result, not something a later message should overwrite in place, and 3.4.2 is
-  explicit that event resources "must not be overwritten". `OBX-1` (Set ID) must be present and unique
-  within the message -- a blank or repeated Set ID would give two `Observation`s the *same* conditional
-  URL inside one transaction Bundle, which is refused with a typed `InvalidFieldError` rather than
-  silently producing a Bundle a FHIR server would reject (or worse, collapse into one entry).
+  each is keyed on `message_identifier(message.msg_id, discriminator=f"obx-{position}")`, where
+  `position` is the `OBX`'s 1-based position among the message's own `OBX` segments (**not** OBX-1, the
+  Set ID -- code-reviewer follow-up on `1aba292`: real LIS interfaces frequently leave Set ID blank or
+  reset it across sub-panels, and refusing every such message was too strict for real ORU traffic).
+  Segment order is exactly as stable across a redelivery of the same bytes as OBX-1 would be if every
+  sender populated it correctly, so this is still fully deterministic and collision-free, with nothing
+  left to refuse. **Treated as an event resource, `POST` + `ifNoneExist`** (channel-spec README 3.4.2):
+  an `Observation` is a record of one result, not something a later message should overwrite in place,
+  and 3.4.2 is explicit that event resources "must not be overwritten".
 
 This reference mapping supports one `OBR` per message (the common unsolicited single-order-result case)
 and numeric (`NM`) and text (`ST`/`TX`) `OBX` value types; other v2 value types (`CE`, `SN`, ...) get a
@@ -65,7 +65,7 @@ from .datatypes import (
     sanitize_fhir_code,
     ts_to_fhir_datetime,
 )
-from .errors import InvalidFieldError, RequiredFieldMissingError, UnsupportedTriggerError, safe_build
+from .errors import RequiredFieldMissingError, UnsupportedTriggerError, safe_build
 from .patient import map_patient
 
 #: A fixed, non-sender-controlled placeholder for `UnsupportedTriggerError` when MSH-9's own text fails
@@ -163,10 +163,8 @@ def _map_observation(obx: Segment, *, patient_ref: Reference, identifier: Identi
 def oru_r01_to_fhir(message: Message, ctx: FhirContext) -> Message:
     """Map an ORU R01 message (already parsed by `tributary.hl7v2.parse`) to a FHIR transaction `Bundle`.
 
-    Raises `UnsupportedTriggerError` if MSH-9 is not `ORU^R01` (security review, MEDIUM 2), `Required
-    FieldMissingError` if PID-3, an `OBX`'s value code (OBX-3) or an `OBX`'s own Set ID (OBX-1) is
-    absent, `InvalidFieldError` if an `OBX`'s Set ID repeats within the message (it would otherwise give
-    two `Observation` entries the same conditional URL in one transaction Bundle), and lets `tributary.
+    Raises `UnsupportedTriggerError` if MSH-9 is not `ORU^R01` (security review, MEDIUM 2),
+    `RequiredFieldMissingError` if PID-3 or an `OBX`'s value code (OBX-3) is absent, and lets `tributary.
     fhir.errors.BundleEntryError` propagate unchanged for any other Bundle-construction failure.
     """
     hl7 = ctx.vars.get(VARS_KEY)
@@ -179,7 +177,7 @@ def oru_r01_to_fhir(message: Message, ctx: FhirContext) -> Message:
     if msg_type != "ORU" or trigger_event != "R01":
         raise UnsupportedTriggerError(*_safe_trigger_codes(msg_type, trigger_event))
 
-    patient = map_patient(hl7)
+    patient = map_patient(hl7, ctx)
     patient_entry = ctx.fhir.upsert(patient)
     patient_ref = Reference(reference=patient_entry.fullUrl)
     entries: list[BundleEntry] = [patient_entry]
@@ -187,16 +185,18 @@ def oru_r01_to_fhir(message: Message, ctx: FhirContext) -> Message:
     obr = hl7.segment("OBR") if hl7.segment_count("OBR") else None
 
     observation_entries: list[BundleEntry] = []
-    seen_obx_set_ids: set[str] = set()
-    for obx in hl7.segments("OBX"):
-        obx_set_id = obx.field(1)
-        if not obx_set_id:
-            raise RequiredFieldMissingError("OBX.1", reason="no Set ID to key the Observation entry on")
-        if obx_set_id in seen_obx_set_ids:
-            raise InvalidFieldError("OBX.1", reason="Set ID repeats within the message; each OBX needs a unique one")
-        seen_obx_set_ids.add(obx_set_id)
+    for position, obx in enumerate(hl7.segments("OBX"), start=1):
+        # `position` (this OBX's 1-based place among the message's own OBX segments), not OBX-1's own
+        # Set ID (code-reviewer follow-up on 1aba292 -- see the module docstring for why): segment order
+        # is exactly as stable across a redelivery of the same bytes, so this is still fully
+        # deterministic and collision-free, and a blank or repeated OBX-1 needs no special handling at
+        # all -- neither is ever read for identifier purposes.
+        def build_obx_identifier(position: int = position) -> Identifier:
+            return message_identifier(message.msg_id, discriminator=f"obx-{position}")
 
-        obx_identifier = message_identifier(message.msg_id, discriminator=f"obx-{obx_set_id}")
+        obx_identifier = safe_build(
+            build_obx_identifier, path="OBX", reason="could not build the Observation identifier"
+        )
         observation = _map_observation(obx, patient_ref=patient_ref, identifier=obx_identifier)
         # Event resource: POST + ifNoneExist, never PUT (channel-spec README 3.4.2, security review
         # MEDIUM 4) -- an Observation must not be overwritten by a later message.
@@ -206,7 +206,7 @@ def oru_r01_to_fhir(message: Message, ctx: FhirContext) -> Message:
 
     if obr is not None:
         report_identifier = _diagnostic_report_identifier(
-            obr, msg_id=message.msg_id, fallback_system=local_identifier_system(hl7["MSH.4"])
+            obr, msg_id=message.msg_id, fallback_system=local_identifier_system(hl7["MSH.4.1"])
         )
         code, display, _system_alias = cwe_components(obr, 4)
 

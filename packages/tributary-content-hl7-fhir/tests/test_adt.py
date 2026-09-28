@@ -205,6 +205,71 @@ def test_invalid_dob_does_not_crash_and_omits_birth_date() -> None:
     assert "birthDate" not in patient
 
 
+# -- MEDIUM, code-reviewer: an omitted invalid date is logged, path only, never the value ----------------
+
+
+def test_invalid_pid7_logs_a_warning_with_path_only() -> None:
+    raw = (
+        b"MSH|^~\\&|TRIBUTARY-SYNTH|SYNTH-HOSPITAL|SYNTH-ADT-RECV|SYNTH-RECV-FACILITY|"
+        b"20260101120000||ADT^A01^ADT_A01|SYNTHMSG00089|P|2.5.1\r"
+        b"PID|1||9000089^^^SYNTH-HOSPITAL^MR||SYNTHPATIENT^X||19800231|M\r"
+    )
+    ctx = fake_fhir_context()
+    parsed = run_step(parse, make_message(raw, content_type="application/hl7-v2+er7"), ctx=ctx)
+    run_step(adt_to_fhir, parsed, ctx=ctx)
+    warnings = [
+        record for record in ctx.log.records if record.level == "warning" and record.event == "field_invalid_omitted"
+    ]
+    assert len(warnings) == 1
+    assert warnings[0].fields == {"path": "PID.7", "reason": "invalid_value"}
+    for record in ctx.log.records:
+        assert "19800231" not in str(record.fields)
+
+
+def test_invalid_pv1_44_and_45_log_warnings_with_path_only() -> None:
+    raw = (
+        b"MSH|^~\\&|TRIBUTARY-SYNTH|SYNTH-HOSPITAL|SYNTH-ADT-RECV|SYNTH-RECV-FACILITY|"
+        b"20260101120000||ADT^A08^ADT_A01|SYNTHMSG00088|P|2.5.1\r"
+        b"PID|1||9000088^^^SYNTH-HOSPITAL^MR||SYNTHPATIENT^X||19800101|M\r"
+        b"PV1|1|I|SYNTHUNIT^101^A^SYNTH-HOSPITAL||||9001^SYNTHDOC^ATTENDING^^^^MD|||SUR||||ADM|A0||||"
+        b"VN20260101-00001|||||||||||||||||||||||||20261301999999|20261302999999\r"
+    )
+    ctx = fake_fhir_context()
+    parsed = run_step(parse, make_message(raw, content_type="application/hl7-v2+er7"), ctx=ctx)
+    run_step(adt_to_fhir, parsed, ctx=ctx)
+    warnings = {
+        record.fields["path"]: record.fields
+        for record in ctx.log.records
+        if record.level == "warning" and record.event == "field_invalid_omitted"
+    }
+    assert warnings.get("PV1.44") == {"path": "PV1.44", "reason": "invalid_value"}
+    assert warnings.get("PV1.45") == {"path": "PV1.45", "reason": "invalid_value"}
+    for record in ctx.log.records:
+        assert "20261301999999" not in str(record.fields)
+        assert "20261302999999" not in str(record.fields)
+
+
+def test_invalid_evn2_logs_a_warning_with_path_only() -> None:
+    """EVN-2 is only consulted as a fallback for `Encounter.period` on A01/A03 when PV1-44/-45 are
+    blank; an invalid EVN-2 is logged the same way, path and reason only."""
+    raw = (
+        b"MSH|^~\\&|TRIBUTARY-SYNTH|SYNTH-HOSPITAL|SYNTH-ADT-RECV|SYNTH-RECV-FACILITY|"
+        b"20260101120000||ADT^A01^ADT_A01|SYNTHMSG00087|P|2.5.1\r"
+        b"EVN|A01|20261301999999\r"
+        b"PID|1||9000087^^^SYNTH-HOSPITAL^MR||SYNTHPATIENT^X||19800101|M\r"
+        b"PV1|1|I|SYNTHUNIT^101^A^SYNTH-HOSPITAL||||9001^SYNTHDOC^ATTENDING^^^^MD|||SUR||||ADM|A0\r"
+    )
+    ctx = fake_fhir_context()
+    parsed = run_step(parse, make_message(raw, content_type="application/hl7-v2+er7"), ctx=ctx)
+    run_step(adt_to_fhir, parsed, ctx=ctx)
+    warnings = [
+        record for record in ctx.log.records if record.level == "warning" and record.event == "field_invalid_omitted"
+    ]
+    assert {"path": "EVN.2", "reason": "invalid_value"} in [record.fields for record in warnings]
+    for record in ctx.log.records:
+        assert "20261301999999" not in str(record.fields)
+
+
 def test_no_phi_leak_anywhere_in_the_exception_chain() -> None:
     """Security review, HIGH 2: `str(exc)` and the full chain (`__cause__`, `__context__`) must never
     carry a field value -- checked directly, not just asserted in a docstring (`errors.safe_build`)."""
@@ -258,6 +323,48 @@ def test_custom_delimiters_fixture_maps_without_misreading_data_as_components() 
     patient_identifier = bundle["entry"][0]["resource"]["identifier"][0]  # type: ignore[index]
     assert patient_identifier["value"] == "9000004^^^SYNTH-HOSPITAL^MR"
     assert "system" not in patient_identifier
+
+
+# -- LOW, security: MSH-4 fallback system reads only HD.1, not the whole field --------------------------
+
+
+def test_msh4_hd_value_uses_only_the_namespace_id_component() -> None:
+    """Security review LOW: an HD-valued MSH-4 (`SYNTH-HOSPITAL^UNIV-ID^ISO`) must contribute only its
+    Namespace ID (HD.1) to the fallback `Identifier.system` -- not the HD's other components folded in
+    as if they were part of one string."""
+    raw = (
+        b"MSH|^~\\&|TRIBUTARY-SYNTH|SYNTH-HOSPITAL^UNIV-ID^ISO|SYNTH-ADT-RECV|SYNTH-RECV-FACILITY|"
+        b"20260101120000||ADT^A01^ADT_A01|SYNTHMSG00091|P|2.5.1\r"
+        b"PID|1||9000091^^^SYNTH-HOSPITAL^MR||SYNTHPATIENT^X||19800101|M||||||||||9000091-ACC\r"
+    )
+    ctx = fake_fhir_context()
+    parsed = run_step(parse, make_message(raw, content_type="application/hl7-v2+er7"), ctx=ctx)
+    mapped = run_step(adt_to_fhir, parsed, ctx=ctx)
+    assert isinstance(mapped, Message)
+    assert mapped.payload is not None
+    bundle = json.loads(mapped.payload)
+    identifiers = bundle["entry"][0]["resource"]["identifier"]
+    account = next(i for i in identifiers if i["value"] == "9000091-ACC")
+    assert account["system"] == "urn:id:SYNTH-HOSPITAL"
+
+
+def test_msh4_hd_value_uses_only_the_namespace_id_component_with_custom_delimiters() -> None:
+    """Same as above, with `!`/`@`/`$`/`\\`/`*` as the five delimiters: HD.1 is still read through the
+    component accessor, not by the field's own literal text."""
+    raw = (
+        b"MSH!@$\\*!TRIBUTARY-SYNTH!SYNTH-HOSPITAL$UNIV-ID$ISO!SYNTH-ADT-RECV!SYNTH-RECV-FACILITY!"
+        b"20260101120000!!ADT@A01@ADT_A01!SYNTHMSG00090!P!2.5.1\r"
+        b"PID!1!!9000090^^^SYNTH-HOSPITAL^MR!!SYNTHPATIENT@X!!19800101!M!!!!!!!!!!9000090-ACC\r"
+    )
+    ctx = fake_fhir_context()
+    parsed = run_step(parse, make_message(raw, content_type="application/hl7-v2+er7"), ctx=ctx)
+    mapped = run_step(adt_to_fhir, parsed, ctx=ctx)
+    assert isinstance(mapped, Message)
+    assert mapped.payload is not None
+    bundle = json.loads(mapped.payload)
+    identifiers = bundle["entry"][0]["resource"]["identifier"]
+    account = next(i for i in identifiers if i["value"] == "9000090-ACC")
+    assert account["system"] == "urn:id:SYNTH-HOSPITAL"
 
 
 def test_repeated_run_produces_a_byte_identical_bundle() -> None:

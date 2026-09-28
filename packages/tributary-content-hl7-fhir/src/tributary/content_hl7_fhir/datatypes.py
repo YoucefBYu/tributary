@@ -41,6 +41,8 @@ from fhir.resources.R4B.humanname import HumanName
 from fhir.resources.R4B.identifier import Identifier
 from tributary.hl7v2 import Segment
 
+from .errors import safe_build
+
 #: HD.1 (Namespace ID) -> `Identifier.system`, for an assigning authority that carries no HD.2/HD.3
 #: universal id -- every fixture in this reference set is like this (a synthetic MRN authority named
 #: only by its local namespace). The v2-to-FHIR "HD to Identifier" datatype map prefers `urn:oid:`/
@@ -87,32 +89,45 @@ _IDENTIFIER_TYPE_DISPLAY = {
 
 def cx_identifier(segment: Segment, field: int, *, fallback_system: str | None = None) -> Identifier | None:
     """A v2 CX (`id^checkDigit^checkDigitScheme^assigningAuthority^identifierTypeCode`) at `segment`'s
-    `field`, to `Identifier`. `None` when CX.1 (the id itself) is absent.
+    `field`, to `Identifier`. `None` when CX.1 (the id itself) is absent, or is whitespace-only --
+    a value made only of spaces, tabs or a non-breaking space (`\\xa0`) is treated as missing rather than
+    handed to `Identifier.value`'s own validator, which rejects it outright and embeds it verbatim in a
+    `ValidationError` (security review, LOW): FHIR's `string` grammar happens to accept a bare literal
+    tab but not a bare `\\xa0`, and neither is a meaningful identifier value either way, so both are
+    rejected here before that distinction matters.
 
     `fallback_system` is used when the CX carries no assigning authority (CX.4, an HD) of its own --
     typically the sending facility, so a bare account or visit number still gets a (locally-scoped, never
     a business system it does not actually belong to) `Identifier.system`.
+
+    The whole construction is one `safe_build` call (security review, LOW): if `fhir.resources`' own
+    validation rejects something the check above did not already catch, the caller gets a typed
+    `InvalidFieldError`, never the pydantic `ValidationError` text underneath it (invariant 6).
     """
     value = segment.field(field, component=1)
-    if not value:
+    if not value or not value.strip():
         return None
     authority = segment.field(field, component=4) or None
     system = local_identifier_system(authority) if authority else fallback_system
     type_code = segment.field(field, component=5) or None
-    identifier = Identifier(value=value)
-    if system is not None:
-        identifier.system = system
-    if type_code:
-        from fhir.resources.R4B.codeableconcept import CodeableConcept
 
-        sanitized_type_code = sanitize_fhir_code(type_code)
-        if sanitized_type_code is not None:
-            coding = Coding(code=sanitized_type_code, system="http://terminology.hl7.org/CodeSystem/v2-0203")
-            display = _IDENTIFIER_TYPE_DISPLAY.get(sanitized_type_code)
-            if display:
-                coding.display = display
-            identifier.type = CodeableConcept(coding=[coding])
-    return identifier
+    def build() -> Identifier:
+        identifier = Identifier(value=value)
+        if system is not None:
+            identifier.system = system
+        if type_code:
+            from fhir.resources.R4B.codeableconcept import CodeableConcept
+
+            sanitized_type_code = sanitize_fhir_code(type_code)
+            if sanitized_type_code is not None:
+                coding = Coding(code=sanitized_type_code, system="http://terminology.hl7.org/CodeSystem/v2-0203")
+                display = _IDENTIFIER_TYPE_DISPLAY.get(sanitized_type_code)
+                if display:
+                    coding.display = display
+                identifier.type = CodeableConcept(coding=[coding])
+        return identifier
+
+    return safe_build(build, path=f"{segment.name}.{field}", reason="could not build a valid Identifier")
 
 
 # -- XPN (Extended Person Name) -----------------------------------------------------------------------

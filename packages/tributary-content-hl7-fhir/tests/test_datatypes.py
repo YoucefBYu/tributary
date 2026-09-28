@@ -75,6 +75,22 @@ def test_cx_identifier_does_not_split_an_escaped_component_separator() -> None:
     assert identifier.value == "9000001"
 
 
+def test_cx_identifier_treats_a_non_breaking_space_as_missing() -> None:
+    """Security review, LOW: a PID-3.1 made only of a non-breaking space (`\\xa0`) must not reach
+    `Identifier.value`'s own validator -- `fhir.resources`' `string` grammar rejects a bare `\\xa0`
+    outright, and the resulting `ValidationError` embeds it verbatim (`input_value=...`), invariant 6's
+    exact concern."""
+    pid = _segment("PID", "1||\xa0")
+    assert cx_identifier(pid, 3) is None
+
+
+def test_cx_identifier_treats_a_tab_only_value_as_missing() -> None:
+    """A bare tab happens to satisfy FHIR's `string` grammar, so this is treated as missing for the same
+    reason as a non-breaking space or plain spaces -- none of these is a meaningful identifier value."""
+    pid = _segment("PID", "1||\t")
+    assert cx_identifier(pid, 3) is None
+
+
 def test_cx_identifier_honours_custom_delimiters() -> None:
     """Security review, MEDIUM 3: `tests/fixtures/hl7/custom_delimiters.hl7`'s own shape -- `^` is not
     this message's component separator, so a literal `^` inside PID-3 is just data, not four components."""

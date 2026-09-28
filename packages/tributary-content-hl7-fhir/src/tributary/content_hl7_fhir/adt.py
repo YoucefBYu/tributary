@@ -89,8 +89,16 @@ def _safe_trigger_codes(message_type: str, trigger_event: str) -> tuple[str, str
     return safe_type, safe_trigger
 
 
+def _warn_if_invalid_date(ctx: FhirContext, *, path: str, raw: str, parsed: str | None) -> None:
+    """Log a `warning` when `raw` was present but failed to parse (`parsed is None`) -- never when the
+    field was simply absent, and never the field's own text (code-reviewer follow-up on 1aba292/5c42b2f:
+    mirrors the `Encounter`-omission warning's shape -- a path/reason only, invariant 6)."""
+    if raw and parsed is None:
+        ctx.log.warning("field_invalid_omitted", path=path, reason="invalid_value")
+
+
 def _map_encounter(
-    hl7: Hl7Message, pv1: Segment | None, *, patient_ref: Reference, status: str, trigger_event: str
+    hl7: Hl7Message, pv1: Segment | None, *, patient_ref: Reference, status: str, trigger_event: str, ctx: FhirContext
 ) -> Encounter | None:
     """PV1 -> `Encounter`, or `None` if the message carries no PV1 at all (ADT_A08 fixtures may omit it
     -- a pure demographic update). IG: "PV1 to Encounter" (build.fhir.org/ig/HL7/v2-to-fhir, PV1.md)."""
@@ -125,12 +133,22 @@ def _map_encounter(
         # would wrongly stamp the *discharge* time as the *admission* time whenever PV1-44 is blank,
         # which this reference set's fixtures deliberately exercise (PV1-44/-45 are both blank; EVN-2
         # only ever answers "when did the event this message reports happen").
-        start = ts_to_fhir_datetime(pv1.field(44))
-        end = ts_to_fhir_datetime(pv1.field(45))
+        pv1_44 = pv1.field(44)
+        start = ts_to_fhir_datetime(pv1_44)
+        _warn_if_invalid_date(ctx, path="PV1.44", raw=pv1_44, parsed=start)
+
+        pv1_45 = pv1.field(45)
+        end = ts_to_fhir_datetime(pv1_45)
+        _warn_if_invalid_date(ctx, path="PV1.45", raw=pv1_45, parsed=end)
+
         if start is None and trigger_event == "A01":
-            start = ts_to_fhir_datetime(hl7.get("EVN.2") or "")
+            evn2 = hl7.get("EVN.2") or ""
+            start = ts_to_fhir_datetime(evn2)
+            _warn_if_invalid_date(ctx, path="EVN.2", raw=evn2, parsed=start)
         if end is None and trigger_event == "A03":
-            end = ts_to_fhir_datetime(hl7.get("EVN.2") or "")
+            evn2 = hl7.get("EVN.2") or ""
+            end = ts_to_fhir_datetime(evn2)
+            _warn_if_invalid_date(ctx, path="EVN.2", raw=evn2, parsed=end)
         if start or end:
             # `Period.start`/`.end` are typed as `datetime` for their parsed representation; the FHIR
             # wire-format `str` `ts_to_fhir_datetime` returns (already calendar/clock-validated) is what
@@ -150,7 +168,9 @@ def _encounter_identifier(pv1: Segment, hl7: Hl7Message, *, msg_id: str, trigger
     for the *same* visit converge on the same conditional PUT (see `adt.py`'s module docstring for why
     that matters and what breaks without it). `fallback_system` mirrors `oru._diagnostic_report_
     identifier`'s reasoning: this reference set's fixtures carry no assigning-authority component on
-    PV1-19 either, so the sending facility (MSH-4) supplies one.
+    PV1-19 either, so the sending facility (MSH-4.1, the HD's own Namespace ID -- security review LOW:
+    reading the whole of MSH-4 would fold an HD's other components, or a custom delimiter's own text,
+    into the system URI) supplies one.
 
     With no PV1-19: `A01` (admitting -- there is no prior `Encounter` to converge with yet) still gets a
     message-scoped identifier, redelivery-idempotent even though it cannot converge with a later
@@ -159,10 +179,13 @@ def _encounter_identifier(pv1: Segment, hl7: Hl7Message, *, msg_id: str, trigger
     whatever A01 already created (or nothing, if A01 never ran through this mapping) rather than
     updating the original -- silently worse than simply not producing an `Encounter` entry.
     """
-    identifier = cx_identifier(pv1, 19, fallback_system=local_identifier_system(hl7["MSH.4"]))
+    identifier = cx_identifier(pv1, 19, fallback_system=local_identifier_system(hl7["MSH.4.1"]))
     if identifier is not None:
         return identifier
     if trigger_event == "A01":
+        # `msg_id` (`tb-msg-id`, always a validated UUID) and the fixed literal `"encounter"` are the
+        # only inputs here -- neither is sender-controlled, so unlike `cx_identifier` above (built from
+        # PV1-19's own text) there is no `safe_build` wrapping to do: nothing this call sees can fail.
         return message_identifier(msg_id, discriminator="encounter")
     return None
 
@@ -188,7 +211,7 @@ def adt_to_fhir(message: Message, ctx: FhirContext) -> Message:
     if msg_type != "ADT" or trigger_event not in _SUPPORTED_TRIGGERS:
         raise UnsupportedTriggerError(*_safe_trigger_codes(msg_type, trigger_event))
 
-    patient = map_patient(hl7)
+    patient = map_patient(hl7, ctx)
     patient_entry = ctx.fhir.upsert(patient)
     patient_ref = Reference(reference=patient_entry.fullUrl)
 
@@ -196,7 +219,12 @@ def adt_to_fhir(message: Message, ctx: FhirContext) -> Message:
 
     pv1 = hl7.segment("PV1") if hl7.segment_count("PV1") else None
     encounter = _map_encounter(
-        hl7, pv1, patient_ref=patient_ref, status=_STATUS_FOR_TRIGGER[trigger_event], trigger_event=trigger_event
+        hl7,
+        pv1,
+        patient_ref=patient_ref,
+        status=_STATUS_FOR_TRIGGER[trigger_event],
+        trigger_event=trigger_event,
+        ctx=ctx,
     )
     encounter_omitted = False
     if encounter is not None and pv1 is not None:

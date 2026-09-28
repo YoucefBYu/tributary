@@ -10,7 +10,6 @@ import json
 
 import pytest
 from tributary.content_hl7_fhir import UnsupportedTriggerError, oru_r01_to_fhir
-from tributary.content_hl7_fhir.errors import InvalidFieldError, RequiredFieldMissingError
 from tributary.fhir.fakes import fake_fhir_context
 from tributary.hl7v2.step import parse
 from tributary.sdk import Message
@@ -19,7 +18,7 @@ from tributary.sdk.testing import make_message, run_step
 from .conftest import GOLDEN_MSG_ID, load_golden, map_fixture
 
 
-def _oru_message(obx_segments: str, *, control_id: str = "SYNTHMSG00099") -> Message:
+def _oru_message(obx_segments: str, *, control_id: str = "SYNTHMSG00099", msg_id: str | None = None) -> Message:
     raw = (
         f"MSH|^~\\&|TRIBUTARY-SYNTH|SYNTH-LAB|SYNTH-ORU-RECV|SYNTH-RECV-FACILITY|"
         f"20260105101500||ORU^R01^ORU_R01|{control_id}|P|2.5.1\r"
@@ -27,7 +26,7 @@ def _oru_message(obx_segments: str, *, control_id: str = "SYNTHMSG00099") -> Mes
         f"OBR|1|SYNTHORD0099|SYNTHFILL0099|CBC^COMPLETE BLOOD COUNT^L|||20260105100000\r"
         f"{obx_segments}"
     ).encode()
-    return make_message(raw, content_type="application/hl7-v2+er7")
+    return make_message(raw, content_type="application/hl7-v2+er7", msg_id=msg_id)
 
 
 def _mapped_observation(obx_segments: str) -> dict[str, object]:
@@ -72,8 +71,10 @@ def test_diagnostic_report_body_carries_its_own_conditional_identifier() -> None
 def test_each_observation_entry_is_a_conditional_post_on_a_distinct_message_identifier() -> None:
     """One `Observation` per `OBX`, each an event-resource `POST` + `ifNoneExist` (channel-spec README
     3.4.2, security review MEDIUM 4 -- not a `PUT`, which would let a corrected later message overwrite
-    a result in place), keyed on `message_identifier(msg_id, discriminator=f"obx-{OBX-1}")` -- distinct
-    per OBX set id, stable across a redelivery of the same message."""
+    a result in place), keyed on `message_identifier(msg_id, discriminator=f"obx-{position}")` where
+    `position` is the OBX's 1-based position among the message's own OBX segments (code-reviewer
+    follow-up on 1aba292: not OBX-1's own Set ID, which real LIS interfaces frequently leave blank or
+    reset across sub-panels) -- distinct per position, stable across a redelivery of the same message."""
     bundle = map_fixture("oru_r01_repeating_obx.hl7", oru_r01_to_fhir)
     observation_entries = [
         entry
@@ -143,22 +144,54 @@ def test_non_structural_msh9_never_reaches_the_exception() -> None:
     assert "not a valid code" not in str(excinfo.value)
 
 
-# -- MEDIUM 4: a blank or repeated OBX-1 must not collide -----------------------------------------------
+# -- HIGH, code-reviewer: a blank or repeated OBX-1 is real lab traffic, not an error -------------------
 
 
-def test_blank_obx1_raises_a_typed_error() -> None:
-    with pytest.raises(RequiredFieldMissingError) as excinfo:
-        _mapped_observation("OBX||NM|8867-4^Heart rate^LN||72|/min|60-100|N|||F\r")
-    assert excinfo.value.path == "OBX.1"
+def _observation_ifnoneexist_values(obx_segments: str, *, msg_id: str | None = None) -> list[str]:
+    ctx = fake_fhir_context()
+    parsed = run_step(parse, _oru_message(obx_segments, msg_id=msg_id), ctx=ctx)
+    mapped = run_step(oru_r01_to_fhir, parsed, ctx=ctx)
+    assert isinstance(mapped, Message)
+    assert mapped.payload is not None
+    bundle = json.loads(mapped.payload)
+    return [
+        entry["request"]["ifNoneExist"]
+        for entry in bundle["entry"]
+        if entry["resource"]["resourceType"] == "Observation"
+    ]
 
 
-def test_repeated_obx1_raises_a_typed_error() -> None:
-    with pytest.raises(InvalidFieldError) as excinfo:
-        _mapped_observation(
-            "OBX|1|NM|8867-4^Heart rate^LN||72|/min|60-100|N|||F\r"
-            "OBX|1|NM|8480-6^Systolic^LN||120|mm[Hg]|90-120|N|||F\r"
-        )
-    assert excinfo.value.path == "OBX.1"
+def test_blank_obx1_still_maps_keyed_on_segment_position() -> None:
+    """A blank Set ID (OBX-1) is common real lab traffic, not an error: the `Observation` is keyed on
+    this OBX's 1-based position among the message's own OBX segments instead."""
+    values = _observation_ifnoneexist_values("OBX||NM|8867-4^Heart rate^LN||72|/min|60-100|N|||F\r")
+    assert len(values) == 1
+    assert values[0].endswith(":obx-1")
+
+
+def test_repeated_obx1_still_maps_with_distinct_deterministic_identifiers() -> None:
+    """A repeated Set ID (OBX-1) is common real lab traffic (sub-panels that each restart numbering), not
+    an error: each `Observation` still gets its own identifier, keyed on segment position rather than
+    OBX-1's own (here identical) text."""
+    values = _observation_ifnoneexist_values(
+        "OBX|1|NM|8867-4^Heart rate^LN||72|/min|60-100|N|||F\rOBX|1|NM|8480-6^Systolic^LN||120|mm[Hg]|90-120|N|||F\r"
+    )
+    assert len(values) == 2
+    assert len(set(values)) == 2
+    assert values[0].endswith(":obx-1")
+    assert values[1].endswith(":obx-2")
+
+
+def test_repeated_obx1_redelivery_gives_the_same_bundle() -> None:
+    """Position-keyed identifiers are exactly as stable across a redelivery of the same bytes (same
+    `tb-msg-id`) as OBX-1 would be if every sender populated it correctly -- a redelivery must produce a
+    byte-identical Bundle."""
+    obx_segments = (
+        "OBX|1|NM|8867-4^Heart rate^LN||72|/min|60-100|N|||F\rOBX|1|NM|8480-6^Systolic^LN||120|mm[Hg]|90-120|N|||F\r"
+    )
+    first = _observation_ifnoneexist_values(obx_segments, msg_id=GOLDEN_MSG_ID)
+    second = _observation_ifnoneexist_values(obx_segments, msg_id=GOLDEN_MSG_ID)
+    assert first == second
 
 
 # -- HIGH 1: unbounded CPU/memory from an unbounded exponent --------------------------------------------
@@ -215,6 +248,30 @@ def test_leading_trailing_space_in_obx3_code_does_not_crash_or_leak() -> None:
     validator, whose `ValidationError` embeds the rejected text verbatim."""
     observation = _mapped_observation("OBX|1|NM|  8867-4  ^Heart rate^LN||72|/min|60-100|N|||F\r")
     assert observation["code"]["coding"][0].get("code") is None or "8867-4" in observation["code"]["coding"][0]["code"]
+
+
+# -- LOW, security: MSH-4 fallback system reads only HD.1, not the whole field --------------------------
+
+
+def test_msh4_hd_value_uses_only_the_namespace_id_component_for_diagnostic_report_fallback() -> None:
+    """Security review LOW: an HD-valued MSH-4 (`SYNTH-LAB^UNIV-ID^ISO`) must contribute only its
+    Namespace ID (HD.1) to the `DiagnosticReport` fallback `Identifier.system` (no OBR-3 assigning
+    authority in this fixture)."""
+    ctx = fake_fhir_context()
+    raw = (
+        b"MSH|^~\\&|TRIBUTARY-SYNTH|SYNTH-LAB^UNIV-ID^ISO|SYNTH-ORU-RECV|SYNTH-RECV-FACILITY|"
+        b"20260105101500||ORU^R01^ORU_R01|SYNTHMSG00086|P|2.5.1\r"
+        b"PID|1||9000086^^^SYNTH-HOSPITAL^MR||SYNTHPATIENT^X||19900101|M\r"
+        b"OBR|1|SYNTHORD0086|SYNTHFILL0086|CBC^COMPLETE BLOOD COUNT^L|||20260105100000\r"
+        b"OBX|1|NM|8867-4^Heart rate^LN||72|/min|60-100|N|||F\r"
+    )
+    parsed = run_step(parse, make_message(raw, content_type="application/hl7-v2+er7"), ctx=ctx)
+    mapped = run_step(oru_r01_to_fhir, parsed, ctx=ctx)
+    assert isinstance(mapped, Message)
+    assert mapped.payload is not None
+    bundle = json.loads(mapped.payload)
+    report_entry = bundle["entry"][-1]
+    assert report_entry["resource"]["identifier"] == [{"system": "urn:id:SYNTH-LAB", "value": "SYNTHFILL0086"}]
 
 
 # -- LOW: fhir.resources is an explicit dependency of this package (checked in test_import.py's sibling) -
