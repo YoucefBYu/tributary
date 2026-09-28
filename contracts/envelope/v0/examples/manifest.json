@@ -35,6 +35,14 @@
     {
       "file": "valid/dlq-quarantine-undecodable.json",
       "note": "Quarantine wrapper (README 5.2): a record whose headers could not be decoded, rewritten as a new engine-constructed dlq record with a freshly minted tb-msg-id, octet-stream content type and the original bytes as the payload. Every header value here comes from the engine, none from the broken record"
+    },
+    {
+      "file": "valid/raw-mllp-sync-request.json",
+      "note": "Set 1.2 (W2-8): a synchronous request on raw. tb-correlation-id, tb-reply-partition and tb-reply-deadline travel together; the sender's MSH-10 is in no header"
+    },
+    {
+      "file": "valid/reply-rejected-with-code.json",
+      "note": "Set 1.2 (W2-8): a reply with tb-reply-status rejected carries tb-error-code (the Reject code). Body mode ack, so the value is zero bytes"
     }
   ],
   "invalid": [
@@ -167,6 +175,34 @@
       "expected_json_path": "$.headers['tb-channel-version']",
       "expected_validator": "pattern",
       "expectation_note": "ADDED 2026-09-22. Measured in the same 96-check run as the entry above"
+    },
+    {
+      "file": "invalid/reply-rejected-without-error-code.json",
+      "violates": "a reply with tb-reply-status rejected or failed must carry tb-error-code: the receiver puts the code in MSA-3, and AE with no reason is the one answer an integrator cannot act on (README 3)",
+      "expected_json_path": "$.headers",
+      "expected_validator": "required",
+      "expectation_note": "PREDICTED by the architect (set 1.2), UNMEASURED. Weak evidence of WHY on its own - 'required' at $.headers is also what a missing core header produces - accepted because every core reply header is present in this example"
+    },
+    {
+      "file": "invalid/raw-reply-partition-without-deadline.json",
+      "violates": "tb-reply-partition on raw requires tb-reply-deadline (and tb-correlation-id): without the deadline the worker cannot skip a reply nobody is waiting for, which after an outage floods reply (S3: 1,026 late replies after one restart)",
+      "expected_json_path": "$.headers",
+      "expected_validator": "dependentRequired",
+      "expectation_note": "PREDICTED by the architect (set 1.2), UNMEASURED. First use of dependentRequired in these contracts"
+    },
+    {
+      "file": "invalid/raw-reply-partition-out-of-range.json",
+      "violates": "tb-reply-partition is decimal 0-63, because channel-spec reply.partitions is at most 64",
+      "expected_json_path": "$.headers['tb-reply-partition']",
+      "expected_validator": "pattern",
+      "expectation_note": "PREDICTED by the architect (set 1.2), UNMEASURED"
+    },
+    {
+      "file": "invalid/out-with-reply-partition.json",
+      "violates": "the reply-routing headers exist on raw only; the worker strips them from out, retry and dlq so a reprocessed or replayed record never answers on a partition nobody is watching (README 6 rule 7)",
+      "expected_json_path": "$.headers",
+      "expected_validator": "not",
+      "expectation_note": "PREDICTED by the architect (set 1.2), UNMEASURED. Same mechanism as raw-with-failure-headers.json"
     }
   ]
 }

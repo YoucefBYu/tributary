@@ -3,6 +3,86 @@
 Newest first. Each entry names the contract, the version, whether the change is additive or
 breaking, and the reason. Breaking changes reference an ADR.
 
+## 2026-09-28 — contract set 1.2: synchronous reply mode (W2-8)
+
+**Additive throughout.** Every document valid under set 1.1 stays valid, including the set 1.0 reply
+example, which has no `tb-reply-status` (that header is schema-optional for exactly this reason).
+Source: `platform-engineer`'s proposal `docs/agent-team/proposals/W2-8-sync-reply.md` (`b0c91cb`).
+Decisions and what they give up: ADR-003 D9 (amended) and D10.
+
+| # | Proposal item | Ruling and why |
+|---|---|---|
+| 1 | `spec.source.reply` on `mllp` and `http`: `timeoutMs`, `after`, `body`, `maxPending`, `partitions` | **Approved with amendments.** Shape as proposed; `after` is `const: routed` (`delivered` reserved). `reply.partitions` is the only sizing input for `reply` (`spec.partitions` does not apply), since it tracks processes, not throughput. The transactional refusal moves **into the schema** (ADR-007 D7: a rule the schema can hold is held there). The split refusal stays a load-time rule, because a `ref` splitter is unknown until load. `ack.timeoutMs` is now documented as the commit-wait bound, distinct from `reply.timeoutMs` |
+| 2 | Targeted routing through the `replier` group | **Approved with three amendments.** (a) `group.instance.id` is unique **per process**, otherwise one process fences another. (b) A process advertises p only once its consumer has an **established fetch position** on p, which closes the `latest`-reset race. (c) A reply record the receiver cannot parse is dropped with topic/partition/offset only, never crashing the consumer. Broadcast is rejected as the default |
+| 3a | `AR` = commit not confirmed, `AE` = committed, `AA` = commit confirmed plus `accepted` reply | **Approved with an amendment: `AE` is also never sent before the successful `raw` callback.** As proposed, a revoke arriving before the callback answered `AE` at once, which claims a commit that may still fail. It now waits for the callback: `AE` on success, `AR` on failure. The same rule already held the async receiver to `AA` and `AR` only, so the rule holds in both modes |
+| 3b | Pipeline `Reject` → `AE`, not `AR` | **Approved.** It was committed; `AR` would tell the sender a resend is safe. HL7 original mode reads `AE` as a content error anyway |
+| 3c | Whole-message `Drop` → `AA` | **Approved** (the proposal's open point). Committed and filtered on purpose. An `onDrop` option is an open item, not in 1.2. Partial failure: status and code of the **first failure in spec order**, not in time (amendment, for determinism). An absent or unknown `tb-reply-status` answers `AE`, never `AA` (amendment, fail-safe) |
+| 3d | HTTP column | **Not adopted in 1.2; decided with W2-7.** Binding constraint: not-committed is exactly `503` + `Retry-After`, and no committed outcome uses a status clients retry automatically (`5xx`, `408`, `429`). The proposed `500` for `failed` breaks it |
+| 4 | Refusals: transactional, split | **Approved** (transactional now in the schema, split at load). A worker whose applied spec cannot reply skips the reply and counts it; the sender gets a truthful `AE` |
+| 5a | Envelope: `tb-reply-partition`, `tb-reply-deadline`, `tb-reply-status`; `tb-error-code` on `reply` | **Approved with amendments.** `tb-reply-status` is schema-optional and code-required: making it `R` would invalidate the set 1.0 valid reply example, which is breaking. `tb-reply-deadline` is `C`, present iff `tb-reply-partition` (was `O`), enforced by `dependentRequired`, and it must not be earlier than the real deadline (produce time + `ack.timeoutMs` + `reply.timeoutMs`), because the reply clock starts at the callback. `tb-reply-partition` pinned to `0`-`63`. A malformed or out-of-range reply-routing header **disables the reply, not the message** (new envelope 2.3.3), the one narrow exception to the 2.3 reject rule. Propagation rule 7: the worker strips both routing headers |
+| 5b | `REPLY_` prefix and six exact codes | **Approved with one rename:** `REPLY_PARTITION_INVALID` → `REPLY_ROUTE_INVALID`, because it also covers a malformed `tb-reply-deadline`. The four receiver codes reach the sender and metrics, never a header or event, and are registered anyway so a `Reject` cannot borrow them. `REPLY_BODY_MISSING` fails the reply only; the message was routed, so there is no `dlq` record |
+| 5c | ACLs; per-channel reply partition count | **Approved.** Receiver: READ on `.reply` and group `tb.<env>.<ch>.replier*`, no WRITE. Worker: WRITE on `.reply`. `topic-defaults.json` gains `clients.reply_consumer` and three `must_not_hardcode` entries. **Found while writing it:** `consumer_groups.roles` had omitted `receiver` since set 1.1; added |
+| 5d | SDK `ctx.reply(body, *, content_type)` | **Approved with amendments:** pipeline steps only (raises in a destination step, where N copies could each answer); a registered content type (`hl7-v2+er7` for `mllp`); body ≤ 1,000,000 bytes; a body set by an attempt that then raised is discarded before the retry; a call on a record that will not reply is discarded and counted, so a step survives a hot reload to async. **Condition on `body: step`:** resolved bodies waiting behind a slower request are charged to `queue.maxBytes` |
+| 6 | Section 3: D9's mitigation does not cover a resend after `AE` | **Correct, and ADR-003 D9 is amended.** A resend is a new message with a new `tb-msg-id` (3.2.2). `tb-msg-id` idempotency absorbs worker replays only. The same error was in ADR-001 sections 7 and 13 and in the STATUS risk table; all corrected, and ADR-001 6.5 notes the targeted refinement. The control-plane warning is made unconditional, because every technique is keyed on `tb-msg-id` (5), so "warn when every destination relies only on `tb-msg-id`" would always fire |
+| 7 | `events/v0` | **No change.** Whether the browser needs "the sender got `AE`" is open: it needs a receiver ACL on `_tb.<env>.events`, an ACL-model change for ADR-004 |
+
+### `tributary.channel-spec/v0`
+
+New `$defs/syncReply`; `reply` in `source.properties` and in the `mllp` and `http` `propertyNames`
+lists; a spec-level `if source.reply then pipeline.transactional const false`. README 3.2.6 (new), 2,
+3.2, 3.2.2, 8, 9. Examples: `valid/lab-query-mllp-sync-reply.json` (`runnable: false`) and five
+invalid, with **predicted, unmeasured** pairs:
+
+| Example | Pinned pair |
+|---|---|
+| `reply-on-sftp-source` | `$.spec.source` / `enum` |
+| `reply-timeout-below-minimum` | `$.spec.source.reply.timeoutMs` / `minimum` |
+| `reply-after-delivered` | `$.spec.source.reply.after` / `const` |
+| `reply-unknown-field` | `$.spec.source.reply` / `additionalProperties` |
+| `reply-with-transactional-pipeline` | `$.spec.pipeline.transactional` / `const` |
+
+### `tributary.envelope/v0`
+
+Three headers; `tb-error-code` on `reply` conditional; the three forbidden on every class they do not
+belong to (they were already invalid everywhere under `additionalProperties: false`, so nothing
+narrows). README 1.1, 2, 2.3, 2.3.2, new 2.3.3, 2.4, 3, 6. `error-codes.json` set 1.2. Examples:
+`valid/raw-mllp-sync-request.json`, `valid/reply-rejected-with-code.json`, and four invalid, with
+**predicted, unmeasured** pairs:
+
+| Example | Pinned pair |
+|---|---|
+| `reply-rejected-without-error-code` | `$.headers` / `required` |
+| `raw-reply-partition-without-deadline` | `$.headers` / `dependentRequired` (first use in these contracts) |
+| `raw-reply-partition-out-of-range` | `$.headers['tb-reply-partition']` / `pattern` |
+| `out-with-reply-partition` | `$.headers` / `not` |
+
+### `tributary.topics/v0`
+
+README 2, 2.2, new 3.3.1, 3.6, 3.7; `topic-defaults.json` `classes.reply`, `security.acls.receiver`
+and `pipeline_worker`, `clients.reply_consumer`, `must_not_hardcode`, `partition_budget`,
+`consumer_groups`.
+
+### Change requests that follow
+
+- `platform-engineer`: add the six `REPLY_` codes to `ENGINE_CODES` and `REPLY_` to
+  `RESERVED_PREFIXES` **in the same commit as this contract change, or immediately after**: the
+  two-way registry cross-check test in `tributary-sdk` goes red until both sides agree.
+- `connector-engineer` and `devops-engineer`: the three new `must_not_hardcode` values each need the
+  effective-configuration test (3.7) when the reply consumer lands.
+
+### Verification owed
+
+Not run by the architect, who has no shell.
+
+- `uv run --no-project --python 3.12 --with jsonschema python contracts/validate.py`: expected
+  **134 / 0** (122 + 12 new examples).
+- `validate.py --emit-expectations`: **needed**. The nine new pairs above are predictions. The least
+  certain is `dependentRequired`, which has no precedent here.
+- `pytest tests/conformance`: expected **139 passed** (127 + 12), if the suite still has one case per
+  example.
+- `uv run pytest packages/tributary-sdk` once `codes.py` is updated: the registry cross-check.
+- The runtime corpus test: `lab-query-mllp-sync-reply.json` must stay unresolved (it names a `ref` step).
+
 ## 2026-09-26 — `TB_DLQ_UNWRITABLE` registered; `raw` `max.message.bytes` ruled not an envelope control
 
 Both **additive**. No schema, example or invalid-example change, so no expected-failure pair moves.

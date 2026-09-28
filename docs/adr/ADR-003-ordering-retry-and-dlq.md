@@ -191,12 +191,25 @@ produced 1,026 late replies, which the receiver correctly dropped as unknown cor
 across the restart was zero.
 
 The consequence is unavoidable rather than a defect: **a sender that retries after a timeout NACK
-creates a duplicate downstream.** Therefore:
+creates a duplicate downstream.**
+
+**Amended 2026-09-28 (W2-8, `platform-engineer`'s finding, verified by the architect).** The original
+text drew the wrong conclusion from that sentence: it said loader idempotency on `tb-msg-id` is the
+mitigation. It is not. **A resent message is a new message with a new `tb-msg-id`**
+(`channel-spec/v0` 3.2.2, "Duplicates at ingest": the receiver mints the id per received message), so
+a loader that is idempotent on `tb-msg-id` delivers it again. `tb-msg-id` idempotency absorbs the
+*other* duplicate source in sync mode — worker replays after a crash, which keep their id. The only
+mitigations for a sender resend are sink-native idempotency on a **business identifier** (for example
+the W2-3 conditional FHIR update on a visit or order identifier) and edge dedupe (D8, deferred). No
+invariant changes: invariant 4 promises at-least-once with `tb-msg-id` idempotency, and it never
+covered a sender resubmitting. Therefore:
 
 1. Every loader on a synchronous channel MUST be idempotent on `tb-msg-id` — invariant 4 already
-   requires this, and sync mode is where it stops being theoretical.
+   requires this, and it absorbs worker-replay duplicates, **not** sender resends after `AE`.
 2. The timeout NACK's meaning MUST be documented for integrators, who will otherwise read `AE` as
-   "resend it, nothing happened".
+   "resend it, nothing happened": `AE` means committed, a resend is a duplicate that `tb-msg-id`
+   idempotency does not absorb, and only a business-identifier sink or D8 would. The control plane
+   warns on every sync channel (`contracts/channel-spec/v0` 3.2.6).
 3. The reply worker uses **fail-fast plus DLQ, not `blocking` retry**: pausing a partition to retry
    one reply would stall every other sender's request on that partition, and the receiver's own
    timeout is the correct control (S5's note to S3).
@@ -204,10 +217,51 @@ creates a duplicate downstream.** Therefore:
    and S3's latency was already dominated by two Kafka commits per request.
 
 **Give up:** exactly-once semantics at the edge. No sender protocol offers it, and edge dedupe (D8)
-is the only mitigation — deferred, and a state store either way.
+is the only general mitigation — deferred, and a state store either way.
 
 **Caveat:** S3's numbers come from a **stand-in echo worker**, not a real pipeline worker. The
 mechanism and its failure semantics are established; the latency figures are not a product number.
+
+### D10. Synchronous reply: routing and what each answer means (decided 2026-09-28, W2-8)
+
+From `platform-engineer`'s proposal (`docs/agent-team/proposals/W2-8-sync-reply.md`), ruled by the
+architect. Contract: `contracts/channel-spec/v0` 3.2.6, `envelope/v0` 3 and 2.3.3, `topics/v0` 3.3.1,
+set 1.2.
+
+**Routing.** Criteria: no coordinator (invariant 3), each reply reaches the process holding the socket,
+cost that does not grow with process count, least PHI exposure.
+
+| Option | Verdict |
+|---|---|
+| Plain consumer group, replies hashed by correlation id | **Rejected.** The reply lands on whichever member owns the hash, not the one holding the socket |
+| Broadcast (ADR-001 6.5 as written): every process reads every partition and filters | **Rejected as the default.** Reads scale as replies × processes, and with `body: step` every process reads every other sender's PHI-bearing answer |
+| **Targeted:** each process holds reply partitions through the `replier` group and advertises one in `tb-reply-partition`; the worker produces to it | **Chosen.** Kafka's assignment is the lease. S3: no slower (p50 43 vs 49 ms at 100 msg/s, 85 vs 136 ms at 1k; single run, one instance, inconclusive) |
+
+**Give up:** a reply partition count that must track the receiver process count (a deploy warning and
+a readiness failure rather than a silent degradation), and a rebalance turns in-flight requests on the
+moved partition into `AE` / `REPLY_ROUTE_LOST`. Planned restarts avoid that with static membership
+(S5: 3.21 s).
+
+**Answers.** One rule across both MLLP modes: **`AR` = commit not confirmed (resend is safe), `AE` =
+committed (resend duplicates), `AA` = committed and routed.** Neither `AA` nor `AE` is ever sent before
+the receiver's own `raw` delivery callback succeeds. A pipeline `Reject` answers `AE`, not `AR`,
+because it was committed; a whole-message `Drop` answers `AA`, because it was committed and filtered on
+purpose. **Rejected:** `AR` for a `Reject`, the proposal's own alternative, which would tell the sender
+a resend is safe when it is not. HL7 original mode reads `AE` as a content error anyway. **Give up:** a
+sender configured to expect `AR` for a refused message sees `AE`, and any sender that treats `AE` as
+"resend" duplicates — hence the D9 amendment and the integrator note.
+
+**Refused in set 1.2:** sync reply on transactional channels (a reply inside the transaction is late
+by up to a batch; one outside could `AA` aborted work) and on channels with any splitter (N outcomes,
+no aggregator). `after: delivered` is reserved. The HTTP status mapping is decided with W2-7 under
+the constraint that no committed outcome uses a status clients retry automatically.
+
+**Invariants.** 1: holds, and the proposal was amended so that a revoke before the commit callback
+cannot produce an `AE`. 5: order is fixed at the `raw` commit and sync mode changes neither
+partitioning nor retry; a resend after `AE` that lands after later messages is **sender-induced**, not
+an engine reordering, and cannot be detected without D8, so it is documented rather than prevented. 6:
+the sender's MSH-10 lives only in the receiver's in-memory map, and the three new headers carry an
+integer, a timestamp and an enum.
 
 ---
 
@@ -247,7 +301,9 @@ partition pause means; Kafka share groups for unordered destinations.
 3. Alert rules for `partition_halted` and DLQ arrival rate ship with the MVP, not after. D3's default
    of `halt-partition` requires an operator, so the alert *is* the mitigation.
 4. Document the ordering and retry model for integrators in `docs/` — this is a migration blocker for
-   Mirth users, who expect per-destination queues with automatic retry. Include D9's `AE` semantics.
+   Mirth users, who expect per-destination queues with automatic retry. Include D9's `AE` semantics
+   as amended (a resend after `AE` is a new `tb-msg-id`), D10's answer table, and the sender-induced
+   reordering of a late resend (2026-09-28).
 5. **Spike `retry-topic` with delay tiers** (D2) before any destination may select it: choose between
    one topic plus `tb-retry-not-before` and one topic per tier, and measure the head-of-line cost that
    separates them. It is the only policy in ADR-001 6.4 with no evidence behind it. **The criteria for

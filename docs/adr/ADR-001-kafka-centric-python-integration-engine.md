@@ -467,6 +467,8 @@ Some integrations need the sender to wait for a downstream result (query/respons
 
 This costs latency and adds a failure mode, so it is opt-in per channel. Default is asynchronous ACK-after-commit.
 
+**Refined 2026-09-28 (W2-8, ADR-003 D10):** step 1's "subscribes for that id" is implemented as **targeted** routing, not broadcast. Each receiver process holds reply partitions through the `replier` consumer group and names one in `tb-reply-partition`; the worker produces the reply to that partition. The answer semantics (`AA` / `AE` / `AR`) and the spec shape are in `contracts/channel-spec/v0` 3.2.6.
+
 ### 6.6 Storage and data model
 
 **PostgreSQL (control plane):** tenants, users, roles, role bindings, channels, channel versions (spec plus bundle digest), deployments (environment, version, status), alert rules, code/KV entries, API tokens, secret references. Migrations with Alembic.
@@ -595,7 +597,7 @@ Rows marked **measured** were exercised in Phase 0; the rest remain design inten
 | Poison message | Retry in place, then DLQ with context; ordered channels can be configured to halt instead | **measured (S5):** exactly 8 of 8 dead-lettered, partition kept moving; `halt-partition` verified as the ordered alternative |
 | Transactional stage killed with a transaction open | Successor fences the dead producer, aborts the transaction, input offsets roll back | **measured (S5):** 50 records proven inside an open transaction at the kill; after restart, 2,000 records with 0 duplicates and 0 losses |
 | Destination outage | Backoff or circuit breaker; lag grows and alerts fire; other destinations unaffected | **partly measured (S5):** 598 blocking pause/seek/resume cycles, 0 loss, 0 skips. Outages of seconds only; a multi-minute outage against `max.poll.interval.ms` is untested |
-| Synchronous reply worker crash | Requests in flight time out; the receiver returns a NACK | **measured (S3, stand-in worker):** 5 to 6 s stall, 0 lost, no reply delivered to the wrong request. **The timed-out requests were already committed**, so a sender retry duplicates them downstream — sync mode requires loader idempotency on `tb-msg-id` and the timeout NACK means "committed, outcome unknown" |
+| Synchronous reply worker crash | Requests in flight time out; the receiver returns a NACK | **measured (S3, stand-in worker):** 5 to 6 s stall, 0 lost, no reply delivered to the wrong request. **The timed-out requests were already committed**, so a sender retry duplicates them downstream, and the timeout NACK means "committed, outcome unknown". The retry carries a **new** `tb-msg-id`, so loader idempotency on `tb-msg-id` does not absorb it; only a business-identifier sink or edge dedupe does (ADR-003 D9, amended 2026-09-28) |
 | ClickHouse or archiver down | Processing unaffected; archiver catches up from Kafka within retention | not measured |
 | PostgreSQL or API down | Data plane keeps running from compacted channel specs; deploys and UI edits unavailable | not measured |
 | Bad deploy | Roll back to previous digest; replay affected range from `raw` | not measured |
@@ -745,7 +747,7 @@ bold; the full version with ratings is `docs/spikes/PHASE-0-DECISION.md` section
 | Contributor fragmentation with OIE | Medium | Medium | none | Open dialogue, interoperability, importer targeting OIE |
 | Security incident from arbitrary Python steps | Low to medium | High | none | Trust model, container isolation, signed bundles, review gates |
 | **Receiver-wide stall on a single broker loss** | **Medium** | **Medium** | **S2: 7.5 to 12.7 s across all connections, 20/20 trials; cause inferred** | **Per-connection head-of-line isolation; broker session and election tuning** |
-| **Sync-reply duplicates after a timeout NACK** | **High** | **Medium** | **S3: 1,026 of 9,000 requests timed out, all already committed** | **Loader idempotency on `tb-msg-id`; document `AE` as "committed, outcome unknown"** |
+| **Sync-reply duplicates after a timeout NACK** | **High** | **Medium** | **S3: 1,026 of 9,000 requests timed out, all already committed** | **Document `AE` as "committed, a resend duplicates" (channel-spec 3.2.6); business-identifier idempotency at the sink; edge dedupe (ADR-003 D8, deferred). `tb-msg-id` idempotency covers worker replays only: a resend has a new id (ADR-003 D9 as amended 2026-09-28)** |
 | **ACK latency target unverified on production-like hardware** | **High** | **Medium** | **S2: p99 33 to 125 ms at 1k msg/s against a 50 ms threshold; a bare producer with no MLLP had p99 131 ms on the same cluster** | **Linux re-run with a dedicated cluster before any sizing or marketing claim** |
 | **Untested mechanisms carried forward** (`retry-topic` delay tiers, claim-check) | **Medium** | **Medium** | **none — neither was exercised in Phase 0** | **Spike both before implementing; claim-check is the largest single PHI store in the design** |
 

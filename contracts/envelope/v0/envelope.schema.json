@@ -58,7 +58,7 @@
       }
     },
     {
-      "$comment": "Class raw: no destination-, retry- or failure-specific headers.",
+      "$comment": "Class raw: no destination-, retry- or failure-specific headers. Set 1.2: a sync-mode request carries tb-reply-partition, and then must also carry tb-correlation-id and tb-reply-deadline; neither reply-routing header may appear without the other (README 3, 2.3.3).",
       "if": { "properties": { "class": { "const": "raw" } }, "required": ["class"] },
       "then": {
         "properties": {
@@ -71,8 +71,15 @@
                     { "required": ["tb-destination"] },
                     { "required": ["tb-stage"] },
                     { "required": ["tb-error-code"] },
-                    { "required": ["tb-retry-not-before"] }
+                    { "required": ["tb-retry-not-before"] },
+                    { "required": ["tb-reply-status"] }
                   ]
+                }
+              },
+              {
+                "dependentRequired": {
+                  "tb-reply-partition": ["tb-correlation-id", "tb-reply-deadline"],
+                  "tb-reply-deadline": ["tb-reply-partition"]
                 }
               }
             ]
@@ -81,7 +88,7 @@
       }
     },
     {
-      "$comment": "Class out: destination required, no failure headers yet.",
+      "$comment": "Class out: destination required, no failure headers yet. Set 1.2: the worker strips the reply-routing headers from every record it produces, so a reprocessed or replayed record never answers on a partition nobody is watching.",
       "if": { "properties": { "class": { "const": "out" } }, "required": ["class"] },
       "then": {
         "properties": {
@@ -93,7 +100,10 @@
                 "not": {
                   "anyOf": [
                     { "required": ["tb-error-code"] },
-                    { "required": ["tb-retry-not-before"] }
+                    { "required": ["tb-retry-not-before"] },
+                    { "required": ["tb-reply-partition"] },
+                    { "required": ["tb-reply-deadline"] },
+                    { "required": ["tb-reply-status"] }
                   ]
                 }
               }
@@ -118,6 +128,15 @@
                   "tb-retry-not-before"
                 ],
                 "properties": { "tb-attempt": { "pattern": "^[1-9][0-9]{0,3}$" } }
+              },
+              {
+                "not": {
+                  "anyOf": [
+                    { "required": ["tb-reply-partition"] },
+                    { "required": ["tb-reply-deadline"] },
+                    { "required": ["tb-reply-status"] }
+                  ]
+                }
               }
             ]
           }
@@ -133,7 +152,16 @@
             "allOf": [
               { "$ref": "#/$defs/requiredCore" },
               { "required": ["tb-stage", "tb-error-code"] },
-              { "not": { "required": ["tb-retry-not-before"] } }
+              {
+                "not": {
+                  "anyOf": [
+                    { "required": ["tb-retry-not-before"] },
+                    { "required": ["tb-reply-partition"] },
+                    { "required": ["tb-reply-deadline"] },
+                    { "required": ["tb-reply-status"] }
+                  ]
+                }
+              }
             ]
           }
         }
@@ -162,7 +190,7 @@
       }
     },
     {
-      "$comment": "Class reply: correlation id is the whole point; tb-source and tb-attempt are optional.",
+      "$comment": "Class reply: correlation id is the whole point; tb-source and tb-attempt are optional. Set 1.2: tb-reply-status is optional in the SCHEMA so that a set 1.0-valid reply record stays valid, and required by CODE from every W2-8 worker (README 3, same arrangement as metadata.version in the channel spec). A receiver treats an absent or unknown status as not accepted: never AA. tb-error-code, forbidden on reply until set 1.1, is now required when the status is rejected or failed and still forbidden otherwise.",
       "if": { "properties": { "class": { "const": "reply" } }, "required": ["class"] },
       "then": {
         "properties": {
@@ -178,10 +206,17 @@
             ],
             "not": {
               "anyOf": [
-                { "required": ["tb-error-code"] },
-                { "required": ["tb-retry-not-before"] }
+                { "required": ["tb-retry-not-before"] },
+                { "required": ["tb-reply-partition"] },
+                { "required": ["tb-reply-deadline"] }
               ]
-            }
+            },
+            "if": {
+              "properties": { "tb-reply-status": { "enum": ["rejected", "failed"] } },
+              "required": ["tb-reply-status"]
+            },
+            "then": { "required": ["tb-error-code"] },
+            "else": { "not": { "required": ["tb-error-code"] } }
           }
         }
       }
@@ -270,9 +305,22 @@
         "tb-destination": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,63}$" },
         "tb-stage": { "$ref": "#/$defs/stage" },
         "tb-error-code": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]{0,63}$" },
-        "tb-retry-not-before": { "$ref": "#/$defs/rfc3339UtcMillis" }
+        "tb-retry-not-before": { "$ref": "#/$defs/rfc3339UtcMillis" },
+        "tb-reply-partition": {
+          "type": "string",
+          "pattern": "^(0|[1-9]|[1-5][0-9]|6[0-3])$",
+          "$comment": "Set 1.2 (W2-8). raw only, set iff the request is synchronous: the reply-topic partition the receiving process holds, 0-63 (channel-spec reply.partitions is at most 64). Decimal ASCII, not PHI. The worker checks it against the real partition count; out of range or malformed disables the reply, not the message (README 2.3.3)."
+        },
+        "tb-reply-deadline": {
+          "$ref": "#/$defs/rfc3339UtcMillis",
+          "$comment": "Set 1.2 (W2-8). raw only, present iff tb-reply-partition is. An upper bound on when the receiver stops waiting: the worker skips a reply past it plus 5 s of skew. MUST NOT be earlier than the receiver's real deadline (README 3)."
+        },
+        "tb-reply-status": {
+          "enum": ["accepted", "rejected", "failed"],
+          "$comment": "Set 1.2 (W2-8). reply only. accepted = every destination produced or deliberately dropped; rejected = a Reject code; failed = any other failure. Only 'accepted' may become AA."
+        }
       },
-      "$comment": "Value budget: the 16 KiB total is a producer-side check, but the schema bounds the worst case so open-ended headers cannot blow it. The 16 registered header values sum to about 2.5 KiB, and the 16 remaining slots can only be tb-usr-*/tb-x-* at 256 bytes each, so a schema-valid header set is roughly 7 KiB including names - comfortably inside 16 KiB. The earlier 1024-byte allowance for those two prefixes admitted about 32 KiB, twice the budget.",
+      "$comment": "Value budget: the 16 KiB total is a producer-side check, but the schema bounds the worst case so open-ended headers cannot blow it. The 19 registered header values (set 1.2 added three short ones: an integer, a timestamp and an enum) sum to about 2.6 KiB, and every remaining slot up to 32 can only be tb-usr-*/tb-x-* at 256 bytes each, so a schema-valid header set is roughly 7 KiB including names - comfortably inside 16 KiB. The earlier 1024-byte allowance for those two prefixes admitted about 32 KiB, twice the budget.",
       "patternProperties": {
         "^tb-x-[a-z0-9-]{1,48}$": {
           "type": "string",

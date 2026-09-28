@@ -1,0 +1,20 @@
+{
+  "class": "raw",
+  "topic": "prod.lab-query.raw",
+  "key_present": true,
+  "key_size": 24,
+  "payload_present": true,
+  "payload_size": 640,
+  "headers": {
+    "tb-msg-id": "01930b7e-4c88-7d21-9a0b-1c2d3e4f5a6b",
+    "tb-channel": "lab-query",
+    "tb-channel-version": "3",
+    "tb-source": "mllp-receiver:recv-2b9c@10.0.2.15:41600",
+    "tb-received-at": "2026-09-28T09:15:02.481Z",
+    "tb-content-type": "application/hl7-v2+er7",
+    "tb-attempt": "0",
+    "tb-correlation-id": "01930b7e-4c88-7a10-b2d4-5e6f7a8b9c0d",
+    "tb-reply-partition": "2",
+    "traceparent": "00-6a1f0c3e9b2d47a58c0e1f2a3b4c5d6e-1a2b3c4d5e6f7a8b-01"
+  }
+}

@@ -104,7 +104,7 @@ Helm read one source instead of hardcoding three.
 | `out.<dest>` | 3, matching `raw` | 7 d | delete |
 | `retry` | 3, matching `raw` | 3 d | delete |
 | `dlq` | 3 | 30 d | delete |
-| `reply` | 3 | 10 min | delete |
+| `reply` | 3, or `spec.source.reply.partitions` (set 1.2); created only for a sync-reply channel | 10 min | delete |
 | `_tb.<env>.channels` | 6 | compacted | compact |
 | `_tb.<env>.events` | 24 (**still unmeasured**, section 2.2) | 3 d | delete |
 | `_tb.<env>.audit` | 6 | 30 d (**TODO(human)**, section 2.1) | delete |
@@ -116,6 +116,13 @@ a silent violation of invariant 5. The runtime MUST refuse to start a channel wh
 disagree.
 
 `dlq` gets fewer partitions because it is keyed by message id, low volume, and read by humans.
+
+**`reply` is sized by receiver processes, not by throughput (set 1.2).** Its count comes only from
+`spec.source.reply.partitions` (channel-spec 3.2.6), never from `spec.partitions`, and it need not
+match `raw`: a reply goes to the explicit partition named in `tb-reply-partition`, not by key hash.
+It must be at least the number of receiver processes, because each process needs one to advertise
+(3.3.1). Raising it on a live topic is harmless; lowering it means recreating the topic, which a
+10-minute retention makes cheap.
 
 ### 2.1 Audit retention is a human decision, not an engineering default
 
@@ -157,8 +164,8 @@ channels** (roughly 21,000 partitions: JVM OOM, then loss of the raft quorum). A
 — 12,009 partitions — were healthy**, with `list_topics` at 0.17 s and 1.4 GiB per broker container.
 
 Budget for deciding when a cluster needs more brokers or topic sharing, in **projected total
-partitions** (`channels x 4 x partitions`; a sync-reply channel has five topics, so it counts for
-more):
+partitions** (`channels x 4 x partitions`, plus `reply.partitions` for each sync-reply channel,
+whose fifth topic is sized separately):
 
 | Trigger | Partitions | Basis |
 |---|---|---|
@@ -234,6 +241,30 @@ available, it NACKs or refuses the connection. It never ACKs optimistically.
 | `isolation.level` | `read_committed` on topics written by a transactional stage | Otherwise a consumer sees aborted records. |
 | `max.poll.interval.ms` | ≥ the slowest destination timeout plus backoff | Otherwise a slow sink looks like a dead consumer and causes a rebalance loop. |
 
+#### 3.3.1 Receiver reply consumer (set 1.2, synchronous reply mode)
+
+Machine-readable in `topic-defaults.json` `clients.reply_consumer`. One per receiver process of a
+sync-reply channel, in group `tb.<env>.<channel>.replier`. **Kafka's partition assignment is the lease
+on a reply partition**, so no coordinator is involved and invariant 3 holds.
+
+| Setting | Value | Why |
+|---|---|---|
+| Offsets | never committed; `enable.auto.commit=false` | A reply older than the process's pending map is useless |
+| `auto.offset.reset` | `latest` | Same reason |
+| `isolation.level` | `read_uncommitted` | The reply producer is not transactional (sync reply is refused on transactional channels) |
+| `partition.assignment.strategy` | `cooperative-sticky` | A joining process takes partitions without revoking everyone's |
+| `group.instance.id` | unique **per process** | A duplicate id fences a live process out of the group |
+| `session.timeout.ms` / `heartbeat.interval.ms` | 15000 / 5000 | As 3.3. Bounds how long a killed process's partition stays unusable; stalls no other process |
+
+Two rules that are not client settings:
+
+1. **Advertise only an established partition.** A process puts p in `tb-reply-partition` only after it
+   holds p and its consumer has a fetch position on p. Otherwise a reply written between assignment
+   and the `latest` offset reset is skipped. That ends as `AE` (safe) but is a race, and the tests
+   must close it.
+2. **No partition, not ready.** A process holding none, or whose reply consumer is disconnected,
+   answers sync requests `AR` / `REPLY_UNAVAILABLE` **before publishing** and fails readiness.
+
 ### 3.4 Transport security and authorization (required)
 
 A cluster built from sections 3.1 to 3.3 alone is plaintext, unauthenticated and unauthorized, and it
@@ -294,6 +325,13 @@ tb.<env>.<channel>.<role>[.<destination>]     role = pipeline | loader | replier
 For example `tb.prod.adt-to-fhir.loader.fhir-server`. A shadow deployment appends
 `.shadow-<label>`, which is what makes shadow deploys free: a second group on the same `raw` topic.
 
+**`replier` (defined in set 1.2)** is the receivers' reply-consumer group in synchronous reply mode
+(3.3.1), on this engine's cluster. Receivers of a sync-reply channel gain READ on
+`<env>.<channel>.reply` and on group `tb.<env>.<channel>.replier*`; the pipeline worker gains WRITE on
+`<env>.<channel>.reply` (`security.acls`). The receiver gets no WRITE on `reply`, so it cannot forge an
+answer. Every receiver process of a channel shares one principal, so targeted routing limits what a
+process reads **by design, not by ACL**.
+
 **`receiver` (set 1.1, additive)** is the group of a `kafka` source (`channel-spec/v0` 3.2.5). That
 group lives on the **external** cluster the source reads, under the source's own credentials — never
 the engine's receiver principal — so section 3.4's ACL shape and `security.acls` gain nothing and lose
@@ -312,7 +350,7 @@ NOT restate them as literals.
 | Partition counts per class, and the partition budget | runtime, topic creation, Helm |
 | `retention.ms`, `cleanup.policy` per class | topic creation, Helm |
 | `min.insync.replicas`, `unclean.leader.election.enable` | topic creation, Compose, Helm |
-| `session.timeout.ms` (15000), `heartbeat.interval.ms` (5000) | worker and loader consumers |
+| `session.timeout.ms` (15000), `heartbeat.interval.ms` (5000) | worker and loader consumers; the receivers' reply consumer (set 1.2) |
 | `commit_every` | worker and loader consumers |
 | `acks`, `enable.idempotence`, `delivery.timeout.ms` | receiver producer |
 

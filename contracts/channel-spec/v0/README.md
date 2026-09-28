@@ -3,7 +3,9 @@
 **Contract id:** `tributary.channel-spec/v0`
 **Status:** Frozen at the Phase 1 wave 1 gate as part of contract set 1.0. **Set 1.1 (2026-09-24)
 adds the wave 2 connector types, per-destination steps and the key-expression semantics — all
-additive**: every document valid under 1.0 is still valid. Breaking changes create `../v1/`.
+additive**: every document valid under 1.0 is still valid. **Set 1.2 (2026-09-28) adds the optional
+`source.reply` block for synchronous reply mode (3.2.6), also additive.** Breaking changes create
+`../v1/`.
 **Owner:** `architect`. Propose changes by message with the exact diff and impact.
 **Source:** ADR-001 sections 6.1 and 6.4, ADR-003 D1/D3/D4/D6, ADR-007 (D1-D9, and D10-D17 for set
 1.1), Phase 0 gate section 7.1.
@@ -103,6 +105,8 @@ schema is expressed there.
 | **Set 1.1:** each destination type may declare only the idempotency techniques it can honour | Invariant 4 — a declared technique must be true |
 | **Set 1.1:** `s3` states `serverSideEncryption` | Encryption at rest for every PHI store (topics/v0 3.5) |
 | **Set 1.1:** `fhir` is `interaction: transaction` only | Identifiers stay in the Bundle body, out of the request line |
+| **Set 1.2:** `source.reply` only on `mllp` and `http`; every field bounded; `after` accepts `routed` only | Invariant 1 — sync mode changes what the sender waits for, never when the commit happens (3.2.6) |
+| **Set 1.2:** `source.reply` with `pipeline.transactional: true` is refused | A reply outside the transaction could answer `AA` for aborted work (3.2.6) |
 
 ---
 
@@ -163,6 +167,11 @@ covers the set 1.1 types.
 | `ack` | R | `mode` is `after-commit` and nothing else. `nackOn` lists the conditions that NACK instead. A NACK carries a code and `tb-msg-id` only — never the record key, never exception text. |
 | `maxMessageBytes` | O | ≤ 1,000,000, the envelope's inline limit. Claim-check for larger payloads is **untested** (gate 7.2 item 18); do not design a channel that depends on it yet. |
 | `queue` | O | When present, `maxBytes` is required; `maxMessages` alone does not conform. When absent the receiver default applies: **64 MiB (67,108,864)**. See 3.2.1. |
+| `reply` | O | **Set 1.2.** Synchronous reply mode, `mllp` and `http` only. Its presence switches sync mode on. See 3.2.6. |
+
+`ack.timeoutMs` bounds the wait for the `raw` commit (queue admission plus publish); its expiry is a
+NACK before any commit is confirmed. `reply.timeoutMs` (3.2.6) is a different clock that starts only
+once the commit is confirmed.
 
 #### 3.2.1 The 64 MiB queue default is picked, not sized
 
@@ -190,13 +199,17 @@ this table is normative — invariant 1 is the column on the left.
 
 | Type | ACK, only after the `raw` record is committed (`acks=all`) | NACK | Kafka unavailable | Input over `maxMessageBytes` |
 |---|---|---|---|---|
-| `mllp` | HL7 `AA` | `AE` / `AR` with a code and `tb-msg-id` only | NACK or no ACK | NACK |
+| `mllp` | HL7 `AA` | `AR` with a code and `tb-msg-id` only, before any commit is confirmed. `AE` only in sync mode, and only after the commit (3.2.6) | `AR` or no ACK | `AR` |
 | `http` | `202 Accepted`, body carries `tb-msg-id` only | `400` parse error, `415` content type, `401`/`403` auth — code only, never payload or exception text | `503` with `Retry-After` | `413` before the body is buffered past the limit |
 | `sftp` | `afterCommit`: delete, or move to `archiveDirectory` | move to `rejectDirectory`; **never delete** | leave the file; retry next poll | move to `rejectDirectory` |
 | `kafka` | commit the **source** offset | none exists — see below | do not commit; pause the source partition | halt that source partition (below) |
 
 **`202` means committed, not processed.** An HTTP sender that needs the pipeline's outcome needs
-synchronous reply mode (W2-8, ADR-003 D9), which is not in set 1.1.
+synchronous reply mode (W2-8, ADR-003 D9 and D10), added in set 1.2 (3.2.6).
+
+**One rule for MLLP senders, in both modes: `AR` means the engine did not confirm a commit, so a
+resend cannot lose data. `AE` means committed, so a resend creates a duplicate.** The async receiver
+already sends only `AA` (after commit) and `AR` (before it); `AE` appears only in sync mode.
 
 **A Kafka source cannot NACK, and it cannot write to `dlq` either**: the receiver role's ACL is
 WRITE on `<env>.<channel>.raw` only (`topics/v0` `security.acls.receiver`), and granting it `dlq` is
@@ -268,6 +281,167 @@ The consumer group is `tb.<env>.<channel>.receiver` (`topics/v0` 3.6, role added
 header is never trusted; the receiver mints the envelope fresh. The inbound key is used only when
 `partitionKey` is `record:key`. Offsets are committed after the `raw` produce is acknowledged, in
 batches of `commit_every` (`topics/v0` 3.3), which is also this source's replay window.
+
+#### 3.2.6 `reply` — synchronous reply mode (set 1.2, W2-8)
+
+Approved 2026-09-28 from `platform-engineer`'s proposal (`docs/agent-team/proposals/W2-8-sync-reply.md`),
+with the amendments marked below. Decisions and what they give up: ADR-003 D9 (as amended) and D10.
+
+| Field | Default | Bound | Meaning |
+|---|---|---|---|
+| `timeoutMs` | 10000 | 1000-60000 | Wait for the reply, counted from the receiver's successful `raw` delivery callback. Expiry answers `AE` / `REPLY_TIMEOUT` |
+| `after` | `routed` | `routed` only | Every `out.<dest>` record acknowledged by Kafka, or deliberately dropped. `delivered` is reserved: it needs loader WRITE on `reply` and a rule for which destination answers |
+| `body` | `ack` | `ack`, `step` | `ack`: the receiver builds the answer from the reply status. `step`: a pipeline step supplies the response payload through `ctx.reply`. `step` may ship after `ack`; until then it is refused at startup |
+| `maxPending` | 10000 | 1-50000 | In-flight requests per receiver process (S3: about 4.6 KB each). Over it: `AR` / `REPLY_BUSY`, nothing published |
+| `partitions` | 3 | 1-64 | Partition count of `<env>.<ch>.reply`, and the only thing that sizes it (`spec.partitions` does not apply). **At least the number of receiver processes** |
+
+The block's presence switches sync mode on; `reply: {}` means every default. `ack.mode` stays
+`after-commit`. Sources: `mllp` now, `http` once W2-7 implements it (refused at receiver startup until
+then, as in 3.0). `sftp` and `kafka` reject the field in the schema.
+
+**Refusals.**
+
+1. `pipeline.transactional: true` — **in the schema** (amended from a code-only rule; ADR-007 D7).
+2. **Any splitter** in the channel, pipeline or destination steps — refused **at load**, because a
+   splitter named by `ref` is known only once the bundle loads. One request would have N outcomes.
+3. `partitions` below the deployed receiver process count — a deploy **warning**. At run time a
+   process with no reply partition is not ready (below).
+
+**Flow.** The receiver mints `tb-correlation-id`, sets `tb-reply-partition` to a reply partition it
+holds and `tb-reply-deadline`, records `{correlation id → tb-msg-id, sender control id, connection
+slot, deadline}` in its pending map, and produces to `raw` as today. The sender's MSH-10 lives **only**
+in that map. The worker runs the pipeline, waits for every `out` (and any `dlq`) delivery callback,
+then produces one record to `reply` on the named partition, keyed by `tb-correlation-id`. **The worker
+replies if and only if the `raw` record carries `tb-reply-partition`** — the record decides, not the
+spec, so a hot reload between sync and async strands nothing. Exception: a worker whose applied spec
+is transactional or contains a splitter produces no reply for such a record and counts
+`replies_skipped`; the sender gets `AE` / `REPLY_TIMEOUT`, which is truthful. The receiver resolves an
+entry only when the correlation id is in its map **and** `tb-msg-id` matches.
+
+**What the sender gets (MLLP, normative).** `AR` = commit not confirmed; `AE` = committed; `AA` =
+committed **and** routed. `MSA-2` is the sender's MSH-10 from the map; `MSA-3` is `<CODE> <tb-msg-id>`,
+never payload or exception text.
+
+| Case | Committed | MLLP |
+|---|---|---|
+| Reply `accepted` (routed; includes a whole-message `Drop`) | yes | `AA`, or the step body |
+| Reply `rejected` (a `Reject` code) | yes | `AE` + code |
+| Reply `failed` (e.g. `TRANSFORM_ERROR`, `REPLY_BODY_MISSING`) | yes | `AE` + code |
+| Reply with `tb-reply-status` absent or unrecognised (fail-safe, amendment) | yes | `AE`, with the reply's `tb-error-code` if it has one. Never `AA` |
+| No reply by the deadline | yes | `AE` `REPLY_TIMEOUT` |
+| Reply partition revoked with the request in flight | yes | `AE` `REPLY_ROUTE_LOST`, at once — **but only after the `raw` callback has succeeded** (amendment) |
+| Kafka down, publish failed or timed out (existing path) | not confirmed | `AR` |
+| Pending map full / process holds no reply partition | no, not published | `AR` `REPLY_BUSY` / `REPLY_UNAVAILABLE` |
+
+Rules behind the table:
+
+- **`AA` needs both** the receiver's own successful `raw` callback and an `accepted` reply; a reply can
+  in principle arrive first. **`AE` also never precedes the successful callback** (amendment): an entry
+  whose partition is revoked, or whose sender-side state changes, before the callback waits for it,
+  then answers `AE` on success or `AR` on failure. Answering `AE` ("committed") for a produce that then
+  fails would be false.
+- **A pipeline `Reject` answers `AE`, not HL7's `AR`**, because it was committed and a resend
+  duplicates it. HL7 original mode also reads `AE` as a content error, so this is the conventional code
+  as well. Only original-mode ACKs are in scope; enhanced mode is the async path.
+- **A whole-message `Drop` answers `AA`** (ruling on the proposal's open point). The message was
+  committed and filtered on purpose; `AR` would claim no commit, and `AE` would report an error that did
+  not happen. Some channels may want a filtered message refused; that is a candidate `onDrop` option,
+  not in set 1.2 (section 9). **Unverified:** whether migrating Mirth channels expect a different code
+  for filtered messages.
+- **Status and code for a partial failure:** `accepted` only if every destination was produced or
+  deliberately dropped. Otherwise the status and code are those of the **first failure in spec order**
+  — pipeline steps, then destinations in list order — not the first in time, so the answer is
+  deterministic (amendment).
+- **The integrator rule, stated with the answers:** `AR` — resend, nothing is lost. `AE` — do not
+  resend blindly: the engine has the message, and **a resend is a new message with a new `tb-msg-id`
+  that loader idempotency does not absorb** (3.2.2 "Duplicates at ingest"; ADR-003 D9 as amended). One
+  exception to `AR`: after a publish **timeout** librdkafka may still complete the write, so a resend
+  after that `AR` can duplicate, though it cannot lose data. **`AA` means routed, not delivered.**
+- The control plane warns on every sync channel that resends after `AE` are duplicates unless a
+  destination deduplicates on a business identifier. It cannot tell that from the spec, so the warning
+  is unconditional (amended from "when every destination relies only on `tb-msg-id`": the key is
+  always `tb-msg-id`, 5).
+
+**HTTP mapping: not fixed in set 1.2** (amendment). It is decided when W2-7 implements sync mode, under
+one binding constraint: **not-committed outcomes are exactly `503` with `Retry-After`, and no committed
+outcome uses a status that standard clients or proxies retry automatically** (`5xx`, `408`, `429`). The
+proposal's `500` for a pipeline failure breaks that constraint: a generic HTTP client resends on `500`,
+and here that resend is a duplicate.
+
+**Worker rules** (ADR-003 D9, fail-fast plus DLQ, batched commit):
+
+- The reply is produced per record; offsets still commit every `commit_every` records. After a crash
+  up to `commit_every` records replay: their `out` duplicates keep their `tb-msg-id`, and their late
+  replies are dropped by the receiver as unknown ids.
+- Producing a reply is never retried and never pauses a partition. A failed reply produce emits a
+  `replied` event with `status: error` and `PRODUCE_FAILED`, and the offset still commits.
+- A `Reject` or an exhausted step goes to `dlq` first; the reply follows the `dlq` callback.
+- **Expired replies are skipped:** past `tb-reply-deadline` plus 5 s of clock-skew allowance, no reply
+  is produced (`replies_expired`). **The message is still processed.** Sync mode never cancels work.
+- **A malformed or out-of-range reply-routing header** (`tb-reply-partition`, `tb-reply-deadline`)
+  disables the reply, not the message: the message is processed normally, no reply is produced, and a
+  `replied` event carries `REPLY_ROUTE_INVALID` (amendment: renamed from `REPLY_PARTITION_INVALID` to
+  cover both headers; envelope 2.3.3).
+- `REPLY_BODY_MISSING` (`body: step`, no `ctx.reply` call, message not dropped) fails the **reply**
+  only. The message was routed, so there is no `dlq` record.
+- The reply producer is the worker's existing idempotent `acks=all` producer. A weaker `acks` needs a
+  measurement and a ruling first.
+
+**Receiver rules** (`topics/v0` 3.3.1 has the consumer settings):
+
+- Every receiver process of the channel joins `tb.<env>.<ch>.replier` with its **own**
+  `group.instance.id`. A duplicate id fences a live process out of the group (amendment: the id is per
+  process, not per pod or per receiver instance).
+- A process **advertises partition p only after its reply consumer holds p and has an established
+  fetch position on it** (amendment). With `auto.offset.reset=latest` and no committed offsets, a reply
+  written between assignment and the offset reset would otherwise be skipped silently. Safe (it ends
+  as `AE`), but a race the tests must close.
+- A process with no assigned partition, or whose reply consumer is not connected, answers every sync
+  request `AR` / `REPLY_UNAVAILABLE` **before publishing** and fails its readiness probe.
+- On revoke of p, entries advertised on p answer `AE` / `REPLY_ROUTE_LOST` at once, subject to the
+  callback rule above.
+- The reply consumer runs on its own thread, only resolves futures, and never writes to a socket.
+  MLLP answers each connection in request order, so a slow reply delays later answers on **that
+  connection only**, bounded by `timeoutMs`.
+- A reply record it cannot parse (any header malformed) is **dropped** with a metric and a log line
+  carrying topic, partition and offset only. The receiver has no `dlq` WRITE, and a reply is not a
+  message. The pending entry then times out.
+- **Memory.** After the `raw` commit the request payload is released and only the fields needed to
+  answer stay in the map, so the W1-5 byte-budget reservation ends at commit for a sync request. That
+  is safe only because `maxPending` bounds the entry count and entries do not hold payload. **Condition
+  on `body: step`:** a resolved step body waiting behind a slower request on the same connection holds
+  up to 1 MB, so its implementation must charge those bodies to `queue.maxBytes`, with a test. Without
+  that, `maxPending` × 1 MB is the bound.
+
+**`ctx.reply` (SDK, approved with amendments).** `ctx.reply(body: bytes, *, content_type: str) -> None`.
+
+- At most once per message; a second call raises. `FakeContext` records the call (invariant 7).
+- **Pipeline steps only.** A destination step gets its own copy per destination, so N destinations
+  could each answer; in a destination step the call raises (amendment).
+- `content_type` must be a registered envelope type (`envelope/v0` 3.1); for an `mllp` source it must
+  be `application/hl7-v2+er7`. `body` is at most 1,000,000 bytes (no claim-check on `reply`). A
+  violation raises a typed error naming neither the body nor any part of it.
+- **A body set during a step attempt that then raised is discarded** before the retry (amendment), so
+  "at most once" holds per successful pipeline run.
+- Calling it is always legal. The body is used only when the record carries `tb-reply-partition` and the
+  applied spec says `body: step`; otherwise it is discarded and counted (`reply_body_discarded`). A step
+  written for sync mode then keeps working across a hot reload to async.
+- A whole-message `Drop` under `body: step` answers as `accepted` with the receiver-built `AA`, not
+  `REPLY_BODY_MISSING`.
+- The receiver does not parse a step body. `MSA-2` inside it is the step's responsibility, and the
+  step sees the request, so it is unit-testable.
+- The body is payload: PHI-bearing, never logged, and never printed by `FakeContext` in test output.
+
+**PHI (invariant 6).** `tb-reply-partition`, `tb-reply-deadline` and `tb-reply-status` carry an
+integer, a timestamp and an enum. The reply key is the engine-minted correlation id. MSH-10 and the
+record key appear in no header, log line, metric label or span attribute; receiver logs carry
+`tb-msg-id` and the correlation id only, and metric labels carry the channel and an outcome code only.
+Targeted routing means a process reads only its own partitions by design. That is **not** an access
+control: every receiver process of a channel shares one principal with READ on the whole topic.
+
+**What the browser shows.** The worker's `replied` event records what the worker produced, not what
+the sender received. A sender-side `AE` after a timeout is a receiver metric and a log line keyed by
+`tb-msg-id`, because the receiver has no `_tb.events` ACL (section 9).
 
 ### 3.3 `spec.pipeline`
 
@@ -992,7 +1166,9 @@ tracked in 3.0.
 uv run --no-project --python 3.12 --with jsonschema python contracts/validate.py
 ```
 
-43 examples: 8 valid, 35 invalid (set 1.0: 4 and 19; set 1.1 added 4 and 16). Tests load
+49 examples: 9 valid, 40 invalid (set 1.0: 4 and 19; set 1.1 added 4 and 16; set 1.2 added 1 and 5).
+**The five set 1.2 pairs are architect predictions, UNMEASURED** until `--emit-expectations` runs.
+Tests load
 [`examples/manifest.json`](examples/manifest.json) and assert that each invalid example fails at the
 `expected_json_path` and `expected_validator` it pins, not merely that it fails.
 
@@ -1022,9 +1198,14 @@ envelope and events manifests, so nothing else in the suite changed.
 
 ## 9. Open items
 
-- **Synchronous reply mode** (ADR-001 6.5, ADR-003 D9) has no fields here. W2-8 implements it; the
-  `reply` block is additive and arrives with it, as a proposal from `connector-engineer` and
-  `platform-engineer`.
+- ~~**Synchronous reply mode** has no fields here.~~ **Set 1.2**, section 3.2.6. What it leaves open:
+  - `after: delivered` (a loader's outcome), which needs loader WRITE on `reply` and a rule for which
+    destination answers;
+  - an `onDrop` option for channels that want a filtered message refused rather than `AA`'d;
+  - the HTTP status mapping, decided with W2-7 under the constraint in 3.2.6;
+  - whether the browser needs "the sender got `AE`", which needs a receiver ACL on `_tb.<env>.events`
+    (an ACL-model change, ADR-004);
+  - edge dedupe (ADR-003 D8), the only mitigation for resends after `AE`, still deferred.
 - ~~`partitionKey` expression semantics.~~ **Fixed in set 1.1**, section 4.3. The evaluator is W2-4.
 - **Claim-check** has no channel-level knob, because it is untested (gate 7.2 item 18) and the
   behaviour is automatic above the inline limit. It is **not scheduled in wave 2** (the phase plan has

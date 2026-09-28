@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://tributary.dev/contracts/channel-spec/v0/channel.schema.json",
   "title": "Tributary channel spec, v0",
-  "description": "One deployed channel: source, pipeline steps, destinations, ordering and retry. Authored as YAML in a bundle and published as JSON on the compacted _tb.<env>.channels topic. See README.md. Producers (CLI, control plane) validate strictly; the runtime must ignore unknown fields rather than refusing to start (invariant 3). Contract set 1.1 (2026-09-24) added the wave 2 connector types; every change since set 1.0 is additive and is listed in contracts/CHANGELOG.md.",
+  "description": "One deployed channel: source, pipeline steps, destinations, ordering and retry. Authored as YAML in a bundle and published as JSON on the compacted _tb.<env>.channels topic. See README.md. Producers (CLI, control plane) validate strictly; the runtime must ignore unknown fields rather than refusing to start (invariant 3). Contract set 1.1 (2026-09-24) added the wave 2 connector types, and set 1.2 (2026-09-28) the optional source.reply block for synchronous reply mode; every change since set 1.0 is additive and is listed in contracts/CHANGELOG.md.",
   "type": "object",
   "required": ["apiVersion", "kind", "metadata", "spec"],
   "additionalProperties": false,
@@ -81,6 +81,16 @@
           },
           "then": { "required": ["partitionKey"] },
           "else": { "not": { "required": ["partitionKey"] } }
+        },
+        {
+          "$comment": "Set 1.2 (W2-8): synchronous reply is refused on a transactional pipeline. A reply produced inside the transaction stays invisible until the batch commits; a reply produced outside it could answer AA for work that is then aborted. Held by the schema rather than only at startup because it can be (ADR-007 D7). The other W2-8 refusal - any splitter in the channel - is a load-time rule, because a splitter named by 'ref' is only known once the bundle loads (README 3.2.6).",
+          "if": {
+            "properties": { "source": { "required": ["reply"] } },
+            "required": ["source"]
+          },
+          "then": {
+            "properties": { "pipeline": { "properties": { "transactional": { "const": false } } } }
+          }
         }
       ]
     },
@@ -143,7 +153,8 @@
           "$comment": "sftp and kafka only: neither protocol says what the bytes are, so the spec must, and it becomes tb-content-type."
         },
         "sftp": { "$ref": "#/$defs/sftpSource" },
-        "kafka": { "$ref": "#/$defs/kafkaSource" }
+        "kafka": { "$ref": "#/$defs/kafkaSource" },
+        "reply": { "$ref": "#/$defs/syncReply" }
       },
       "allOf": [
         {
@@ -161,11 +172,11 @@
           "then": { "required": ["tls"] }
         },
         {
-          "$comment": "mllp: the set 1.0 shape, unchanged.",
+          "$comment": "mllp: the set 1.0 shape, plus the optional set 1.2 'reply' block (synchronous reply mode, README 3.2.6).",
           "if": { "properties": { "type": { "const": "mllp" } }, "required": ["type"] },
           "then": {
             "required": ["bind", "port"],
-            "propertyNames": { "enum": ["type", "bind", "port", "tls", "ack", "maxMessageBytes", "queue"] }
+            "propertyNames": { "enum": ["type", "bind", "port", "tls", "ack", "maxMessageBytes", "queue", "reply"] }
           }
         },
         {
@@ -174,7 +185,7 @@
           "then": {
             "required": ["bind", "port", "path", "accept", "auth"],
             "propertyNames": {
-              "enum": ["type", "bind", "port", "tls", "ack", "maxMessageBytes", "queue", "path", "accept", "auth"]
+              "enum": ["type", "bind", "port", "tls", "ack", "maxMessageBytes", "queue", "path", "accept", "auth", "reply"]
             }
           }
         },
@@ -288,7 +299,50 @@
           "items": { "enum": ["parse-error", "spec-invalid", "queue-full"] },
           "$comment": "Conditions that produce a NACK rather than an ACK. A NACK carries a code and tb-msg-id only: never the record key, never exception text (contracts/envelope/v0 section 4). A per-key channel whose partitionKey does not resolve on a message is a parse-error (README 4.3)."
         },
-        "timeoutMs": { "type": "integer", "minimum": 100, "maximum": 120000 }
+        "timeoutMs": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 120000,
+          "$comment": "Bounds the receiver's wait for the raw commit (queue admission plus publish). Expiry is a NACK before any commit is confirmed. Distinct from reply.timeoutMs, which starts after the commit (README 3.2.6)."
+        }
+      }
+    },
+    "syncReply": {
+      "type": "object",
+      "additionalProperties": false,
+      "$comment": "Set 1.2 (W2-8, approved 2026-09-28): synchronous reply mode. The block's PRESENCE switches it on; an empty object means every default. Permitted on mllp and http sources only (sftp and kafka have no waiting sender), via the per-type propertyNames lists. ack.mode stays after-commit: sync mode changes what the sender waits for, not when the commit happens. What each answer means (AA / AE / AR) is normative in README 3.2.6. Not to be confused with ack.timeoutMs, which bounds the wait for the raw commit; reply.timeoutMs starts only once that commit is confirmed.",
+      "properties": {
+        "timeoutMs": {
+          "type": "integer",
+          "minimum": 1000,
+          "maximum": 60000,
+          "default": 10000,
+          "$comment": "Wait for the reply, counted from the receiver's successful raw delivery callback. Expiry answers AE / REPLY_TIMEOUT: committed, outcome unknown (ADR-003 D9). Default from ADR-001 6.5."
+        },
+        "after": {
+          "const": "routed",
+          "default": "routed",
+          "$comment": "routed: every out.<dest> record was acknowledged by Kafka, or the message was deliberately dropped for that destination. 'delivered' (a loader's outcome) is RESERVED and not accepted in set 1.2: it needs loader WRITE on reply and a rule for which destination answers. AA therefore means committed and routed, never delivered to a destination."
+        },
+        "body": {
+          "enum": ["ack", "step"],
+          "default": "ack",
+          "$comment": "ack: the receiver builds the protocol answer from the reply status. step: a pipeline step supplies the response payload through ctx.reply (README 3.2.6). May be implemented after 'ack'; until then a spec selecting it is refused at component startup."
+        },
+        "maxPending": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 50000,
+          "default": 10000,
+          "$comment": "Cap on in-flight sync requests per receiver process. S3 measured about 4.6 KB per entry, so 10,000 is about 46 MB. Over the cap: AR / REPLY_BUSY and nothing is published."
+        },
+        "partitions": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 64,
+          "default": 3,
+          "$comment": "Partition count of <env>.<ch>.reply, and the ONLY thing that sizes it: spec.partitions does not apply to the reply topic, because reply is sized by receiver processes, not by throughput. MUST be at least the number of receiver processes: a process that holds no reply partition is not ready and refuses sync requests before publishing (README 3.2.6, topics/v0 3.3.1). Counts against the topics/v0 2.2 partition budget."
+        }
       }
     },
     "queue": {

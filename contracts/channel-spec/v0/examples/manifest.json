@@ -74,6 +74,15 @@
         "connector:destination/kafka (W2-6)"
       ],
       "note": "Set 1.1. External Kafka source over SASL_SSL keyed by the inbound record key, to ClickHouse and to a partner cluster over mTLS with the key preserved"
+    },
+    {
+      "file": "valid/lab-query-mllp-sync-reply.json",
+      "runnable": false,
+      "requires": [
+        "bundle-fetch for ref steps (unscheduled)",
+        "source.reply synchronous reply mode (W2-8: receiver pending map and reply consumer, connector-engineer; worker reply producer, platform-engineer)"
+      ],
+      "note": "Set 1.2. Synchronous reply on a per-key MLLP source with mTLS: every field of the reply block stated at its default, non-transactional pipeline, no splitter (README 3.2.6)"
     }
   ],
   "invalid": [
@@ -304,6 +313,41 @@
       "expected_json_path": "$.spec.destinations[0].with.topic",
       "expected_validator": "not",
       "expectation_note": "Predicted by the architect (set 1.1); MEASURED 2026-09-24 by qa-engineer, matched"
+    },
+    {
+      "file": "invalid/reply-on-sftp-source.json",
+      "violates": "source.reply is permitted on mllp and http only; an sftp poller has no sender waiting on a connection, so a reply block there is a spec error, never silently ignored (README 3.2.6)",
+      "expected_json_path": "$.spec.source",
+      "expected_validator": "enum",
+      "expectation_note": "PREDICTED by the architect (set 1.2), UNMEASURED. Same mechanism as source-field-from-another-type.json: propertyNames reports at the containing object with the inner keyword"
+    },
+    {
+      "file": "invalid/reply-timeout-below-minimum.json",
+      "violates": "reply.timeoutMs is 1000-60000; 500 ms is below the Kafka commit latency S3 measured at p99, so almost every request would answer AE / REPLY_TIMEOUT",
+      "expected_json_path": "$.spec.source.reply.timeoutMs",
+      "expected_validator": "minimum",
+      "expectation_note": "PREDICTED by the architect (set 1.2), UNMEASURED"
+    },
+    {
+      "file": "invalid/reply-after-delivered.json",
+      "violates": "reply.after 'delivered' is reserved and not accepted in set 1.2: it needs loader WRITE on reply and a rule for which destination answers. AA means committed and routed only",
+      "expected_json_path": "$.spec.source.reply.after",
+      "expected_validator": "const",
+      "expectation_note": "PREDICTED by the architect (set 1.2), UNMEASURED"
+    },
+    {
+      "file": "invalid/reply-unknown-field.json",
+      "violates": "reply has additionalProperties false like every other object in the spec; 'retries' is not a field, and a reply is never retried (fail-fast, ADR-003 D9)",
+      "expected_json_path": "$.spec.source.reply",
+      "expected_validator": "additionalProperties",
+      "expectation_note": "PREDICTED by the architect (set 1.2), UNMEASURED"
+    },
+    {
+      "file": "invalid/reply-with-transactional-pipeline.json",
+      "violates": "synchronous reply is refused on a transactional pipeline: a reply inside the transaction is invisible until the batch commits, and one outside it could answer AA for work that is then aborted (README 3.2.6)",
+      "expected_json_path": "$.spec.pipeline.transactional",
+      "expected_validator": "const",
+      "expectation_note": "PREDICTED by the architect (set 1.2), UNMEASURED. The rule is a spec-level if/then keyed on source.reply being present; the failure reports at the pipeline field it constrains"
     }
   ]
 }

@@ -18,6 +18,9 @@
       "clients.worker_consumer.session.timeout.ms",
       "clients.worker_consumer.heartbeat.interval.ms",
       "clients.worker_consumer.commit_every",
+      "clients.reply_consumer.session.timeout.ms",
+      "clients.reply_consumer.heartbeat.interval.ms",
+      "clients.reply_consumer.auto.offset.reset",
       "clients.receiver_producer.acks",
       "clients.receiver_producer.enable.idempotence",
       "clients.receiver_producer.delivery.timeout.ms",
@@ -100,7 +103,8 @@
     },
     "reply": {
       "partitions": 3,
-      "partitions_source": "matches the channel default (S4). Sync-reply channels add a fifth topic, so the sharing trigger's channels x 4 x partitions projection understates them.",
+      "partitions_source": "matches the channel default (S4). Set 1.2: overridden ONLY by channel-spec spec.source.reply.partitions (1-64), never by spec.partitions, because the reply topic is sized by receiver processes, not throughput: each process must hold at least one partition (README 3.3.1). It need not match raw - replies are routed to an explicit partition, not by key hash. Sync-reply channels add a fifth topic, so the sharing trigger's channels x 4 x partitions projection understates them: add reply.partitions per sync channel.",
+      "created_when": "Only for a channel whose spec has source.reply (set 1.2). An async channel has no reply topic.",
       "configs": {
         "cleanup.policy": "delete",
         "retention.ms": 600000,
@@ -183,8 +187,8 @@
     },
     "acls": {
       "model": "Deny by default, least privilege per component, granted on the topic prefix <env>.<channel>. so one channel's compromise does not read another's traffic.",
-      "receiver": "WRITE, DESCRIBE on <env>.<channel>.raw; IDEMPOTENT_WRITE on the cluster",
-      "pipeline_worker": "READ on <env>.<channel>.raw; WRITE on <env>.<channel>.out.*, .retry, .dlq; WRITE on _tb.<env>.events; READ on _tb.<env>.channels; READ on group tb.<env>.<channel>.pipeline*",
+      "receiver": "WRITE, DESCRIBE on <env>.<channel>.raw; IDEMPOTENT_WRITE on the cluster. Set 1.2, sync-reply channels only: READ on <env>.<channel>.reply and READ on group tb.<env>.<channel>.replier*. No WRITE on reply, so a receiver cannot forge an answer",
+      "pipeline_worker": "READ on <env>.<channel>.raw; WRITE on <env>.<channel>.out.*, .retry, .dlq; WRITE on _tb.<env>.events; READ on _tb.<env>.channels; READ on group tb.<env>.<channel>.pipeline*. Set 1.2, sync-reply channels only: WRITE on <env>.<channel>.reply",
       "loader": "READ on <env>.<channel>.out.<dest> and .retry; WRITE on .retry and .dlq; WRITE on _tb.<env>.events; READ on group tb.<env>.<channel>.loader.<dest>*",
       "archiver": "READ on _tb.<env>.events; READ on group tb.<env>.archiver*",
       "control_plane": "WRITE on _tb.<env>.channels and _tb.<env>.audit; DESCRIBE on the cluster",
@@ -221,10 +225,26 @@
       "commit_every_source": "MEASURED (S5): committing every 50 records instead of every 1 gave 4.9x throughput (151 -> 733 msg/s) for a replay window of 50 instead of 1. Invariant 4 requires loader idempotency on tb-msg-id anyway, so a window of 1 buys little. 50 is the value that was measured; the surrounding curve was not, so it is a measured point rather than an optimum.",
       "commit_every_note": "This is the REPLAY WINDOW: after an unclean worker death, up to this many records are redelivered (S5 measured 12 replayed at commit_every=20). At-least-once permits that and an idempotent loader absorbs it. A destination declaring idempotency.technique 'none' in its channel spec has no such absorber, so up to 50 visible duplicates at that destination is the consequence - lower it per destination, or accept it in the justification note the channel spec already requires.",
       "commit_every_scope": "Deployment-level in v0. Deliberately NOT a channel-spec field: it is an operational tuning knob rather than channel semantics, and there is no evidence yet about per-destination variation. Revisit when there is."
+    },
+    "reply_consumer": {
+      "$comment": "Set 1.2 (W2-8). The receiver's consumer of <env>.<channel>.reply in synchronous reply mode, one per receiver process, in group tb.<env>.<channel>.replier. Kafka's assignment IS the lease on a reply partition; there is no coordinator (invariant 3). README 3.3.1.",
+      "group": "tb.<env>.<channel>.replier",
+      "enable.auto.commit": false,
+      "commits": "never. A reply older than this process's pending map is useless, so there is nothing to resume from",
+      "auto.offset.reset": "latest",
+      "isolation.level": "read_uncommitted",
+      "isolation.level_source": "the reply producer is not transactional: sync reply is refused on transactional channels (channel-spec README 3.2.6)",
+      "partition.assignment.strategy": "cooperative-sticky",
+      "group.instance.id": "unique PER PROCESS (not per pod or receiver instance): a duplicate fences a live process out of the group",
+      "session.timeout.ms": 15000,
+      "heartbeat.interval.ms": 5000,
+      "session.timeout.ms_source": "same measured value as worker_consumer (S5, S4). Here it bounds how long a killed process's reply partition stays unusable; it stalls no other process",
+      "advertise_rule": "A process advertises partition p in tb-reply-partition only after it holds p AND its consumer has an established fetch position on p. With auto.offset.reset=latest and no committed offsets, a reply written between assignment and the offset reset would otherwise be skipped",
+      "not_ready_rule": "A process holding no reply partition, or whose reply consumer is disconnected, answers sync requests AR / REPLY_UNAVAILABLE before publishing and fails its readiness probe"
     }
   },
   "partition_budget": {
-    "$comment": "MEASURED (S4, ADR-002 D4). Projected total partitions = channels x 4 x partitions (a sync-reply channel has 5 topics). Applies per tenant partition group, since a share group may not cross a tenant boundary.",
+    "$comment": "MEASURED (S4, ADR-002 D4). Projected total partitions = channels x 4 x partitions, plus reply.partitions for each sync-reply channel (set 1.2: its fifth topic is sized separately). Applies per tenant partition group, since a share group may not cross a tenant boundary.",
     "warn_at_partitions": 8000,
     "warn_at_partitions_basis": "judgement, NOT a measurement",
     "share_new_channels_at_partitions": 12000,
@@ -234,6 +254,7 @@
   },
   "consumer_groups": {
     "pattern": "tb.<env>.<channel>.<role>[.<destination>][.shadow-<label>]",
-    "roles": ["pipeline", "loader", "replier", "archiver"]
+    "roles": ["pipeline", "loader", "replier", "archiver", "receiver"],
+    "roles_note": "replier (set 1.2) = the receivers' reply-consumer group in synchronous reply mode, on this engine's cluster (clients.reply_consumer). receiver (set 1.1) = a kafka source's group on the EXTERNAL cluster it reads; README 3.6 added it in set 1.1 and this list omitted it until set 1.2"
   }
 }

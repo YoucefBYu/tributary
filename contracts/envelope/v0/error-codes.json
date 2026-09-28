@@ -1,8 +1,9 @@
 {
   "contract": "tributary.envelope/v0",
   "registry": "engine tb-error-code values",
-  "set": "1.1",
-  "published": "2026-09-25",
+  "set": "1.2",
+  "published": "2026-09-28",
+  "set_note": "1.1 published 2026-09-25; 1.2 (2026-09-28, additive) adds the REPLY_ prefix and six exact REPLY_ codes for synchronous reply mode (W2-8, envelope README 2.3.2 and 2.3.3, channel-spec README 3.2.6).",
   "note": "Rationale and rules: envelope/v0 README 2.3.2. The contract is the source; tributary.sdk.codes is checked against this file by a tributary-sdk test (ENGINE_CODES == codes + log_only; RESERVED_PREFIXES == reserved_prefixes). A channel's Reject(code) may not use any code listed here or any code under a reserved prefix. Codes only, never values: this file is PHI-free by construction.",
   "grammar": {
     "tb-error-code": "^[A-Z][A-Z0-9_]{0,63}$",
@@ -19,7 +20,8 @@
     { "prefix": "SSH_", "owner": "sftp loader and source: SSH_HOST_KEY_MISMATCH, SSH_AUTH_FAILED (channel-spec README 3.4)" },
     { "prefix": "S3_", "owner": "s3 loader: S3_<ERROR_CODE> (channel-spec README 3.4)" },
     { "prefix": "MLLP_", "owner": "mllp loader: MLLP_AE, MLLP_AR, MLLP_TIMEOUT, MLLP_NO_ACK (channel-spec README 3.4.6)" },
-    { "prefix": "KAFKA_", "owner": "kafka loader: KAFKA_<librdkafka error name> (channel-spec README 3.4.7)" }
+    { "prefix": "KAFKA_", "owner": "kafka loader: KAFKA_<librdkafka error name> (channel-spec README 3.4.7)" },
+    { "prefix": "REPLY_", "owner": "synchronous reply path, receivers and pipeline worker (channel-spec README 3.2.6). Set 1.2" }
   ],
   "codes": [
     { "code": "HEADER_PARSE_ERROR", "status": "emitted", "emitter": "any record reader", "meaning": "One registered header malformed on an identifiable record (envelope 2.3, 2.3.1)" },
@@ -46,7 +48,13 @@
     { "code": "VALIDATE_SEGMENT_MISSING", "status": "emitted", "emitter": "tributary.core.validate", "meaning": "A segment in requireSegments does not occur (channel-spec README 3.3.2)" },
     { "code": "VALIDATE_VERSION_MISMATCH", "status": "emitted", "emitter": "tributary.core.validate", "meaning": "MSH-12.1 absent or not listed in version (channel-spec README 3.3.2)" },
     { "code": "SPLIT_TOO_LARGE", "status": "emitted", "emitter": "any splitter (SDK)", "meaning": "More than 10,000 children (channel-spec README 3.3.2 split rule 4)" },
-    { "code": "SPLIT_INPUT_INVALID", "status": "emitted", "emitter": "tributary.core.split", "meaning": "Input the splitter cannot read (channel-spec README 3.3.2)" }
+    { "code": "SPLIT_INPUT_INVALID", "status": "emitted", "emitter": "tributary.core.split", "meaning": "Input the splitter cannot read (channel-spec README 3.3.2)" },
+    { "code": "REPLY_TIMEOUT", "status": "emitted", "emitter": "mllp and http receivers, sync mode (sender-facing MSA-3 and metrics; never a header or event)", "meaning": "Committed; no reply before reply.timeoutMs after the raw commit callback. MLLP AE (channel-spec README 3.2.6)" },
+    { "code": "REPLY_ROUTE_LOST", "status": "emitted", "emitter": "mllp and http receivers, sync mode (sender-facing; never a header or event)", "meaning": "Committed; the reply partition this request advertised was revoked, so its reply is unreachable. Answered only after the raw commit callback succeeded. MLLP AE" },
+    { "code": "REPLY_BUSY", "status": "emitted", "emitter": "mllp and http receivers, sync mode (sender-facing; never a header or event)", "meaning": "Not published: the pending map is at reply.maxPending. MLLP AR" },
+    { "code": "REPLY_UNAVAILABLE", "status": "emitted", "emitter": "mllp and http receivers, sync mode (sender-facing; never a header or event)", "meaning": "Not published: this process holds no reply partition or its reply consumer is not connected. MLLP AR; the process also fails readiness" },
+    { "code": "REPLY_BODY_MISSING", "status": "emitted", "emitter": "runtime worker, sync mode", "meaning": "body: step and no pipeline step called ctx.reply on a message that was not dropped. The reply is failed (tb-error-code on the reply record, and the replied event); the message was routed, so there is no dlq record" },
+    { "code": "REPLY_ROUTE_INVALID", "status": "emitted", "emitter": "runtime worker, sync mode", "meaning": "tb-reply-partition malformed or out of range, or tb-reply-deadline malformed, on a raw record. The message is processed normally and no reply is produced; carried by a replied EVENT only (envelope README 2.3.3). Named REPLY_PARTITION_INVALID in the W2-8 proposal; renamed to cover both headers" }
   ],
   "log_only": [
     { "code": "ENVELOPE_INVALID", "emitter": "runtime record decoder", "meaning": "Internal reason below RECORD_UNDECODABLE / HEADER_PARSE_ERROR (envelope 2.3). Never in a header or event" }

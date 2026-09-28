@@ -22,7 +22,20 @@ from typing import Final
 REJECT_CODE: Final = re.compile(r"^[A-Z][A-Z0-9_]{2,63}$")
 
 #: Families of engine codes (error-codes.json `reserved_prefixes`). A new member needs no change.
-RESERVED_PREFIXES: Final = ("TB_", "KEY_", "HTTP_", "FHIR_", "PG_", "CH_", "SFTP_", "SSH_", "S3_", "MLLP_", "KAFKA_")
+RESERVED_PREFIXES: Final = (
+    "TB_",
+    "KEY_",
+    "HTTP_",
+    "FHIR_",
+    "PG_",
+    "CH_",
+    "SFTP_",
+    "SSH_",
+    "S3_",
+    "MLLP_",
+    "KAFKA_",
+    "REPLY_",  # set 1.2: synchronous reply path (channel-spec README 3.2.6)
+)
 
 #: A step raised on every attempt (stepRetries exhausted). Envelope 2.3.2: the contract's spelling.
 TRANSFORM_ERROR: Final = "TRANSFORM_ERROR"
@@ -38,6 +51,19 @@ TB_PIPELINE_TIME_BUDGET: Final = "TB_PIPELINE_TIME_BUDGET"
 #: only): the partition halts. A member of the reserved `TB_` family, registered by name in
 #: error-codes.json (2026-09-28).
 TB_DLQ_UNWRITABLE: Final = "TB_DLQ_UNWRITABLE"
+
+# Synchronous reply mode (set 1.2, channel-spec README 3.2.6, envelope README 2.3.3). The four
+# receiver codes reach the sender and metrics only, never a header or event; they are registered so a
+# channel's `Reject` cannot borrow them. The two worker codes are emitted by `tributary.runtime.reply`.
+REPLY_TIMEOUT: Final = "REPLY_TIMEOUT"
+REPLY_ROUTE_LOST: Final = "REPLY_ROUTE_LOST"
+REPLY_BUSY: Final = "REPLY_BUSY"
+REPLY_UNAVAILABLE: Final = "REPLY_UNAVAILABLE"
+#: `body: step` and no pipeline step called `ctx.reply` on a message that was not dropped.
+REPLY_BODY_MISSING: Final = "REPLY_BODY_MISSING"
+#: `tb-reply-partition` or `tb-reply-deadline` malformed on a `raw` record: the reply is disabled,
+#: the message is processed normally (envelope 2.3.3). Carried by a `replied` event only.
+REPLY_ROUTE_INVALID: Final = "REPLY_ROUTE_INVALID"
 
 # Built-in step codes. Named here so the built-ins and the reserved list cannot drift apart.
 FILTER_UNRESOLVED: Final = "FILTER_UNRESOLVED"
@@ -72,6 +98,13 @@ ENGINE_CODES: Final = frozenset(
         TB_OUTPUT_ENVELOPE_INVALID,
         TB_PIPELINE_TIME_BUDGET,
         TB_DLQ_UNWRITABLE,
+        # synchronous reply (set 1.2)
+        REPLY_TIMEOUT,
+        REPLY_ROUTE_LOST,
+        REPLY_BUSY,
+        REPLY_UNAVAILABLE,
+        REPLY_BODY_MISSING,
+        REPLY_ROUTE_INVALID,
         # built-in steps (channel-spec README 3.3.2)
         FILTER_UNRESOLVED,
         VALIDATE_NOT_HL7,
