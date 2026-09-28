@@ -50,7 +50,8 @@ wave's exit criteria here.
     3.3.3.
 
   `--emit-expectations` is not needed, because no schema or invalid example changed.
-- **Only one wave 2 item is blocked on a human: W2-2 item 4** (above). SFTP was unblocked on 2026-09-24: the human approved
+- **Only one wave 2 item is blocked on a human: W2-2 item 4.** Decided 2026-09-28 (vendor the FHIR R4
+  schema); it now waits only on the human adding `hl7.org` or `build.fhir.org` to the network allow-list. SFTP was unblocked on 2026-09-24: the human approved
   `paramiko` (see decisions log). The
   PostgreSQL *loader* is **not** blocked: it uses `asyncpg` (Apache-2.0 per the lead; `licence_check.py`
   confirms it when the dependency lands). `psycopg` matters only to the wave 3 control plane.
@@ -85,9 +86,10 @@ wave's exit criteria here.
   number). One visit would then be a new Encounter per message, and conditional-update idempotency
   (channel-spec 3.4.2) would hold per message but not per encounter, which is the wrong resource
   identity. `security-reviewer` is running. Not done until both have cleared.
-- **W2-2 item 4 is blocked, and needs a human decision** (open questions). Validating the golden
-  files against the FHIR R4 JSON Schema could not be done: `hl7.org` is blocked by the proxy, and no
-  installed package ships the schema. That validation was a condition of the W2-2 approval: it
+- **W2-2 item 4: decided 2026-09-28, waiting on network access** (open questions). Validating the
+  golden files against the FHIR R4 JSON Schema could not be done: `hl7.org` is blocked by the proxy,
+  and no installed package ships the schema. The human chose to vendor the file; fetching it needs the
+  allow-list change. That validation was a condition of the W2-2 approval: it
   guards against the R4B models accepting R4-invalid output. So W2-2 stays approved with that
   condition open, not closed.
 - **Contract edits 2026-09-25, not yet verified** (the architect has no shell). Commands and expected
@@ -295,6 +297,8 @@ All six filed and synthesised. Full threshold table with evidence ratings quoted
 | 2026-09-25 | **W2-5 contract proposals ruled (six).** (1) A keyword-named `with` key binds to `key_`, and `**kwargs` is refused: **approved**. (2) Derived child-id encoding: **approved with the layout pinned exactly.** Bits 12-17 of the 80-bit digest prefix are discarded, and the "set version and variant bits" wording, which also reads as overwrite-in-place, is replaced. (3) Engine error-code registry: **approved with amendments.** The contract is the source and code is checked against it, not generated from it. Eight loader-family prefixes are added. **Drift found:** the executor emits `STEP_ERROR` where the contract says `TRANSFORM_ERROR`, and the contract wins. (4) Built-in `with` shapes: **approved.** The filter's JSON deny-list applies to every pointer token, which corrects my "ends in" wording. (5) Reprocess refuses `tb-parent-id` records until W3-3: **approved as refuse-only.** It over-refuses reprocessed records, on purpose. (6) Manifest: **approved.** It was three examples, not two. The `parse` `version` gap is added to two examples, and nothing flips to runnable. Rejected: generating the registry from `codes.py`, and "refuse or scope" for split children before a re-entry point exists | `contracts/CHANGELOG.md` 2026-09-25, channel-spec README 3.3-3.3.3, envelope README 2.3.2, ADR-003 follow-up 10 |
 | 2026-09-25 | **W2-5 second round (five items).** (1) **Filter allow-list ratified** (21 fields; security MEDIUM 3), **with an amendment**: a repeated `ORC`/`OBR`/`OBX` (any repeated segment) is unresolved for the filter, so a first-occurrence read cannot silently drop a multi-result message. No example is refused. Rejected: a longer deny-list, because it fails open. (2) hl7-batch final CR only if the parent had it: **ratified**. (3) `TB_OUTPUT_ENVELOPE_INVALID` and `TB_PIPELINE_TIME_BUDGET` **registered by exact name**; fixed names under a reserved prefix are listed. (4) Bundle-declared `Reject` codes **deferred to bundle-fetch**; interim, codes are literals, and a data-built code is Critical in review. (5) `ref` restricted to the pinned bundle's own packages: **approved now**, enforced with bundle-fetch | `contracts/CHANGELOG.md` 2026-09-25 (later), channel-spec README 3.3.1, 3.3.2, 9 |
 | 2026-09-26 | **`raw` `max.message.bytes` stays 1,048,576 and is ruled not an envelope control.** Kafka checks it against the batch after compression, and `raw` is `compression.type: producer` with `lz4` from receivers, so a compressible payload over 1,000,000 bytes passes at any value. Rejected: lowering it to the envelope-derived 1,019,105, which would refuse only incompressible oversize records and look like a guarantee. The controls that hold: receiver-only WRITE on `raw`, receivers refusing input over 1,000,000 bytes, and the worker halting the partition with `TB_DLQ_UNWRITABLE` (registered, additive). Real fix: claim-check | `contracts/CHANGELOG.md` 2026-09-26, `topic-defaults.json` `classes.raw.max.message.bytes_source`, `envelope/v0/error-codes.json` |
+| 2026-09-28 | **Human (asked directly by the lead): vendor the FHIR R4 JSON Schema, fetched over the network (option a).** The file is HL7's official `fhir.schema.json` for FHIR 4.0.1, published under CC0, which the human ruled compatible with Apache-2.0. It is **test data, not a code dependency**. Plan: commit it under a test-fixtures path, recording its source URL, FHIR version and SHA-256; a test then validates every W2-3 golden Bundle against it with `jsonschema` (already a dev dependency). Scope: the JSON Schema checks structure only; business rules and terminology are covered by the exit-criterion-1 end-to-end test against a real HAPI FHIR server. **BLOCKED until the human adds `hl7.org` (or `build.fhir.org`) to this environment's network allow-list**; the sandbox proxy refuses it today. Closes W2-2 open item 4 once done | open questions below |
+| 2026-09-28 | **Human (asked directly by the lead): the wave 3 archiver uses `clickhouse-connect` (option B), so `certifi` (MPL-2.0) is APPROVED in the runtime**, unmodified, scoped to its use through `clickhouse-connect` in the archiver package. Recorded as **its own approval, not an extension** of the 2026-09-23 dev-only `certifi` approval or of the 2026-09-25 loader decision. **The `clickhouse` loader keeps its stdlib HTTP client.** Conditions: `clickhouse-connect`'s silent retries (`query_retries` and its internal HTTP retries) turned off, so the runtime retry policy is the only retry; the archiver gets the same code and security review as the loaders. Follow-up for wave 3, when the archiver package is created: `devops-engineer` updates `MPL_APPROVED` in `.github/scripts/licence_check.py` for the new runtime scope. CLAUDE.md stack table already updated by the lead on `wave/1-2`. Rejected: building the archiver on the loader's stdlib HTTP client | ADR-001 2.3 |
 
 ## Open questions for the human
 
@@ -307,19 +311,15 @@ on the human's approval (2026-09-24).
 
 **Open, new in wave 2:**
 
-- **FHIR R4 JSON Schema for W2-2 golden-file validation: vendor the file, or allow one-time network
-  access?** (Raised 2026-09-25.) This is a condition of the W2-2 approval: the `fhir.resources` models
-  are R4B, and validating the goldens against the R4 schema catches R4-invalid output they accept.
-  `hl7.org` is blocked by the proxy, and no installed package ships the schema.
-  - **Option 1, vendor `fhir.schema.json` into the repo.** Reproducible and offline. It is a
-    licensing question, because it is third-party content in the repo. The architect's
-    understanding is that HL7 publishes FHIR under CC0, but that is **unverified**, and CC0 is not
-    on invariant 10's list.
-  - **Option 2, allow one-time network access to fetch it.** No licensing change to the tree, but
-    the check is not reproducible offline or in CI unless the fetched file is cached somewhere.
-
-  Either way it is a human call (licensing, or environment access). Until then, W2-2 condition 4
-  stays open and the golden files are unchecked against R4.
+- **FHIR R4 JSON Schema for W2-2 golden-file validation: DECIDED 2026-09-28, WAITING ON NETWORK
+  ACCESS.** The human chose to vendor HL7's official `fhir.schema.json` (FHIR 4.0.1, CC0, ruled
+  compatible with Apache-2.0; test data, not a code dependency), fetched over the network (decisions
+  log). The file is fetched once and committed under a test-fixtures path with its source URL, version
+  and SHA-256, so the check is reproducible offline and in CI. It checks structure only; business rules
+  and terminology are the exit-criterion-1 end-to-end test against a real HAPI FHIR server.
+  **Still needed from the human:** add `hl7.org` (or `build.fhir.org`) to this environment's network
+  allow-list; the proxy refuses it today. Until then W2-2 condition 4 stays open and the golden files
+  are unchecked against R4.
 
 - ~~**SFTP client licence.**~~ **DECIDED 2026-09-24: `paramiko` approved**, unmodified and scoped
   (decisions log, ADR-001 2.3). Kept for one revision so the change is visible. The scope question is
@@ -346,13 +346,15 @@ on the human's approval (2026-09-24).
   `connector-engineer`). Invariant 10 has no LGPL path. The options: approve it as an unmodified
   dependency, or amend the stack table to a permissive driver. The wave 2 loaders already use `asyncpg`
   (Apache-2.0), which shows one exists. Choosing the stack is the human's decision. Not a wave 2 blocker.
-- **ClickHouse client for the wave 3 archiver — answer needed before the archiver is built.** On
+- ~~**ClickHouse client for the wave 3 archiver — answer needed before the archiver is built.** On
   2026-09-25 the human decided that the `clickhouse` *loader* uses the HTTP interface via the standard
   library, because `clickhouse-connect` unconditionally pulls in `certifi` (MPL-2.0, approved dev-only)
   and retries silently by default (decisions log). That decision does **not** cover the archiver. If the
   archiver uses `clickhouse-connect`, as the CLAUDE.md stack table still says, the same question
   returns: approve `certifi` for the runtime, or build the archiver on the same stdlib HTTP client as
-  the loader. Not decided, and not a wave 2 blocker.
+  the loader.~~ **DECIDED 2026-09-28: `clickhouse-connect`, with `certifi` approved in the runtime**
+  for the archiver only, silent retries off, loader-level review (decisions log, ADR-001 2.3). The
+  loader keeps its stdlib client. Kept for one revision so the change is visible.
 - **Linux re-run capacity.** The approved re-run has not happened (see Current). The memo priced it as
   "CI runner time and a dedicated 3-broker cluster". A hosted runner is not a dedicated cluster.
   Whether to pay for dedicated capacity is cloud spend.

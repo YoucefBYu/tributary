@@ -142,9 +142,23 @@ Sources to re-check: openintegrationengine.org and the OIE GitHub repository (li
   the standard library, on the HTTP loader's rules: redirects refused, no pooling, no hidden retries,
   auth headers from `secretRef`, stdlib TLS. **No new dependency; `certifi`'s scope is unchanged.**
   Rejected: approving `certifi` for the runtime; deferring the loader. This departs from the CLAUDE.md
-  stack table (Archive: `clickhouse-connect`) **for the loader only**. The wave 3 archiver's client is
-  an open human question (`docs/agent-team/STATUS.md`), and `clickhouse-connect` there would raise the
-  same `certifi` question.
+  stack table (Archive: `clickhouse-connect`) **for the loader only**. The wave 3 archiver's client was
+  left open here and was decided by the human on 2026-09-28 (next entry).
+- **`certifi` (MPL-2.0) in the runtime, HUMAN-APPROVED 2026-09-28** as its own decision. It is **not**
+  an extension of the 2026-09-23 dev-only `certifi` approval, nor of the 2026-09-25 loader decision.
+  The human chose `clickhouse-connect` (Apache-2.0) as the wave 3 archiver's ClickHouse client when
+  asked directly by the lead, over building the archiver on the loader's stdlib HTTP client.
+  **Scope:** unmodified `certifi`, in the runtime, only as a dependency of `clickhouse-connect` in the
+  archiver package. Any other package or path pulling it into the runtime, or a modified or vendored
+  copy, needs a fresh decision. **The `clickhouse` loader is unchanged:** it keeps its stdlib HTTP
+  client, and `tributary-loaders` must not gain `certifi` in its runtime closure.
+  **Conditions:** (1) `clickhouse-connect`'s silent retries are turned off, both `query_retries` and
+  its internal HTTP retries, so the runtime's retry policy is the only retry; (2) the archiver passes
+  the same `code-reviewer` and `security-reviewer` review as the loaders, including the library-default
+  checks of `wave-2.md` 6.3. **Follow-up (wave 3, when the archiver package is created):**
+  `devops-engineer` extends `MPL_APPROVED` in `.github/scripts/licence_check.py` to cover `certifi`'s
+  runtime scope. Until then the checker still treats `certifi` as non-runtime only, which is correct.
+  The CLAUDE.md stack-table line was updated by the lead on `wave/1-2`.
 - **How this one nearly passed unnoticed, which is the reusable part.** The root manifest annotates
   `"testcontainers[kafka]>=4.8",  # Apache-2.0`. That comment is *correct about testcontainers itself*
   and says nothing about its transitive closure, so it reads as a clearance while clearing nothing —
