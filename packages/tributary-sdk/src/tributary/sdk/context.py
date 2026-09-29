@@ -115,3 +115,24 @@ class Context(Protocol):
 
     def usr_headers(self) -> Mapping[str, str]:
         """The `tb-usr-*` values set by steps so far, without the prefix."""
+
+
+@runtime_checkable
+class ReplyContext(Context, Protocol):
+    """A `Context` that can supply a synchronous reply body (set 1.2, channel-spec README 3.2.6).
+
+    A separate protocol so that adding it was additive: a wrapper written against `Context` (for
+    example one that adds `.fhir`) stays a valid `Context`, and gains `reply` by forwarding it. The
+    runtime's context and `FakeContext` implement it; a step that answers annotates `ctx: ReplyContext`.
+    """
+
+    def reply(self, body: bytes, *, content_type: str) -> None:
+        """Supply the synchronous reply body for this message (set 1.2, channel-spec README 3.2.6).
+
+        At most once per message; pipeline steps only (a destination step raises); `content_type` must
+        be a registered envelope type, `application/hl7-v2+er7` for an `mllp` source; at most 1,000,000
+        bytes. Violations raise `ReplyError`, whose message never quotes the body.
+
+        Always legal otherwise: the body is used only when the request is synchronous and the channel
+        says `reply.body: step`, and is discarded (and counted) in every other case.
+        """

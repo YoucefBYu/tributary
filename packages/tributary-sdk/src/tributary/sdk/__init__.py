@@ -13,7 +13,7 @@ This package has no third-party dependencies and never opens a socket.
 
 from __future__ import annotations
 
-from .context import Context, KeyValueStore, Logger, SecretStore
+from .context import Context, KeyValueStore, Logger, ReplyContext, SecretStore
 from .errors import (
     AttrError,
     DropReasonError,
@@ -25,6 +25,7 @@ from .errors import (
     MissingHeaderError,
     PayloadError,
     RejectCodeError,
+    ReplyError,
     SecretNotFoundError,
     StepConfigError,
     StepDefinitionError,
@@ -54,6 +55,8 @@ __all__ = [
     "PayloadError",
     "Reject",
     "RejectCodeError",
+    "ReplyContext",
+    "ReplyError",
     "SecretNotFoundError",
     "SecretStore",
     "SplitResult",

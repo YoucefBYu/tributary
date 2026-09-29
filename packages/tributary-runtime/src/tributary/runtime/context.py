@@ -19,6 +19,7 @@ from typing import Any
 from tributary.sdk.context import KeyValueStore, Logger, SecretStore
 from tributary.sdk.errors import SecretNotFoundError
 from tributary.sdk.guards import validate_attr, validate_attrs, validate_usr
+from tributary.sdk.reply import ReplyBody, check_once, check_reply
 
 
 class EnvSecretStore:
@@ -63,6 +64,20 @@ class UnavailableKeyValueStore:
         raise NotImplementedError("ctx.kv arrives with the control plane in Wave 3")
 
 
+class ReplyCell:
+    """Where one message's `ctx.reply` body is held (channel-spec README 3.2.6).
+
+    One cell per message for the pipeline steps. A split child gets a detached cell of its own (a
+    channel with a splitter never replies, so its body is only ever discarded and counted), and a
+    destination step gets none: there the call raises.
+    """
+
+    __slots__ = ("body",)
+
+    def __init__(self) -> None:
+        self.body: ReplyBody | None = None
+
+
 class WorkerContext:
     """The `ctx` a step receives inside a pipeline worker."""
 
@@ -70,6 +85,7 @@ class WorkerContext:
         "_attrs",
         "_kv",
         "_log",
+        "_reply",
         "_secrets",
         "_usr",
         "_vars",
@@ -78,6 +94,7 @@ class WorkerContext:
         "channel_version",
         "destination",
         "instance",
+        "source_type",
         "traceparent",
     )
 
@@ -93,6 +110,7 @@ class WorkerContext:
         destination: str | None = None,
         attempt: int = 0,
         traceparent: str | None = None,
+        source_type: str | None = None,
     ) -> None:
         self.channel = channel
         self.channel_version = channel_version
@@ -100,12 +118,14 @@ class WorkerContext:
         self.destination = destination
         self.attempt = attempt
         self.traceparent = traceparent
+        self.source_type = source_type
         self._log = log
         self._secrets: SecretStore = secrets if secrets is not None else EnvSecretStore()
         self._kv: KeyValueStore = kv if kv is not None else UnavailableKeyValueStore()
         self._vars: dict[str, Any] = {}
         self._attrs: dict[str, str] = {}
         self._usr: dict[str, str] = {}
+        self._reply: ReplyCell | None = None if destination is not None else ReplyCell()
 
     @property
     def vars(self) -> MutableMapping[str, object]:
@@ -142,6 +162,31 @@ class WorkerContext:
     def usr_headers(self) -> Mapping[str, str]:
         return MappingProxyType(dict(self._usr))
 
+    def reply(self, body: bytes, *, content_type: str) -> None:
+        """Hold this message's synchronous reply body. Same rules as `FakeContext` (`tributary.sdk.reply`)."""
+        check_once(self._reply.body if self._reply is not None else None)
+        checked = check_reply(
+            body, content_type=content_type, destination=self.destination, source_type=self.source_type
+        )
+        if self._reply is None:  # pragma: no cover - check_reply refuses a destination context first
+            return
+        self._reply.body = checked
+
+    @property
+    def reply_body(self) -> ReplyBody | None:
+        """The body a pipeline step supplied, or `None`. The worker decides whether it is used."""
+        return self._reply.body if self._reply is not None else None
+
+    def restore_reply(self, body: ReplyBody | None) -> None:
+        """Put the reply body back to what it was before a step attempt.
+
+        The executor calls this before every attempt, so a body set by an attempt that then raised is
+        discarded before the retry (amendment, channel-spec 3.2.6) and "at most once" holds per
+        successful pipeline run rather than per attempt.
+        """
+        if self._reply is not None:
+            self._reply.body = body
+
     def fork(self, *, destination: str | None = None, traceparent: str | None = None) -> WorkerContext:
         """A copy for one branch of the executor tree: a split child, or one destination's steps.
 
@@ -161,7 +206,10 @@ class WorkerContext:
             destination=destination if destination is not None else self.destination,
             attempt=self.attempt,
             traceparent=traceparent if traceparent is not None else self.traceparent,
+            source_type=self.source_type,
         )
+        # A destination fork has no cell (the constructor saw a destination); a split child gets a
+        # detached one, so its body can never become the message's answer.
         clone._vars = dict(self._vars)
         clone._attrs = dict(self._attrs)
         clone._usr = dict(self._usr)

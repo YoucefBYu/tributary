@@ -29,6 +29,8 @@ from tributary.sdk.codes import TRANSFORM_ERROR
 from tributary.sdk.context import Logger
 from tributary.sdk.errors import TributaryError, safe_token
 
+from .context import WorkerContext
+
 #: Envelope 2.3.2: a step that exhausts `stepRetries` dead-letters as `TRANSFORM_ERROR`. Wave 1 to the
 #: first W2-5 build emitted `STEP_ERROR`, which stays registered as reserved so old records stay readable.
 STEP_ERROR_CODE = TRANSFORM_ERROR
@@ -249,7 +251,7 @@ class PipelineExecutor:
 
     def _run_one(self, step: Step, message: Message, ctx: Context, before_attempt: Check | None) -> Message | Drop:
         outcome = _attempts(
-            lambda: step(message, ctx),
+            _attempt_call(step, message, ctx),
             name=step.name,
             retries=self._retries,
             stats=self._stats,
@@ -259,6 +261,21 @@ class PipelineExecutor:
         if not isinstance(outcome, Message | Drop):  # pragma: no cover - Step.__call__ normalises or raises
             raise StepFailure(step.name, 1, type(outcome).__name__)
         return outcome
+
+
+def _attempt_call(step: Step, message: Message, ctx: Context) -> Callable[[], object]:
+    """One attempt of `step`. In the worker, each attempt first restores the `ctx.reply` body to what it
+    was before the step began, so a body set by an attempt that then raised is discarded before the
+    retry (channel-spec 3.2.6 amendment)."""
+    if not isinstance(ctx, WorkerContext):
+        return lambda: step(message, ctx)
+    worker_ctx, before = ctx, ctx.reply_body
+
+    def call() -> object:
+        worker_ctx.restore_reply(before)
+        return step(message, worker_ctx)
+
+    return call
 
 
 def run_splitter(

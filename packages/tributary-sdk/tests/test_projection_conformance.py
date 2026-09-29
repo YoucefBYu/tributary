@@ -39,6 +39,9 @@ PLAUSIBLE: dict[str, str] = {
     h.TB_ERROR_CODE: "HTTP_503",
     h.TB_RETRY_NOT_BEFORE: "2026-09-20T11:22:38.123Z",
     h.TB_CORRELATION_ID: "b7d3b3f4-3d8f-4a2b-9c1e-2f5a6b7c8d9e",
+    h.TB_REPLY_PARTITION: "2",
+    h.TB_REPLY_DEADLINE: "2026-09-28T09:15:17.481Z",
+    h.TB_REPLY_STATUS: "accepted",
 }
 
 
@@ -286,6 +289,78 @@ def test_a_well_formed_usr_header_still_passes() -> None:
     """The guard has to let the legitimate case through, or channels route around it."""
     message = make_message(key=b"SYNTH-KEY-0001").with_header("tb-usr-batch-id", "b-4471")
     validate_for_produce(message, topic_class="raw")
+
+
+# -- set 1.2: synchronous reply headers -----------------------------------------------------------
+
+
+def sync_raw_message() -> Message:
+    return make_message(
+        b"synthetic-query",
+        key=b"SYNTH-KEY-0001",
+        correlation_id=new_correlation_id(),
+        headers={h.TB_REPLY_PARTITION: "2", h.TB_REPLY_DEADLINE: "2026-09-28T09:15:17.481Z"},
+    )
+
+
+def status_reply(status: str | None, code: str | None) -> Message:
+    message = reply_message()
+    if status is not None:
+        message = message.with_header(h.TB_REPLY_STATUS, status)
+    if code is not None:
+        message = message.with_header(h.TB_ERROR_CODE, code)
+    return message
+
+
+def test_a_sync_request_passes_the_schema_and_the_producer_check(validator: Draft202012Validator) -> None:
+    message = sync_raw_message()
+    assert failures(validator, record_projection(message, topic_class="raw")) == set()
+    validate_for_produce(message, topic_class="raw")
+
+
+@pytest.mark.parametrize("missing", [h.TB_CORRELATION_ID, h.TB_REPLY_DEADLINE, h.TB_REPLY_PARTITION])
+def test_the_reply_routing_headers_travel_together(validator: Draft202012Validator, missing: str) -> None:
+    """dependentRequired in the schema, mirrored in code: each pair must fail both checks."""
+    broken = sync_raw_message().without_header(missing)
+    assert ("$.headers", "dependentRequired") in failures(validator, record_projection(broken, topic_class="raw"))
+    with pytest.raises(EnvelopeError):
+        validate_for_produce(broken, topic_class="raw")
+
+
+@pytest.mark.parametrize(
+    ("status", "code", "valid"),
+    [
+        ("accepted", None, True),
+        ("rejected", "VALIDATE_SEGMENT_MISSING", True),
+        ("failed", "TRANSFORM_ERROR", True),
+        (None, None, True),  # the set 1.0 shape stays valid
+        ("rejected", None, False),
+        ("failed", None, False),
+        ("accepted", "TRANSFORM_ERROR", False),
+        (None, "TRANSFORM_ERROR", False),
+    ],
+)
+def test_the_reply_error_code_rule_matches_the_schema(
+    validator: Draft202012Validator, status: str | None, code: str | None, valid: bool
+) -> None:
+    """The schema's if/then/else on reply, and the producer check, agree on every combination."""
+    message = status_reply(status, code)
+    assert (failures(validator, record_projection(message, topic_class="reply")) == set()) is valid
+    if valid:
+        validate_for_produce(message, topic_class="reply")
+    else:
+        with pytest.raises(EnvelopeError):
+            validate_for_produce(message, topic_class="reply")
+
+
+@pytest.mark.parametrize("value", ["0", "63"])
+def test_reply_partition_bounds_are_well_formed(value: str) -> None:
+    assert h.is_well_formed(h.TB_REPLY_PARTITION, value)
+
+
+@pytest.mark.parametrize("value", ["64", "-1", "02", "+1", " 1", "1_0", "", "x"])
+def test_malformed_reply_partitions_are_not_well_formed(value: str) -> None:
+    assert not h.is_well_formed(h.TB_REPLY_PARTITION, value)
 
 
 def test_the_schema_check_itself_can_go_red(validator: Draft202012Validator) -> None:

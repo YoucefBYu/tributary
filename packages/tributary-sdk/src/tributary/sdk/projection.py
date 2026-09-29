@@ -21,6 +21,7 @@ emitters in the package's conformance tests (gate requirement 10).
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Literal
 
 from . import headers as h
@@ -62,13 +63,20 @@ REQUIRED: dict[str, tuple[str, ...]] = {
     ),
 }
 
+_REPLY_HEADERS = (h.TB_REPLY_PARTITION, h.TB_REPLY_DEADLINE, h.TB_REPLY_STATUS)
+
 FORBIDDEN: dict[str, tuple[str, ...]] = {
-    "raw": (h.TB_DESTINATION, h.TB_STAGE, h.TB_ERROR_CODE, h.TB_RETRY_NOT_BEFORE),
-    "out": (h.TB_ERROR_CODE, h.TB_RETRY_NOT_BEFORE),
-    "retry": (),
-    "dlq": (h.TB_RETRY_NOT_BEFORE,),
-    "reply": (h.TB_ERROR_CODE, h.TB_RETRY_NOT_BEFORE),
+    "raw": (h.TB_DESTINATION, h.TB_STAGE, h.TB_ERROR_CODE, h.TB_RETRY_NOT_BEFORE, h.TB_REPLY_STATUS),
+    "out": (h.TB_ERROR_CODE, h.TB_RETRY_NOT_BEFORE, *_REPLY_HEADERS),
+    "retry": _REPLY_HEADERS,
+    "dlq": (h.TB_RETRY_NOT_BEFORE, *_REPLY_HEADERS),
+    # tb-error-code on reply is conditional since set 1.2: see `_validate_conditionals`.
+    "reply": (h.TB_RETRY_NOT_BEFORE, h.TB_REPLY_PARTITION, h.TB_REPLY_DEADLINE),
 }
+
+#: `reply` statuses that require `tb-error-code`; every other reply (including one with no status, the
+#: set 1.0 shape) must not carry one (envelope 3, schema `if`/`then`/`else`).
+_FAILED_REPLY_STATUSES = frozenset({"rejected", "failed"})
 
 MAX_INLINE_PAYLOAD_BYTES = 1_000_000
 MAX_KEY_BYTES = 256
@@ -120,6 +128,8 @@ def validate_for_produce(
         if name in headers:
             raise EnvelopeError(f"class {topic_class}: header {safe_token(name)} must not be set")
 
+    _validate_conditionals(headers, topic_class=topic_class)
+
     if len(headers) > h.MAX_HEADERS:
         raise EnvelopeError(f"{len(headers)} headers, at most {h.MAX_HEADERS} allowed")
 
@@ -162,6 +172,25 @@ def validate_for_produce(
         )
 
     _validate_key(message, topic_class=topic_class, ordering=ordering)
+
+
+def _validate_conditionals(headers: Mapping[str, str], *, topic_class: str) -> None:
+    """The set 1.2 presence rules the schema holds with `dependentRequired` and `if`/`then`/`else`."""
+    if topic_class == "raw":
+        # dependentRequired: a sync request names its partition, its deadline and its correlation id
+        # together, and a deadline never travels alone.
+        if h.TB_REPLY_PARTITION in headers:
+            for name in (h.TB_CORRELATION_ID, h.TB_REPLY_DEADLINE):
+                if not headers.get(name):
+                    raise EnvelopeError(f"class raw: {h.TB_REPLY_PARTITION} requires header {safe_token(name)}")
+        if h.TB_REPLY_DEADLINE in headers and h.TB_REPLY_PARTITION not in headers:
+            raise EnvelopeError(f"class raw: {h.TB_REPLY_DEADLINE} requires header {h.TB_REPLY_PARTITION}")
+    elif topic_class == "reply":
+        failed = headers.get(h.TB_REPLY_STATUS) in _FAILED_REPLY_STATUSES
+        if failed and not headers.get(h.TB_ERROR_CODE):
+            raise EnvelopeError(f"class reply: a rejected or failed reply requires {h.TB_ERROR_CODE}")
+        if not failed and h.TB_ERROR_CODE in headers:
+            raise EnvelopeError(f"class reply: {h.TB_ERROR_CODE} is allowed only on a rejected or failed reply")
 
 
 def _validate_key(message: Message, *, topic_class: str, ordering: Ordering) -> None:

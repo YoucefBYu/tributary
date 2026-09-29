@@ -15,6 +15,7 @@ from types import MappingProxyType
 
 from .errors import KeyValueConflictError, SecretNotFoundError
 from .guards import validate_attr, validate_attrs, validate_log_event, validate_log_fields, validate_usr
+from .reply import ReplyBody, check_once, check_reply
 
 #: A fixed instant, so a step that stamps a time produces the same output on every run.
 DEFAULT_NOW = datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC)
@@ -96,6 +97,10 @@ class FakeContext:
     `now()` is a fixed instant by default rather than the wall clock, because a step that stamps a
     timestamp should produce a comparable result on every run. Pass a `datetime` or a callable to
     control it.
+
+    `ctx.reply` is recorded in `replied` with the runtime's rules (`tributary.sdk.reply`): set
+    `destination` to test a destination step (the call raises there) and `source_type="mllp"` to hold
+    the body to the MLLP content type. The recorded body never appears in `repr`.
     """
 
     channel: str = "test-channel"
@@ -109,6 +114,8 @@ class FakeContext:
     secrets: FakeSecrets = field(default_factory=FakeSecrets)
     kv: FakeKeyValueStore = field(default_factory=FakeKeyValueStore)
     clock: datetime | Callable[[], datetime] = DEFAULT_NOW
+    source_type: str | None = None
+    replied: ReplyBody | None = field(default=None, init=False, repr=False)
     _attrs: dict[str, str] = field(default_factory=dict, init=False, repr=False)
     _usr: dict[str, str] = field(default_factory=dict, init=False, repr=False)
 
@@ -130,3 +137,9 @@ class FakeContext:
 
     def usr_headers(self) -> Mapping[str, str]:
         return MappingProxyType(dict(self._usr))
+
+    def reply(self, body: bytes, *, content_type: str) -> None:
+        check_once(self.replied)
+        self.replied = check_reply(
+            body, content_type=content_type, destination=self.destination, source_type=self.source_type
+        )

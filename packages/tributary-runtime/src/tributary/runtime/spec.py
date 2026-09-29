@@ -25,6 +25,7 @@ from .errors import ChannelSpecError, safe_token
 from .topics import CHANNEL, DESTINATION
 
 Ordering = Literal["per-key", "none"]
+ReplyBodyMode = Literal["ack", "step"]
 OnExhaust = Literal["halt-partition", "dlq-and-continue"]
 
 #: ADR-003 D4: a step exception is retried in place a small number of times, then dead-lettered.
@@ -110,6 +111,30 @@ class ChannelSpec:
     @property
     def ordered(self) -> bool:
         return self.ordering == "per-key"
+
+    @property
+    def source_type(self) -> str | None:
+        kind = self.source.get("type")
+        return kind if isinstance(kind, str) else None
+
+    @property
+    def sync_reply(self) -> bool:
+        """True when `source.reply` is present: its presence alone switches sync mode on (README 3.2.6).
+
+        The worker does not use this to decide **whether** to reply — the consumed record decides, by
+        carrying `tb-reply-partition` — only to refuse a spec that cannot reply at load.
+        """
+        return isinstance(self.source.get("reply"), dict)
+
+    @property
+    def reply_body(self) -> ReplyBodyMode:
+        """`source.reply.body`: `step` only when the applied spec says so; anything else is `ack`.
+
+        Lenient (section 1.1): an unknown value from a newer control plane means the receiver builds the
+        answer, which is the reading that never needs a body this worker cannot supply.
+        """
+        block = self.source.get("reply")
+        return "step" if isinstance(block, dict) and block.get("body") == "step" else "ack"
 
     @classmethod
     def from_document(cls, document: Any) -> ChannelSpec:

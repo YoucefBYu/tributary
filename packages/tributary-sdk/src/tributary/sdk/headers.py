@@ -32,6 +32,12 @@ TB_DESTINATION = "tb-destination"
 TB_STAGE = "tb-stage"
 TB_ERROR_CODE = "tb-error-code"
 TB_RETRY_NOT_BEFORE = "tb-retry-not-before"
+#: Set 1.2, synchronous reply mode (envelope README 3, 2.3.3). `raw` only: the reply partition the
+#: receiving process holds, and the time after which nobody waits for the answer.
+TB_REPLY_PARTITION = "tb-reply-partition"
+TB_REPLY_DEADLINE = "tb-reply-deadline"
+#: Set 1.2. `reply` only: `accepted`, `rejected` or `failed`. Only `accepted` may become `AA`.
+TB_REPLY_STATUS = "tb-reply-status"
 TRACEPARENT = "traceparent"
 TRACESTATE = "tracestate"
 
@@ -56,16 +62,43 @@ REGISTERED: frozenset[str] = frozenset(
         TB_STAGE,
         TB_ERROR_CODE,
         TB_RETRY_NOT_BEFORE,
+        TB_REPLY_PARTITION,
+        TB_REPLY_DEADLINE,
+        TB_REPLY_STATUS,
         TRACEPARENT,
         TRACESTATE,
     }
 )
 
+#: The two headers that route an answer rather than describe the message. A parse failure disables the
+#: reply, never the message (envelope 2.3.3), and neither is propagated past `raw` (section 6 rule 7).
+REPLY_ROUTING_HEADERS: tuple[str, str] = (TB_REPLY_PARTITION, TB_REPLY_DEADLINE)
+
+#: `tb-reply-status` values (envelope 3). A reader treats anything else, or absence, as not accepted.
+REPLY_STATUSES: frozenset[str] = frozenset({"accepted", "rejected", "failed"})
+
 #: Headers whose value is an integer. Gate requirement 13 asks for total parsing across all of them.
-INTEGER_HEADERS: Mapping[str, int] = {TB_ATTEMPT: 9999, TB_CHANNEL_VERSION: 9_999_999_999}
+INTEGER_HEADERS: Mapping[str, int] = {TB_ATTEMPT: 9999, TB_CHANNEL_VERSION: 9_999_999_999, TB_REPLY_PARTITION: 63}
 
 #: Headers whose value is an RFC 3339 UTC timestamp with 3 to 9 fractional digits.
-TIMESTAMP_HEADERS: frozenset[str] = frozenset({TB_RECEIVED_AT, TB_RETRY_NOT_BEFORE})
+TIMESTAMP_HEADERS: frozenset[str] = frozenset({TB_RECEIVED_AT, TB_RETRY_NOT_BEFORE, TB_REPLY_DEADLINE})
+
+#: The registered media types (envelope 3.1), compared on type/subtype only: parameters are additive.
+CONTENT_TYPES: frozenset[str] = frozenset(
+    {
+        "application/hl7-v2+er7",
+        "application/hl7-v2+xml",
+        "application/fhir+json",
+        "application/fhir+xml",
+        "application/json",
+        "application/xml",
+        "text/csv",
+        "text/plain",
+        "application/edi-x12",
+        "application/dicom",
+        "application/octet-stream",
+    }
+)
 
 MAX_HEADERS = 32
 MAX_NAME_BYTES = 64
@@ -276,9 +309,16 @@ def is_well_formed(name: str, value: str) -> bool:
             return bool(_ERROR_CODE.match(value))
         elif name == TB_STAGE:
             return value in STAGES
+        elif name == TB_REPLY_STATUS:
+            return value in REPLY_STATUSES
     except HeaderError:
         return False
     return True
+
+
+def media_type(content_type: str) -> str:
+    """The `type/subtype` of a content type, lowercased, without parameters (envelope 3.1)."""
+    return content_type.split(";", 1)[0].strip().lower()
 
 
 def usr_name(name: str) -> str:

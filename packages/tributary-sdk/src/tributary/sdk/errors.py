@@ -125,3 +125,11 @@ class StepConfigError(StepDefinitionError):
 
 class RejectCodeError(TributaryError):
     """`Reject(code)` with a code that breaks the grammar or that the engine reserves."""
+
+
+class ReplyError(TributaryError):
+    """`ctx.reply` broke a rule: a second call, a destination step, a type or a size (channel-spec 3.2.6).
+
+    The message names the rule and, at most, a byte count or a media type the engine registers. Never the
+    body or any part of it: a reply body is payload and PHI-bearing.
+    """

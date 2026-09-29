@@ -64,7 +64,7 @@ from tributary.sdk.errors import EnvelopeError
 
 from .errors import DeliveryError
 from .events import EventEmitter, MessageEvent, PartitionEvent, RecordEvent
-from .executor import StepFailure
+from .executor import PipelineAbort, StepFailure
 from .records import ConsumedRecord, DecodeContext, RecordDecodeError, RecordRejectError, decode_record
 from .spec import RetryPolicy
 from .transactions import Committer, OffsetCommitter, TransactionError
@@ -126,6 +126,16 @@ class DlqWriter(Protocol):
 
 
 Key = tuple[str, int]
+
+
+class DeadLetterObserver(Protocol):
+    """Told after a dead letter's delivery callback succeeded and the record was marked.
+
+    The pipeline worker answers a synchronous request here: the reply must follow the `dlq` callback
+    (channel-spec 3.2.6). `rejected` is True only for a channel's own `Reject`.
+    """
+
+    def __call__(self, record: ConsumedRecord, *, error_code: str, rejected: bool) -> None: ...
 
 
 @dataclass(slots=True)
@@ -205,8 +215,10 @@ class ConsumerLoop:
         read_stage: str = "queued",
         clock: Callable[[], float] = time.monotonic,
         committer: Committer | None = None,
+        on_dead_lettered: DeadLetterObserver | None = None,
     ) -> None:
         self._consumer = consumer
+        self._on_dead_lettered = on_dead_lettered
         self._handler = handler
         self._topics = topics
         self._retry = retry
@@ -334,7 +346,8 @@ class ConsumerLoop:
                 self._dead_letter(record, error_code=exc.error_code, stage="pending")
             return
         except StepFailure as exc:
-            self._dead_letter(record, error_code=exc.error_code, stage="transformed")
+            rejected = exc.rejected and not isinstance(exc, PipelineAbort)
+            self._dead_letter(record, error_code=exc.error_code, stage="transformed", rejected=rejected)
             return
 
         self._succeed(record)
@@ -570,7 +583,7 @@ class ConsumerLoop:
 
     # -- dead letters ----------------------------------------------------------------------------
 
-    def _dead_letter(self, record: ConsumedRecord, *, error_code: str, stage: str) -> bool:
+    def _dead_letter(self, record: ConsumedRecord, *, error_code: str, stage: str, rejected: bool = False) -> bool:
         """Dead-letter and mark the record. False when the dead letter could not be written and the
         partition was halted instead."""
         if self._dlq is None:
@@ -601,7 +614,22 @@ class ConsumerLoop:
         )
         self._retry_state.pop((record.topic, record.partition), None)
         self._mark((record.topic, record.partition), record.offset)
+        self._notify_dead_lettered(record, error_code=error_code, rejected=rejected)
         return True
+
+    def _notify_dead_lettered(self, record: ConsumedRecord, *, error_code: str, rejected: bool) -> None:
+        """After the mark, and guarded: an observer failure must not replay a record already dead-lettered."""
+        if self._on_dead_lettered is None:
+            return
+        try:
+            self._on_dead_lettered(record, error_code=error_code, rejected=rejected)
+        except Exception as exc:
+            self._log.error(
+                "dead_letter_observer_failed",
+                channel=self._channel,
+                message_id=record.msg_id,
+                error_type=type(exc).__name__,
+            )
 
     def _reject(self, exc: RecordRejectError) -> None:
         """An ordinary reject: identity intact, one or more other registered headers malformed.
@@ -654,6 +682,7 @@ class ConsumerLoop:
             bad_headers=",".join(exc.bad_headers),
         )
         self._mark((record.topic, record.partition), record.offset)
+        self._notify_dead_lettered(record, error_code=exc.error_code, rejected=False)
 
     def _quarantine(self, raw: Any, topic: str, partition: int, offset: int, exc: RecordDecodeError) -> None:
         """A record we cannot decode at all.
