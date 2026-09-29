@@ -39,7 +39,7 @@ from .channels import ChannelsConsumerLike, LiveSpecSource, open_spec_source
 from .clients import KafkaSettings, consumer_config, events_producer_config, max_poll_interval_ms, producer_config
 from .config import TopicDefaults, load_topic_defaults
 from .consumer import ConsumerLoop, KafkaConsumerLike, LoopSettings, LoopStats
-from .context import WorkerContext
+from .context import ContextExtension, WorkerContext
 from .engine_kafka import load_engine_kafka_or_exit
 from .errors import (
     ChannelSpecError,
@@ -51,6 +51,7 @@ from .errors import (
 )
 from .events import EventEmitter, MessageEvent, NullEmitter
 from .executor import ChannelPlan, PipelineAbort, StepFailure, StepStats, run_splitter
+from .extensions import load_context_extensions
 from .logs import JsonLogger
 from .producer import KafkaEventEmitter, KafkaProducerLike, RecordProducer
 from .records import RECORD_UNDECODABLE, ConsumedRecord, quarantine_blob
@@ -387,6 +388,9 @@ class PipelineHandler:
     consumed offset is committed by the loop only after this returns, and this returns only after every
     `out` and `dlq` record it queued has been flushed (or, in a transaction, joined it), so "every child
     and destination produced or dead-lettered" holds before the commit.
+
+    `context_extensions` wrap each branch's `WorkerContext` before its first step (`extensions.py`):
+    that is how a mapping step gets `ctx.fhir` without this package importing `tributary-fhir`.
     """
 
     def __init__(
@@ -406,8 +410,10 @@ class PipelineHandler:
         time_budget_s: float | None = None,
         clock: Callable[[], float] = time.monotonic,
         replies: ReplyPublisher | None = None,
+        context_extensions: Sequence[ContextExtension] = (),
     ) -> None:
         self._env = env
+        self._extensions = tuple(context_extensions)
         self._replies = replies
         self._transactional = transactional
         self._warned_version: int | None = None
@@ -502,6 +508,8 @@ class PipelineHandler:
             attempt=message.attempt,
             traceparent=message.traceparent,
             source_type=spec.source_type,
+            extensions=self._extensions,
+            subject=message,
         )
         # A StepFailure here propagates: the loop dead-letters the consumed record (stage transformed)
         # and then calls `after_dead_letter`, which answers a synchronous request.
@@ -560,7 +568,7 @@ class PipelineHandler:
         )
         for subject in branches:
             budget.check()
-            branch_ctx = ctx if plan.splitter is None else ctx.fork(traceparent=subject.traceparent)
+            branch_ctx = ctx if plan.splitter is None else ctx.fork(traceparent=subject.traceparent, subject=subject)
             if plan.splitter is not None:
                 child = self._run_child(spec, plan, record, subject, branch_ctx, pending, budget)
                 if child is None:
@@ -672,7 +680,7 @@ class PipelineHandler:
             outgoing, usr, attrs = subject, ctx.usr_headers(), ctx.attrs()
             if executor is not None and len(executor):
                 budget.check()
-                destination_ctx = ctx.fork(destination=destination.name)
+                destination_ctx = ctx.fork(destination=destination.name, subject=subject)
                 try:
                     result = executor.run(subject, destination_ctx, before_attempt=budget.check)
                 except PipelineAbort:
@@ -971,6 +979,9 @@ class PipelineWorker:
     settings: WorkerSettings
     steps_override: tuple[Node, ...] | None = None
     defaults: TopicDefaults | None = None
+    #: `None` discovers the installed `tributary.context` entry points (`extensions.py`); a tuple, even an
+    #: empty one, replaces discovery (tests).
+    context_extensions: tuple[ContextExtension, ...] | None = None
     log: Logger = field(default_factory=lambda: JsonLogger("worker"))
     loop: ConsumerLoop | None = field(default=None, init=False)
     specs: LiveSpecSource | None = field(default=None, init=False)
@@ -985,6 +996,13 @@ class PipelineWorker:
         # Before any client is built: a warning emitted after a failed connection is a warning nobody
         # sees on the run where it matters most.
         emit_profile_warning(self.log, defaults, profile=self.settings.profile)
+        # Before any client too: an extension that cannot load, or breaks attrs, tb-usr-* or reply
+        # delegation, refuses the worker here instead of dead-lettering every message (`extensions.py`).
+        extensions = (
+            self.context_extensions
+            if self.context_extensions is not None
+            else tuple(loaded.extend for loaded in load_context_extensions(log=self.log))
+        )
         # Every client below, the `_tb.<env>.channels` reader first, is built from this one link. Its
         # `engine_kafka_link` line was logged once by `load_engine_kafka_or_exit` in `main`.
 
@@ -1060,6 +1078,7 @@ class PipelineWorker:
             # Sized from the same poll interval the consumer is built with (MEDIUM 2, W2-5 review).
             time_budget_s=handle_budget_s(max_poll_interval_ms(spec), self.settings.flush_timeout_s),
             replies=replies,
+            context_extensions=extensions,
         )
         # Resolve and bind every step now: a bad `with`, or a splitter on a per-key channel, stops the
         # worker before it consumes anything rather than on the first message (README 3.3, 3.3.2).

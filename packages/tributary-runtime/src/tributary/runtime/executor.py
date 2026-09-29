@@ -266,16 +266,25 @@ class PipelineExecutor:
 def _attempt_call(step: Step, message: Message, ctx: Context) -> Callable[[], object]:
     """One attempt of `step`. In the worker, each attempt first restores the `ctx.reply` body to what it
     was before the step began, so a body set by an attempt that then raised is discarded before the
-    retry (channel-spec 3.2.6 amendment)."""
+    retry (channel-spec 3.2.6 amendment).
+
+    The step receives the worker context's `step_view` (the context wrapped by any installed extension,
+    e.g. `ctx.fhir`), while the restore acts on the `WorkerContext` underneath, which is where a
+    wrapper's `reply` lands."""
     if not isinstance(ctx, WorkerContext):
         return lambda: step(message, ctx)
     worker_ctx, before = ctx, ctx.reply_body
 
     def call() -> object:
         worker_ctx.restore_reply(before)
-        return step(message, worker_ctx)
+        return step(message, worker_ctx.step_view)
 
     return call
+
+
+def _step_ctx(ctx: Context) -> Context:
+    """What a step or splitter is handed: the extended view of a worker context, or `ctx` itself."""
+    return ctx.step_view if isinstance(ctx, WorkerContext) else ctx
 
 
 def run_splitter(
@@ -289,7 +298,7 @@ def run_splitter(
 ) -> SplitResult:
     """Run a splitter with the same retry and `Reject` rules as a step. Raises `StepFailure`."""
     outcome = _attempts(
-        lambda: node(message, ctx),
+        lambda: node(message, _step_ctx(ctx)),
         name=node.name,
         retries=step_retries,
         stats=stats,

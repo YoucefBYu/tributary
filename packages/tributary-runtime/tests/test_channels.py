@@ -249,3 +249,189 @@ def test_the_source_is_the_only_hot_reload_path() -> None:
     source = LiveSpecSource(subject, CHANNEL)
     assert source.cache is subject
     assert source.current().name == CHANNEL
+
+
+# -- broker outage: the cache says it may be stale, and keeps serving (invariant 3) -------------------
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 100.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+@dataclass
+class FlakyChannelsConsumer(FakeChannelsConsumer):
+    """`list_topics` fails while `down`, the way librdkafka does with every broker unreachable."""
+
+    down: bool = False
+    probes: int = 0
+    topic_error: Any = None
+    leader: int = 0
+
+    def list_topics(self, topic: str | None = None, timeout: float = -1) -> Any:
+        self.probes += 1
+        if self.down and self.probes > 1:  # the first call is `start()`'s own metadata read
+            from confluent_kafka import KafkaError, KafkaException
+
+            raise KafkaException(KafkaError(KafkaError._TRANSPORT, "broker SYNTHPATIENT^ALPHA:9092 unreachable"))
+        metadata = FakeMetadata(topic or TOPIC, self.partitions)
+        detail = type("PartitionMetadata", (), {"error": None, "leader": self.leader})()
+        metadata.topics[topic or TOPIC].partitions = dict.fromkeys(range(self.partitions), detail)
+        metadata.topics[topic or TOPIC].error = self.topic_error
+        return metadata
+
+
+def started(consumer: FlakyChannelsConsumer, clock: FakeClock, stream: io.StringIO) -> ChannelCache:
+    subject = ChannelCache(
+        consumer, TOPIC, log=JsonLogger("test", stream=stream, level="debug"), probe_interval_s=5.0, clock=clock
+    )
+    subject.start()
+    subject.catch_up(timeout_s=1.0)
+    return subject
+
+
+def events(stream: io.StringIO) -> list[dict[str, Any]]:
+    return [json.loads(line) for line in stream.getvalue().splitlines()]
+
+
+def test_an_unreachable_broker_raises_a_typed_error_and_the_spec_keeps_serving() -> None:
+    """The security finding: callers could not tell they were serving stale specs. Now `poll_once`
+    raises `ChannelsUnavailableError` while the topic cannot be shown readable, and the cache and
+    `LiveSpecSource.current()` keep answering from the last applied spec."""
+    from tributary.runtime.errors import ChannelsUnavailableError
+
+    consumer = FlakyChannelsConsumer(records=[FakeChannelsRecord(CHANNEL.encode(), spec_bytes(version=2)), eof(0)])
+    clock, stream = FakeClock(), io.StringIO()
+    subject = started(consumer, clock, stream)
+    source = LiveSpecSource(subject, CHANNEL)
+
+    consumer.down = True
+    clock.now += 5.0
+    with pytest.raises(ChannelsUnavailableError) as raised:
+        subject.poll_once(timeout_s=0.0)
+    assert raised.value.error_code == "_TRANSPORT"
+    assert raised.value.code == "CHANNELS_UNAVAILABLE"
+    assert "SYNTHPATIENT" not in str(raised.value), "broker text never reaches the message"
+    assert subject.available is False and source.available is False
+    assert subject.require(CHANNEL).version == 2, "invariant 3: the applied spec is still served"
+    assert source.current().version == 2, "current() never fails on an outage"
+
+    clock.now += 1.0
+    with pytest.raises(ChannelsUnavailableError):
+        subject.poll_once(timeout_s=0.0)  # a level, not an edge: raised for as long as it lasts
+
+    logged = [line for line in events(stream) if line["event"].startswith("channels_")]
+    assert [line["event"] for line in logged] == ["channels_unavailable"], "logged once per streak"
+    assert logged[0]["error_code"] == "_TRANSPORT"
+    assert "SYNTHPATIENT" not in stream.getvalue()
+
+
+def test_recovery_is_proven_by_the_next_probe_and_logged_once() -> None:
+    consumer = FlakyChannelsConsumer(records=[FakeChannelsRecord(CHANNEL.encode(), spec_bytes()), eof(0)])
+    clock, stream = FakeClock(), io.StringIO()
+    subject = started(consumer, clock, stream)
+    consumer.down = True
+    clock.now += 5.0
+    source = LiveSpecSource(subject, CHANNEL)
+    source.current()
+    assert subject.available is False
+
+    consumer.down = False
+    clock.now += 2.0
+    source.current()
+    assert subject.available is False, "the probe is rate-limited: not re-run within the interval"
+    clock.now += 3.0
+    assert subject.poll_once(timeout_s=0.0) is False  # no raise
+
+    assert subject.available is True and subject.outages == 1
+    recovered = [line for line in events(stream) if line["event"] == "channels_recovered"]
+    assert len(recovered) == 1 and recovered[0]["outage_s"] == 5.0
+
+
+def test_the_probe_is_rate_limited_while_healthy() -> None:
+    """One metadata request per interval, however often a worker asks for its spec."""
+    consumer = FlakyChannelsConsumer(records=[FakeChannelsRecord(CHANNEL.encode(), spec_bytes()), eof(0)])
+    clock = FakeClock()
+    subject = started(consumer, clock, io.StringIO())
+    after_start, started_at = consumer.probes, clock.now
+    for tick in range(60):  # 100 ms apart for 6 s: the probe is due once, at 5 s
+        clock.now = started_at + tick / 10
+        subject.poll_once(timeout_s=0.0)
+    assert consumer.probes - after_start == 1
+
+
+@pytest.mark.parametrize(
+    ("change", "code"),
+    [
+        ({"topic_error": FakeError(29)}, "29"),  # TOPIC_AUTHORIZATION_FAILED, as a fake without name()
+        ({"leader": -1}, "LEADER_NOT_AVAILABLE"),
+    ],
+)
+def test_a_readable_cluster_with_an_unreadable_topic_is_an_outage(change: dict[str, Any], code: str) -> None:
+    from tributary.runtime.errors import ChannelsUnavailableError
+
+    consumer = FlakyChannelsConsumer(records=[FakeChannelsRecord(CHANNEL.encode(), spec_bytes()), eof(0)])
+    clock = FakeClock()
+    subject = started(consumer, clock, io.StringIO())
+    for name, value in change.items():
+        setattr(consumer, name, value)
+    clock.now += 5.0
+    with pytest.raises(ChannelsUnavailableError) as raised:
+        subject.poll_once(timeout_s=0.0)
+    assert raised.value.error_code == code
+
+
+def test_a_consumer_error_event_is_an_outage_until_a_fetch_succeeds() -> None:
+    """A fetch error outranks a passing metadata probe in the same interval (READ can be denied while
+    DESCRIBE is allowed); a delivered record or an EOF is proof of readability and ends it at once."""
+    from tributary.runtime.errors import ChannelsUnavailableError
+
+    consumer = FlakyChannelsConsumer(records=[FakeChannelsRecord(CHANNEL.encode(), spec_bytes()), eof(0)])
+    clock, stream = FakeClock(), io.StringIO()
+    subject = started(consumer, clock, stream)
+    consumer.records.append(FakeChannelsRecord(None, None, _error=FakeError(29)))
+    clock.now += 5.0
+    with pytest.raises(ChannelsUnavailableError):
+        subject.poll_once(timeout_s=0.0)
+    assert [line["event"] for line in events(stream)][-2:] == ["channels_consumer_error", "channels_unavailable"]
+
+    consumer.records.append(FakeChannelsRecord(CHANNEL.encode(), spec_bytes(version=5), _offset=1))
+    assert subject.poll_once(timeout_s=0.0) is True, "the record is applied, and nothing is raised"
+    assert subject.available is True and subject.require(CHANNEL).version == 5
+
+
+def test_catch_up_is_not_interrupted_by_the_outage_signal() -> None:
+    """Startup keeps its own rule (refuse after `timeout_s`), rather than failing on the first error event."""
+    consumer = FlakyChannelsConsumer(
+        records=[
+            FakeChannelsRecord(None, None, _error=FakeError(29)),
+            FakeChannelsRecord(CHANNEL.encode(), spec_bytes()),
+            eof(0),
+        ]
+    )
+    subject = started(consumer, FakeClock(), io.StringIO())
+    assert subject.require(CHANNEL).name == CHANNEL
+    assert subject.available is True, "the EOF after the error proved the topic readable"
+
+
+def test_the_mllp_receivers_feed_now_sees_the_outage() -> None:
+    """`LiveSpecFeed.poll` is what the MLLP runner wraps for `spec_poll_failed`/`spec_poll_recovered`;
+    before this change it could never raise, so neither line could fire."""
+    from tributary.receivers.mllp.runner import LiveSpecFeed
+    from tributary.runtime.errors import ChannelsUnavailableError
+
+    consumer = FlakyChannelsConsumer(records=[FakeChannelsRecord(CHANNEL.encode(), spec_bytes(version=3)), eof(0)])
+    clock = FakeClock()
+    feed = LiveSpecFeed(LiveSpecSource(started(consumer, clock, io.StringIO()), CHANNEL), CHANNEL)
+    consumer.down = True
+    clock.now += 5.0
+    with pytest.raises(ChannelsUnavailableError):
+        feed.poll()
+    spec = feed.get()
+    assert spec is not None and spec.version == 3, "the runner reconciles against the last good spec"
+    consumer.down = False
+    clock.now += 5.0
+    feed.poll()

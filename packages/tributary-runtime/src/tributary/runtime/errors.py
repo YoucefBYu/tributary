@@ -12,6 +12,7 @@ from tributary.sdk.errors import EnvelopeError, TributaryError, safe_token
 __all__ = [
     "ENGINE_KAFKA_CODES",
     "ChannelSpecError",
+    "ChannelsUnavailableError",
     "ConfigError",
     "DeliveryError",
     "DlqUnwritableError",
@@ -87,6 +88,28 @@ class ChannelSpecError(RuntimeConfigurationError):
     """A record on `_tb.<env>.channels` is not a usable channel spec."""
 
     code = "CHANNEL_SPEC_INVALID"
+
+
+class ChannelsUnavailableError(TributaryError):
+    """`_tb.<env>.channels` cannot be read right now; the specs already applied are still being served.
+
+    Not a `ChannelSpecError`: nothing is wrong with any spec, and a caller that refuses a spec on
+    `ChannelSpecError` must not refuse one because a broker is down. Invariant 3 is why this is an
+    exception a caller may catch and carry on from: the cache keeps every applied spec, and
+    `ChannelCache.get` / `LiveSpecSource.current` keep answering from it. What the caller learns is that
+    the answer may be stale. `error_code` is a librdkafka error name or a fixed token, never broker text.
+    """
+
+    code = "CHANNELS_UNAVAILABLE"
+
+    def __init__(self, topic: str, *, error_code: str, unavailable_for_s: float) -> None:
+        super().__init__(
+            f"{safe_token(topic)} unreadable ({safe_token(error_code)}) for {unavailable_for_s:.1f}s; "
+            "serving the last applied channel specs"
+        )
+        self.topic = topic
+        self.error_code = error_code
+        self.unavailable_for_s = unavailable_for_s
 
 
 class PartitionMismatchError(RuntimeConfigurationError):
