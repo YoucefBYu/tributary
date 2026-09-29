@@ -125,6 +125,7 @@ class MllpRunner:
         self._rejected_version: int | None = None
         self._start_failure: tuple[MllpSettings, float | None] | None = None
         self._poll_failing = False
+        self._metrics_failing = False
         self.restart_requested = False
 
     @property
@@ -198,8 +199,16 @@ class MllpRunner:
 
     def _write_metrics(self) -> None:
         if self._metrics_file:
-            with open(self._metrics_file, "w") as f:
-                json.dump(self.metrics.snapshot(), f)
+            try:
+                with open(self._metrics_file, "w") as f:
+                    json.dump(self.metrics.snapshot(), f)
+            except OSError:
+                # A metrics file that cannot be written must never stop the listener.
+                if not self._metrics_failing:
+                    self._metrics_failing = True
+                    self._log.warning("metrics_file_unwritable")
+            else:
+                self._metrics_failing = False
 
     async def _reconcile(self, spec: ChannelSpec | None) -> None:
         server = self._server
@@ -251,7 +260,14 @@ class MllpRunner:
             self.restart_requested = True
             self._stop.set()
             return
-        await server.apply_settings(cfg)
+        try:
+            await server.apply_settings(cfg)
+        except Exception as exc:
+            # Nothing was applied (`apply_settings` validates before it mutates): keep the last good spec.
+            self._log.error(
+                "spec_update_rejected", channel_version=cfg.channel_version, error=safe_token(type(exc).__name__)
+            )
+            return
         self._log.info(
             "spec_applied",
             channel_version=cfg.channel_version,

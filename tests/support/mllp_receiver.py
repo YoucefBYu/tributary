@@ -52,7 +52,9 @@ def receiver_args(*, channel: str, env: str, instance: str) -> list[str]:
     ]
 
 
-def start_mllp_receiver(*, channel: str, env: str, bootstrap: str, instance: str = "mllp-e2e") -> ManagedProcess:
+def start_mllp_receiver(
+    *, channel: str, env: str, bootstrap: str, instance: str = "mllp-e2e", secrets_dir: Path | str | None = None
+) -> ManagedProcess:
     """Spawn the receiver without waiting for it: it stays not-ready until a spec is on the topic.
     (`tests.support.processes.spawn_mllp_receiver_from_topic` is the same command plus the `listening` wait.)"""
     args = [
@@ -66,6 +68,8 @@ def start_mllp_receiver(*, channel: str, env: str, bootstrap: str, instance: str
         "--instance",
         instance,
     ]
+    if secrets_dir is not None:
+        args += ["--secrets-dir", str(secrets_dir)]
     return ManagedProcess(args, env=engine_kafka_env(bootstrap))
 
 

@@ -7,9 +7,13 @@ Real receiver processes (`python -m tributary.receivers.mllp`), real Kafka, synt
 
 from __future__ import annotations
 
+import shutil
 import socket
+import ssl
+import subprocess
 import time
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -150,8 +154,11 @@ def test_tombstone_refuses_new_connections_and_never_acks_what_it_did_not_commit
     try:
         assert exchange(idle, adt("GONE-0")) == "AA"
 
-        # A pipelined burst is in flight when the tombstone lands. Whatever the interleaving, a message is
-        # ACKed exactly when it was committed: no AA for a dropped message, no commit that got an AR.
+        # A pipelined burst is sent just before the tombstone lands. Whether the tombstone falls before,
+        # during or after the burst depends on timing, so this test does NOT prove the in-flight case; the
+        # deterministic one is `test_runner.py::test_tombstone_refuses_new_connections_but_acks_what_was_already_committed`
+        # (a gated publisher holds a frame in flight). What this checks under any interleaving: a message is
+        # ACKed exactly when it was committed (no AA for a dropped message, no commit that got an AR).
         sent = [f"BURST-{i:03d}" for i in range(200)]
         burst.sendall(b"".join(SB + adt(cid) + EB + CR for cid in sent))
         publish_channel_spec(kafka, ENV, channel, None)
@@ -193,3 +200,83 @@ def read_acks(sock: socket.socket, timeout: float = 20.0) -> list[str]:
             break
         buf += chunk
     return [part.split(b"|")[0].decode() for part in buf.split(b"\rMSA|")[1:]]
+
+
+def _openssl(*args: str) -> None:
+    exe = shutil.which("openssl")
+    assert exe is not None
+    subprocess.run([exe, *args], check=True, capture_output=True)  # noqa: S603 - fixed argv, test fixture only
+
+
+def _pki(base: Path) -> ssl.SSLContext:
+    """A throwaway CA, a server secret dir `<base>/srv-tls`, and a client context whose certificate carries
+    the SAN `DNS:sender.example.org`."""
+    ca = base / "ca"
+    ca.mkdir()
+    _openssl("req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-keyout", str(ca / "ca.key"), "-out", str(ca / "ca.crt"), "-subj", "/CN=test-ca")  # fmt: skip
+    srv = base / "srv-tls"
+    srv.mkdir()
+    _openssl("req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-keyout", str(srv / "tls.key"), "-out", str(srv / "tls.crt"), "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1")  # fmt: skip
+    (srv / "ca.crt").write_bytes((ca / "ca.crt").read_bytes())
+    cli = base / "client"
+    cli.mkdir()
+    _openssl("req", "-newkey", "rsa:2048", "-nodes", "-keyout", str(cli / "k"), "-out", str(cli / "c"), "-subj", "/CN=client")  # fmt: skip
+    (cli / "ext").write_text("subjectAltName=DNS:sender.example.org\n", encoding="utf-8")
+    _openssl("x509", "-req", "-in", str(cli / "c"), "-CA", str(ca / "ca.crt"), "-CAkey", str(ca / "ca.key"), "-CAcreateserial", "-out", str(cli / "crt"), "-days", "1", "-extfile", str(cli / "ext"))  # fmt: skip
+    ctx = ssl.create_default_context(cafile=str(srv / "tls.crt"))
+    ctx.load_cert_chain(str(cli / "crt"), str(cli / "k"))
+    return ctx
+
+
+def tls_spec(channel: str, port: int, version: int, sans: list[str]) -> dict[str, Any]:
+    doc = spec(channel, port, version, ["queue-full"])
+    doc["spec"]["source"]["tls"] = {"secretRef": "srv-tls", "clientAuth": "required", "allowedClientSans": sans}
+    return doc
+
+
+@pytest.mark.skipif(shutil.which("openssl") is None, reason="openssl not on PATH")
+def test_removing_a_san_from_the_allow_list_closes_the_open_mtls_session(
+    channels: str, receivers: list[ManagedProcess], tmp_path: Path
+) -> None:
+    kafka, channel, port = channels, make_channel(channels, "spec-revoke"), free_port()
+    client_ctx = _pki(tmp_path)
+    publish_channel_spec(kafka, ENV, channel, tls_spec(channel, port, 1, ["dns:sender.example.org"]))
+    proc = start_mllp_receiver(channel=channel, env=ENV, bootstrap=kafka, instance="mllp-revoke", secrets_dir=tmp_path)
+    receivers.append(proc)
+    proc.wait_for_event("listening", timeout_s=60)
+
+    raw = socket.create_connection(("127.0.0.1", port), timeout=15)
+    session = client_ctx.wrap_socket(raw, server_hostname="localhost")
+    try:
+        assert exchange(session, adt("REV-1")) == "AA"
+
+        publish_channel_spec(kafka, ENV, channel, tls_spec(channel, port, 2, ["dns:someone-else.example.org"]))
+        # The revocation is logged (by `apply_settings`) just before `spec_applied`.
+        refused = proc.wait_for_event("tls_peer_refused", timeout_s=60)
+        assert refused["code"] == "TLS_PEER_NOT_ALLOWED" and len(refused["cert_sha256"]) == 64
+        applied = proc.wait_for_event("spec_applied", timeout_s=30)
+        assert "tls.allowed_client_sans" in applied["changed"]
+
+        # The session that was open when the SAN was revoked is closed: it cannot publish another frame.
+        session.settimeout(15)
+        try:
+            closed = exchange(session, adt("REV-2")) == ""
+        except OSError:
+            closed = True
+        assert closed
+    finally:
+        session.close()
+
+    # and a new session with the same certificate is refused too
+    fresh = client_ctx.wrap_socket(
+        socket.create_connection(("127.0.0.1", port), timeout=15), server_hostname="localhost"
+    )
+    try:
+        try:
+            refused_new = exchange(fresh, adt("REV-3")) == ""
+        except OSError:
+            refused_new = True
+        assert refused_new
+    finally:
+        fresh.close()
+    assert control_ids(drain_topic(kafka, raw_topic(ENV, channel), partitions=1, expected=1)) == ["REV-1"]

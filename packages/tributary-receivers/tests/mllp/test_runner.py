@@ -9,11 +9,16 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 import pytest
+from tributary.receivers.errors import ConfigError
 from tributary.receivers.metrics import Metrics
+from tributary.receivers.mllp import server as server_mod
 from tributary.receivers.mllp.config import MllpSettings
 from tributary.receivers.mllp.runner import MllpRunner, RunnerOptions, SpecFeed
 from tributary.receivers.mllp.server import MllpServer
@@ -22,6 +27,7 @@ from tributary.runtime.spec import ChannelSpec
 from tributary.sdk import Message
 
 from tests.support.channel_spec import walking_skeleton_document
+from tests.support.engine_kafka import write_engine_kafka_file
 
 SB, EB, CR = b"\x0b", b"\x1c", b"\x0d"
 CHANNEL = "adt-passthrough"
@@ -440,3 +446,181 @@ def test_logs_carry_no_payload_fragments() -> None:
     blob = repr(h.log.events) + repr(h.emitted)
     for needle in ("CTRL-SECRET-1", "TESTPATIENT", "SYNTH0001", "not hl7"):
         assert needle not in blob
+
+
+# -- edges of a live update (security review of 392a09b) --------------------------------------------
+
+
+class HeldPublisher:
+    """Every publish waits for `release()`; records what it was handed."""
+
+    def __init__(self) -> None:
+        self.calls: list[Message] = []
+        self.entered = asyncio.Event()
+        self.gate = asyncio.Event()
+
+    async def publish(self, message: Message, *, timeout_s: float) -> bool:
+        self.calls.append(message)
+        self.entered.set()
+        await self.gate.wait()
+        return True
+
+
+def one_slot(**kw: Any) -> MllpSettings:
+    return MllpSettings(
+        channel="adt-passthrough", channel_version=1, bind="127.0.0.1", port=0, tls=None, ack_timeout_s=10.0,
+        nack_on=frozenset(), max_message_bytes=100_000, queue_max_bytes=1_000_000, queue_max_messages=1,
+        env="dev", **kw,
+    )  # fmt: skip
+
+
+async def _ack(r: asyncio.StreamReader) -> bytes:
+    buf = b""
+    while EB + CR not in buf:
+        chunk = await asyncio.wait_for(r.read(65536), 10)
+        if not chunk:
+            break
+        buf += chunk
+    return buf
+
+
+def test_a_frame_admitted_under_v1_is_stamped_v1_even_if_v2_lands_while_it_waits() -> None:
+    async def go() -> None:
+        pub = HeldPublisher()
+        srv = MllpServer(one_slot(), pub)  # type: ignore[arg-type]
+        listener = await srv.start()
+        port = listener.sockets[0].getsockname()[1]
+        try:
+            ra, wa = await asyncio.open_connection("127.0.0.1", port)
+            rb, wb = await asyncio.open_connection("127.0.0.1", port)
+            wa.write(SB + adt("A") + EB + CR)
+            await wa.drain()
+            await asyncio.wait_for(pub.entered.wait(), 5)  # A holds the only queue slot
+            wb.write(SB + adt("B") + EB + CR)  # B is admitted under v1 and waits for the slot
+            await wb.drain()
+            await asyncio.sleep(0.1)
+            await srv.apply_settings(replace(srv.cfg, channel_version=2))  # v2 lands during that wait
+            pub.gate.set()
+            assert b"MSA|AA|A" in await _ack(ra) and b"MSA|AA|B" in await _ack(rb)
+            versions = {m.payload.split(b"|")[9]: m.headers["tb-channel-version"] for m in pub.calls if m.payload}
+            assert versions == {b"A": "1", b"B": "1"}
+            wc_r, wc = await asyncio.open_connection("127.0.0.1", port)
+            wc.write(SB + adt("C") + EB + CR)
+            assert b"MSA|AA|C" in await _ack(wc_r)
+            assert pub.calls[-1].headers["tb-channel-version"] == "2"
+        finally:
+            listener.close()
+
+    asyncio.run(go())
+
+
+def test_a_frame_waiting_for_the_queue_is_not_published_after_a_tombstone() -> None:
+    async def go() -> None:
+        pub = HeldPublisher()
+        srv = MllpServer(one_slot(), pub)  # type: ignore[arg-type]
+        listener = await srv.start()
+        port = listener.sockets[0].getsockname()[1]
+        try:
+            ra, wa = await asyncio.open_connection("127.0.0.1", port)
+            rb, wb = await asyncio.open_connection("127.0.0.1", port)
+            wa.write(SB + adt("A") + EB + CR)
+            await wa.drain()
+            await asyncio.wait_for(pub.entered.wait(), 5)
+            wb.write(SB + adt("B") + EB + CR)
+            await wb.drain()
+            await asyncio.sleep(0.1)
+            srv.stop_accepting("channel-undeployed")
+            pub.gate.set()
+            assert b"MSA|AA|A" in await _ack(ra)  # committed before the tombstone: ACKed
+            assert b"MSA|AR|B|channel-undeployed" in await _ack(rb)
+            assert [m.payload.split(b"|")[9] for m in pub.calls if m.payload] == [b"A"]
+            assert srv.budget.used_messages == 0
+        finally:
+            listener.close()
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [{"queue": {"maxBytes": 0}}, {"queue": {"maxBytes": 2_000_000, "maxMessages": 0}}, {"maxMessageBytes": 0},
+     {"ack": {"mode": "after-commit", "timeoutMs": 0}}, {"port": 70000}, {"queue": {"maxBytes": -5}}],
+)  # fmt: skip
+def test_zero_or_negative_limits_are_refused_and_the_last_good_spec_keeps_serving(bad: dict[str, Any]) -> None:
+    async def scenario(h: Harness) -> None:
+        port = await h.listening_port()
+        h.feed.spec = parse(spec_doc(2, **bad))
+        await h.until(lambda: "spec_update_rejected" in h.log.names())
+        assert h.runner.server is not None and h.runner.server.cfg.channel_version == 1
+        assert await send(port, adt("C1")) == "AA"
+        assert h.runner.restart_requested is False
+
+    run(scenario, FakeFeed(parse(spec_doc(1))))
+
+
+def test_settings_reject_non_positive_numbers_as_config_errors() -> None:
+    with pytest.raises(ConfigError):
+        replace(one_slot(), queue_max_messages=0)
+    with pytest.raises(ConfigError):
+        replace(one_slot(), queue_max_bytes=0)
+
+
+def test_an_unwritable_metrics_file_does_not_stop_the_listener(tmp_path: Path) -> None:
+    async def go() -> None:
+        h = Harness(FakeFeed(parse(spec_doc(1))))
+        h.runner._metrics_file = str(tmp_path / "missing-dir" / "m.json")
+        h.runner._opts = replace(h.runner._opts, metrics_every_s=0.01)
+        task = asyncio.create_task(h.runner.run())
+        try:
+            port = await h.listening_port()
+            await h.until(lambda: "metrics_file_unwritable" in h.log.names())
+            assert await send(port, adt("C1")) == "AA"
+        finally:
+            h.runner.request_stop()
+            assert await asyncio.wait_for(task, 15) == 0
+
+    asyncio.run(go())
+
+
+def _no_client(*_a: object, **_k: object) -> Any:
+    raise AssertionError("a Kafka client was built before the refusal")
+
+
+def _main(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *argv: str) -> None:
+    monkeypatch.setattr("confluent_kafka.Producer", _no_client)
+    monkeypatch.setattr("confluent_kafka.Consumer", _no_client)
+    monkeypatch.setenv("TB_ENGINE_KAFKA_FILE", str(write_engine_kafka_file(tmp_path, "127.0.0.1:9092")))
+    monkeypatch.delenv("TB_BOOTSTRAP_SERVERS", raising=False)
+    monkeypatch.setattr("sys.argv", ["prog", *argv])
+    server_mod.main()
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--channel", "c", "--env", "dev", "--bogus-flag=SYNTH-VALUE-77"],
+        ["--channel", "c", "--env", "dev", "--profile", "SYNTH-VALUE-77"],
+        ["--env", "dev"],
+    ],
+)
+def test_usage_errors_are_one_startup_refused_line_and_echo_nothing(
+    argv: list[str], capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    with pytest.raises(SystemExit) as exc:
+        _main(monkeypatch, tmp_path, *argv)
+    err = capsys.readouterr()
+    assert exc.value.code == 2
+    assert "SYNTH-VALUE-77" not in err.err + err.out and "usage:" not in err.err
+    lines = [json.loads(x) for x in err.err.splitlines() if "startup_refused" in x]
+    assert len(lines) == 1 and lines[0]["code"] == "ARGUMENTS_INVALID"
+
+
+def test_a_bad_contracts_dir_exits_2_without_a_traceback(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    with pytest.raises(SystemExit) as exc:
+        _main(monkeypatch, tmp_path, "--channel", "c", "--env", "dev", "--contracts-dir", str(tmp_path / "nope"))
+    err = capsys.readouterr().err
+    assert exc.value.code == 2 and "Traceback" not in err and str(tmp_path) not in err
+    lines = [json.loads(x) for x in err.splitlines() if "startup_refused" in x]
+    assert len(lines) == 1 and lines[0]["code"] == "CONFIG_INVALID"

@@ -68,6 +68,17 @@ class MllpSettings:
     # unconditionally (kafka_publisher.py) rather than accepting it as a parameter here.
 
     def __post_init__(self) -> None:
+        # Every numeric value is checked here, once, so a spec that reaches a *serving* receiver is
+        # refused as a `ConfigError` before anything is applied (a zero `queue.maxBytes` used to reach
+        # `ByteBudget.set_limits` and raise mid-update).
+        for name in ("queue_max_bytes", "max_message_bytes"):
+            _positive_int(getattr(self, name), name, self.channel)
+        if self.queue_max_messages is not None:
+            _positive_int(self.queue_max_messages, "queue_max_messages", self.channel)
+        if isinstance(self.port, bool) or not isinstance(self.port, int) or not 0 <= self.port <= 65535:
+            raise ConfigError(f"channel {self.channel!r}: source.port must be an integer in 0..65535")
+        if not isinstance(self.ack_timeout_s, int | float) or self.ack_timeout_s <= 0:
+            raise ConfigError(f"channel {self.channel!r}: source.ack.timeoutMs must be a positive number")
         # A frame under max_message_bytes must always be able to fit the (empty) byte budget on
         # its own, or the first max-size message to arrive would be a ByteBudget.BudgetExceeded
         # crash mid-connection instead of a config error caught at startup. The channel-spec schema
@@ -80,6 +91,11 @@ class MllpSettings:
                 f"queue.maxBytes ({self.queue_max_bytes}); a single max-size message could never "
                 "be admitted to the queue"
             )
+
+
+def _positive_int(value: object, field: str, channel: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ConfigError(f"channel {channel!r}: {field} must be a positive integer")
 
 
 def _require(mapping: Mapping[str, Any], key: str, where: str) -> Any:

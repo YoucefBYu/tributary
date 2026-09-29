@@ -263,3 +263,114 @@ def test_the_channel_spec_field_reaches_both_receivers() -> None:
     cfg = mllp_settings_from_channel_spec(spec, env="dev")
     assert cfg.tls is not None and cfg.tls.allowed_client_sans == ("dns:a.example.org",)
     assert replace(cfg).tls == cfg.tls
+
+
+# -- revoking a SAN while a session is open (security review of 392a09b, High) ---------------------
+
+
+class _GatedRecorder(Recorder):
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = asyncio.Event()
+        self.gate = asyncio.Event()
+
+    async def publish(self, message: Message, *, timeout_s: float) -> bool:
+        self.calls.append(message)
+        self.entered.set()
+        await self.gate.wait()
+        return True
+
+
+async def _mtls_session(
+    tmp_path: Path, pub: Recorder
+) -> tuple[MllpServer, asyncio.base_events.Server, int, asyncio.StreamReader, asyncio.StreamWriter, Pki]:
+    pki = Pki(tmp_path)
+    ctx = pki.client_context("client", "DNS:sender.example.org")
+    cfg = _mllp_settings(TlsSpec("srv-tls", "required", allowed_client_sans=("dns:sender.example.org",)))
+    cfg = replace(cfg, idle_timeout_s=30.0)
+    srv = MllpServer(cfg, pub, metrics=Metrics(), secret_resolver=pki.resolver)  # type: ignore[arg-type]
+    server = await srv.start()
+    port = server.sockets[0].getsockname()[1]
+    r, w = await asyncio.open_connection("127.0.0.1", port, ssl=ctx, server_hostname="localhost")
+    return srv, server, port, r, w, pki
+
+
+def _revoked(srv: MllpServer) -> MllpSettings:
+    assert srv.cfg.tls is not None
+    return replace(srv.cfg, tls=replace(srv.cfg.tls, allowed_client_sans=("dns:someone-else.example.org",)))
+
+
+def test_revoking_a_san_closes_an_idle_open_connection_at_once(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    pub = Recorder()
+
+    async def go() -> None:
+        srv, server, _port, r, w, _pki = await _mtls_session(tmp_path, pub)
+        try:
+            w.write(SB + HL7 + EB + CR)
+            assert b"MSA|AA|C1" in await asyncio.wait_for(r.read(65536), 5)
+            await srv.apply_settings(_revoked(srv))
+            assert await asyncio.wait_for(r.read(65536), 2) == b""  # closed now, not at the idle timeout
+            assert srv.metrics.rejected_peer_not_allowed == 1
+            assert len(pub.calls) == 1
+        finally:
+            w.close()
+            server.close()
+
+    with caplog.at_level(logging.WARNING, logger="tributary.receivers.tls"):
+        asyncio.run(go())
+    [line] = [json.loads(x.getMessage()) for x in caplog.records if x.name == "tributary.receivers.tls"]
+    assert line["code"] == "TLS_PEER_NOT_ALLOWED" and len(line["cert_sha256"]) == 64
+    assert "example.org" not in json.dumps(line)
+
+
+def test_revoking_a_san_mid_flight_acks_what_is_committed_nacks_the_next_frame_and_closes(tmp_path: Path) -> None:
+    pub = _GatedRecorder()
+
+    async def go() -> None:
+        srv, server, _port, r, w, _pki = await _mtls_session(tmp_path, pub)
+        try:
+            w.write(SB + HL7 + EB + CR)
+            await w.drain()
+            await asyncio.wait_for(pub.entered.wait(), 5)  # frame 1 is in flight
+            await srv.apply_settings(_revoked(srv))
+            w.write(SB + HL7.replace(b"|C1|", b"|C2|") + EB + CR)  # frame 2 from the revoked peer
+            await w.drain()
+            await asyncio.sleep(0.1)
+            pub.gate.set()
+            data = b""
+            while True:
+                chunk = await asyncio.wait_for(r.read(65536), 5)
+                if not chunk:
+                    break
+                data += chunk
+            assert b"MSA|AA|C1" in data  # committed before the revocation: still ACKed
+            assert b"MSA|AR|C2|peer-not-allowed" in data
+            assert len(pub.calls) == 1  # the revoked peer's second frame was never published
+            assert srv.budget.used_messages == 0
+        finally:
+            w.close()
+            server.close()
+
+    asyncio.run(go())
+
+
+def test_revoked_connection_with_only_in_flight_frames_closes_after_the_ack(tmp_path: Path) -> None:
+    pub = _GatedRecorder()
+
+    async def go() -> None:
+        srv, server, _port, r, w, _pki = await _mtls_session(tmp_path, pub)
+        try:
+            w.write(SB + HL7 + EB + CR)
+            await w.drain()
+            await asyncio.wait_for(pub.entered.wait(), 5)
+            await srv.apply_settings(_revoked(srv))
+            pub.gate.set()
+            assert b"MSA|AA|C1" in await asyncio.wait_for(r.read(65536), 5)
+            assert await asyncio.wait_for(r.read(65536), 5) == b""
+        finally:
+            w.close()
+            server.close()
+
+    asyncio.run(go())
