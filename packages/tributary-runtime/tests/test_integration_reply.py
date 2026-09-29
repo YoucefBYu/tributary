@@ -10,6 +10,17 @@ controls: requests naming different partitions (a worker that ignored the header
 the key's hash partition, which differs for at least one), an async record in the same run (no reply),
 and a request naming a partition the topic does not have (no reply, message still routed, a
 `replied` event with `REPLY_ROUTE_INVALID`).
+
+The failure answers, each on its own channel (own topics, own consumer group):
+
+* `rejected`: a `Reject` is dead-lettered, then answered `rejected` with the channel's code;
+* `failed`: a step that raises is dead-lettered, then answered `failed` / `TRANSFORM_ERROR`, and the
+  exception text (a synthetic name) reaches neither the reply nor an event;
+* dlq-then-reply: in both, the `dlq` record and its event precede the reply's `replied` event on
+  `_tb.<env>.events` (one partition, one idempotent producer, so its offsets are emission order), and
+  no `out` record exists;
+* `body: step`: the step's `ctx.reply` body is the reply's payload with its content type; without a
+  call the reply is `failed` / `REPLY_BODY_MISSING`, the message is still routed and not dead-lettered.
 """
 
 from __future__ import annotations
@@ -30,9 +41,9 @@ from tributary.runtime.clients import KafkaSettings
 from tributary.runtime.config import load_topic_defaults
 from tributary.runtime.topics import channels_topic, dlq_topic, events_topic, out_topic, raw_topic, reply_topic
 from tributary.runtime.worker import PipelineWorker, WorkerSettings
-from tributary.sdk import Message, step
+from tributary.sdk import Message, Reject, step
 from tributary.sdk import headers as h
-from tributary.sdk.codes import REPLY_ROUTE_INVALID
+from tributary.sdk.codes import REPLY_BODY_MISSING, REPLY_ROUTE_INVALID, TRANSFORM_ERROR
 from tributary.sdk.ids import new_correlation_id, new_traceparent, uuid7
 from tributary.sdk.projection import record_projection
 from tributary.sdk.testing import make_message
@@ -49,9 +60,29 @@ PARTITIONS = 3
 REPLY_PARTITIONS = 3
 
 
+HL7 = "application/hl7-v2+er7"
+ACK_BODY = b"MSH|^~\\&|ENGINE|LAB|TRIBUTARY-SYNTH|LAB|20260928||ACK^Q11|ACK-1|P|2.5.1\rMSA|AA|SYNTH-ACK-CONTROL\r"
+EXCEPTION_MARKER = "SYNTH^EXCEPTION^MARKER"
+
+
 @step
 def passthrough(message: Message) -> None:
     return None
+
+
+@step
+def reject_lab(message: Message) -> None:
+    raise Reject("LAB_QUERY_UNSUPPORTED")
+
+
+@step
+def explode(message: Message) -> None:
+    raise ValueError(EXCEPTION_MARKER)
+
+
+@step
+def answer(message: Message, ctx: Any) -> None:
+    ctx.reply(ACK_BODY, content_type=HL7)
 
 
 @pytest.fixture(scope="module")
@@ -85,48 +116,74 @@ def kafka() -> Iterator[str]:
         container.stop()
 
 
-@pytest.fixture(scope="module")
-def deployed(kafka: str) -> str:
-    admin = AdminClient({"bootstrap.servers": kafka})
+def deploy(bootstrap: str, channel: str, *, reply: dict[str, Any]) -> None:
+    """One channel's topics and its spec record on `_tb.<env>.channels` (created once per broker)."""
+    admin = AdminClient({"bootstrap.servers": bootstrap})
     wanted = [
-        NewTopic(raw_topic(ENV, CHANNEL), PARTITIONS, 1),
-        NewTopic(out_topic(ENV, CHANNEL, DESTINATION), PARTITIONS, 1),
-        NewTopic(dlq_topic(ENV, CHANNEL), 1, 1),
-        NewTopic(reply_topic(ENV, CHANNEL), REPLY_PARTITIONS, 1),
+        NewTopic(raw_topic(ENV, channel), PARTITIONS, 1),
+        NewTopic(out_topic(ENV, channel, DESTINATION), PARTITIONS, 1),
+        NewTopic(dlq_topic(ENV, channel), 1, 1),
+        NewTopic(reply_topic(ENV, channel), REPLY_PARTITIONS, 1),
+    ]
+    existing = admin.list_topics(timeout=10).topics
+    for shared in (
         NewTopic(events_topic(ENV), 1, 1),
         NewTopic(channels_topic(ENV), 1, 1, config={"cleanup.policy": "compact"}),
-    ]
+    ):
+        if shared.topic not in existing:
+            wanted.append(shared)
     for _topic, future in admin.create_topics(wanted).items():
         future.result(timeout=30)
 
-    document = spec_document(reply={}, version=1)
-    document["metadata"] = {**document["metadata"], "name": CHANNEL}
-    producer = Producer({"bootstrap.servers": kafka, "acks": "all", "enable.idempotence": True})
-    producer.produce(channels_topic(ENV), key=CHANNEL.encode(), value=json.dumps(document).encode())
+    document = spec_document(reply=reply, version=1)
+    document["metadata"] = {**document["metadata"], "name": channel}
+    producer = Producer({"bootstrap.servers": bootstrap, "acks": "all", "enable.idempotence": True})
+    producer.produce(channels_topic(ENV), key=channel.encode(), value=json.dumps(document).encode())
     assert producer.flush(30) == 0
+
+
+@pytest.fixture(scope="module")
+def deployed(kafka: str) -> str:
+    deploy(kafka, CHANNEL, reply={})
     return kafka
 
 
-def request(partition: str | None) -> Message:
+def run_worker(bootstrap: str, channel: str, steps: tuple[Any, ...], *, max_iterations: int = 300) -> None:
+    worker = PipelineWorker(
+        settings=WorkerSettings(
+            env=ENV,
+            channel=channel,
+            kafka=KafkaSettings(bootstrap_servers=bootstrap),
+            instance_id=f"reply-it-{channel}",
+            poll_timeout_s=0.1,
+        ),
+        steps_override=steps,
+        defaults=load_topic_defaults(),
+    )
+    worker.build()
+    worker.run(max_iterations=max_iterations)
+
+
+def request(partition: str | None, channel: str = CHANNEL) -> Message:
     deadline = h.format_timestamp(datetime.now(UTC) + timedelta(minutes=5))
     headers = {} if partition is None else {h.TB_REPLY_PARTITION: partition, h.TB_REPLY_DEADLINE: deadline}
     return make_message(
         REQUEST_PAYLOAD,
         key=KEY_MARKER,
-        channel=CHANNEL,
+        channel=channel,
         msg_id=uuid7(),
-        content_type="application/hl7-v2+er7",
+        content_type=HL7,
         traceparent=new_traceparent(),
         correlation_id=new_correlation_id(),
         headers=headers,
     )
 
 
-def publish(bootstrap: str, messages: list[Message]) -> None:
+def publish(bootstrap: str, messages: list[Message], channel: str = CHANNEL) -> None:
     producer = Producer({"bootstrap.servers": bootstrap, "acks": "all", "enable.idempotence": True})
     for message in messages:
         producer.produce(
-            raw_topic(ENV, CHANNEL),
+            raw_topic(ENV, channel),
             key=message.key,
             value=message.payload,
             headers=[(name, value.encode()) for name, value in message.headers.items()],
@@ -174,19 +231,7 @@ def test_each_reply_lands_on_the_partition_its_request_named(deployed: str) -> N
     out_of_range = request("9")  # well-formed (0-63) but the topic has 3 partitions
     publish(deployed, [*sync, async_record, out_of_range])
 
-    worker = PipelineWorker(
-        settings=WorkerSettings(
-            env=ENV,
-            channel=CHANNEL,
-            kafka=KafkaSettings(bootstrap_servers=deployed),
-            instance_id="reply-it-1",
-            poll_timeout_s=0.1,
-        ),
-        steps_override=(passthrough,),
-        defaults=load_topic_defaults(),
-    )
-    worker.build()
-    worker.run(max_iterations=300)
+    run_worker(deployed, CHANNEL, (passthrough,))
 
     replies = read_all(deployed, reply_topic(ENV, CHANNEL), REPLY_PARTITIONS, expected=len(sync))
     by_correlation = {headers_of(raw)[h.TB_CORRELATION_ID]: raw for raw in replies}
@@ -224,3 +269,93 @@ def test_each_reply_lands_on_the_partition_its_request_named(deployed: str) -> N
     assert [event["message_id"] for event in invalid] == [out_of_range.msg_id]
     ok = {event["message_id"] for event in replied if event["status"] == "ok"}
     assert ok == {message.msg_id for message in sync}, "every delivered reply was confirmed by its callback"
+
+
+# -- failure answers, dlq-then-reply, body: step ------------------------------------------------------
+
+
+def _events_for(bootstrap: str, ids: set[str]) -> list[tuple[int, dict[str, Any]]]:
+    """(offset, event) for the given message ids, in `_tb.<env>.events` offset order."""
+    raws = read_all(bootstrap, events_topic(ENV), 1, expected=1)
+    found = [(raw.offset(), json.loads(raw.value())) for raw in raws]
+    return sorted((offset, event) for offset, event in found if event.get("message_id") in ids)
+
+
+def _answered_after_dlq(bootstrap: str, channel: str, steps: tuple[Any, ...]) -> tuple[Message, dict[str, str], Any]:
+    """Run one sync request through a failing pipeline; return it, its reply headers and its reply."""
+    deploy(bootstrap, channel, reply={})
+    sent = request("1", channel)
+    publish(bootstrap, [sent], channel)
+    run_worker(bootstrap, channel, steps)
+
+    (reply,) = read_all(bootstrap, reply_topic(ENV, channel), REPLY_PARTITIONS, expected=1)
+    (dead,) = read_all(bootstrap, dlq_topic(ENV, channel), 1, expected=1)
+    assert headers_of(dead)[h.TB_MSG_ID] == sent.msg_id
+    assert read_all(bootstrap, out_topic(ENV, channel, DESTINATION), PARTITIONS, expected=0, timeout_s=5.0) == []
+    assert reply.partition() == 1 and reply.key() == sent.require(h.TB_CORRELATION_ID).encode()
+
+    events = _events_for(bootstrap, {sent.msg_id})
+    stages = [event["stage"] for _offset, event in events]
+    assert "dlq" in stages and "replied" in stages, stages
+    assert stages.index("dlq") < stages.index("replied"), f"dlq-then-reply: {stages}"
+    assert dead.timestamp()[1] <= reply.timestamp()[1], "the reply was produced after the dlq record"
+    return sent, headers_of(reply), reply
+
+
+def test_a_rejected_message_is_dead_lettered_then_answered_rejected(kafka: str) -> None:
+    _sent, headers, reply = _answered_after_dlq(kafka, "lab-sync-reject", (reject_lab,))
+    assert headers[h.TB_REPLY_STATUS] == "rejected"
+    assert headers[h.TB_ERROR_CODE] == "LAB_QUERY_UNSUPPORTED"
+    assert reply.value() in (None, b"")
+
+
+def test_a_failing_step_is_dead_lettered_then_answered_failed_without_its_text(kafka: str) -> None:
+    sent, headers, reply = _answered_after_dlq(kafka, "lab-sync-fail", (explode,))
+    assert headers[h.TB_REPLY_STATUS] == "failed"
+    assert headers[h.TB_ERROR_CODE] == TRANSFORM_ERROR
+    rendered = json.dumps(headers) + (reply.value() or b"").decode()
+    assert EXCEPTION_MARKER not in rendered and KEY_MARKER.decode() not in rendered
+    events = json.dumps([event for _offset, event in _events_for(kafka, {sent.msg_id})])
+    assert EXCEPTION_MARKER not in events and CONTROL_ID_MARKER not in events
+
+
+def test_body_step_answers_with_the_steps_body_and_fails_the_reply_only_without_one(kafka: str) -> None:
+    channel = "lab-sync-body"
+    deploy(kafka, channel, reply={"body": "step"})
+    with_body = request("0", channel)
+    publish(kafka, [with_body], channel)
+    run_worker(kafka, channel, (answer,))
+
+    without_body = request("2", channel)
+    publish(kafka, [without_body], channel)
+    run_worker(kafka, channel, (passthrough,))  # same group: resumes after the first request
+
+    replies = read_all(kafka, reply_topic(ENV, channel), REPLY_PARTITIONS, expected=2)
+    by_msg = {headers_of(raw)[h.TB_MSG_ID]: raw for raw in replies}
+    assert set(by_msg) == {with_body.msg_id, without_body.msg_id}
+
+    answered = by_msg[with_body.msg_id]
+    assert answered.partition() == 0 and answered.value() == ACK_BODY
+    assert headers_of(answered)[h.TB_CONTENT_TYPE] == HL7
+    assert headers_of(answered)[h.TB_REPLY_STATUS] == "accepted"
+
+    missing = headers_of(by_msg[without_body.msg_id])
+    assert (missing[h.TB_REPLY_STATUS], missing[h.TB_ERROR_CODE]) == ("failed", REPLY_BODY_MISSING)
+    assert by_msg[without_body.msg_id].value() in (None, b"")
+
+    routed = read_all(kafka, out_topic(ENV, channel, DESTINATION), PARTITIONS, expected=2)
+    assert {headers_of(raw)[h.TB_MSG_ID] for raw in routed} == {with_body.msg_id, without_body.msg_id}
+    assert read_all(kafka, dlq_topic(ENV, channel), 1, expected=0, timeout_s=5.0) == [], (
+        "the reply fails, not the message"
+    )
+    replied = {
+        event["message_id"]: event
+        for _o, event in _events_for(kafka, {without_body.msg_id})
+        if event["stage"] == "replied"
+    }
+    assert (replied[without_body.msg_id]["status"], replied[without_body.msg_id]["error_code"]) == (
+        "error",
+        REPLY_BODY_MISSING,
+    )
+    events = json.dumps([event for _o, event in _events_for(kafka, {with_body.msg_id})])
+    assert "SYNTH-ACK-CONTROL" not in events, "a step body is payload: never in an event"

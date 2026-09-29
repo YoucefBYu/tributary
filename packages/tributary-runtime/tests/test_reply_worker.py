@@ -411,6 +411,25 @@ def test_the_partition_count_is_fetched_off_the_callers_thread() -> None:
     assert spawn.pending == [], "fresh: nothing to fetch"
 
 
+def test_prime_fetches_once_on_the_callers_thread_for_start_up() -> None:
+    now = [0.0]
+    spawn = _Deferred()
+    calls: list[str] = []
+
+    def list_topics(*, topic: str, timeout: float) -> _Metadata:
+        calls.append(topic)
+        return _Metadata(3)
+
+    count = ReplyPartitionCount(list_topics, REPLY, refresh_s=30.0, clock=lambda: now[0], spawn=spawn)
+    assert count.prime() == 3 and calls == [REPLY]
+    assert count(9) == 3 and spawn.pending == [], "fresh from the start: 9 is provably out of range"
+
+    def broken(*, topic: str, timeout: float) -> _Metadata:
+        raise RuntimeError("synthetic metadata timeout")
+
+    assert ReplyPartitionCount(broken, REPLY, spawn=spawn).prime() is None, "a failed prime is unknown"
+
+
 def test_a_stale_count_is_refreshed_and_does_not_prove_a_miss() -> None:
     counts = iter([3, 6])
     now = [0.0]

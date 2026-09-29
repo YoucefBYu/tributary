@@ -1024,13 +1024,19 @@ class PipelineWorker:
             log=self.log,
         )
 
+        reply_partitions = ReplyPartitionCount(data_producer.list_topics, reply_topic(env, channel))
+        if spec.sync_reply:
+            # Start-up, before consuming: the one metadata fetch allowed on this thread. After it, the
+            # count refreshes in the background (a list_topics per record would stall the partition).
+            # An async-only channel never asks, so it never names a `reply` topic to the broker.
+            reply_partitions.prime()
         replies = ReplyPublisher(
             cast("KafkaProducerLike", data_producer),
             reply_topic(env, channel),
             emitter=self.emitter,
             log=self.log,
             instance=self.settings.instance,
-            partition_count=ReplyPartitionCount(data_producer.list_topics, reply_topic(env, channel)),
+            partition_count=reply_partitions,
         )
         handler = PipelineHandler(
             env=env,

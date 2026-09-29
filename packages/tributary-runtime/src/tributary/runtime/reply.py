@@ -160,7 +160,8 @@ class ReplyPartitionCount:
     in flight and at most one started per `refresh_s`, so a flood of bad headers cannot turn into a
     metadata request per record, and an operator who adds reply partitions is picked up without a
     restart. Async records never get here (`ReplyPublisher.route`), so an async-only worker never asks
-    for a `reply` topic's metadata. `spawn` runs the fetch; the default is a daemon thread.
+    for a `reply` topic's metadata. `spawn` runs the fetch; the default is a daemon thread. `prime()` is
+    the one synchronous fetch, for start-up.
     """
 
     __slots__ = (
@@ -206,6 +207,19 @@ class ReplyPartitionCount:
         if count is not None and (fresh or wanted is None or wanted < count):
             return count
         return None  # unknown, or beyond a stale count: unverified, not invalid
+
+    def prime(self) -> int | None:
+        """Fetch once **on the caller's thread**, bounded by the 5 s metadata timeout. For start-up only,
+        before any record is consumed (the worker calls it when the applied spec is sync), so the first
+        records' out-of-range headers are already provable. A failure leaves the count unknown."""
+        with self._lock:
+            if self._in_flight:
+                return self._count
+            self._in_flight = True
+            self._attempted_at = self._clock()
+        self._fetch_and_store()
+        with self._lock:
+            return self._count
 
     def _start_fetch(self, now: float) -> None:
         with self._lock:
