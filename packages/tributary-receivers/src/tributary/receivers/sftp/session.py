@@ -35,6 +35,7 @@ from .config import SftpSettings
 
 __all__ = [
     "HostKeyMismatchError",
+    "NotRegularFileError",
     "ParamikoSession",
     "RemoteEntry",
     "RemoteExistsError",
@@ -47,6 +48,8 @@ __all__ = [
 
 _MAX_HANDSHAKE_ATTEMPTS = 6
 _READ_CHUNK = 32768
+_MIN_ENTRY_BYTES = 12
+_EXTRA_SCANNED = 4096  # skipped entries (`.`, `..`, undecodable names) tolerated beyond `limit` in one listing
 _RSA_ALGORITHMS = ("ssh-rsa", "rsa-sha2-256", "rsa-sha2-512")
 
 
@@ -56,6 +59,10 @@ class SessionError(ReceiverError):
 
 class HostKeyMismatchError(SessionError):
     """The server's host key is not one of the pinned fingerprints. Nothing was sent to it."""
+
+
+class NotRegularFileError(SessionError):
+    """The claimed name is not a regular file (a link, a directory or a swapped-in object). Nothing was read."""
 
 
 class RemoteNotFoundError(SessionError):
@@ -83,7 +90,6 @@ class SftpSession(Protocol):
 
     def list_dir(self, directory: str, limit: int) -> list[RemoteEntry]: ...
     def rename(self, src: str, dst: str) -> None: ...
-    def is_regular_file(self, path: str) -> bool: ...
     def read_bounded(self, path: str, max_bytes: int) -> bytes | None: ...
     def remove(self, path: str) -> None: ...
     def exists(self, path: str) -> bool: ...
@@ -113,16 +119,27 @@ class ParamikoSession:
         non-UTF-8 name raises and would abort the whole listing, stopping the poller on one bad file): an
         entry whose name is not valid UTF-8 is skipped and counted in `undecodable_names`."""
         out: list[RemoteEntry] = []
+        scanned = 0
+        max_scanned = limit + _EXTRA_SCANNED  # entries examined, kept or not: `.`, `..` and bad names count too
         handle = None
         try:
             _, msg = self._client._request(CMD_OPENDIR, directory)
             handle = msg.get_string()
-            while len(out) < limit:
+            while len(out) < limit and scanned < max_scanned:
                 try:
                     _, msg = self._client._request(CMD_READDIR, handle)
                 except EOFError:
                     break
-                for _ in range(msg.get_int()):
+                count = msg.get_int()
+                # A server-claimed count is never trusted: an entry needs at least 12 bytes (two empty
+                # strings and an attribute flags word), so a count the reply cannot hold is a lie, and looping
+                # on it would spin for billions of iterations over an exhausted buffer.
+                if count > (len(msg.asbytes()) - msg.packet.tell()) // _MIN_ENTRY_BYTES:
+                    raise SessionError("sftp directory listing is malformed")
+                for _ in range(count):
+                    if len(out) >= limit or scanned >= max_scanned:
+                        break  # the limit holds per entry, not per reply
+                    scanned += 1
                     raw_name = msg.get_string()
                     msg.get_string()  # longname: unused, and a second place a name could appear
                     attrs = paramiko.SFTPAttributes._from_msg(msg)
@@ -149,14 +166,6 @@ class ParamikoSession:
                 with contextlib.suppress(Exception):
                     self._client._request(CMD_CLOSE, handle)
         return out[:limit]
-
-    def is_regular_file(self, path: str) -> bool:
-        """`lstat` (never follows a symlink): a claim that was swapped for a link is not a regular file."""
-        try:
-            mode = self._client.lstat(path).st_mode
-        except (TimeoutError, OSError, EOFError, paramiko.SSHException) as exc:
-            raise self._map(exc) from None
-        return mode is not None and stat.S_ISREG(mode)
 
     @staticmethod
     def _map(exc: BaseException) -> SessionError:
@@ -187,11 +196,30 @@ class ParamikoSession:
 
     def read_bounded(self, path: str, max_bytes: int) -> bytes | None:
         """The file's bytes, or `None` if it is larger than `max_bytes` (at most `max_bytes + 1` are
-        ever read into memory, whatever the server's stat said)."""
+        ever read into memory, whatever the server's stat said). Raises `NotRegularFileError` before any
+        byte is read unless the file is regular.
+
+        No lstat-then-open-by-name gap: the file is opened first, the open handle is `fstat`ed (that is
+        the object we would read), and only then is the name `lstat`ed again and required to be a regular
+        file matching the handle's size, mtime and mode. SFTP v3 has no `O_NOFOLLOW` and no inode, so a
+        link in the name's place is caught by the second `lstat` (a link is not regular), and a swap in the
+        window between `open` and that `lstat` needs a regular file whose size and mtime equal the target's.
+        That residual needs write access to the claimed directory and cannot be closed on this protocol."""
         chunks: list[bytes] = []
         total = 0
         try:
             with self._client.open(path, "rb") as handle:
+                opened = handle.stat()
+                if opened.st_mode is None or not stat.S_ISREG(opened.st_mode):
+                    raise NotRegularFileError("not a regular file")
+                named = self._client.lstat(path)
+                if (
+                    named.st_mode is None
+                    or not stat.S_ISREG(named.st_mode)
+                    or (named.st_mode, named.st_size, named.st_mtime)
+                    != (opened.st_mode, opened.st_size, opened.st_mtime)
+                ):
+                    raise NotRegularFileError("not a regular file")
                 while total <= max_bytes:
                     chunk = handle.read(min(_READ_CHUNK, max_bytes + 1 - total))
                     if not chunk:
@@ -241,6 +269,9 @@ DISABLED_ALGORITHMS: dict[str, tuple[str, ...]] = {
         "diffie-hellman-group1-sha1",
         "diffie-hellman-group14-sha1",
         "diffie-hellman-group-exchange-sha1",
+        # Group exchange lets the server pick the group and paramiko's client minimum is 1024 bits; group14
+        # (2048), group16 (4096), ECDH and curve25519 remain, so nothing needed is lost.
+        "diffie-hellman-group-exchange-sha256",
     ),
     "macs": ("hmac-md5", "hmac-md5-96", "hmac-sha1", "hmac-sha1-96"),
     "keys": ("ssh-rsa",),  # server host key signature: RSA with SHA-1 (rsa-sha2-* stays)

@@ -33,6 +33,7 @@ class Metrics:
     nacked_queue_full: int = 0
     nacked_unavailable: int = 0
     rejected_auth: int = 0
+    rejected_peer_not_allowed: int = 0  # TLS_PEER_NOT_ALLOWED
     rejected_content_type: int = 0
     poll_errors: int = 0
     partitions_halted: int = 0
@@ -61,6 +62,7 @@ class Metrics:
             "nacked_queue_full": self.nacked_queue_full,
             "nacked_unavailable": self.nacked_unavailable,
             "rejected_auth": self.rejected_auth,
+            "rejected_peer_not_allowed": self.rejected_peer_not_allowed,
             "rejected_content_type": self.rejected_content_type,
             "poll_errors": self.poll_errors,
             "partitions_halted": self.partitions_halted,

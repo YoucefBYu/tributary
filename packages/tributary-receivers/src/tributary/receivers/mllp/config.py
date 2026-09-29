@@ -59,6 +59,7 @@ class MllpSettings:
     idle_timeout_s: float = 60.0
     write_timeout_s: float = 10.0
     max_conns: int = 512
+    tls_handshake_timeout_s: float = 10.0
     conn_pipeline: int = 256
     max_inflight: int = 5000
     linger_ms: int = 5  # matches contracts/topics/v0 clients.receiver_producer.linger.ms
@@ -135,6 +136,7 @@ def mllp_settings_from_channel_spec(
             _require(tls_obj, "secretRef", "source.tls"),
             _require(tls_obj, "clientAuth", "source.tls"),
             tls_obj.get("minVersion", "1.2"),
+            tuple(tls_obj.get("allowedClientSans", ())),
         )
         if tls_obj is not None
         else None

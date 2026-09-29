@@ -18,6 +18,7 @@ from tributary.receivers.metrics import Metrics
 from tributary.receivers.sftp.config import SftpSettings
 from tributary.receivers.sftp.poller import CLAIM_PREFIX, SftpPoller
 from tributary.receivers.sftp.session import (
+    NotRegularFileError,
     RemoteEntry,
     RemoteExistsError,
     RemoteNotFoundError,
@@ -71,16 +72,12 @@ class FakeSession:
             self.mtimes[dst] = self.mtimes.pop(src, 0.0)
             self.log.append(("rename", posixpath.dirname(dst)))
 
-    def is_regular_file(self, path: str) -> bool:
-        with self.lock:
-            if path not in self.files:
-                raise RemoteNotFoundError("gone")
-            return path not in self.symlinks
-
     def read_bounded(self, path: str, max_bytes: int) -> bytes | None:
         with self.lock:
             if path not in self.files:
                 raise RemoteNotFoundError("gone")
+            if path in self.symlinks:
+                raise NotRegularFileError("link")
             data = self.files[path]
         return None if len(data) > max_bytes else data
 
@@ -425,9 +422,6 @@ def test_a_claim_swapped_for_a_symlink_is_rejected_and_never_read() -> None:
             super().rename(src, dst)
             if posixpath.basename(dst).startswith(CLAIM_PREFIX):
                 self.symlinks.add(dst)  # the sender swaps the file for a link right after we claim it
-
-        def read_bounded(self, path: str, max_bytes: int) -> bytes | None:
-            raise AssertionError("a symlink must never be read")
 
     s = Swapping()
     s.put("a.hl7", HL7)

@@ -43,7 +43,7 @@ from ..mllp.kafka_publisher import RawPublisher, topic_name
 from ..net import is_loopback, require_safe_bind
 from ..payload import well_formed
 from ..secrets import DirSecretResolver, SecretResolver
-from ..tls import AEAD_CIPHER_PIN, build_ssl_context
+from ..tls import AEAD_CIPHER_PIN, build_ssl_context, log_peer_refused, peer_san_allowed
 from .config import HttpSettings, http_settings_from_channel_spec
 
 __all__ = ["HttpServer", "HttpSettings", "serve_from_channel_spec"]
@@ -333,6 +333,20 @@ class HttpServer:
             self.metrics.connections_refused += 1
             w.close()
             return
+        if self.cfg.tls is not None and self.cfg.tls.allowed_client_sans:
+            ssl_object = w.get_extra_info("ssl_object")
+            if not peer_san_allowed(ssl_object, self.cfg.tls.allowed_client_sans):
+                # README 3.2.7: a bare 403, sent without reading the request; never 401, never 5xx.
+                self.metrics.rejected_peer_not_allowed += 1
+                log_peer_refused(self.cfg.channel, ssl_object)
+                try:
+                    w.write(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+                    await asyncio.wait_for(w.drain(), self.cfg.write_timeout_s)
+                except (TimeoutError, ConnectionError, OSError, ssl.SSLError):
+                    pass
+                finally:
+                    w.close()
+                return
         self.metrics.connections_total += 1
         self.metrics.connections_open += 1
         ctx: dict[str, Any] = {}
@@ -367,6 +381,10 @@ class HttpServer:
             w.close()
 
     async def start(self) -> asyncio.base_events.Server:
+        """Start listening. Known bound, not counted: a TLS handshake in progress is not yet a connection
+        (asyncio calls the handler after the handshake), so it does not count against `max_conns`. Half-open
+        handshakes are bounded by `tls_handshake_timeout_s` and the listen backlog; a plaintext-to-TLS flood
+        is the operator's edge-firewall concern. Counting them needs a custom protocol factory, not done."""
         return await asyncio.start_server(
             self.handle,
             self.cfg.bind,

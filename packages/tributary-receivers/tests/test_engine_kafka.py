@@ -73,6 +73,12 @@ def test_plaintext_to_loopback_is_allowed(bootstrap: str) -> None:
             "enable.ssl.certificate.verification": True,
         },  # no credentials
         {"security.protocol": "SASL_PLAINTEXT"},
+        {  # verified TLS but no client certificate: a remote broker would get no client authentication
+            "security.protocol": "SSL",
+            "ssl.cipher.suites": PINNED_CIPHER_SUITES,
+            "ssl.endpoint.identification.algorithm": "https",
+            "enable.ssl.certificate.verification": True,
+        },
     ],
 )
 def test_an_insecure_or_unverified_tls_config_is_refused(props: dict[str, Any]) -> None:
@@ -109,3 +115,53 @@ def test_a_missing_credential_secret_fails_closed(tmp_path: Path) -> None:
     )
     with pytest.raises(FileNotFoundError):
         engine_security_properties("kafka.example:9093", str(doc), DirSecretResolver(tmp_path))
+
+
+_MTLS = {
+    "security.protocol": "SSL",
+    "ssl.cipher.suites": PINNED_CIPHER_SUITES,
+    "ssl.endpoint.identification.algorithm": "https",
+    "enable.ssl.certificate.verification": True,
+    "ssl.certificate.location": "/run/secrets/eng/tls.crt",
+    "ssl.key.location": "/run/secrets/eng/tls.key",
+}
+
+
+def test_ssl_with_a_client_certificate_and_key_passes() -> None:
+    require_secure_link("kafka.example:9093", _MTLS)
+
+
+def test_ssl_without_a_client_certificate_from_the_security_file_is_refused(tmp_path: Path) -> None:
+    doc = tmp_path / "sec.json"
+    doc.write_text(json.dumps({"protocol": "SSL", "tls": {}}), encoding="utf-8")
+    with pytest.raises(ConfigError, match="mTLS"):
+        engine_security_properties("kafka.example:9093", str(doc), DirSecretResolver(tmp_path))
+
+
+def test_ssl_mtls_from_secret_ref_resolves_the_client_certificate(tmp_path: Path) -> None:
+    (tmp_path / "eng").mkdir()
+    for name in ("tls.crt", "tls.key"):
+        (tmp_path / "eng" / name).write_text("synthetic", encoding="utf-8")
+    doc = tmp_path / "sec.json"
+    doc.write_text(json.dumps({"protocol": "SSL", "secretRef": "eng"}), encoding="utf-8")
+    props = engine_security_properties("kafka.example:9093", str(doc), DirSecretResolver(tmp_path))
+    assert props["ssl.certificate.location"].endswith("tls.crt") and props["ssl.key.location"].endswith("tls.key")
+
+
+@pytest.mark.parametrize("key", ["bootstrap.servers", "metadata.broker.list", "acks", "enable.idempotence"])
+def test_a_security_mapping_carrying_a_non_security_key_is_refused(key: str) -> None:
+    """`bootstrap.servers` in the mapping would override the checked address after the loopback check."""
+    with pytest.raises(ConfigError, match="security"):
+        require_secure_link("127.0.0.1:9092", {"security.protocol": "PLAINTEXT", key: "evil.example:9092"})
+    with pytest.raises(ConfigError, match="security"):
+        RawPublisher("127.0.0.1:9092", "dev.c.raw", security={key: "evil.example:9092"})
+    with pytest.raises(ConfigError, match="security"):
+        require_secure_link("kafka.example:9093", {**_MTLS, key: "evil.example:9092"})
+
+
+@pytest.mark.parametrize(
+    "bootstrap", ["127.1.1.300:9092", "127.0.0.1:0", "127.0.0.1:99999", "127.0.0.1:x", "[::2]:9092"]
+)
+def test_a_malformed_or_out_of_range_loopback_literal_is_not_loopback(bootstrap: str) -> None:
+    with pytest.raises(ConfigError, match="PLAINTEXT"):
+        require_secure_link(bootstrap, None)

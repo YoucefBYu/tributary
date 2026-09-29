@@ -16,6 +16,8 @@ from tributary.receivers.sftp.poller import CLAIM_PREFIX, SftpPoller
 from tributary.receivers.sftp.session import (
     DISABLED_ALGORITHMS,
     HostKeyMismatchError,
+    NotRegularFileError,
+    ParamikoSession,
     RemoteExistsError,
     RemoteNotFoundError,
     SessionError,
@@ -248,20 +250,104 @@ def test_a_non_utf8_file_name_is_skipped_and_counted_not_fatal(
             session.close()
 
 
-def test_is_regular_file_uses_lstat_and_does_not_follow_links(
+def test_read_bounded_refuses_a_link_a_directory_and_a_missing_name_before_reading(
     root: Path, ed25519: paramiko.PKey, secrets: DirSecretResolver
 ) -> None:
     (root / "in" / "real.hl7").write_bytes(HL7)
     (root / "in" / "link.hl7").symlink_to(root / "in" / "real.hl7")
+    (root / "in" / "subdir").mkdir()
     with FakeSftpServer(root, [ed25519]) as srv:
         session = connect(cfg_for(srv, [pin(ed25519)]), secrets)
         try:
-            assert session.is_regular_file("/in/real.hl7") is True
-            assert session.is_regular_file("/in/link.hl7") is False
+            assert session.read_bounded("/in/real.hl7", 1000) == HL7
+            with pytest.raises(NotRegularFileError):
+                session.read_bounded("/in/link.hl7", 1000)
+            with pytest.raises(SessionError):  # a server may refuse the open itself; either way nothing is read
+                session.read_bounded("/in/subdir", 1000)
             with pytest.raises(RemoteNotFoundError):
-                session.is_regular_file("/in/none.hl7")
+                session.read_bounded("/in/none.hl7", 1000)
         finally:
             session.close()
+
+
+def test_a_name_that_no_longer_matches_the_opened_handle_is_refused(
+    root: Path, ed25519: paramiko.PKey, secrets: DirSecretResolver
+) -> None:
+    """The name is re-checked after the open: a size that differs from the handle's is a swapped object."""
+    (root / "in" / "real.hl7").write_bytes(HL7)
+    with FakeSftpServer(root, [ed25519]) as srv:
+        session = connect(cfg_for(srv, [pin(ed25519)]), secrets)
+        try:
+            real_lstat = session._client.lstat
+
+            def swapped(path: str) -> paramiko.SFTPAttributes:
+                attrs = real_lstat(path)
+                attrs.st_size = (attrs.st_size or 0) + 1
+                return attrs
+
+            session._client.lstat = swapped  # type: ignore[method-assign]
+            with pytest.raises(NotRegularFileError):
+                session.read_bounded("/in/real.hl7", 1000)
+        finally:
+            session.close()
+
+
+def _readdir_reply(entries: list[bytes], claimed: int) -> paramiko.Message:
+    msg = paramiko.Message()
+    msg.add_int(claimed)
+    for name in entries:
+        msg.add_string(name)
+        msg.add_string(b"")
+        msg.add_int(0)  # attribute flags: none
+    msg.rewind()
+    return msg
+
+
+class _ScriptedClient:
+    """Answers OPENDIR, then a fixed list of READDIR replies; counts the READDIRs it was asked for."""
+
+    def __init__(self, replies: list[paramiko.Message]) -> None:
+        self.replies = replies
+        self.readdirs = 0
+
+    def _request(self, cmd: int, *_args: object) -> tuple[int, paramiko.Message]:
+        from paramiko.sftp import CMD_CLOSE, CMD_OPENDIR, CMD_READDIR
+
+        if cmd == CMD_OPENDIR:
+            msg = paramiko.Message()
+            msg.add_string(b"h")
+            msg.rewind()
+            return 0, msg
+        if cmd == CMD_CLOSE:
+            return 0, paramiko.Message()
+        assert cmd == CMD_READDIR
+        self.readdirs += 1
+        if not self.replies:
+            raise EOFError
+        return 0, self.replies.pop(0)
+
+
+def _scripted(replies: list[paramiko.Message]) -> tuple[ParamikoSession, _ScriptedClient]:
+    client = _ScriptedClient(replies)
+    return ParamikoSession(None, client), client  # type: ignore[arg-type]
+
+
+def test_a_listing_limit_holds_per_entry_inside_one_reply() -> None:
+    session, _ = _scripted([_readdir_reply([f"f{i}".encode() for i in range(500)], 500)])
+    assert len(session.list_dir("/in", 10)) == 10
+
+
+def test_a_hostile_entry_count_larger_than_the_reply_is_refused_not_looped() -> None:
+    session, _ = _scripted([_readdir_reply([b"a"], 0xFFFFFFFF)])
+    with pytest.raises(SessionError):
+        session.list_dir("/in", 1000)
+
+
+def test_a_server_that_only_returns_dot_entries_cannot_keep_a_listing_running() -> None:
+    dots = [_readdir_reply([b"."] * 100, 100) for _ in range(10_000)]
+    session, client = _scripted(dots)
+    assert session.list_dir("/in", 10) == []
+    assert client.readdirs < 100  # stopped by the scan bound long before the script ran out
 
 
 def test_disabled_algorithm_set_is_pinned() -> None:
@@ -271,6 +357,7 @@ def test_disabled_algorithm_set_is_pinned() -> None:
         "diffie-hellman-group1-sha1",
         "diffie-hellman-group14-sha1",
         "diffie-hellman-group-exchange-sha1",
+        "diffie-hellman-group-exchange-sha256",  # server-chosen group, client minimum 1024 bits
     }
     assert set(d["macs"]) == {"hmac-md5", "hmac-md5-96", "hmac-sha1", "hmac-sha1-96"}
     assert d["keys"] == ["ssh-rsa"] and d["pubkeys"] == ["ssh-rsa"]

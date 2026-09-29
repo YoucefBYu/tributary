@@ -57,7 +57,15 @@ from ..mllp.kafka_publisher import RawPublisher, topic_name
 from ..payload import well_formed
 from ..secrets import DirSecretResolver, SecretResolver
 from .config import SftpSettings, sftp_settings_from_channel_spec
-from .session import RemoteEntry, RemoteExistsError, RemoteNotFoundError, SessionError, SftpSession, connect
+from .session import (
+    NotRegularFileError,
+    RemoteEntry,
+    RemoteExistsError,
+    RemoteNotFoundError,
+    SessionError,
+    SftpSession,
+    connect,
+)
 
 __all__ = ["SftpPoller", "serve_from_channel_spec"]
 
@@ -172,10 +180,13 @@ class SftpPoller:
         claim = posixpath.join(cfg.directory, claim_name)
         self.metrics.messages_received += 1
         try:
-            # lstat, not stat: a claim swapped for a symlink must not be followed (it would read a file the
-            # sender never meant to send). A non-regular claim is refused like any other bad input.
-            regular = await asyncio.to_thread(session.is_regular_file, claim)
-            payload = await asyncio.to_thread(session.read_bounded, claim, cfg.max_message_bytes) if regular else b""
+            # `read_bounded` opens, fstats the handle and re-checks the name before reading a byte, so there is
+            # no lstat-then-open-by-name gap; a link or other non-regular object is refused like any bad input.
+            payload = await asyncio.to_thread(session.read_bounded, claim, cfg.max_message_bytes)
+            regular = True
+        except NotRegularFileError:
+            regular = False
+            payload = b""
         except RemoteNotFoundError:
             return 0  # vanished under us: nothing to commit and nothing to lose
         if not regular:

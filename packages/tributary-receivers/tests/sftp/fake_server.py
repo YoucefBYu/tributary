@@ -90,7 +90,11 @@ class _Fs(paramiko.SFTPServerInterface):  # type: ignore[misc]
 
 
 class _FileHandle(paramiko.SFTPHandle):  # type: ignore[misc]
-    pass
+    def stat(self) -> Any:  # SSH_FXP_FSTAT: attributes of the object actually opened
+        try:
+            return paramiko.SFTPAttributes.from_stat(os.fstat(self.readfile.fileno()))
+        except OSError as exc:
+            return paramiko.SFTPServer.convert_errno(exc.errno)
 
 
 class _Auth(paramiko.ServerInterface):  # type: ignore[misc]

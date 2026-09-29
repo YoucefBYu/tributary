@@ -24,13 +24,13 @@ from tributary.sdk.keys import KeyExpression
 
 from ..errors import ConfigError
 from ..keys import key_expression_from_spec
+from ..net import is_loopback_host_port
 
 DEFAULT_ACK_TIMEOUT_MS = 10_000
 DEFAULT_MAX_MESSAGE_BYTES = 1_000_000  # envelope inline limit, invariant 8
 DEFAULT_MIN_TLS_VERSION = "1.2"
 SUPPORTED_NACK_ON = frozenset({"parse-error"})
 
-LOOPBACK_HOST_PORT = re.compile(r"(localhost|127\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}|\[::1\]):[0-9]{2,5}")
 _HOST_PORT = re.compile(r"^(\[::1\]|[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?):[0-9]{2,5}$")
 _EXTERNAL_TOPIC = re.compile(r"^[A-Za-z0-9._-]{1,249}$")
 _CHANNEL_SHAPED = re.compile(r"^[a-z][a-z0-9-]{0,15}\.[a-z][a-z0-9-]{0,63}\.(raw|retry|dlq|reply|out\..+)$")
@@ -89,9 +89,7 @@ class KafkaSourceSettings:
             raise ConfigError(f"channel {self.channel!r}: kafka.connection.bootstrapServers must list 1-16 servers")
         if not all(_HOST_PORT.match(b) for b in self.source_bootstrap):
             raise ConfigError(f"channel {self.channel!r}: kafka.connection.bootstrapServers entry is not host:port")
-        if self.security.protocol == "PLAINTEXT" and not all(
-            LOOPBACK_HOST_PORT.fullmatch(b) for b in self.source_bootstrap
-        ):
+        if self.security.protocol == "PLAINTEXT" and not all(is_loopback_host_port(b) for b in self.source_bootstrap):
             raise ConfigError(
                 f"channel {self.channel!r}: PLAINTEXT is only allowed when every bootstrap server is loopback"
             )

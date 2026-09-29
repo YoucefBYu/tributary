@@ -14,10 +14,8 @@ module is also what a "FHIR receiver" is built from.
 Known gaps, stated rather than hidden:
 
 * `auth: mtls` authenticates that the client certificate chains to the trust bundle in `tls.secretRef`.
-  Every certificate that chains is accepted: the channel-spec has no field for a per-channel subject or
-  SAN allow-list, so one channel cannot be limited to one sender. Contract proposal (architect): an
-  optional `tls.allowedSubjects` (list of exact certificate subject or SAN strings), enforced after the
-  handshake. Not implemented, since an unapproved field must not be invented here.
+  Without `tls.allowedClientSans` (set 1.3, README 3.2.7) every certificate that chains is accepted; with
+  it, the leaf must carry a listed SAN, enforced after the handshake and before any byte is read.
 * `ack.nackOn: spec-invalid` is schema-valid but refused at startup, as `mllp` does: it means "NACK
   because the channel spec became invalid", and nothing in this wave watches the spec after start-up
   (no `_tb.<env>.channels` consumption in a receiver), so accepting it would promise a NACK that can
@@ -154,6 +152,7 @@ def http_settings_from_channel_spec(
             _require(tls_obj, "secretRef", "source.tls"),
             _require(tls_obj, "clientAuth", "source.tls"),
             tls_obj.get("minVersion", "1.2"),
+            tuple(tls_obj.get("allowedClientSans", ())),
         )
         if tls_obj is not None  # `is not None`, never truthiness: `tls: {}` still means "configured"
         else None

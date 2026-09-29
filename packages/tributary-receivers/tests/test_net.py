@@ -38,3 +38,26 @@ def test_ipv6_wildcard_without_tls_is_refused() -> None:
 def test_non_loopback_literal_without_tls_is_refused() -> None:
     with pytest.raises(BindError):
         require_safe_bind("10.0.0.5", tls_configured=False)
+
+
+@pytest.mark.parametrize(
+    ("entry", "expected"),
+    [
+        ("localhost:9092", True),
+        ("127.0.0.1:9092", True),
+        ("127.255.255.254:65535", True),
+        ("[::1]:9092", True),
+        ("127.1.1.300:9092", False),  # not an IPv4 literal
+        ("127.0.0.1:0", False),
+        ("127.0.0.1:65536", False),
+        ("127.0.0.1", False),
+        ("10.0.0.1:9092", False),
+        ("kafka:9092", False),
+        ("[::2]:9092", False),
+        ("::1:9092", False),
+    ],
+)
+def test_is_loopback_host_port_uses_ipaddress(entry: str, expected: bool) -> None:
+    from tributary.receivers.net import is_loopback_host_port
+
+    assert is_loopback_host_port(entry) is expected
