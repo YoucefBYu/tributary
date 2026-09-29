@@ -1,0 +1,11 @@
+{
+  "apiVersion": "tributary.dev/v1",
+  "kind": "EngineKafkaConnection",
+  "bootstrapServers": ["kafka:9094"],
+  "security": {
+    "protocol": "SASL_SSL",
+    "saslMechanism": "SCRAM-SHA-512",
+    "secretRef": "tb-lite-topic-bootstrap",
+    "tls": { "secretRef": "tb-lite-kafka-ca" }
+  }
+}

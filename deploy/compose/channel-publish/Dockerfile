@@ -11,6 +11,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --require-hashes -r requirements.txt \
     && rm requirements.txt
 COPY publish_channel.py .
+# Shared with topic-bootstrap via the compose `additional_contexts: common` (deploy/compose/common).
+COPY --from=common kafka_conn.py .
 
 USER tributary:tributary
 ENTRYPOINT ["python", "publish_channel.py"]

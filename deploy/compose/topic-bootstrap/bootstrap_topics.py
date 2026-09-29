@@ -22,6 +22,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,6 +40,83 @@ class TopicSpec:
     partitions: int
     replication_factor: int
     configs: dict[str, str]
+
+
+@dataclass(frozen=True, slots=True)
+class Grant:
+    """One ACL binding, before it is tied to a principal or to confluent-kafka types."""
+
+    resource_type: str  # "TOPIC" | "GROUP" | "CLUSTER"
+    name: str
+    pattern: str  # "LITERAL" | "PREFIXED"
+    operation: str  # AclOperation member name
+
+
+# Which `security.acls` role each compose component takes, and which principal it runs as. The
+# grants themselves are never restated here: they are parsed from the contract (topics README 3.7).
+ROLE_OF_COMPONENT = {
+    "receiver": "receiver",
+    "worker": "pipeline_worker",
+    "loader": "loader",
+    "channel-publish": "control_plane",
+}
+
+_CLAUSE = re.compile(r"^(?P<ops>[A-Z_]+(?:, [A-Z_]+)*) on (?P<rest>.+)$")
+
+
+def parse_grants(text: str, *, env: str, channel: str, destinations: tuple[str, ...]) -> list[Grant]:
+    """Turn one `security.acls` role string into concrete bindings.
+
+    The contract states grants as a sentence ("WRITE on <env>.<channel>.out.*, .retry, .dlq; ...").
+    Only the first sentence is the base grant: later sentences are the set-1.2 sync-reply additions
+    and prohibitions, which the demo channel does not use. Anything this grammar does not recognise
+    raises, so a contract change can never quietly become a missing (or, worse, wider) grant."""
+    first = text.split(". ")[0].rstrip(".")
+    grants: list[Grant] = []
+    for clause in first.split(";"):
+        m = _CLAUSE.match(clause.strip())
+        if m is None:
+            raise ValueError(f"unrecognised ACL clause: {clause.strip()!r}")
+        ops, rest = m.group("ops").split(", "), m.group("rest")
+        if rest == "the cluster":
+            grants += [Grant("CLUSTER", "kafka-cluster", "LITERAL", op) for op in ops]
+            continue
+        kind = "TOPIC"
+        if rest.startswith("group "):
+            kind, rest = "GROUP", rest[len("group ") :]
+        for target in re.split(r", | and ", rest):
+            if target.startswith("."):  # relative to the channel prefix
+                target = f"<env>.<channel>{target}"
+            for dest in destinations if "<dest>" in target else (None,):
+                name = target.replace("<env>", env).replace("<channel>", channel)
+                if dest is not None:
+                    name = name.replace("<dest>", dest)
+                if "<" in name or ">" in name:
+                    raise ValueError(f"unresolved placeholder in ACL target: {target!r}")
+                prefixed = name.endswith("*")
+                grants += [
+                    Grant(kind, name.rstrip("*") if prefixed else name, "PREFIXED" if prefixed else "LITERAL", op)
+                    for op in ops
+                ]
+    return grants
+
+
+def derive_acls(
+    defaults: dict[str, Any], *, env: str, channel: str, destinations: tuple[str, ...], principals: dict[str, str]
+) -> list[tuple[str, Grant]]:
+    """(principal, grant) for every component in `principals` (component -> `User:<name>`)."""
+    acls = defaults["security"]["acls"]
+    out: list[tuple[str, Grant]] = []
+    for component, principal in principals.items():
+        role = ROLE_OF_COMPONENT[component]
+        out += [(principal, g) for g in parse_grants(acls[role], env=env, channel=channel, destinations=destinations)]
+    return out
+
+
+def parse_principals(text: str) -> dict[str, str]:
+    """`receiver=tb-lite-receiver,worker=...` -> component -> `User:<name>`."""
+    pairs = (item.split("=", 1) for item in text.split(",") if item)
+    return {component.strip(): f"User:{name.strip()}" for component, name in pairs}
 
 
 def load_defaults(path: Path) -> dict[str, Any]:
@@ -125,17 +203,30 @@ def emit_lite_warning(defaults: dict[str, Any], profile: str) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--bootstrap", default=os.environ.get("KAFKA_BOOTSTRAP", "kafka:9092"))
     p.add_argument("--env", default=os.environ.get("TB_ENV", "dev"))
     p.add_argument("--profile", default=os.environ.get("TB_PROFILE", "lite"), choices=["lite", "production"])
     p.add_argument("--channel", default=os.environ.get("TB_CHANNEL", "adt-passthrough"))
     p.add_argument("--destination", action="append", default=None, help="repeatable; default: http-stub")
     p.add_argument(
+        "--principals",
+        default=os.environ.get("TB_ACL_PRINCIPALS", ""),
+        help="component=scram-user pairs to grant, e.g. receiver=tb-lite-receiver,worker=tb-lite-worker",
+    )
+    p.add_argument(
         "--defaults", type=Path, default=Path(os.environ.get("TB_TOPIC_DEFAULTS", str(DEFAULT_DEFAULTS_PATH)))
     )
     args = p.parse_args(argv)
 
-    from confluent_kafka.admin import AdminClient, NewTopic  # type: ignore[attr-defined]  # deferred import
+    from confluent_kafka.admin import (  # type: ignore[attr-defined]  # deferred import
+        AclBinding,
+        AclOperation,
+        AclPermissionType,
+        AdminClient,
+        NewTopic,
+        ResourcePatternType,
+        ResourceType,
+    )
+    from kafka_conn import KafkaConnError, load_client_config
 
     defaults = load_defaults(args.defaults)
     emit_lite_warning(defaults, args.profile)
@@ -144,7 +235,11 @@ def main(argv: list[str] | None = None) -> int:
         defaults, env=args.env, profile=args.profile, channel=args.channel, destinations=destinations
     )
 
-    admin = AdminClient({"bootstrap.servers": args.bootstrap})
+    try:
+        admin = AdminClient(load_client_config())
+    except KafkaConnError as exc:
+        log.error(json.dumps({"status": "no-kafka-connection", "reason": str(exc)}))
+        return 1
     new_topics = [
         NewTopic(t.name, num_partitions=t.partitions, replication_factor=t.replication_factor, config=t.configs)
         for t in topics
@@ -161,6 +256,37 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 failed = True
                 log.error(json.dumps({"topic": name, "status": "failed", "reason": type(exc).__name__}))
+    if failed:
+        return 1
+
+    # Deny-by-default cluster: nothing but these grants lets a data-plane principal touch a topic.
+    acls = derive_acls(
+        defaults,
+        env=args.env,
+        channel=args.channel,
+        destinations=destinations,
+        principals=parse_principals(args.principals),
+    )
+    bindings = [
+        AclBinding(
+            # confluent-kafka names the cluster resource (Kafka's "kafka-cluster") ResourceType.BROKER.
+            getattr(ResourceType, "BROKER" if g.resource_type == "CLUSTER" else g.resource_type),
+            g.name,
+            getattr(ResourcePatternType, g.pattern),
+            principal,
+            "*",
+            getattr(AclOperation, g.operation),
+            AclPermissionType.ALLOW,
+        )
+        for principal, g in acls
+    ]
+    for future in admin.create_acls(bindings, request_timeout=30).values():
+        try:
+            future.result()
+        except Exception as exc:
+            failed = True
+            log.error(json.dumps({"acl": "create", "status": "failed", "reason": type(exc).__name__}))
+    log.info(json.dumps({"acls": len(bindings), "status": "failed" if failed else "applied"}))
     return 1 if failed else 0
 
 

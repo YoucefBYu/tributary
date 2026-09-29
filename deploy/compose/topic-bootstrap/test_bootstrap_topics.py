@@ -109,3 +109,76 @@ def test_unclean_leader_election_is_always_pinned_false(defaults: dict) -> None:
     topics = derive_topics(defaults, env="dev", profile="lite", channel="adt-passthrough", destinations=("http-stub",))
     for t in topics:
         assert t.configs["unclean.leader.election.enable"] == "false"
+
+
+# --- ACLs (ADR-008 D5): parsed from the contract's security.acls, deny by default otherwise ----------
+
+from bootstrap_topics import derive_acls, parse_grants, parse_principals  # noqa: E402
+
+ENV, CHANNEL, DESTS = "dev", "adt-passthrough", ("http-stub",)
+
+
+def _grants(defaults: dict, role: str) -> set[tuple[str, str, str, str]]:  # type: ignore[type-arg]
+    return {
+        (g.resource_type, g.name, g.pattern, g.operation)
+        for g in parse_grants(defaults["security"]["acls"][role], env=ENV, channel=CHANNEL, destinations=DESTS)
+    }
+
+
+def test_receiver_may_write_raw_only(defaults: dict) -> None:  # type: ignore[type-arg]
+    assert _grants(defaults, "receiver") == {
+        ("TOPIC", "dev.adt-passthrough.raw", "LITERAL", "WRITE"),
+        ("TOPIC", "dev.adt-passthrough.raw", "LITERAL", "DESCRIBE"),
+        ("CLUSTER", "kafka-cluster", "LITERAL", "IDEMPOTENT_WRITE"),
+    }
+
+
+def test_worker_grants_and_no_write_on_channels(defaults: dict) -> None:  # type: ignore[type-arg]
+    g = _grants(defaults, "pipeline_worker")
+    assert ("TOPIC", "dev.adt-passthrough.raw", "LITERAL", "READ") in g
+    assert ("TOPIC", "dev.adt-passthrough.out.", "PREFIXED", "WRITE") in g
+    assert ("TOPIC", "dev.adt-passthrough.retry", "LITERAL", "WRITE") in g
+    assert ("TOPIC", "dev.adt-passthrough.dlq", "LITERAL", "WRITE") in g
+    assert ("TOPIC", "_tb.dev.events", "LITERAL", "WRITE") in g
+    assert ("TOPIC", "_tb.dev.channels", "LITERAL", "READ") in g
+    assert ("GROUP", "tb.dev.adt-passthrough.pipeline", "PREFIXED", "READ") in g
+    # A compromised worker must not be able to deploy a channel spec (topics README 3.4).
+    assert not any(n == "_tb.dev.channels" and op == "WRITE" for _, n, _, op in g)
+    assert not any(op in {"DELETE", "ALTER"} for *_, op in g)
+
+
+def test_loader_grants_are_per_destination(defaults: dict) -> None:  # type: ignore[type-arg]
+    g = _grants(defaults, "loader")
+    assert ("TOPIC", "dev.adt-passthrough.out.http-stub", "LITERAL", "READ") in g
+    assert ("TOPIC", "dev.adt-passthrough.retry", "LITERAL", "READ") in g
+    assert ("GROUP", "tb.dev.adt-passthrough.loader.http-stub", "PREFIXED", "READ") in g
+    assert not any(n.startswith("_tb.dev.channels") for _, n, _, _ in g)
+
+
+def test_control_plane_stand_in_writes_channels(defaults: dict) -> None:  # type: ignore[type-arg]
+    g = _grants(defaults, "control_plane")
+    assert ("TOPIC", "_tb.dev.channels", "LITERAL", "WRITE") in g
+    assert ("CLUSTER", "kafka-cluster", "LITERAL", "DESCRIBE") in g
+
+
+def test_sync_reply_additions_are_not_granted(defaults: dict) -> None:  # type: ignore[type-arg]
+    for role in ("receiver", "pipeline_worker"):
+        assert not any(n.endswith(".reply") or "replier" in n for _, n, _, _ in _grants(defaults, role))
+
+
+def test_unrecognised_clause_fails_loudly() -> None:
+    with pytest.raises(ValueError, match="unrecognised"):
+        parse_grants("permit everything to everyone", env=ENV, channel=CHANNEL, destinations=DESTS)
+    with pytest.raises(ValueError, match="placeholder"):
+        parse_grants("READ on <env>.<channel>.<mystery>", env=ENV, channel=CHANNEL, destinations=DESTS)
+
+
+def test_every_component_role_exists_in_the_contract(defaults: dict) -> None:  # type: ignore[type-arg]
+    acls = derive_acls(
+        defaults,
+        principals=parse_principals("receiver=r,worker=w,loader=l,channel-publish=c"),
+        env=ENV,
+        channel=CHANNEL,
+        destinations=DESTS,
+    )
+    assert {p for p, _ in acls} == {"User:r", "User:w", "User:l", "User:c"}

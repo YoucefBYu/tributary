@@ -17,20 +17,46 @@
 # data-plane component must also emit it once W1-4/5/6 land (topic-defaults.json README 3.8).
 # BARRED FROM PRODUCTION. Never point this stack at anything but synthetic data (CLAUDE.md).
 #
-# Every published port is bound to 127.0.0.1 explicitly. Docker's default is 0.0.0.0, which would
-# expose an unauthenticated, unencrypted dev cluster to the whole local network (Phase 0 gate finding
-# High 2 / SR-8, and Phase 1 requirement 8). Do not remove the `127.0.0.1:` prefixes and do not add
-# credentials here to make wider exposure "safe enough" -- production topology is Helm, not this file.
-# PLAINTEXT and no-auth throughout are fine ONLY because nothing here is reachable off-loopback and
-# nothing here ever carries real patient data.
+# Kafka is SASL_SSL, exactly like production (ADR-008 D5, contracts/engine-kafka/v0 README section 6).
+# There is no PLAINTEXT opt-out: a container network is not loopback, and every data-plane process
+# refuses PLAINTEXT to a non-loopback broker. `kafka-tls-init` (a one-shot, at `up`) generates a dev
+# CA, the broker certificate (SANs kafka, localhost, 127.0.0.1) and one random SCRAM-SHA-512 user per
+# component into the `kafka-secrets` volume; the CA key goes to a separate volume no component mounts.
+# Each component mounts ONLY its own secret directory (and the CA bundle), read-only, by volume
+# subpath. Nothing secret is committed, baked into an image, or printed. Authorization is deny by
+# default (`StandardAuthorizer`, `allow.everyone.if.no.acl.found=false`); topic-bootstrap applies the
+# per-role grants it parses from contracts/topics/v0/topic-defaults.json `security.acls`.
 #
-# Storage is intentionally ephemeral (no named volumes), matching spikes/common/docker-compose.yml:
+# Every published port is bound to 127.0.0.1 explicitly. Docker's default is 0.0.0.0, which would
+# expose a dev cluster to the whole local network. Do not remove the `127.0.0.1:` prefixes.
+# ClickHouse and PostgreSQL below are still no-auth and PLAINTEXT: fine ONLY because their ports are
+# loopback-bound and nothing here ever carries real patient data. Production topology is Helm.
+#
+# Storage is intentionally ephemeral (no named volumes for data), matching spikes/common/docker-compose.yml:
 # `stop`/`start` keeps a container's data, `down` starts clean. Avoids the root-owned volume
 # permission trap on Windows/WSL2 too. Add named volumes yourself for a longer-lived local sandbox.
 
 name: tributary-lite
 
 services:
+  kafka-tls-init:
+    # One-shot, runs as root for the shortest possible time to write the two secret volumes and chown
+    # them to the uids that read them (apache/kafka 1000, the app images 10001). Uses the Kafka image
+    # only because it carries bash and openssl; see kafka/tls-init.sh for what it writes and what it
+    # never prints. Idempotent: existing valid credentials are kept.
+    image: apache/kafka:4.0.0@sha256:3f7b939115cd4872e9cee9369d80bd69712fde55f9902f46d793f64848dedc75
+    container_name: tb-kafka-tls-init
+    user: root
+    restart: "no"
+    entrypoint: ["/bin/bash", "/opt/tb/tls-init.sh"]
+    volumes:
+      - ./kafka/tls-init.sh:/opt/tb/tls-init.sh:ro
+      - kafka-secrets:/secrets
+      - kafka-ca-private:/ca-private
+    read_only: true
+    tmpfs:
+      - /tmp
+
   kafka:
     # Apache Software Foundation image (Apache-2.0). Do not swap in confluentinc/cp-* -- Confluent
     # Community License is not on CLAUDE.md's allowed list (Apache-2.0/MIT/BSD/ISC/PSF, MPL only as
@@ -42,43 +68,33 @@ services:
     # DOES trigger a restart policy, and any restart policy would silently resurrect the broker
     # inside a fault-injection window and make the result a lie.
     restart: "no"
+    depends_on:
+      kafka-tls-init:
+        condition: service_completed_successfully
+    # Our own entrypoint (deploy/compose/kafka/start-broker.sh), not the image's env-var configurator:
+    # it formats storage with the per-component SCRAM users and starts the broker on the
+    # server.properties that kafka-tls-init generated (listeners, JAAS, ACL settings, cipher pin).
+    entrypoint: ["/bin/bash", "/opt/tb/start-broker.sh"]
     ports:
-      - "127.0.0.1:19092:19092"
+      - "127.0.0.1:19092:19092"   # SASL_SSL; the certificate carries IP:127.0.0.1
+    volumes:
+      - ./kafka/start-broker.sh:/opt/tb/start-broker.sh:ro
+      - type: volume
+        source: kafka-secrets
+        target: /etc/tributary/broker
+        read_only: true
+        volume:
+          subpath: broker
     environment:
-      CLUSTER_ID: ZEBnsPTsTmysrIwkF8yYDw
-      KAFKA_NODE_ID: "1"
-      KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
-      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
-      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:19092
-      # EXTERNAL advertises the loopback address on purpose: it is the only address a host-side tool
-      # (a local kcat, the future e2e test) can actually reach through the port mapping above.
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://127.0.0.1:19092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
-      # RF=1 / min.insync.replicas=1: the lite-profile exception (see the file header). Not in
-      # topic-defaults.json `must_not_hardcode` -- that list covers per-topic-class configs (created
-      # by topic-bootstrap, which reads them from the file at every run) and worker/producer client
-      # settings, not these two broker-wide defaults, which are fixed by "one broker" rather than
-      # measured. `auto.create.topics.enable` stays false so nothing but topic-bootstrap creates a
-      # topic, and so an under-configured auto-created topic can never be how invariant 1 goes quiet.
-      KAFKA_DEFAULT_REPLICATION_FACTOR: "1"
-      KAFKA_MIN_INSYNC_REPLICAS: "1"
-      KAFKA_UNCLEAN_LEADER_ELECTION_ENABLE: "false"
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
-      # __consumer_offsets and the transaction-state log are internal topics the broker creates
-      # itself, so KAFKA_DEFAULT_REPLICATION_FACTOR does not reach them -- they have their own
-      # settings, defaulting to 3. On a single broker that default can never be satisfied:
-      # __consumer_offsets never gets created, every consumer group hangs at FIND_COORDINATOR forever,
-      # and nothing ever reaches out.<dest> even though produce-and-ACK on raw keeps working (found by
-      # qa-engineer-2 building W1-8, confirmed against a real cluster; same three values
-      # platform-engineer's testcontainers fixture already uses for a single-broker Kafka).
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      # The lite-profile durability settings (RF=1, min.insync.replicas=1, no auto-create topics, the
+      # internal-topic replication factors) are in the generated server.properties now, because the
+      # broker no longer starts through the image's KAFKA_* env-var configurator: see the "lite profile"
+      # block in kafka/tls-init.sh. Only the JVM heap is still an environment variable.
       KAFKA_HEAP_OPTS: ${TB_KAFKA_HEAP:--Xmx512M -Xms512M}
     healthcheck:
-      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1 || exit 1"]
+      # Authenticated over the real SASL_SSL listener as the admin principal, so "healthy" proves
+      # TLS, hostname verification and SCRAM all work. 127.0.0.1 is in the certificate SANs.
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server 127.0.0.1:9094 --command-config /etc/tributary/broker/healthcheck.properties >/dev/null 2>&1 || exit 1"]
       interval: 5s
       timeout: 5s
       retries: 24
@@ -135,6 +151,8 @@ services:
   topic-bootstrap:
     build:
       context: ./topic-bootstrap
+      additional_contexts:
+        common: ./common
     container_name: tb-topic-bootstrap
     restart: "no"
     depends_on:
@@ -146,8 +164,24 @@ services:
       # start, every run, so a contract change or a re-measurement reaches the lite stack without a
       # rebuild.
       - ../../contracts/topics/v0/topic-defaults.json:/contracts/topics/v0/topic-defaults.json:ro
+      - ./engine-kafka/topic-bootstrap.json:/etc/tributary/engine-kafka.json:ro
+      - type: volume
+        source: kafka-secrets
+        target: /var/run/secrets/tributary/tb-lite-topic-bootstrap
+        read_only: true
+        volume:
+          subpath: tb-lite-topic-bootstrap
+      - type: volume
+        source: kafka-secrets
+        target: /var/run/secrets/tributary/tb-lite-kafka-ca
+        read_only: true
+        volume:
+          subpath: tb-lite-kafka-ca
     environment:
-      KAFKA_BOOTSTRAP: kafka:9092
+      TB_ENGINE_KAFKA_FILE: /etc/tributary/engine-kafka.json
+      # Who gets which `security.acls` role. topic-bootstrap (a super user, the control-plane
+      # stand-in) creates the topics and applies these; the grants come from the contract file.
+      TB_ACL_PRINCIPALS: receiver=tb-lite-receiver,worker=tb-lite-worker,loader=tb-lite-loader,channel-publish=tb-lite-channel-publish
       TB_ENV: dev
       TB_PROFILE: lite
       TB_CHANNEL: adt-passthrough
@@ -171,8 +205,12 @@ services:
       - tributary.receivers.mllp
       - --channel-spec=/generated/channel.json
       - --env=dev
+      # TODO(connector-engineer migration): delete this flag once the receiver reads the bootstrap
+      # servers from TB_ENGINE_KAFKA_FILE (`--bootstrap` is a retired input; PLAINTEXT kafka:9092 no
+      # longer exists in this stack).
       - --bootstrap=kafka:9092
     environment:
+      TB_ENGINE_KAFKA_FILE: /etc/tributary/engine-kafka.json
       # kafka_publisher.py reads clients.receiver_producer (acks, idempotence, delivery timeout)
       # from topic-defaults.json rather than hardcoding it (must_not_hardcode), so it needs the same
       # contracts/ mount and TB_CONTRACTS_DIR as the worker below.
@@ -181,6 +219,19 @@ services:
     volumes:
       - channel-spec-published:/generated:ro
       - ../../contracts:/contracts:ro
+      - ./engine-kafka/receiver.json:/etc/tributary/engine-kafka.json:ro
+      - type: volume
+        source: kafka-secrets
+        target: /var/run/secrets/tributary/tb-lite-receiver
+        read_only: true
+        volume:
+          subpath: tb-lite-receiver
+      - type: volume
+        source: kafka-secrets
+        target: /var/run/secrets/tributary/tb-lite-kafka-ca
+        read_only: true
+        volume:
+          subpath: tb-lite-kafka-ca
     read_only: true
     tmpfs:
       - /tmp
@@ -219,6 +270,8 @@ services:
     # publish_channel.py's docstring.
     build:
       context: ./channel-publish
+      additional_contexts:
+        common: ./common
     container_name: tb-channel-publish
     restart: "no"
     depends_on:
@@ -237,8 +290,21 @@ services:
       # tb-channel-version would disagree between what the receiver stamps and what the worker
       # actually applied.
       - channel-spec-published:/generated
+      - ./engine-kafka/channel-publish.json:/etc/tributary/engine-kafka.json:ro
+      - type: volume
+        source: kafka-secrets
+        target: /var/run/secrets/tributary/tb-lite-channel-publish
+        read_only: true
+        volume:
+          subpath: tb-lite-channel-publish
+      - type: volume
+        source: kafka-secrets
+        target: /var/run/secrets/tributary/tb-lite-kafka-ca
+        read_only: true
+        volume:
+          subpath: tb-lite-kafka-ca
     environment:
-      KAFKA_BOOTSTRAP: kafka:9092
+      TB_ENGINE_KAFKA_FILE: /etc/tributary/engine-kafka.json
       TB_ENV: dev
       TB_CHANNEL_SPEC: /contracts/channel.json
       TB_CHANNEL_VERSION: "1"
@@ -262,7 +328,7 @@ services:
     environment:
       TB_ENV: dev
       TB_CHANNEL: adt-passthrough
-      TB_BOOTSTRAP_SERVERS: kafka:9092
+      TB_ENGINE_KAFKA_FILE: /etc/tributary/engine-kafka.json
       TB_INSTANCE_ID: worker-0
       # The worker refuses to start without contracts/topics/v0/topic-defaults.json
       # (tributary.runtime.config: "must ship contracts/ or set TB_CONTRACTS_DIR"); mounted, not
@@ -274,6 +340,19 @@ services:
       TB_PROFILE: lite
     volumes:
       - ../../contracts:/contracts:ro
+      - ./engine-kafka/worker.json:/etc/tributary/engine-kafka.json:ro
+      - type: volume
+        source: kafka-secrets
+        target: /var/run/secrets/tributary/tb-lite-worker
+        read_only: true
+        volume:
+          subpath: tb-lite-worker
+      - type: volume
+        source: kafka-secrets
+        target: /var/run/secrets/tributary/tb-lite-kafka-ca
+        read_only: true
+        volume:
+          subpath: tb-lite-kafka-ca
     read_only: true
     tmpfs:
       - /tmp
@@ -298,14 +377,30 @@ services:
       - --channel=adt-passthrough
       - --destination=http-stub
       - --env=dev
+      # TODO(connector-engineer migration): delete this flag once the loader reads the bootstrap
+      # servers from TB_ENGINE_KAFKA_FILE.
       - --bootstrap=kafka:9092
     environment:
+      TB_ENGINE_KAFKA_FILE: /etc/tributary/engine-kafka.json
       # Consumer defaults (session.timeout.ms, commit_every, ...) come from topic-defaults.json, same
       # reason and same mount as the worker and the receiver above.
       TB_CONTRACTS_DIR: /contracts
       TB_PROFILE: lite
     volumes:
       - ../../contracts:/contracts:ro
+      - ./engine-kafka/loader.json:/etc/tributary/engine-kafka.json:ro
+      - type: volume
+        source: kafka-secrets
+        target: /var/run/secrets/tributary/tb-lite-loader
+        read_only: true
+        volume:
+          subpath: tb-lite-loader
+      - type: volume
+        source: kafka-secrets
+        target: /var/run/secrets/tributary/tb-lite-kafka-ca
+        read_only: true
+        volume:
+          subpath: tb-lite-kafka-ca
     read_only: true
     tmpfs:
       - /tmp
@@ -328,3 +423,9 @@ volumes:
   # channel spec from channel-publish to mllp-receiver and loader, not data that needs to survive a
   # restart, so it is not itself a durability concern. `docker compose down -v` clears it.
   channel-spec-published:
+  # Generated at `up` by kafka-tls-init; NEVER committed. `kafka-secrets` is mounted per component by
+  # subpath (read-only). `kafka-ca-private` holds the CA key and is mounted only by kafka-tls-init.
+  # Both survive `down` (that is what keeps the broker's SCRAM users and the files in step); reset
+  # them with `docker compose down -v`.
+  kafka-secrets:
+  kafka-ca-private:
