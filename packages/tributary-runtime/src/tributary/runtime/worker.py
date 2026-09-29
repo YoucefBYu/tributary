@@ -19,8 +19,9 @@ from __future__ import annotations
 import functools
 import os
 import signal
+import sys
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, cast
@@ -39,6 +40,7 @@ from .clients import KafkaSettings, consumer_config, events_producer_config, max
 from .config import TopicDefaults, load_topic_defaults
 from .consumer import ConsumerLoop, KafkaConsumerLike, LoopSettings, LoopStats
 from .context import WorkerContext
+from .engine_kafka import load_engine_kafka
 from .errors import (
     ChannelSpecError,
     DeliveryError,
@@ -974,6 +976,9 @@ class PipelineWorker:
         # Before any client is built: a warning emitted after a failed connection is a warning nobody
         # sees on the run where it matters most.
         emit_profile_warning(self.log, defaults, profile=self.settings.profile)
+        # Protocol, mechanism and broker count only: never a host, principal or path (engine-kafka/v0 4.5).
+        # Every client below, the `_tb.<env>.channels` reader first, is built from this one link.
+        self.log.info("engine_kafka_link", **self.settings.kafka.describe())
 
         cache_consumer = cast(
             "ChannelsConsumerLike",
@@ -1127,12 +1132,23 @@ class PipelineWorker:
             self.loop.stop()
 
 
-def main() -> int:
-    """Entry point for the container image: configuration from the environment, SIGTERM-aware."""
+def main(argv: Sequence[str] | None = None) -> int:
+    """Entry point for the container image: configuration from the environment, SIGTERM-aware.
+
+    The engine link comes only from the `TB_ENGINE_KAFKA_FILE` document (`engine-kafka/v0`, ADR-008):
+    there is no default broker, and `TB_BOOTSTRAP_SERVERS` or `--bootstrap` refuses to start rather
+    than being silently ignored. A refused configuration exits 2 before any Kafka client exists.
+    """
+    try:
+        kafka = load_engine_kafka(argv=sys.argv[1:] if argv is None else argv)
+    except RuntimeConfigurationError as exc:
+        # The message names JSON paths, rules and secretRef names only (EngineKafkaError contract).
+        JsonLogger("worker").error("startup_refused", error=type(exc).__name__, reason=str(exc)[:256])
+        return 2
     settings = WorkerSettings(
         env=os.environ.get("TB_ENV", "dev"),
         channel=os.environ["TB_CHANNEL"],
-        kafka=KafkaSettings(bootstrap_servers=os.environ.get("TB_BOOTSTRAP_SERVERS", "localhost:9092")),
+        kafka=kafka,
         instance_id=os.environ.get("TB_INSTANCE_ID", f"pipeline-{os.getpid()}"),
         profile=os.environ.get("TB_PROFILE", "lite"),
         contracts_dir=os.environ.get("TB_CONTRACTS_DIR"),

@@ -14,6 +14,8 @@ __all__ = [
     "ConfigError",
     "DeliveryError",
     "DlqUnwritableError",
+    "EngineKafkaError",
+    "KafkaSecurityError",
     "PartitionMismatchError",
     "RuntimeConfigurationError",
     "TopicNameError",
@@ -27,6 +29,21 @@ class RuntimeConfigurationError(TributaryError):
 
 class ConfigError(RuntimeConfigurationError):
     """A contract defaults file is missing, unreadable, or does not have the shape the runtime needs."""
+
+
+class KafkaSecurityError(RuntimeConfigurationError):
+    """A Kafka client configuration would connect unauthenticated, unverified or weakened.
+
+    Raised by `KafkaSettings` at construction (`contracts/engine-kafka/v0` section 4). The message names
+    the rule and, at most, a property name or entry index: never a host, a credential, a path or a value.
+    """
+
+
+class EngineKafkaError(RuntimeConfigurationError):
+    """The engine Kafka connection document (`TB_ENGINE_KAFKA_FILE`) is missing, invalid or unresolvable.
+
+    Same message rule as `KafkaSecurityError`: JSON paths, rule names and `secretRef` names only.
+    """
 
 
 class TopicNameError(RuntimeConfigurationError):
