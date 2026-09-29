@@ -8,7 +8,10 @@ What is pinned here, each against the contract rule it comes from:
   partial failure -> the first failure in **spec order**;
 * fail-fast: a lost reply neither raises, nor retries, nor fails the next record's flush;
 * a bad routing header disables the reply, not the message (envelope 2.3.3);
-* expired, transactional and split records produce no reply and are counted;
+* expired, transactional and split records produce no reply and are counted; an expired one is also a
+  `replied` / `dropped` event;
+* an unknown or stale `reply` partition count leaves a route unverified (reply attempted), never
+  `REPLY_ROUTE_INVALID`, and metadata is never fetched on the consumer thread;
 * `ctx.reply`: pipeline steps only, a failed attempt's body discarded, `REPLY_BODY_MISSING`;
 * PHI: neither the record key nor MSH-10 reaches a reply header, the reply key, a log line or an event.
 """
@@ -25,6 +28,7 @@ from tributary.runtime.errors import ChannelSpecError
 from tributary.runtime.events import MessageEvent
 from tributary.runtime.reply import (
     ACCEPTED,
+    EXPIRED_MESSAGE,
     PIPELINE_RANK,
     FailureLedger,
     ReplyOutcome,
@@ -55,6 +59,7 @@ from .reply_harness import (
 
 OUT = "dev.adt-passthrough.out.http-stub"
 HL7 = "application/hl7-v2+er7"
+EVENT_SCHEMA = json.loads((CONTRACTS / "events" / "v0" / "event.schema.json").read_text(encoding="utf-8"))
 ACK_BODY = (
     f"MSH|^~\\&|ENGINE|LAB|TRIBUTARY-SYNTH|LAB|20260928||ACK^Q11|ACK-1|P|2.5.1\rMSA|AA|{CONTROL_ID_MARKER}\r".encode()
 )
@@ -277,6 +282,12 @@ def test_an_expired_reply_is_skipped_but_the_message_is_processed() -> None:
     assert r.producer.records(OUT), "sync mode never cancels work"
     assert r.producer.replies() == []
     assert r.replies.stats.expired == 1
+    (event,) = replied(r)
+    assert (event.status, event.error_code) == ("dropped", None), "a deliberate skip: no code, like a Drop"
+    assert event.error_message == EXPIRED_MESSAGE and event.correlation_id is not None
+    projected = event.to_dict()
+    assert list(Draft202012Validator(EVENT_SCHEMA).iter_errors(projected)) == [], "valid under events/v0"
+    assert "MARKER" not in json.dumps(projected)
 
 
 def test_the_skew_allowance_is_five_seconds() -> None:
@@ -325,37 +336,144 @@ def test_a_deadline_without_a_partition_is_invalid_and_no_route_is_async() -> No
     assert parse_route(no_correlation, partition_count=3) == RouteInvalid("correlation-id-invalid")
 
 
-def test_an_unknown_reply_topic_refuses_the_route() -> None:
-    assert parse_route(sync_request(), partition_count=None) == RouteInvalid("reply-topic-unknown")
+def test_an_unknown_partition_count_leaves_the_route_unverified_not_invalid() -> None:
+    """W2-8 review: a transient metadata failure was reported as `REPLY_ROUTE_INVALID`, which says the
+    *header* is wrong (envelope 2.3.3). Unknown proves nothing about the header, so the range check is
+    skipped and the reply attempted; a partition that does not exist fails its produce instead."""
+    route = parse_route(sync_request(partition="9"), partition_count=None)
+    assert isinstance(route, ReplyRoute) and route.partition == 9
+    assert parse_route(sync_request(partition="9"), partition_count=3) == RouteInvalid("partition-out-of-range")
     route = parse_route(sync_request(partition="2"), partition_count=3)
     assert isinstance(route, ReplyRoute) and route.partition == 2
 
 
-def test_the_partition_count_is_cached_and_refreshed_on_a_miss_at_most_once_per_interval() -> None:
+def test_the_worker_answers_when_metadata_is_unavailable() -> None:
+    r = rig(steps=(passthrough,), partitions=None)
+    r.run(sync_request(partition="2"))
+    (reply,) = r.producer.replies()
+    assert reply.partition == 2
+    assert [event.error_code for event in replied(r)] == [None]
+    assert r.replies.stats.route_invalid == 0
+
+
+def test_an_unverified_partition_that_does_not_exist_fails_as_produce_failed() -> None:
+    r = rig(steps=(passthrough,), partitions=None)
+    r.producer.refuse_topics.add(REPLY)  # what librdkafka does with an unknown partition
+    r.run(sync_request(partition="9"))
+    (event,) = replied(r)
+    assert (event.status, event.error_code) == ("error", "PRODUCE_FAILED")
+    assert r.replies.stats.route_invalid == 0
+
+
+class _Topic:
+    error = None
+
+    def __init__(self, count: int) -> None:
+        self.partitions = dict.fromkeys(range(count))
+
+
+class _Metadata:
+    def __init__(self, count: int) -> None:
+        self.topics = {REPLY: _Topic(count)}
+
+
+class _Deferred:
+    """A `spawn` that queues the fetch, so a test controls exactly when the 'background' fetch runs."""
+
+    def __init__(self) -> None:
+        self.pending: list[Any] = []
+
+    def __call__(self, target: Any) -> None:
+        self.pending.append(target)
+
+    def run_all(self) -> None:
+        pending, self.pending = self.pending, []
+        for target in pending:
+            target()
+
+
+def test_the_partition_count_is_fetched_off_the_callers_thread() -> None:
     calls: list[str] = []
+    now = [0.0]
+    spawn = _Deferred()
+
+    def list_topics(*, topic: str, timeout: float) -> _Metadata:
+        calls.append(topic)
+        return _Metadata(3)
+
+    count = ReplyPartitionCount(list_topics, REPLY, refresh_s=30.0, clock=lambda: now[0], spawn=spawn)
+    assert count(1) is None and calls == [], "unknown: answered at once, fetched later"
+    assert count(1) is None and len(spawn.pending) == 1, "one fetch in flight at most"
+    spawn.run_all()
+    assert calls == [REPLY]
+    assert count(1) == 3 and count(2) == 3
+    assert count(4) == 3, "a fresh count proves 4 out of range"
+    assert spawn.pending == [], "fresh: nothing to fetch"
+
+
+def test_a_stale_count_is_refreshed_and_does_not_prove_a_miss() -> None:
     counts = iter([3, 6])
     now = [0.0]
+    spawn = _Deferred()
 
-    class Topic:
-        error = None
+    def list_topics(*, topic: str, timeout: float) -> _Metadata:
+        return _Metadata(next(counts))
 
-        def __init__(self, count: int) -> None:
-            self.partitions = dict.fromkeys(range(count))
-
-    class Metadata:
-        def __init__(self, count: int) -> None:
-            self.topics = {REPLY: Topic(count)}
-
-    def list_topics(*, topic: str, timeout: float) -> Metadata:
-        calls.append(topic)
-        return Metadata(next(counts))
-
-    count = ReplyPartitionCount(list_topics, REPLY, refresh_s=30.0, clock=lambda: now[0])
-    assert count(1) == 3
-    assert count(2) == 3 and len(calls) == 1, "in range: cached"
-    assert count(4) == 3 and len(calls) == 1, "a miss inside the interval does not refetch"
+    count = ReplyPartitionCount(list_topics, REPLY, refresh_s=30.0, clock=lambda: now[0], spawn=spawn)
+    count(0)
+    spawn.run_all()
     now[0] = 31.0
-    assert count(4) == 6 and len(calls) == 2, "a miss after the interval refetches"
+    assert count(1) == 3, "below any known count is valid: Kafka cannot remove partitions"
+    assert len(spawn.pending) == 1, "stale: a refresh started in the background"
+    assert count(4) is None, "beyond a stale count: unverified (an operator may have added partitions)"
+    assert len(spawn.pending) == 1, "still one in flight"
+    spawn.run_all()
+    assert count(4) == 6
+
+
+def test_a_failing_fetch_leaves_routes_unverified_and_is_retried_once_per_interval() -> None:
+    now = [0.0]
+    calls: list[float] = []
+    spawn = _Deferred()
+
+    def broken(*, topic: str, timeout: float) -> _Metadata:
+        calls.append(now[0])
+        raise RuntimeError("synthetic metadata timeout")
+
+    count = ReplyPartitionCount(broken, REPLY, refresh_s=30.0, clock=lambda: now[0], spawn=spawn)
+    assert count(9) is None
+    spawn.run_all()
+    assert count(9) is None and spawn.pending == [], "no retry inside the interval: a flood is one request"
+    now[0] = 30.0
+    assert count(9) is None and len(spawn.pending) == 1
+    spawn.run_all()
+    assert calls == [0.0, 30.0]
+
+
+def test_a_blocked_metadata_request_does_not_block_the_caller() -> None:
+    """The default spawn is a real thread: a `list_topics` stuck for its whole timeout costs the caller
+    nothing (it used to run on the consumer thread with a 5 s timeout)."""
+    import threading
+    import time
+
+    release = threading.Event()
+    entered = threading.Event()
+
+    def stuck(*, topic: str, timeout: float) -> _Metadata:
+        entered.set()
+        release.wait(5.0)
+        return _Metadata(3)
+
+    count = ReplyPartitionCount(stuck, REPLY)
+    started = time.monotonic()
+    assert count(1) is None
+    assert time.monotonic() - started < 0.5
+    assert entered.wait(2.0), "the fetch ran on another thread"
+    release.set()
+    deadline = time.monotonic() + 2.0
+    while count(1) is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert count(1) == 3
 
 
 # -- specs that cannot reply -----------------------------------------------------------------------

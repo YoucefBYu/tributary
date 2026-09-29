@@ -7,10 +7,19 @@ Normative sources: channel-spec README 3.2.6 ("Worker rules"), envelope README 3
 the `raw` record carries `tb-reply-partition`, so a hot reload between sync and async strands nothing.
 Three exceptions produce no reply and count it: a worker whose applied spec is transactional or has a
 splitter (`replies_skipped`), a reply past `tb-reply-deadline` plus 5 s of skew (`replies_expired`;
-the message is still processed), and a malformed or out-of-range routing header, which disables the
-reply and **not** the message (envelope 2.3.3: a `replied` event with `REPLY_ROUTE_INVALID`). In every
-one of them the sender gets `AE` / `REPLY_TIMEOUT` from its receiver, which is the truthful answer: the
-message was committed.
+the message is still processed; a `replied` event with `status: dropped` and a fixed `error_message`,
+no code, the way a `Drop` reason is carried), and a malformed or out-of-range routing header, which
+disables the reply and **not** the message (envelope 2.3.3: a `replied` event with
+`REPLY_ROUTE_INVALID`). In every one of them the sender gets `AE` / `REPLY_TIMEOUT` from its receiver,
+which is the truthful answer: the message was committed.
+
+**Out of range means proven out of range.** The `reply` partition count comes from cluster metadata,
+fetched off the consumer thread (`ReplyPartitionCount`), so a slow or failing metadata request never
+stalls a partition. `REPLY_ROUTE_INVALID` is only given against a count fetched within `refresh_s`.
+When the count is unknown (the first sync record, a failed fetch) or a header names a partition beyond
+a stale count (an operator may have added partitions), the route is *unverified*, not invalid: the
+reply is attempted, and a partition that does not exist fails its produce as `PRODUCE_FAILED`. A
+transient metadata failure is therefore never reported as a bad header.
 
 **When.** After every `out` record's delivery callback, and after the `dlq` callback when the message
 was dead-lettered — `AA` means committed *and routed* (D10). The worker caller guarantees the order;
@@ -35,6 +44,7 @@ that body is payload: never logged. Log lines carry `tb-msg-id`, codes and coord
 
 from __future__ import annotations
 
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -62,6 +72,9 @@ SKEW_ALLOWANCE = timedelta(seconds=5)
 
 #: Envelope 3: a reply without a step body is zero bytes of this type; the status header is the answer.
 EMPTY_REPLY_CONTENT_TYPE = "application/octet-stream"
+
+#: The `error_message` of the `replied` / `dropped` event for a reply past its deadline. Static text.
+EXPIRED_MESSAGE = "reply past tb-reply-deadline plus the skew allowance; not produced, message processed"
 
 #: Reply produce failures reuse the registered `PRODUCE_FAILED` with stage `replied` (proposal 6).
 PRODUCE_FAILED = "PRODUCE_FAILED"
@@ -101,9 +114,10 @@ class RouteInvalid:
 def parse_route(message: Message, *, partition_count: int | None) -> ReplyRoute | RouteInvalid | None:
     """The reply route of a consumed `raw` record: `None` for an async record, else a route or a refusal.
 
-    Total: never raises. `partition_count` is the real partition count of the channel's `reply` topic,
-    or `None` when it is unknown, which refuses every route: a partition that cannot be checked is not
-    one to answer on.
+    Total: never raises. `partition_count` is a **verified** partition count of the channel's `reply`
+    topic, or `None` when none is available now; then the range check is skipped (the route is
+    unverified, see the module doc) rather than failed, because an unknown count says nothing about the
+    header.
     """
     partition_text = message.get(h.TB_REPLY_PARTITION)
     deadline_text = message.get(h.TB_REPLY_DEADLINE)
@@ -117,9 +131,7 @@ def parse_route(message: Message, *, partition_count: int | None) -> ReplyRoute 
         partition = h.parse_int(h.TB_REPLY_PARTITION, partition_text)  # 0-63, envelope 3
     except HeaderError:
         return RouteInvalid("partition-malformed")
-    if partition_count is None:
-        return RouteInvalid("reply-topic-unknown")
-    if partition >= partition_count:
+    if partition_count is not None and partition >= partition_count:
         return RouteInvalid("partition-out-of-range")
     try:
         deadline = h.parse_timestamp(h.TB_REPLY_DEADLINE, deadline_text)
@@ -131,15 +143,38 @@ def parse_route(message: Message, *, partition_count: int | None) -> ReplyRoute 
     return ReplyRoute(partition=partition, deadline=deadline, correlation_id=correlation_id)
 
 
-class ReplyPartitionCount:
-    """The real partition count of one `reply` topic, from cluster metadata, cached.
+def _spawn_daemon(target: Callable[[], None]) -> None:
+    threading.Thread(target=target, name="tb-reply-metadata", daemon=True).start()
 
-    Refreshed at most once per `refresh_s` when asked about a partition the cached count does not cover
-    or when the count is unknown, so an operator who adds reply partitions is picked up without a
-    restart and a flood of bad headers cannot turn into a metadata request per record.
+
+class ReplyPartitionCount:
+    """The partition count of one `reply` topic, from cluster metadata, **never fetched on the caller's
+    thread** (the consumer thread: a 5 s `list_topics` there stalled every partition it held).
+
+    `__call__(wanted)` answers from the cache at once. It returns a count to check `wanted` against, or
+    `None` when the route cannot be verified now: the count is unknown, or `wanted` is at or beyond a
+    count fetched more than `refresh_s` ago. A partition below any known count is always valid (Kafka
+    cannot remove partitions). Only a count fetched within `refresh_s` can prove a header out of range.
+
+    Whenever the count is unknown or older than `refresh_s`, a background fetch is started: at most one
+    in flight and at most one started per `refresh_s`, so a flood of bad headers cannot turn into a
+    metadata request per record, and an operator who adds reply partitions is picked up without a
+    restart. Async records never get here (`ReplyPublisher.route`), so an async-only worker never asks
+    for a `reply` topic's metadata. `spawn` runs the fetch; the default is a daemon thread.
     """
 
-    __slots__ = ("_checked_at", "_clock", "_count", "_list_topics", "_refresh_s", "_topic")
+    __slots__ = (
+        "_attempted_at",
+        "_clock",
+        "_count",
+        "_fetched_at",
+        "_in_flight",
+        "_list_topics",
+        "_lock",
+        "_refresh_s",
+        "_spawn",
+        "_topic",
+    )
 
     def __init__(
         self,
@@ -148,27 +183,58 @@ class ReplyPartitionCount:
         *,
         refresh_s: float = 30.0,
         clock: Callable[[], float] = time.monotonic,
+        spawn: Callable[[Callable[[], None]], None] = _spawn_daemon,
     ) -> None:
         self._list_topics = list_topics
         self._topic = topic
         self._refresh_s = refresh_s
         self._clock = clock
+        self._spawn = spawn
+        self._lock = threading.Lock()
         self._count: int | None = None
-        self._checked_at: float | None = None
+        self._fetched_at: float | None = None
+        self._attempted_at: float | None = None
+        self._in_flight = False
 
     def __call__(self, wanted: int | None = None) -> int | None:
-        stale = self._count is None or (wanted is not None and wanted >= self._count)
         now = self._clock()
-        if stale and (self._checked_at is None or now - self._checked_at >= self._refresh_s):
-            self._checked_at = now
-            self._count = self._fetch() or self._count
-        return self._count
+        with self._lock:
+            count, fetched_at = self._count, self._fetched_at
+        fresh = count is not None and fetched_at is not None and now - fetched_at < self._refresh_s
+        if not fresh:
+            self._start_fetch(now)
+        if count is not None and (fresh or wanted is None or wanted < count):
+            return count
+        return None  # unknown, or beyond a stale count: unverified, not invalid
+
+    def _start_fetch(self, now: float) -> None:
+        with self._lock:
+            if self._in_flight or (self._attempted_at is not None and now - self._attempted_at < self._refresh_s):
+                return
+            self._in_flight = True
+            self._attempted_at = now
+        try:
+            self._spawn(self._fetch_and_store)
+        except Exception:  # no thread: stay unverified and try again after refresh_s
+            with self._lock:
+                self._in_flight = False
+
+    def _fetch_and_store(self) -> None:
+        count: int | None = None
+        try:
+            count = self._fetch()
+        finally:
+            with self._lock:
+                if count is not None:
+                    self._count = count
+                    self._fetched_at = self._clock()
+                self._in_flight = False
 
     def _fetch(self) -> int | None:
         try:
             metadata = self._list_topics(topic=self._topic, timeout=5.0)
             topic = metadata.topics.get(self._topic)
-        except Exception:  # metadata is best effort: unknown refuses the route, the message still flows
+        except Exception:  # metadata is best effort: unknown leaves routes unverified, never invalid
             return None
         if topic is None or getattr(topic, "error", None) is not None or not topic.partitions:
             return None
@@ -336,7 +402,18 @@ class ReplyPublisher:
         if self._now() > route.deadline + SKEW_ALLOWANCE:
             # The message was processed; only the answer is skipped. Nobody is waiting for it, and after
             # an outage a backlog would otherwise flood `reply` (S3: 1,026 late replies in one restart).
+            # The skip is deliberate, so its event is `dropped` with a fixed reason and no code (events/v0:
+            # a code is for `error` and `timeout`; `REPLY_TIMEOUT` is the receiver's, envelope 2.3.2).
             self.stats.expired += 1
+            self._emit(
+                record,
+                channel,
+                channel_version,
+                status="dropped",
+                error_code=None,
+                error_message=EXPIRED_MESSAGE,
+                correlation_id=route.correlation_id,
+            )
             return False
         try:
             message = reply_message(
@@ -501,7 +578,7 @@ class ReplyPublisher:
         channel: str,
         channel_version: int,
         *,
-        status: Literal["ok", "error"],
+        status: Literal["ok", "error", "dropped"],
         error_code: str | None,
         error_message: str | None,
         correlation_id: str | None,
