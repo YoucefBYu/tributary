@@ -74,20 +74,16 @@ from tests.support.processes import (
 
 pytestmark = pytest.mark.integration
 
-#: Exit criterion 1 cannot pass at HEAD; both blockers are component gaps, reported to their owners
-#: (2026-09-29), and this strict xfail turns into a failure the moment they are fixed so it gets removed:
-#:  1. the MLLP receiver refuses `ordering: per-key` (`spec_rejected`: needs the W2-4 keyExpression
-#:     evaluator), and the published example is per-key. Owner: connector-engineer (receiver) with
-#:     platform-engineer (shared evaluator).
-#:  2. the worker's `WorkerContext` has no `.fhir` / `.terminology`, so the real W2-3 step
-#:     `tributary.content_hl7_fhir.adt` raises `AttributeError` and the message is dead-lettered
-#:     (`TRANSFORM_ERROR`). Owner: platform-engineer (`tributary-runtime`, `attach()` call site).
-#: With both worked around in a scratch run (ordering none plus a sitecustomize attaching LocalFhir) every
-#: assertion below passes, so the test body itself is validated.
+#: Exit criterion 1 (the main test) still cannot pass at HEAD: the worker's `WorkerContext` has no
+#: `.fhir` / `.terminology`, so the real W2-3 step `tributary.content_hl7_fhir.adt` raises `AttributeError`
+#: and the message is dead-lettered (`TRANSFORM_ERROR`). Owner: platform-engineer (`tributary-runtime`,
+#: the `attach()` call site). The MLLP per-key refusal was fixed in 6ad5569. This strict xfail turns into a
+#: failure the moment the worker is fixed, so it gets removed then. With `ctx.fhir` attached in a scratch
+#: run every assertion below passed, so the test body itself is validated.
 BLOCKED = pytest.mark.xfail(
     strict=True,
     raises=(ProcessDiedError, AssertionError),
-    reason="W2 exit criterion 1 blocked: receiver refuses per-key; WorkerContext has no ctx.fhir",
+    reason="worker has no ctx.fhir (platform-engineer)",
 )
 
 ENV = "dev"
@@ -510,7 +506,6 @@ def test_adt_flows_from_mllp_to_hapi_and_clickhouse(
     assert phi_leaks(lines) == [], "a process wrote a patient marker to its log (invariant 6)"
 
 
-@BLOCKED
 def test_control_a_spec_without_the_fhir_destination_fails_the_hapi_assertions(
     kafka: str, hapi: str, clickhouse: ClickHouseContainer, secrets_dir: str, tmp_path: Path
 ) -> None:

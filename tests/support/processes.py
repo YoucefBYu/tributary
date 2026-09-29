@@ -170,8 +170,8 @@ def spawn_mllp_receiver_from_topic(
     timeout_s: float = 30.0,
 ) -> ManagedProcess:
     """The receiver in its post-migration form: `--channel <name>`, the spec read from the compacted
-    `_tb.<env>.channels` topic (invariant 3). `--channel-spec` is retired at HEAD (`CHANNEL_SPEC_FLAG_RETIRED`),
-    so `spawn_mllp_receiver` above no longer starts. The spec must be published before this is called."""
+    `_tb.<env>.channels` topic (invariant 3). For a spec already on the topic; `spawn_mllp_receiver` above
+    publishes a spec file first and then does the same. The spec must be published before this is called."""
     args = [
         sys.executable,
         "-m",
