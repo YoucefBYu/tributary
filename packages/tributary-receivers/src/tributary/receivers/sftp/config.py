@@ -59,7 +59,6 @@ class SftpSettings:
     max_message_bytes: int
     ack_timeout_s: float
     env: str
-    bootstrap_servers: str
     instance: str = "sftp-0"
     connect_timeout_s: float = 15.0
     op_timeout_s: float = 30.0
@@ -105,9 +104,7 @@ def _require(mapping: Mapping[str, Any], key: str, where: str) -> Any:
         raise ConfigError(f"{where}: missing required field {key!r}") from None
 
 
-def sftp_settings_from_channel_spec(
-    spec: Mapping[str, Any], *, env: str, bootstrap_servers: str, instance: str = "sftp-0"
-) -> SftpSettings:
+def sftp_settings_from_channel_spec(spec: Mapping[str, Any], *, env: str, instance: str = "sftp-0") -> SftpSettings:
     """Build `SftpSettings` from a parsed channel-spec document. Raises `ConfigError` for anything this
     poller cannot honour; never silently ignores a field the schema allows."""
     metadata = _require(spec, "metadata", "channel spec")
@@ -155,6 +152,5 @@ def sftp_settings_from_channel_spec(
         max_message_bytes=int(source.get("maxMessageBytes", DEFAULT_MAX_MESSAGE_BYTES)),
         ack_timeout_s=ack.get("timeoutMs", DEFAULT_ACK_TIMEOUT_MS) / 1000,
         env=env,
-        bootstrap_servers=bootstrap_servers,
         instance=instance,
     )

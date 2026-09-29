@@ -83,7 +83,6 @@ class HttpSettings:
     queue_max_bytes: int
     queue_max_messages: int | None
     env: str
-    bootstrap_servers: str
     instance: str = "http-0"
     idle_timeout_s: float = 30.0
     request_timeout_s: float = 30.0  # whole head + body, not per read: a trickling sender cannot outlast it
@@ -121,9 +120,7 @@ def _require(mapping: Mapping[str, Any], key: str, where: str) -> Any:
         raise ConfigError(f"{where}: missing required field {key!r}") from None
 
 
-def http_settings_from_channel_spec(
-    spec: Mapping[str, Any], *, env: str, bootstrap_servers: str, instance: str = "http-0"
-) -> HttpSettings:
+def http_settings_from_channel_spec(spec: Mapping[str, Any], *, env: str, instance: str = "http-0") -> HttpSettings:
     """Build `HttpSettings` from a parsed channel-spec document. Raises `ConfigError` for anything
     this receiver cannot honour; never silently ignores a field the schema allows."""
     metadata = _require(spec, "metadata", "channel spec")
@@ -186,6 +183,5 @@ def http_settings_from_channel_spec(
         queue_max_bytes=queue_max_bytes,
         queue_max_messages=queue.get("maxMessages"),
         env=env,
-        bootstrap_servers=bootstrap_servers,
         instance=instance,
     )

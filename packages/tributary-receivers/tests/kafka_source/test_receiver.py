@@ -142,7 +142,6 @@ def settings(**kw: object) -> KafkaSourceSettings:
         max_message_bytes=1_000_000,
         ack_timeout_s=5.0,
         env="dev",
-        bootstrap_servers="engine:9092",
         commit_every=3,
         commit_flush_interval_s=10.0,
     )

@@ -3,7 +3,7 @@ is acknowledged; an unavailable `raw` cluster commits nothing; a refused record 
 
 The source connection is configured explicitly (ADR-007 D11) even though the test's source and engine
 clusters are the same container: the receiver is given the source side through `source_bootstrap` and the
-engine side through `bootstrap_servers`, and the unavailable-Kafka test points only the latter at a dead
+engine side through the `KafkaSettings` given to `RawPublisher`, and the unavailable-Kafka test points only the latter at a dead
 port, which is what proves the two are separate connections.
 """
 
@@ -21,6 +21,7 @@ from tributary.receivers.kafka_source.config import KafkaSourceSettings, SourceS
 from tributary.receivers.kafka_source.receiver import KafkaSourceReceiver, build_consumer
 from tributary.receivers.mllp.kafka_publisher import RawPublisher, topic_name
 from tributary.receivers.secrets import DirSecretResolver
+from tributary.runtime.clients import KafkaSettings
 from tributary.sdk.keys import parse_key_expression
 
 from tests.support.kafka_helpers import create_topics_with_retry, drain_topic, free_port, header_map
@@ -44,7 +45,6 @@ def cfg_for(source: str, engine: str, channel: str, topic: str, **kw: object) ->
         max_message_bytes=1_000,
         ack_timeout_s=kw.pop("ack_timeout_s", 15.0),  # type: ignore[arg-type]
         env=ENV,
-        bootstrap_servers=engine,
         instance=f"kafka-{uuid.uuid4().hex[:6]}",
         commit_every=2,
         commit_flush_interval_s=0.5,
@@ -95,7 +95,9 @@ def test_source_offset_advances_only_for_records_committed_to_raw(kafka: str) ->
     cfg = cfg_for(kafka, kafka, channel, src)
 
     async def go() -> KafkaSourceReceiver:
-        publisher = RawPublisher(kafka, topic_name(ENV, channel), ordering="per-key", client_id_prefix="ksrc-test")
+        publisher = RawPublisher(
+            KafkaSettings(kafka), topic_name(ENV, channel), ordering="per-key", client_id_prefix="ksrc-test"
+        )
         publisher.start(asyncio.get_running_loop())
         rx = KafkaSourceReceiver(cfg, publisher, build_consumer(cfg, DirSecretResolver()))
         try:
@@ -121,7 +123,9 @@ def test_unreachable_raw_cluster_commits_no_source_offset(kafka: str) -> None:
     cfg = cfg_for(kafka, dead, channel, src, ack_timeout_s=1.0)
 
     async def go() -> KafkaSourceReceiver:
-        publisher = RawPublisher(dead, topic_name(ENV, channel), ordering="per-key", client_id_prefix="ksrc-test")
+        publisher = RawPublisher(
+            KafkaSettings(dead), topic_name(ENV, channel), ordering="per-key", client_id_prefix="ksrc-test"
+        )
         publisher.start(asyncio.get_running_loop())
         rx = KafkaSourceReceiver(cfg, publisher, build_consumer(cfg, DirSecretResolver()))
         try:
@@ -143,7 +147,9 @@ def test_refused_record_halts_the_partition_and_later_records_are_not_committed_
     cfg = cfg_for(kafka, kafka, channel, src)  # max_message_bytes=1000: record C is oversize
 
     async def go() -> tuple[KafkaSourceReceiver, dict[int, int]]:
-        publisher = RawPublisher(kafka, topic_name(ENV, channel), ordering="per-key", client_id_prefix="ksrc-test")
+        publisher = RawPublisher(
+            KafkaSettings(kafka), topic_name(ENV, channel), ordering="per-key", client_id_prefix="ksrc-test"
+        )
         publisher.start(asyncio.get_running_loop())
         rx = KafkaSourceReceiver(cfg, publisher, build_consumer(cfg, DirSecretResolver()))
         stop = asyncio.Event()

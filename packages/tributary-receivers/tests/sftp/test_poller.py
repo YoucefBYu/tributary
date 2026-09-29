@@ -156,7 +156,6 @@ def settings(**kw: object) -> SftpSettings:
         max_message_bytes=1_000_000,
         ack_timeout_s=5.0,
         env="dev",
-        bootstrap_servers="unused:9092",
     )
     return replace(base, **kw)  # type: ignore[arg-type]
 

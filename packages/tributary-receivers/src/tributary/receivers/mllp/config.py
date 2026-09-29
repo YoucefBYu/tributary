@@ -54,7 +54,6 @@ class MllpSettings:
     queue_max_bytes: int
     queue_max_messages: int | None
     env: str
-    bootstrap_servers: str
     instance: str = "mllp-0"
     idle_timeout_s: float = 60.0
     write_timeout_s: float = 10.0
@@ -89,9 +88,7 @@ def _require(mapping: Mapping[str, Any], key: str, where: str) -> Any:
         raise ConfigError(f"{where}: missing required field {key!r}") from None
 
 
-def mllp_settings_from_channel_spec(
-    spec: Mapping[str, Any], *, env: str, bootstrap_servers: str, instance: str = "mllp-0"
-) -> MllpSettings:
+def mllp_settings_from_channel_spec(spec: Mapping[str, Any], *, env: str, instance: str = "mllp-0") -> MllpSettings:
     """Build `MllpSettings` from a parsed channel-spec document. Raises `ConfigError` for anything
     this receiver cannot honour; never silently ignores a field the schema allows."""
     metadata = _require(spec, "metadata", "channel spec")
@@ -157,6 +154,5 @@ def mllp_settings_from_channel_spec(
         queue_max_bytes=queue_max_bytes,
         queue_max_messages=queue.get("maxMessages"),
         env=env,
-        bootstrap_servers=bootstrap_servers,
         instance=instance,
     )

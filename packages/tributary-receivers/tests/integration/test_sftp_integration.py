@@ -15,6 +15,7 @@ from tributary.receivers.mllp.kafka_publisher import RawPublisher, topic_name
 from tributary.receivers.secrets import DirSecretResolver
 from tributary.receivers.sftp.poller import SftpPoller
 from tributary.receivers.sftp.session import connect, fingerprint
+from tributary.runtime.clients import KafkaSettings
 
 from tests.support.kafka_helpers import create_topics_with_retry, drain_topic, free_port, header_map
 
@@ -44,7 +45,6 @@ def make_cfg(server: FakeSftpServer, key: paramiko.PKey, bootstrap: str, channel
         port=server.port,
         host_keys=frozenset({fingerprint(key.asbytes())}),
         auth_secret_ref="cred",  # noqa: S106
-        bootstrap_servers=bootstrap,
         ack_timeout_s=kw.pop("ack_timeout_s", 15.0),  # type: ignore[arg-type]
         connect_timeout_s=5.0,
         op_timeout_s=5.0,
@@ -62,7 +62,9 @@ def test_file_is_archived_only_after_its_record_is_committed(
     async def go() -> None:
         with FakeSftpServer(root, [key]) as srv:
             cfg = make_cfg(srv, key, kafka, channel)
-            publisher = RawPublisher(kafka, topic_name("dev", channel), client_id_prefix="sftp-receiver-test")
+            publisher = RawPublisher(
+                KafkaSettings(kafka), topic_name("dev", channel), client_id_prefix="sftp-receiver-test"
+            )
             publisher.start(asyncio.get_running_loop())
             try:
                 poller = SftpPoller(cfg, publisher, lambda: connect(cfg, secrets))
@@ -87,7 +89,9 @@ def test_unreachable_kafka_leaves_the_file_in_place(world: tuple[Path, DirSecret
     async def go() -> None:
         with FakeSftpServer(root, [key]) as srv:
             cfg = make_cfg(srv, key, dead, "sftp-down", ack_timeout_s=2.0)
-            publisher = RawPublisher(dead, topic_name("dev", "sftp-down"), client_id_prefix="sftp-receiver-test")
+            publisher = RawPublisher(
+                KafkaSettings(dead), topic_name("dev", "sftp-down"), client_id_prefix="sftp-receiver-test"
+            )
             publisher.start(asyncio.get_running_loop())
             try:
                 poller = SftpPoller(cfg, publisher, lambda: connect(cfg, secrets))

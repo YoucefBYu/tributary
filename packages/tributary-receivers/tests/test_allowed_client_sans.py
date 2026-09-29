@@ -88,7 +88,7 @@ def _http_settings(tls: TlsSpec) -> HttpSettings:
         channel="fhir-in", channel_version=1, bind="127.0.0.1", port=0, tls=tls, path="/ingest",
         accept=frozenset({"application/fhir+json"}), auth=AuthSpec("mtls"), key_expression=None,
         nack_on=frozenset(), ack_timeout_s=5.0, max_message_bytes=1_000_000, queue_max_bytes=64 * 1024 * 1024,
-        queue_max_messages=None, env="dev", bootstrap_servers="unused:9092", idle_timeout_s=2.0,
+        queue_max_messages=None, env="dev", idle_timeout_s=2.0,
         request_timeout_s=3.0,
     )  # fmt: skip
 
@@ -97,7 +97,7 @@ def _mllp_settings(tls: TlsSpec) -> MllpSettings:
     return MllpSettings(
         channel="adt-in", channel_version=1, bind="127.0.0.1", port=0, tls=tls, ack_timeout_s=5.0,
         nack_on=frozenset(), max_message_bytes=1_000_000, queue_max_bytes=64 * 1024 * 1024,
-        queue_max_messages=None, env="dev", bootstrap_servers="unused:9092", idle_timeout_s=2.0,
+        queue_max_messages=None, env="dev", idle_timeout_s=2.0,
     )  # fmt: skip
 
 
@@ -260,6 +260,6 @@ def test_the_channel_spec_field_reaches_both_receivers() -> None:
             },
         },
     }  # fmt: skip
-    cfg = mllp_settings_from_channel_spec(spec, env="dev", bootstrap_servers="k:9093")
+    cfg = mllp_settings_from_channel_spec(spec, env="dev")
     assert cfg.tls is not None and cfg.tls.allowed_client_sans == ("dns:a.example.org",)
     assert replace(cfg).tls == cfg.tls

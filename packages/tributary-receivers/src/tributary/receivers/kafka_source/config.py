@@ -3,7 +3,7 @@
 A Kafka source reads a topic on a cluster that is **always configured explicitly with its own
 credentials**, even when that is the same physical cluster the engine runs on (ADR-007 D11): nothing
 here reads the engine's bootstrap servers or principal for the source side. The engine-side producer
-to `<env>.<channel>.raw` is a separate connection (`--bootstrap`, the receiver principal).
+to `<env>.<channel>.raw` is a separate connection (`TB_ENGINE_KAFKA_FILE`, the receiver principal).
 
 Refused at startup, because the schema allows it but this receiver cannot honour it or it would be
 unsafe: a `tls.minVersion` other than the default (librdkafka has no property that enforces a TLS
@@ -65,7 +65,6 @@ class KafkaSourceSettings:
     max_message_bytes: int
     ack_timeout_s: float
     env: str
-    bootstrap_servers: str  # the ENGINE cluster `raw` is produced to; never the source's
     instance: str = "kafka-0"
     commit_every: int = 50
     poll_timeout_s: float = 1.0
@@ -144,7 +143,6 @@ def kafka_source_settings_from_channel_spec(
     spec: Mapping[str, Any],
     *,
     env: str,
-    bootstrap_servers: str,
     instance: str = "kafka-0",
     commit_every: int | None = None,
 ) -> KafkaSourceSettings:
@@ -189,7 +187,6 @@ def kafka_source_settings_from_channel_spec(
         max_message_bytes=int(source.get("maxMessageBytes", DEFAULT_MAX_MESSAGE_BYTES)),
         ack_timeout_s=ack.get("timeoutMs", DEFAULT_ACK_TIMEOUT_MS) / 1000,
         env=env,
-        bootstrap_servers=bootstrap_servers,
         instance=instance,
         commit_every=commit_every,
     )

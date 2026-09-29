@@ -29,11 +29,15 @@ import asyncio
 import json
 import os
 import ssl
+import sys
 import time
 from typing import Any
 
+from tributary.runtime import load_engine_kafka_or_exit
+from tributary.runtime.clients import KafkaSettings
+from tributary.runtime.logs import JsonLogger
+
 from ..backpressure import ByteBudget
-from ..engine_kafka import engine_security_properties
 from ..metrics import Metrics
 from ..net import require_safe_bind
 from ..secrets import DirSecretResolver, SecretResolver
@@ -201,23 +205,18 @@ async def serve_from_channel_spec(
     spec: dict[str, Any],
     *,
     env: str,
-    bootstrap_servers: str,
+    kafka: KafkaSettings,
     instance: str = "mllp-0",
     secret_resolver: SecretResolver | None = None,
     metrics_file: str | None = None,
-    engine_security_file: str | None = None,
 ) -> None:
     """Load, bind and serve forever. The coroutine to run from `python -m tributary.receivers.mllp`
     and the one an integration test drives with a real Kafka cluster."""
-    cfg = mllp_settings_from_channel_spec(spec, env=env, bootstrap_servers=bootstrap_servers, instance=instance)
-    engine_security = engine_security_properties(
-        cfg.bootstrap_servers, engine_security_file, secret_resolver or DirSecretResolver()
-    )
+    cfg = mllp_settings_from_channel_spec(spec, env=env, instance=instance)
     topic = topic_name(cfg.env, cfg.channel)
     publisher = RawPublisher(
-        cfg.bootstrap_servers,
+        kafka,
         topic,
-        security=engine_security,
         linger_ms=cfg.linger_ms,
         queue_max_messages=cfg.max_inflight * 2,
     )
@@ -273,15 +272,9 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--channel-spec", required=True, help="path to a contracts/channel-spec/v0 JSON document")
     p.add_argument("--env", required=True, help="the topic-name env segment, e.g. 'dev' or 'prod'")
-    p.add_argument("--bootstrap", required=True, help="Kafka bootstrap.servers")
     p.add_argument("--instance", default="mllp-0", help="this process's identity, for tb-source")
     p.add_argument("--secrets-dir", help="overrides TB_SECRETS_DIR / the default secrets mount")
     p.add_argument("--metrics-file")
-    p.add_argument(
-        "--engine-security",
-        help="JSON file (channel-spec $defs/kafkaSecurity shape) for the engine Kafka link; absent means "
-        "plaintext, which is refused unless every --bootstrap host is loopback (PROVISIONAL, engine_kafka.py)",
-    )
     p.add_argument(
         "--profile",
         default=os.environ.get("TB_PROFILE", "lite"),
@@ -289,6 +282,7 @@ def main() -> None:
         help="topic-defaults.json profile in use; 'lite' emits the mandatory RF=1 startup warning",
     )
     a = p.parse_args()
+    kafka = load_engine_kafka_or_exit(argv=sys.argv[1:], log=JsonLogger("receiver-mllp"))
     emit_lite_profile_warning(profile=a.profile)
     with open(a.channel_spec, encoding="utf-8") as f:
         spec = json.load(f)
@@ -296,11 +290,10 @@ def main() -> None:
     coro = serve_from_channel_spec(
         spec,
         env=a.env,
-        bootstrap_servers=a.bootstrap,
+        kafka=kafka,
         instance=a.instance,
         secret_resolver=resolver,
         metrics_file=a.metrics_file,
-        engine_security_file=a.engine_security,
     )
     try:
         import uvloop  # type: ignore[import-not-found]  # no Windows wheel; optional on this platform

@@ -21,7 +21,7 @@ def load() -> dict[str, Any]:
 
 
 def build(spec: dict[str, Any]) -> HttpSettings:
-    return http_settings_from_channel_spec(spec, env="dev", bootstrap_servers="kafka:9092")
+    return http_settings_from_channel_spec(spec, env="dev")
 
 
 def test_contract_example_is_accepted() -> None:

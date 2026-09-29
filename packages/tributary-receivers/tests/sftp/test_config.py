@@ -23,7 +23,7 @@ def load() -> dict[str, Any]:
 
 
 def build(spec: dict[str, Any], **kw: Any) -> SftpSettings:
-    return sftp_settings_from_channel_spec(spec, env="dev", bootstrap_servers="k:9092", **kw)
+    return sftp_settings_from_channel_spec(spec, env="dev", **kw)
 
 
 def test_contract_example_is_accepted() -> None:

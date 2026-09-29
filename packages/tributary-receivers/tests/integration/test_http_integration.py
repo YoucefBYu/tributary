@@ -11,6 +11,7 @@ from confluent_kafka.admin import NewTopic
 from tributary.receivers.http.config import AuthSpec, HttpSettings
 from tributary.receivers.http.server import HttpServer
 from tributary.receivers.mllp.kafka_publisher import RawPublisher, topic_name
+from tributary.runtime.clients import KafkaSettings
 from tributary.sdk.keys import parse_key_expression
 
 from tests.support.kafka_helpers import create_topics_with_retry, drain_topic, free_port, header_map
@@ -21,7 +22,7 @@ ENV = "dev"
 BODY = json.dumps({"subject": {"reference": "Patient/SYNTH42"}, "meta": "TRIBUTARY-SYNTH"}).encode()
 
 
-def cfg(channel: str, bootstrap: str, **kw: object) -> HttpSettings:
+def cfg(channel: str, **kw: object) -> HttpSettings:
     base = HttpSettings(
         channel=channel,
         channel_version=1,
@@ -38,7 +39,6 @@ def cfg(channel: str, bootstrap: str, **kw: object) -> HttpSettings:
         queue_max_bytes=64 * 1024 * 1024,
         queue_max_messages=None,
         env=ENV,
-        bootstrap_servers=bootstrap,
     )
     return base
 
@@ -59,9 +59,9 @@ async def post(port: int, body: bytes) -> tuple[int, dict[str, str], bytes]:
     return int(lines[0].split(" ")[1]), {k.lower(): v for k, v in (x.split(": ", 1) for x in lines[1:])}, payload
 
 
-async def serve(config: HttpSettings) -> tuple[HttpServer, asyncio.base_events.Server, RawPublisher]:
+async def serve(config: HttpSettings, bootstrap: str) -> tuple[HttpServer, asyncio.base_events.Server, RawPublisher]:
     publisher = RawPublisher(
-        config.bootstrap_servers,
+        KafkaSettings(bootstrap),
         topic_name(config.env, config.channel),
         ordering="per-key",
         client_id_prefix="http-receiver-test",
@@ -76,7 +76,7 @@ def test_202_means_the_record_is_committed_to_raw_with_the_evaluated_key(kafka: 
     create_topics_with_retry(kafka, [NewTopic(topic_name(ENV, channel), 3, 1)])
 
     async def go() -> None:
-        srv, server, publisher = await serve(cfg(channel, kafka))
+        srv, server, publisher = await serve(cfg(channel), kafka)
         try:
             port = server.sockets[0].getsockname()[1]
             status, _, body = await post(port, BODY)
@@ -105,7 +105,7 @@ def test_unreachable_kafka_is_503_with_retry_after_never_202() -> None:
     dead = f"127.0.0.1:{free_port()}"  # nothing listens: the produce can never be acknowledged
 
     async def go() -> None:
-        srv, server, publisher = await serve(cfg("http-down", dead, ack_timeout_s=2.0))
+        srv, server, publisher = await serve(cfg("http-down", ack_timeout_s=2.0), dead)
         try:
             port = server.sockets[0].getsockname()[1]
             status, headers, body = await post(port, BODY)

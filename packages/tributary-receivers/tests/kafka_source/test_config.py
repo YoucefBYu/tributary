@@ -21,9 +21,7 @@ def load() -> dict[str, Any]:
 
 
 def build(spec: dict[str, Any], **kw: Any) -> KafkaSourceSettings:
-    return kafka_source_settings_from_channel_spec(
-        spec, env="dev", bootstrap_servers="engine:9092", commit_every=kw.pop("commit_every", 50), **kw
-    )
+    return kafka_source_settings_from_channel_spec(spec, env="dev", commit_every=kw.pop("commit_every", 50), **kw)
 
 
 def test_contract_example_is_accepted() -> None:
@@ -32,7 +30,6 @@ def test_contract_example_is_accepted() -> None:
     assert cfg.source_bootstrap == ("kafka-1.lab.example.org:9093", "kafka-2.lab.example.org:9093")
     assert cfg.security.protocol == "SASL_SSL" and cfg.security.tls is not None
     assert cfg.group_id == "tb.dev.lab-event-bridge.receiver"
-    assert cfg.bootstrap_servers == "engine:9092"  # the engine cluster, distinct from the source's
     assert cfg.key_expression is not None  # record:key
 
 
@@ -42,7 +39,7 @@ def test_secret_refs_are_not_in_repr() -> None:
 
 
 def test_commit_every_defaults_to_the_topics_contract() -> None:
-    cfg = kafka_source_settings_from_channel_spec(load(), env="dev", bootstrap_servers="e:9092")
+    cfg = kafka_source_settings_from_channel_spec(load(), env="dev")
     assert cfg.commit_every == 50
 
 

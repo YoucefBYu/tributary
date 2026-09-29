@@ -101,27 +101,21 @@ class RawPublisher:
 
     def __init__(
         self,
-        bootstrap_servers: str,
+        kafka: KafkaSettings,
         topic: str,
         *,
         linger_ms: int | None = None,
         queue_max_messages: int = 100_000,
-        security: dict[str, object] | None = None,
         topic_defaults: TopicDefaults | None = None,
         ordering: Ordering = "none",
         client_id_prefix: str = "mllp-receiver",
     ) -> None:
         from confluent_kafka import Producer  # lazy: unit tests need no broker client
 
-        from ..engine_kafka import require_secure_link
-
-        require_secure_link(bootstrap_servers, security)  # before anything is built or connected
-
         self.topic = topic
         self._ordering: Ordering = ordering
         defaults = topic_defaults if topic_defaults is not None else _cached_topic_defaults()
-        settings = KafkaSettings(bootstrap_servers=bootstrap_servers, security=security or {})
-        config = producer_config(settings, defaults, client_id=f"{client_id_prefix}-{topic}")
+        config = producer_config(kafka, defaults, client_id=f"{client_id_prefix}-{topic}")
         if linger_ms is not None:
             config["linger.ms"] = linger_ms  # not in the contract's must_not_hardcode list
         config["queue.buffering.max.messages"] = queue_max_messages

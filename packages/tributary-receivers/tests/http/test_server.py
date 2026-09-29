@@ -48,7 +48,6 @@ def settings(**overrides: object) -> HttpSettings:
         queue_max_bytes=64 * 1024 * 1024,
         queue_max_messages=None,
         env="dev",
-        bootstrap_servers="unused:9092",
         idle_timeout_s=2.0,
         request_timeout_s=3.0,
     )

@@ -48,7 +48,6 @@ def settings(**overrides: object) -> MllpSettings:
         queue_max_bytes=64 * 1024 * 1024,
         queue_max_messages=None,
         env="dev",
-        bootstrap_servers="unused:9092",
     )
     return replace(base, **overrides)  # type: ignore[arg-type]
 
