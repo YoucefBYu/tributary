@@ -133,7 +133,7 @@ when a connector lands with its tests.
 | destination | `postgresql` | W2-6 | **Built** (`eca445a`, `asyncpg`): integration test against a real PostgreSQL, startup uniqueness check. **Genuine-redelivery duplicate test pending** (W2-9 harness, 5.1) |
 | destination | `clickhouse` | W2-6 | Contracted, not built |
 | destination | `sftp` | W2-6 | **Built** (2026-09-29, `tributary.loaders.sftp`): `paramiko`, human-approved (section 10.2). A 5.1 redelivery test exists (`tests/integration/test_sftp_loader_duplicate_delivery_uncommitted_redelivery.py`); **Implemented** once confirmed green in CI |
-| destination | `s3` | W2-6 | **Built** (2026-09-29, `tributary.loaders.s3`), **with two licence questions open with the human** (raised by the lead 2026-09-29, not ruled here): `botocore`'s bundled `cacert.pem` (MPL-2.0 data) in the runtime closure, and MinIO (AGPL-3.0) as the test-only container its integration and redelivery tests run against. Not "Implemented" until both are answered |
+| destination | `s3` | W2-6 | **Built** (2026-09-29, `tributary.loaders.s3`). **Licence questions resolved by the human 2026-09-29** (ADR-001 2.3): `botocore` is approved in the runtime for this loader only, including its bundled, unmodified `cacert.pem` (MPL-2.0 data), and the loader still prefers the OS CA file; MinIO (AGPL-3.0) is allowed **only** as the test container for its integration and redelivery tests, never in Compose, Helm or a shipped artefact. A 5.1 redelivery test exists (`tests/integration/test_s3_loader_duplicate_delivery_uncommitted_redelivery.py`); **Implemented** once confirmed green in CI |
 | destination | `mllp` (client) | W2-6 | Contracted, not built |
 | destination | `kafka` | W2-6 | Contracted, not built |
 
@@ -417,6 +417,30 @@ and here that resend is a duplicate.
   that, `maxPending` × 1 MB is the bound.
 
 **`ctx.reply` (SDK, approved with amendments).** `ctx.reply(body: bytes, *, content_type: str) -> None`.
+
+**Where it lives: on `ReplyContext(Context)`, not on `Context`** (ruled 2026-09-29, set 1.3.1, on
+`platform-engineer`'s implementation in `tributary.sdk.context`). A step that answers annotates
+`ctx: ReplyContext`. The runtime's context and `FakeContext` implement it.
+
+- **Why.** `Context` is a structural `Protocol` and a public SDK interface. Adding a member to it
+  breaks every implementer written against set 1.1: `tributary-fhir`'s `_Attached` failed `mypy
+  --strict`, and a third-party wrapper would too. Under the contract rules that is a breaking change,
+  needing an ADR, to gain one method. A sub-protocol is additive, and it is the pattern `FhirContext`
+  already uses. **Rule from here on: `Context` is frozen for set 1.x; a new `ctx` capability arrives
+  as an additive sub-protocol.**
+- **Rejected:** `reply` on `Context` with a one-line forward in `_Attached`. That fixes the one
+  in-tree wrapper and leaves every out-of-tree one broken.
+- **Give up:** a step typed `ctx: Context` cannot call `reply`, and a wrapper does not gain it by
+  itself. That is the real cost. Once the runtime wraps each message's context with
+  `tributary.fhir.attach` (ADR-001 6.2; the `attach` docstring says this is not wired yet, and the
+  architect has not checked), a FHIR pipeline on a `body: step` channel receives an `_Attached` with no
+  `reply` member and cannot answer: the step raises `AttributeError`.
+- **Condition, `healthcare-standards-engineer`, before `body: step` is lifted:** a context produced by
+  `attach()` from a `ReplyContext` must also be a `ReplyContext` under `mypy --strict` and forward
+  `reply` to its base. The owner chooses the shape (for example a `FhirReplyContext(FhirContext,
+  ReplyContext)` protocol with an `attach` overload). Include a test showing that a body set through
+  the attached context is recorded by `FakeContext`. `body: ack` is unaffected, and `body: step` is
+  refused at startup until it is built, so nothing is broken today.
 
 - At most once per message; a second call raises. `FakeContext` records the call (invariant 7).
 - **Pipeline steps only.** A destination step gets its own copy per destination, so N destinations

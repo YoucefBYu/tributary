@@ -94,15 +94,25 @@ wave's exit criteria here.
   condition open, not closed.
 - **Contract edits 2026-09-25, not yet verified** (the architect has no shell). Commands and expected
   results are in the verification note below.
-- **W2-8 (synchronous reply): contract set 1.2 published 2026-09-28, unverified.** The architect ruled
-  on `platform-engineer`'s proposal (decisions log): approved with amendments, nothing breaking, no
-  invariant change. **Unblocked now:** `platform-engineer` builds the worker reply producer, status
-  rules, `ctx.reply` and `FakeContext`, the property test; `connector-engineer` builds the pending map,
-  the `replier` consumer and the MLLP mapping. The HTTP mapping waits for W2-7, and `body: step` waits
-  on its memory-bound condition. **Must land with the contract commit:** the six `REPLY_` codes and the
-  `REPLY_` prefix in `tributary.sdk.codes`, or the registry cross-check test goes red on the branch.
-  Verification owed (`qa-engineer`): `validate.py` **134 / 0**; `--emit-expectations` for the nine
-  predicted pairs (`dependentRequired` has no precedent); conformance **139 passed**.
+- **W2-8 (synchronous reply): HALF BUILT. The worker side is done and reviewed; the receiver side is
+  not built** (status 2026-09-29, relayed by the lead). Contract set 1.2, 2026-09-28.
+  - **Done and reviewed (`platform-engineer`):** the worker reply producer and status rules,
+    `ctx.reply` on `ReplyContext` with `FakeContext` (shape ruled 2026-09-29, decisions log), and the
+    `REPLY_` codes.
+  - **Not built (`connector-engineer`):** the receiver pending map, the `replier` consumer and the
+    MLLP answers (`AA`/`AE`/`AR`). So **no sender gets a synchronous answer yet**, and W2-8 is not
+    done.
+  - **What the property test proves, and what it does not.**
+    `packages/tributary-runtime/tests/test_reply_properties.py` (one answer per request, never ahead
+    of the `raw` callback, three broken-implementation controls) runs against the **model** in
+    `tributary.runtime.sync_answer`, not against a real receiver. It fixes the answer rules. It does
+    not show that the receiver keeps them. **The invariant-1 risk row stays open** until the receiver
+    either uses `sync_answer` or has the same property test run against it, with a broken-receiver
+    control that goes red.
+  - The HTTP mapping waits for W2-7. `body: step` waits on its memory-bound condition and on
+    `healthcare-standards-engineer` making `attach()` forward `reply` (channel-spec 3.2.6).
+  - Verification owed (`qa-engineer`), unchanged: `validate.py` **134 / 0** for set 1.2 (148 with set
+    1.3); `--emit-expectations` for the nine predicted pairs; conformance **139 passed**.
 - **Contract set 1.3 published 2026-09-29, additive, unverified** (decisions log; `contracts/CHANGELOG.md`;
   ADR-008; ADR-007 D18-D20). It answers the W2-7 security-review HIGH (receivers produced to `raw` over
   PLAINTEXT, unauthenticated; fixed for receivers in `e3ddee1`) and the lead's W2-6 items. **Workers and
@@ -123,6 +133,17 @@ wave's exit criteria here.
   - `qa-engineer`: `engine-kafka` conformance suite; `validate.py` expected **148 / 0** and
     `--emit-expectations` for nine predicted pairs; confirm the `fhir`/`sftp`/`s3` redelivery tests green
     in CI (promotes them to Implemented); an ACL negative test in the Compose e2e.
+- **Set 1.3.1 (patch, 2026-09-29, README-only, counts unchanged)**, with three follow-ups:
+  - `connector-engineer`: move `RawPublisher` onto the runtime loader and delete the `ssl.`/`sasl.`
+    prefix check in `tributary.receivers.engine_kafka`. It is shadowed by `KafkaSettings`' exact-list
+    `check_link` (read from the source, not run), so this is drift risk, not an open hole. ADR-008
+    follow-up 6.
+  - `devops-engineer`: record `botocore`'s bundled `cacert.pem` runtime scope (`tributary-loaders`,
+    `s3` only) in `licence_check.py`. A name entry in `MPL_APPROVED` is never consulted for a package
+    whose metadata says Apache-2.0, so this needs a bundled-file check (ADR-001 2.3).
+  - `healthcare-standards-engineer`: `attach()` of a `ReplyContext` must be a `ReplyContext` under
+    `mypy --strict` and forward `reply`, with a test. It blocks lifting `body: step`, and nothing
+    else.
 - **Waiting on teammates:** final W2-2 signatures after the conditions (`healthcare-standards-engineer`);
   the `retry-topic` spike report (`platform-engineer`). The first model result has pause-until-due at
   p50 lateness of about 515 s at production tiers, which is option (a)'s head-of-line cost made
@@ -336,6 +357,10 @@ All six filed and synthesised. Full threshold table with evidence ratings quoted
 | 2026-09-29 | **`nackOn: spec-invalid` stays refused on every source type, documented as reserved** until receiver live reload exists, which must also define it | ADR-007 D19, channel-spec README 3.2.8 |
 | 2026-09-29 | **`oauth2-client-credentials` not defined; exit-criterion-1 example switched to `bearer`**; `oauth2-client-credentials` and `mtls` reserved for `http`/`fhir`. OAuth needs a token client and, for SMART Backend Services, `private_key_jwt` key management (ADR-004 + human). Unblocks exit criterion 1 | ADR-007 D20, channel-spec README 3.4.1 |
 | 2026-09-29 | **Seventeen fixed error codes registered** (the lead's four plus every loader fixed name never registered since set 1.1, and `TLS_PEER_NOT_ALLOWED`); minted `S3_` codes that collide with a fixed name become `S3_UNKNOWN`. **`fhir`, `sftp`, `s3` loaders → Built**; `s3` flagged with the two licence questions the lead has taken to the human (botocore `cacert.pem`, MinIO), not ruled here. Set 1.3 published, unverified | envelope README 2.3.2, channel-spec README 3.0, `contracts/CHANGELOG.md` 2026-09-29 |
+| 2026-09-29 | **Human (asked directly by the lead): `botocore` APPROVED in the runtime**, unmodified, scoped to the `s3` loader in `tributary-loaders`, **including its bundled, unmodified `cacert.pem`** (Mozilla CA data, MPL-2.0). Recorded as **its own approval, not an extension** of the archiver's 2026-09-28 `certifi` approval. The loader still prefers the OS CA file. Found by `security-reviewer`, not by `licence_check.py`: the checker reads package metadata (botocore declares Apache-2.0), not bundled files. Follow-up for `devops-engineer`: extend `MPL_APPROVED` for this runtime scope, as a bundled-file check scoped to `tributary-loaders`, because a metadata-keyed entry is never consulted | ADR-001 2.3 |
+| 2026-09-29 | **Human (asked directly by the lead): MinIO (AGPL-3.0) ALLOWED as a test-only container image** for the `s3` integration and redelivery tests. **Never in Compose, Helm or any shipped artefact.** "S3/MinIO" elsewhere means an operator-supplied S3-compatible store. `s3` loader licence questions closed; it is Implemented once its redelivery test is confirmed green in CI | ADR-001 2.3, channel-spec README 3.0 |
+| 2026-09-29 | **`engine-kafka/v0` rule 4 narrowed to an exact ten-key allow-list** (set 1.3.1, patch), matching `platform-engineer`'s `SECURITY_KEYS`. Rejected: the `ssl.*`/`sasl.*` prefixes, which admit `ssl.engine.location` and `ssl.providers` (shared-object loading) and inline PEM keys. **Give up:** PKCS#11 engines and HSM providers need a contract change. Follow-up for `connector-engineer`: `RawPublisher` onto the runtime loader, and delete the receivers' prefix check (shadowed by `KafkaSettings` today; read from source, not run) | ADR-008 D4 and follow-up 6, `engine-kafka/v0` 4 |
+| 2026-09-29 | **`ctx.reply` stays on the additive `ReplyContext(Context)` protocol**; `Context` is frozen for set 1.x, and new `ctx` capabilities arrive as sub-protocols. Rejected: `reply` on `Context` plus a forward in `_Attached`, which is breaking for every structural implementer and fixes only the in-tree one. **Give up:** wrappers do not gain `reply` by themselves. `healthcare-standards-engineer` makes `attach()` of a `ReplyContext` a `ReplyContext` before `body: step` is lifted | ADR-003 D10, channel-spec README 3.2.6 |
 
 ## Open questions for the human
 
@@ -484,7 +509,8 @@ version is `docs/spikes/PHASE-0-DECISION.md` section 9 and ADR-001 section 13.
 | **A produce-time `EnvelopeError` crashes the pipeline worker** (W2-5; **fix delivered, pending review**) | Low once reviewed | High: a crash loop on one record halts the partition, which is the envelope 2.3 failure class | Dead-letter the consumed record as `TB_OUTPUT_ENVELOPE_INVALID`, producing nothing (`2a16e24`, `8af0d63`, `6daf4f4`). Closes when the reviewers clear it |
 | **A `raw` payload over 1 MB halts its partition** (W2-5 residual, accepted for wave 2) | Low: needs WRITE on `raw`, which is receiver-only (`topics/v0` 3.4). Broker `max.message.bytes` does not stop it, because it checks the compressed batch | Medium: the partition halts until an operator clears it; nothing is lost | Claim-check (unscheduled). Interim done (`361935e`): `partition_halted` with `TB_DLQ_UNWRITABLE` instead of a crash loop. No clear or skip tooling yet |
 | **Contract and code drift on names nobody checks** (latest: `STEP_ERROR` vs `TRANSFORM_ERROR`, found only while writing the registry) | Medium | Medium | Registry plus a two-way cross-check test in `tributary-sdk`. The same shape as the wave 1 finding: a green conformance run says the contracts are self-consistent, not that they agree with the code |
-| **Sync reply answers `AE` or `AA` before the commit is confirmed** (W2-8; the proposal allowed it on a revoke before the callback) | Low once tested | High: invariant 1 in its sync form, a false "committed" | Amended in channel-spec 3.2.6: neither answer precedes the successful `raw` callback. The proposal's Hypothesis property is extended to `AE`, with a broken-implementation control |
+| **Sync reply answers `AE` or `AA` before the commit is confirmed** (W2-8; the proposal allowed it on a revoke before the callback) | Low once tested | High: invariant 1 in its sync form, a false "committed" | Amended in channel-spec 3.2.6: neither answer precedes the successful `raw` callback. The proposal's Hypothesis property is extended to `AE`, with a broken-implementation control. **2026-09-29: proved on the `sync_answer.py` model only; the receiver is not built.** Open until the receiver uses the model or the property runs against it |
 | **Workers and loaders connect to Kafka unauthenticated and unverified** (W2-7 review HIGH, fixed for receivers only in `e3ddee1`). The worker's `_tb.<env>.channels` link is the worst case: an injected spec is RCE across the data plane | High until fixed | High | ADR-008 follow-ups (`platform-engineer`, `connector-engineer`). Contract published 2026-09-29 |
 | **Compose lite stack does not start** since `e3ddee1` (its receiver refuses PLAINTEXT to `kafka:9092`) | Certain until `devops-engineer` lands ADR-008 D5 | Medium: no Compose demo; exit-criterion tests use testcontainers on loopback and are unaffected | Compose on `SASL_SSL` (`engine-kafka/v0` 6) |
 | **Sync reply latency on the real worker is unmeasured** (three sequential commits, S3 had two, stand-in worker, Windows) | High | Medium | `benchmarks/sync_reply/` with `qa-engineer`: five runs per cell on Linux, 1 and 3 receiver processes. No latency claim until then |
+| **The licence checker cannot see licensed files bundled inside a permissively declared package** (botocore's MPL-2.0 `cacert.pem`, 2026-09-29; found by review, not CI) | Medium: CA bundles and vendored data are common | Medium: an unapproved licence ships unnoticed | Bundled-file check for known cases (`devops-engineer`); `security-reviewer` keeps inspecting new dependencies' contents; the W4-7 SBOM should scan files, not only metadata |

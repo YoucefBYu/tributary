@@ -3,6 +3,24 @@
 Newest first. Each entry names the contract, the version, whether the change is additive or
 breaking, and the reason. Breaking changes reference an ADR.
 
+## 2026-09-29 (later) — contract set 1.3.1 (patch): exact engine-Kafka key allow-list, `ctx.reply` shape, `s3` licences
+
+**Patch. No schema, example or manifest changes**, so `validate.py` and conformance counts are
+unchanged from set 1.3 (expected 148 / 0). No invariant changes. Documentation of rules that were
+already implemented, plus two human licence decisions.
+
+| # | Contract | Change | Why |
+|---|---|---|---|
+| 1 | `engine-kafka/v0` README 4 rule 4 | `ssl.*` / `sasl.*` prefixes → **exact ten-key allow-list** (`security.protocol`, `sasl.mechanism`, `sasl.username`, `sasl.password`, `enable.ssl.certificate.verification`, `ssl.endpoint.identification.algorithm`, `ssl.cipher.suites`, `ssl.ca.location`, `ssl.certificate.location`, `ssl.key.location`) | `platform-engineer` implemented the exact list (`tributary.runtime.kafka_security.SECURITY_KEYS`) and flagged that a prefix admits `ssl.engine.location` and `ssl.providers` (shared-object loading) and inline PEM keys. The list is exactly what the schema can express, so no valid document is affected. Narrowing only what the loader's internal map accepts is why this is a patch, not a breaking change. The schema encodes no prefixes and is unchanged. ADR-008 D4 amended |
+| 2 | `channel-spec/v0` README 3.2.6 | `ctx.reply` lives on the additive `ReplyContext(Context)` protocol, not on `Context`. `Context` is frozen for set 1.x, and new capabilities arrive as sub-protocols. `attach()` of a `ReplyContext` must become a `ReplyContext` before `body: step` is lifted | Adding a `Protocol` member breaks every structural implementer (`tributary-fhir`'s `_Attached` failed `mypy --strict`). ADR-003 D10 |
+| 3 | `channel-spec/v0` README 3.0 | `s3` row: licence questions **resolved** (human, 2026-09-29): `botocore` approved in the runtime for the `s3` loader including its bundled `cacert.pem`; MinIO test-only, never shipped | ADR-001 2.3 |
+
+**Follow-ups:** `connector-engineer` moves `RawPublisher` onto the runtime loader and deletes the
+prefix check in `tributary.receivers.engine_kafka`. This is shadowed today by `KafkaSettings`'
+exact-list check, read from the source and not run (ADR-008 follow-up 6). `healthcare-standards-engineer`
+makes `attach()` of a `ReplyContext` a `ReplyContext`. `devops-engineer` records botocore's bundled-file
+scope in `licence_check.py` (ADR-001 2.3).
+
 ## 2026-09-29 — contract set 1.3: engine Kafka credentials, mTLS client allow-list, W2-6 loader codes
 
 **Additive throughout; no invariant changes.** Every document valid under set 1.2 stays valid. One valid

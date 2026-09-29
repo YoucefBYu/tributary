@@ -159,6 +159,30 @@ Sources to re-check: openintegrationengine.org and the OIE GitHub repository (li
   `devops-engineer` extends `MPL_APPROVED` in `.github/scripts/licence_check.py` to cover `certifi`'s
   runtime scope. Until then the checker still treats `certifi` as non-runtime only, which is correct.
   The CLAUDE.md stack-table line was updated by the lead on `wave/1-2`.
+- **`botocore` in the runtime, HUMAN-APPROVED 2026-09-29** (asked directly by the lead), as **its own
+  decision**. It is **not** an extension of the archiver's 2026-09-28 runtime `certifi` approval, or of
+  any other entry above. **Scope:** unmodified `botocore`, as a runtime dependency of the `s3` loader in
+  `tributary-loaders` only. The approval includes its **bundled, unmodified `cacert.pem`**, which is
+  Mozilla CA data under MPL-2.0 shipped inside a package whose metadata declares Apache-2.0. Any other
+  package or path bringing `botocore` into the runtime, or a modified or vendored copy, needs a fresh
+  decision. **Condition:** the loader keeps preferring the OS CA file, and the bundled file is only
+  botocore's own fallback. **How it was found:** `security-reviewer`, not `licence_check.py`. The
+  checker reads package metadata, not bundled files, so a package declaring Apache-2.0 that carries
+  MPL data passes it. That is another instance of the pattern above: a licence claim is only as good
+  as the mechanism that produced it. **Follow-up, `devops-engineer`:** extend `MPL_APPROVED` in
+  `.github/scripts/licence_check.py` to record this runtime scope. Note that an entry keyed on
+  `botocore`'s metadata is never consulted, because the MPL branch runs only on an MPL expression. The
+  record has to be a bundled-file check, scoped like `LGPL_APPROVED`'s `importers_of`, that fails if
+  `botocore` enters the runtime closure through any other workspace member. The owner chooses the
+  mechanism.
+- **MinIO (AGPL-3.0) as a test-only container image, HUMAN DECISION 2026-09-29** (asked directly by
+  the lead). It is **allowed** as the S3-compatible server that the `s3` loader's integration and
+  redelivery tests start through testcontainers. It is an image the tests run, not a Python dependency,
+  and it is never linked or distributed. **It must never appear in Compose, Helm or any shipped
+  artefact.** Where this ADR and the contracts say "S3/MinIO" or "the MinIO equivalent", they mean an
+  S3-compatible store that an operator supplies and the `endpoint` field points at, not something
+  Tributary ships. A lite-profile object store, if one is ever needed, requires a permissively licensed
+  image and a fresh decision.
 - **How this one nearly passed unnoticed, which is the reusable part.** The root manifest annotates
   `"testcontainers[kafka]>=4.8",  # Apache-2.0`. That comment is *correct about testcontainers itself*
   and says nothing about its transitive closure, so it reads as a clearance while clearing nothing —
@@ -510,7 +534,9 @@ TTL toDateTime(ts) + INTERVAL 90 DAY;
 
 **Searching without storing PHI in clear text:** searchable identifiers (for example MRN) are stored as keyed hashes (HMAC) in `attrs`; the message browser hashes the search term with the same key. Content can be envelope-encrypted with a key from Vault Transit or a cloud KMS.
 
-**Object storage (S3/MinIO):** claim-check payloads and optional long-term content archive.
+**Object storage (S3/MinIO):** claim-check payloads and optional long-term content archive. The
+object store is operator-supplied: MinIO (AGPL-3.0) is never shipped in Compose or Helm (section 2.3,
+2026-09-29).
 
 ### 6.7 API design
 

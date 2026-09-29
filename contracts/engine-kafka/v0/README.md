@@ -3,7 +3,8 @@
 **Contract id:** `tributary.engine-kafka/v0`
 **Status:** Draft, **new in contract set 1.3 (2026-09-29)**. Additive: it fills the `TODO` that
 `topics/v0` `topic-defaults.json` `security.clients.credentials` left open, and no existing document
-changes meaning.
+changes meaning. **Set 1.3.1 (2026-09-29, patch):** section 4 rule 4 narrowed from `ssl.*`/`sasl.*`
+prefixes to an exact ten-key allow-list. Schema and examples unchanged.
 **Owner:** `architect`. Propose changes by message with the exact diff and impact.
 **Source:** ADR-008 (D1-D4); `topics/v0` 3.4; the W2-7 security review HIGH fixed in `e3ddee1`.
 **Schema:** [`engine-kafka.schema.json`](engine-kafka.schema.json) · **Examples:**
@@ -84,12 +85,29 @@ client that bypasses it (ADR-008 D2, D3).
    `SASL_SSL`; `tls.crt` and `tls.key` for `SSL`. The broker is not left to discover a missing
    principal.
 4. **No property passthrough, and contract values win.** The security properties this document
-   produces may contain only `security.protocol`, `sasl.mechanism`, `sasl.username`, `sasl.password`,
-   `enable.ssl.certificate.verification` and `ssl.*`. `KafkaSettings` rejects any other key at
-   construction. The client settings in `topic-defaults.json` `clients.*` (`acks`,
-   `enable.idempotence`, `session.timeout.ms`, ...) are applied from that file and cannot be
-   overridden by the security map. **Today they can:** `producer_config` merges `settings.security`
-   *after* the contract defaults (ADR-008 D4).
+   produces may contain **exactly these ten keys and no others** (amended in set 1.3.1; the set 1.3
+   text said `sasl.*` and `ssl.*`):
+
+   | Key | Produced from |
+   |---|---|
+   | `security.protocol` | `security.protocol` |
+   | `sasl.mechanism`, `sasl.username`, `sasl.password` | `saslMechanism`; `security.secretRef` keys `username`, `password` |
+   | `enable.ssl.certificate.verification`, `ssl.endpoint.identification.algorithm`, `ssl.cipher.suites` | rule 2's fixed values, never the document |
+   | `ssl.ca.location` | `tls.secretRef` key `ca.crt` (a path) |
+   | `ssl.certificate.location`, `ssl.key.location` | `security.secretRef` keys `tls.crt`, `tls.key` (paths), both or neither |
+
+   `KafkaSettings` rejects any other key at construction, by exact match, never by prefix. The list is
+   exactly what the schema can express, so no valid document loses anything. **Why not `ssl.*` /
+   `sasl.*`:** a prefix admits `ssl.engine.location` and `ssl.providers`, which load a shared object
+   into the process; `ssl.key.pem`, `ssl.certificate.pem`, `ssl.ca.pem` and `ssl.key.password`, which
+   put key material in the map itself rather than behind a file path; and, from librdkafka's
+   configuration reference (not re-checked in this revision), `sasl.kerberos.kinit.cmd`, a shell
+   command, and `sasl.oauthbearer.token.endpoint.url`, an outbound URL. Found by `platform-engineer`,
+   who implemented the exact list first (`tributary.runtime.kafka_security.SECURITY_KEYS`). Adding a
+   key needs an architect-approved contract change and a `security-reviewer` pass. The client settings in
+   `topic-defaults.json` `clients.*` (`acks`, `enable.idempotence`, `session.timeout.ms`, ...) are
+   applied from that file and cannot be overridden by the security map. **Before set 1.3 they could:**
+   `producer_config` merged `settings.security` *after* the contract defaults (ADR-008 D4).
 5. **Errors carry no secret value**, and startup logs the protocol and mechanism only. Never a
    password, key path content or token (invariant 6 and CLAUDE.md "no secrets").
 6. Every role logs the `topics/v0` 3.8 lite warning when the profile is `lite`, as before.

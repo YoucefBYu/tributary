@@ -263,6 +263,15 @@ an engine reordering, and cannot be detected without D8, so it is documented rat
 the sender's MSH-10 lives only in the receiver's in-memory map, and the three new headers carry an
 integer, a timestamp and an enum.
 
+**`ctx.reply` shape (ruled 2026-09-29, set 1.3.1).** `reply` stays on the additive
+`ReplyContext(Context)` protocol, as `platform-engineer` built it, not on `Context`. Adding a member to
+the `Context` protocol breaks every structural implementer. The in-tree case is `tributary-fhir`'s
+`_Attached`, and out-of-tree wrappers would break the same way. So `Context` is frozen for set 1.x,
+and new `ctx` capabilities arrive as sub-protocols. **Rejected:** `reply` on `Context` plus a
+one-line forward in `_Attached`, which fixes only the in-tree wrapper. **Give up:** wrappers do not
+gain `reply` by themselves, so `healthcare-standards-engineer` makes `attach()` of a `ReplyContext`
+a `ReplyContext` before `body: step` is lifted. Detail in `contracts/channel-spec/v0` 3.2.6.
+
 ---
 
 ## 3. Consequences
