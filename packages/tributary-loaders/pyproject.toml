@@ -10,6 +10,7 @@ dependencies = [
     "confluent-kafka>=2.6.0",   # Apache-2.0
     "asyncpg>=0.30.0",          # Apache-2.0; PostgreSQL loader. Not psycopg (LGPL-3.0, fails licence_check.py)
     "paramiko>=3.4,<5",         # LGPL-2.1, unmodified, human-approved 2026-09-24 for SFTP only (licence_check.py LGPL_APPROVED)
+    "botocore>=1.36",           # Apache-2.0; S3 loader (SigV4, credential chain). Not boto3: no transfer manager needed
 ]
 
 [build-system]
