@@ -31,7 +31,12 @@ from tributary.runtime.clients import (
     producer_config,
 )
 from tributary.runtime.config import load_topic_defaults
-from tributary.runtime.errors import EngineKafkaError, KafkaSecurityError, RuntimeConfigurationError
+from tributary.runtime.errors import (
+    ChannelSpecError,
+    EngineKafkaError,
+    KafkaSecurityError,
+    RuntimeConfigurationError,
+)
 from tributary.runtime.kafka_security import PINNED_CIPHER_SUITES, is_loopback_host_port, split_bootstrap
 from tributary.runtime.logs import JsonLogger
 from tributary.runtime.secrets import DirSecretResolver, SecretResolutionError
@@ -82,6 +87,8 @@ def secrets_dir(tmp_path: Path) -> Path:
     (root / "tb-worker-synth" / "tls.crt").write_text("SYNTHETIC CERT\n", encoding="utf-8")
     (root / "tb-worker-synth" / "tls.key").write_text("SYNTHETIC KEY\n", encoding="utf-8")
     (root / "tb-ca" / "ca.crt").write_text("SYNTHETIC CA\n", encoding="utf-8")
+    for key in root.glob("*/*"):
+        key.chmod(0o600)  # independent of the umask: group- or world-writable secrets are refused
     return root
 
 
@@ -674,7 +681,15 @@ def worker_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 
 def _refused(capsys: pytest.CaptureFixture[str]) -> dict[str, Any]:
     lines = [json.loads(line) for line in capsys.readouterr().err.splitlines() if line.strip()]
-    return next(line for line in lines if line["event"] == "startup_refused")
+    (refused,) = [line for line in lines if line["event"] == "startup_refused"]
+    assert refused["component"] == "worker"
+    return refused
+
+
+def _exits_2(main: Any) -> None:
+    with pytest.raises(SystemExit) as exited:
+        main([])
+    assert exited.value.code == 2
 
 
 @pytest.mark.usefixtures("worker_env")
@@ -689,8 +704,10 @@ def test_worker_main_refuses_without_a_document_and_builds_no_client(
 
     monkeypatch.setattr(confluent_kafka, "Consumer", no_client)
     monkeypatch.setattr(confluent_kafka, "Producer", no_client)
-    assert worker.main([]) == 2
-    assert "TB_ENGINE_KAFKA_FILE is not set" in _refused(capsys)["reason"]
+    _exits_2(worker.main)
+    refused = _refused(capsys)
+    assert refused["code"] == "ENGINE_KAFKA_FILE_UNSET"
+    assert "TB_ENGINE_KAFKA_FILE is not set" in refused["reason"]
 
 
 @pytest.mark.usefixtures("worker_env")
@@ -702,8 +719,10 @@ def test_worker_main_refuses_the_retired_bootstrap_variable(
     for name, value in environ_for(tmp_path, document("PLAINTEXT")).items():
         monkeypatch.setenv(name, value)
     monkeypatch.setenv("TB_BOOTSTRAP_SERVERS", "localhost:9092")
-    assert worker.main([]) == 2
-    assert "TB_BOOTSTRAP_SERVERS is retired" in _refused(capsys)["reason"]
+    _exits_2(worker.main)
+    refused = _refused(capsys)
+    assert refused["code"] == "ENGINE_KAFKA_RETIRED_INPUT"
+    assert "TB_BOOTSTRAP_SERVERS is retired" in refused["reason"]
 
 
 @pytest.mark.usefixtures("worker_env")
@@ -714,9 +733,10 @@ def test_worker_main_refuses_a_non_loopback_plaintext_document(
 
     for name, value in environ_for(tmp_path, document("PLAINTEXT", ["kafka:9092"])).items():
         monkeypatch.setenv(name, value)
-    assert worker.main([]) == 2
+    _exits_2(worker.main)
     refused = _refused(capsys)
     assert refused["error"] == "EngineKafkaError" and "no opt-out" in refused["reason"]
+    assert refused["code"] == "ENGINE_KAFKA_DOCUMENT_INVALID"
 
 
 class _Stop(Exception):
@@ -752,12 +772,144 @@ def test_the_channels_reader_is_the_first_client_and_uses_the_loaded_link(
     assert config["security.protocol"] == "SASL_SSL"
     assert all(config[key] == value for key, value in TLS_PINS.items())
     assert config["bootstrap.servers"] == "kafka-0.synth:9093"
-    logged = [json.loads(line) for line in stream.getvalue().splitlines()]
-    link = next(line for line in logged if line["event"] == "engine_kafka_link")
-    assert link["protocol"] == "SASL_SSL" and link["sasl_mechanism"] == "SCRAM-SHA-512"
     assert PASSWORD_MARKER not in stream.getvalue() and USERNAME not in stream.getvalue()
 
 
 def test_refusals_are_runtime_configuration_errors() -> None:
     assert issubclass(EngineKafkaError, RuntimeConfigurationError)
     assert issubclass(KafkaSecurityError, RuntimeConfigurationError)
+
+
+# --- the shared entry point (load_engine_kafka_or_exit) ------------------------------------------------
+
+
+def _or_exit(environ: Mapping[str, str], **kwargs: Any) -> tuple[int | str | None, list[dict[str, Any]], str]:
+    stream = io.StringIO()
+    with pytest.raises(SystemExit) as exited:
+        ek.load_engine_kafka_or_exit(environ, log=JsonLogger("receiver-synth", stream=stream), **kwargs)
+    raw = stream.getvalue()
+    return exited.value.code, [json.loads(line) for line in raw.splitlines()], raw
+
+
+def test_the_entry_point_returns_the_settings_and_logs_the_link_once(tmp_path: Path, secrets_dir: Path) -> None:
+    stream = io.StringIO()
+    settings_ = ek.load_engine_kafka_or_exit(
+        environ_for(tmp_path, document(), secrets_dir), log=JsonLogger("receiver-synth", stream=stream)
+    )
+    assert settings_.protocol == "SASL_SSL"
+    (line,) = [json.loads(raw) for raw in stream.getvalue().splitlines()]
+    assert line["event"] == "engine_kafka_link" and line["component"] == "receiver-synth"
+    assert {k: line[k] for k in ("protocol", "sasl_mechanism", "client_certificate", "brokers")} == (
+        settings_.describe()
+    )
+    assert PASSWORD_MARKER not in stream.getvalue() and USERNAME not in stream.getvalue()
+
+
+@pytest.mark.parametrize(
+    ("setup", "code"),
+    [
+        (lambda tmp, sec: {}, "ENGINE_KAFKA_FILE_UNSET"),
+        (
+            lambda tmp, sec: {**environ_for(tmp, document(), sec), "TB_BOOTSTRAP_SERVERS": "x:1"},
+            "ENGINE_KAFKA_RETIRED_INPUT",
+        ),
+        (lambda tmp, sec: {"TB_ENGINE_KAFKA_FILE": "relative.json"}, "ENGINE_KAFKA_FILE_UNREADABLE"),
+        (lambda tmp, sec: {"TB_ENGINE_KAFKA_FILE": str(tmp / "absent.json")}, "ENGINE_KAFKA_FILE_UNREADABLE"),
+        (lambda tmp, sec: environ_for(tmp, "{not json"), "ENGINE_KAFKA_DOCUMENT_INVALID"),
+        (lambda tmp, sec: environ_for(tmp, document("PLAINTEXT", ["kafka:9092"])), "ENGINE_KAFKA_DOCUMENT_INVALID"),
+        (lambda tmp, sec: environ_for(tmp, document(), tmp / "no-secrets"), "ENGINE_KAFKA_SECRET_UNRESOLVED"),
+    ],
+    ids=["unset", "retired-env", "relative", "absent", "not-json", "plaintext-remote", "no-secrets"],
+)
+def test_every_refusal_is_one_line_with_its_code_and_exit_2(
+    tmp_path: Path, secrets_dir: Path, setup: Any, code: str
+) -> None:
+    status, lines, raw = _or_exit(setup(tmp_path, secrets_dir))
+    assert status == 2
+    (line,) = lines
+    assert line["event"] == "startup_refused" and line["level"] == "error"
+    assert line["component"] == "receiver-synth" and line["error"] == "EngineKafkaError"
+    assert line["code"] == code and line["reason"]
+    assert PASSWORD_MARKER not in raw and str(secrets_dir) not in raw
+
+
+def test_a_retired_flag_is_refused_through_argv(tmp_path: Path, secrets_dir: Path) -> None:
+    status, (line,), raw = _or_exit(
+        environ_for(tmp_path, document(), secrets_dir), argv=["--bootstrap=" + PASSWORD_MARKER]
+    )
+    assert status == 2 and line["code"] == "ENGINE_KAFKA_RETIRED_INPUT"
+    assert line["reason"].startswith("--bootstrap is retired") and PASSWORD_MARKER not in raw
+
+
+def test_the_entry_point_catches_every_runtime_configuration_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """KafkaSecurityError raised directly, and any other RuntimeConfigurationError: exit 2, one line. Only
+    the classes whose messages are fixed sentences have a `reason`; any other logs its class and code."""
+    for raised, code, has_reason in [
+        (KafkaSecurityError("a PLAINTEXT link carries no ssl.* or sasl.* property"), "KAFKA_LINK_REFUSED", True),
+        (ChannelSpecError(f"free text {PASSWORD_MARKER}"), "CHANNEL_SPEC_INVALID", False),
+        (RuntimeConfigurationError(f"free text {PASSWORD_MARKER}"), "RUNTIME_CONFIG_INVALID", False),
+    ]:
+
+        def raise_it(*_a: object, _exc: Exception = raised, **_k: object) -> KafkaSettings:
+            raise _exc
+
+        monkeypatch.setattr(ek, "load_engine_kafka", raise_it)
+        status, (line,), raw = _or_exit({})
+        assert status == 2 and line["error"] == type(raised).__name__ and line["code"] == code
+        assert ("reason" in line) is has_reason
+        assert PASSWORD_MARKER not in raw
+
+
+def test_an_unexpected_error_is_not_swallowed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A bug is a traceback, not a configuration refusal: exit 2 would tell the operator to fix a file."""
+
+    def broken(*_a: object, **_k: object) -> KafkaSettings:
+        raise ZeroDivisionError
+
+    monkeypatch.setattr(ek, "load_engine_kafka", broken)
+    with pytest.raises(ZeroDivisionError):
+        ek.load_engine_kafka_or_exit({}, log=JsonLogger("receiver-synth", stream=io.StringIO()))
+
+
+def test_a_logger_that_refuses_the_reason_still_gets_one_line_and_exit_2() -> None:
+    class Picky:
+        def __init__(self) -> None:
+            self.lines: list[dict[str, object]] = []
+
+        def error(self, event: str, /, **fields: object) -> None:
+            if "reason" in fields:
+                raise ValueError("guard refused the field")
+            self.lines.append({"event": event, **fields})
+
+    picky = Picky()
+    with pytest.raises(SystemExit) as exited:
+        ek.load_engine_kafka_or_exit({}, log=picky)  # type: ignore[arg-type]
+    assert exited.value.code == 2
+    assert picky.lines == [{"event": "startup_refused", "error": "EngineKafkaError", "code": "ENGINE_KAFKA_FILE_UNSET"}]
+
+
+def test_the_package_exports_the_entry_point_api() -> None:
+    import tributary.runtime as runtime
+    from tributary.runtime import secrets
+
+    assert runtime.load_engine_kafka is ek.load_engine_kafka
+    assert runtime.load_engine_kafka_or_exit is ek.load_engine_kafka_or_exit
+    assert runtime.EngineKafkaError is EngineKafkaError and runtime.KafkaSecurityError is KafkaSecurityError
+    assert runtime.DirSecretResolver is secrets.DirSecretResolver
+    assert runtime.SecretResolver is secrets.SecretResolver
+    assert set(runtime.__all__) >= {
+        "load_engine_kafka",
+        "load_engine_kafka_or_exit",
+        "EngineKafkaError",
+        "KafkaSecurityError",
+        "DirSecretResolver",
+        "SecretResolver",
+    }
+
+
+def test_error_codes_are_stable_tokens() -> None:
+    from tributary.runtime.errors import ENGINE_KAFKA_CODES
+
+    for code in [*ENGINE_KAFKA_CODES, KafkaSecurityError.code, SecretResolutionError.code]:
+        assert re.fullmatch(r"[A-Z][A-Z0-9_]{2,63}", code)
+    assert EngineKafkaError("x", code="NOT_A_CODE").code == "ENGINE_KAFKA_DOCUMENT_INVALID"

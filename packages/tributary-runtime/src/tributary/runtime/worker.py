@@ -40,7 +40,7 @@ from .clients import KafkaSettings, consumer_config, events_producer_config, max
 from .config import TopicDefaults, load_topic_defaults
 from .consumer import ConsumerLoop, KafkaConsumerLike, LoopSettings, LoopStats
 from .context import WorkerContext
-from .engine_kafka import load_engine_kafka
+from .engine_kafka import load_engine_kafka_or_exit
 from .errors import (
     ChannelSpecError,
     DeliveryError,
@@ -976,9 +976,8 @@ class PipelineWorker:
         # Before any client is built: a warning emitted after a failed connection is a warning nobody
         # sees on the run where it matters most.
         emit_profile_warning(self.log, defaults, profile=self.settings.profile)
-        # Protocol, mechanism and broker count only: never a host, principal or path (engine-kafka/v0 4.5).
-        # Every client below, the `_tb.<env>.channels` reader first, is built from this one link.
-        self.log.info("engine_kafka_link", **self.settings.kafka.describe())
+        # Every client below, the `_tb.<env>.channels` reader first, is built from this one link. Its
+        # `engine_kafka_link` line was logged once by `load_engine_kafka_or_exit` in `main`.
 
         cache_consumer = cast(
             "ChannelsConsumerLike",
@@ -1137,14 +1136,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     The engine link comes only from the `TB_ENGINE_KAFKA_FILE` document (`engine-kafka/v0`, ADR-008):
     there is no default broker, and `TB_BOOTSTRAP_SERVERS` or `--bootstrap` refuses to start rather
-    than being silently ignored. A refused configuration exits 2 before any Kafka client exists.
+    than being silently ignored. A refused configuration exits 2 (`SystemExit`) before any Kafka client
+    exists, through the shared `load_engine_kafka_or_exit`.
     """
-    try:
-        kafka = load_engine_kafka(argv=sys.argv[1:] if argv is None else argv)
-    except RuntimeConfigurationError as exc:
-        # The message names JSON paths, rules and secretRef names only (EngineKafkaError contract).
-        JsonLogger("worker").error("startup_refused", error=type(exc).__name__, reason=str(exc)[:256])
-        return 2
+    kafka = load_engine_kafka_or_exit(argv=sys.argv[1:] if argv is None else argv, log=JsonLogger("worker"))
     settings = WorkerSettings(
         env=os.environ.get("TB_ENV", "dev"),
         channel=os.environ["TB_CHANNEL"],
