@@ -40,7 +40,7 @@ from .bundle import (
     sequential_id_factory,
     uuid_id_factory,
 )
-from .context import FhirContext, FhirInterface, Terminology, attach
+from .context import FhirContext, FhirInterface, FhirReplyContext, Terminology, attach
 from .errors import (
     BundleEntryError,
     FhirError,
@@ -61,6 +61,7 @@ __all__ = [
     "FhirContext",
     "FhirError",
     "FhirInterface",
+    "FhirReplyContext",
     "Identifier",
     "LocalFhir",
     "LocalTerminology",

@@ -30,9 +30,9 @@ from __future__ import annotations
 
 from collections.abc import Mapping, MutableMapping
 from datetime import datetime
-from typing import Protocol, runtime_checkable
+from typing import Protocol, overload, runtime_checkable
 
-from tributary.sdk import Context, KeyValueStore, Logger, SecretStore
+from tributary.sdk import Context, KeyValueStore, Logger, ReplyContext, SecretStore
 
 from .bundle import BundleEntry, Identifier, Resource
 from .terminology import CodeLookup
@@ -82,6 +82,11 @@ class FhirContext(Context, Protocol):
 
     @property
     def terminology(self) -> Terminology: ...
+
+
+@runtime_checkable
+class FhirReplyContext(FhirContext, ReplyContext, Protocol):
+    """`FhirContext` over a base that is a `ReplyContext`: `attach()` returns this for such a base."""
 
 
 class _Attached:
@@ -154,6 +159,29 @@ class _Attached:
         return self._base.usr_headers()
 
 
+class _AttachedReply(_Attached):
+    """`_Attached` over a `ReplyContext` base: additionally forwards `reply` (channel-spec 3.2.6).
+
+    A separate subclass, not a `reply` on `_Attached`, so a plain base yields a wrapper with no `reply`
+    at all and `isinstance(ctx, ReplyContext)` is true exactly when the inner context is one.
+    """
+
+    def __init__(self, base: ReplyContext, fhir: FhirInterface, terminology: Terminology) -> None:
+        super().__init__(base, fhir, terminology)
+        self._reply_base = base
+
+    def reply(self, body: bytes, *, content_type: str) -> None:
+        self._reply_base.reply(body, content_type=content_type)
+
+
+@overload
+def attach(base: ReplyContext, *, fhir: FhirInterface, terminology: Terminology) -> FhirReplyContext: ...
+
+
+@overload
+def attach(base: Context, *, fhir: FhirInterface, terminology: Terminology) -> FhirContext: ...
+
+
 def attach(base: Context, *, fhir: FhirInterface, terminology: Terminology) -> FhirContext:
     """Compose a base `Context` with `.fhir` and `.terminology`. Pure Python, no I/O of its own.
 
@@ -167,5 +195,9 @@ def attach(base: Context, *, fhir: FhirInterface, terminology: Terminology) -> F
     that message's `tb-msg-id`. Wiring this call site into the running engine is `tributary-runtime`'s
     (ADR-001 6.2); `tributary.fhir.fakes.fake_fhir_context` already does the test-time equivalent with
     `sequential_id_factory`.
+
+    When `base` is a `ReplyContext` the result is one too and forwards `reply`; otherwise it is not.
     """
+    if isinstance(base, ReplyContext):
+        return _AttachedReply(base, fhir, terminology)
     return _Attached(base, fhir, terminology)
