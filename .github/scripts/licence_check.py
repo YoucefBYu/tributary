@@ -254,8 +254,11 @@ def classify(
     return (status if ok else "fail"), detail
 
 
-def bundled_files(dist: md.Distribution) -> list[str]:
-    """Paths (POSIX, relative to site-packages) of every known bundled-licence file in `dist`."""
+def bundled_files(dist: md.Distribution) -> list[str] | None:
+    """Paths (POSIX, relative to site-packages) of every known bundled-licence file in `dist`, or None
+    when the package has no RECORD file: then its contents cannot be inspected at all."""
+    if dist.files is None:
+        return None
     return sorted(
         {PurePosixPath(str(f)).as_posix() for f in dist.files or [] if PurePosixPath(str(f)).name in BUNDLED_FILE_NAMES}
     )
@@ -263,7 +266,7 @@ def bundled_files(dist: md.Distribution) -> list[str]:
 
 def check_bundled(
     name: str,
-    files: list[str],
+    files: list[str] | None,
     *,
     runtime_names: frozenset[str] = frozenset(),
     importer_names: frozenset[str] = frozenset(),
@@ -275,6 +278,8 @@ def check_bundled(
     Unknown importers (an empty set for a runtime package) fail: the check cannot vouch for a scope it
     could not compute."""
     problems: list[str] = []
+    if files is None:
+        return [f"{name}: no RECORD file, so bundled licence files cannot be inspected"]
     for path in files:
         approval = BUNDLED_LICENCE_FILES.get((name, path))
         if approval is None:
@@ -305,7 +310,19 @@ def build_requires() -> list[str]:
 
 def _export(*extra: str) -> list[str]:
     export = subprocess.run(
-        ["uv", "export", "--frozen", "--no-emit-workspace", "--no-hashes", "--no-header", *extra],
+        # --all-extras: an optional dependency (`pkg[extra]`) is still a dependency somebody can install and
+        # ship, and without this flag it is absent from every closure computed here (runtime, per-importer
+        # and the licence scan itself).
+        [
+            "uv",
+            "export",
+            "--frozen",
+            "--all-extras",
+            "--no-emit-workspace",
+            "--no-hashes",
+            "--no-header",
+            *extra,
+        ],
         cwd=ROOT,
         check=True,
         capture_output=True,

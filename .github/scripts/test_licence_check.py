@@ -263,7 +263,10 @@ def test_bundled_files_finds_them_from_the_record(tmp_path: Path) -> None:
             return [md.PackagePath("botocore/cacert.pem"), md.PackagePath("botocore/__init__.py")]
 
     assert lc.bundled_files(Recorded("botocore")) == ["botocore/cacert.pem"]
-    assert lc.bundled_files(FakeDist("plain")) == []
+    # No RECORD at all: not "no bundled files" but "cannot tell", which the check must not read as clean.
+    assert lc.bundled_files(FakeDist("plain")) is None
+    assert lc.check_bundled("plain", None)
+    assert lc.check_bundled("plain", []) == []
 
 
 def test_certifi_runtime_mpl_scope_is_archiver_only() -> None:
@@ -289,3 +292,23 @@ def test_certifi_runtime_mpl_scope_is_archiver_only() -> None:
     assert {"certifi": archiver} == lc.MPL_RUNTIME_IMPORTERS
     status, _ = lc.classify("hypothesis", FakeDist("hypothesis", **mpl), runtime_names=frozenset({"hypothesis"}))
     assert status == "fail"
+
+
+def test_export_passes_all_extras(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Optional dependencies escaped every closure computed here because `uv export` was never given
+    --all-extras."""
+    seen: list[list[str]] = []
+
+    class Done:
+        stdout = "orjson==1\n"
+
+    def fake_run(cmd: list[str], **_: object) -> Done:
+        seen.append(cmd)
+        return Done()
+
+    monkeypatch.setattr(lc.subprocess, "run", fake_run)
+    lc._export("--no-dev", "--all-packages")
+    lc._export("--package", "x", "--no-dev")
+    lc._export("--all-groups", "--all-packages")
+    assert seen
+    assert all("--all-extras" in cmd for cmd in seen)
