@@ -14,10 +14,18 @@ The name is a pure function of `tb-msg-id`, so a redelivery targets the same fil
 1. If `<name>` already exists with the payload's size, the delivery is a duplicate and counts as
    success (`deliver` returns `reason="duplicate"`, a metric of its own). A same-named file of a
    *different* size is not ours: `SFTP_NAME_CONFLICT`, non-retryable (never silently "success").
-2. Otherwise write `<name>.part` (truncating a leftover from a crash), check its size, and
-   **rename** it to `<name>`. A plain SFTP rename fails if the target exists, so it can never overwrite;
+2. Otherwise write `<name>.<attempt>.part`, check its size, and **rename** it to `<name>`. `<attempt>` is
+   16 random hex characters, fresh **per attempt** (code review, Medium: with one shared `<name>.part`,
+   two writers of the same message, a redelivery racing a first attempt that is still in flight or two
+   loader instances after a rebalance, truncate each other's half-written file and one of them can rename
+   a torn one into place). A plain SFTP rename fails if the target exists, so it can never overwrite;
    if it fails and `<name>` now exists with the right size, a concurrent delivery won the race and this
-   one is a duplicate too (the `.part` is removed).
+   one is a duplicate too. The attempt's own `.part` is removed on every failure path the loader gets to
+   run. A `.part` left by a SIGKILL or a lost connection is an **orphan that nothing overwrites** (each
+   attempt has its own name); it is never a candidate for the final name and holds at most one payload, mode
+   `0600`. Operators sweep `*.part` files older than the retry horizon.
+3. The file is created `0600` (owner read and write only) before the payload is written into it, best
+   effort: a server that refuses `SETSTAT` is warned about (`sftp_chmod_refused`) and its own umask decides.
 
 `tests/sftp/test_integration_sftp_loader.py` proves it against a real OpenSSH server, and
 `tests/integration/test_sftp_loader_duplicate_delivery_uncommitted_redelivery.py` proves it through a real
@@ -44,6 +52,7 @@ from __future__ import annotations
 
 import contextlib
 import re
+import uuid
 from collections.abc import Callable
 from typing import Final
 
@@ -150,27 +159,30 @@ class SftpLoader:
             self._session = self._connect()
         session = self._session
         final = self._path(name)
-        part = final + PART_SUFFIX
-
         existing = session.size(final)
         if existing is not None:
             return self._duplicate_or_conflict(existing, len(payload))
 
-        session.write(part, payload)
-        written = session.size(part)
-        if written != len(payload):
-            raise RemoteError(4)  # short or missing write: a general failure, retryable
+        part = f"{final}.{uuid.uuid4().hex[:16]}{PART_SUFFIX}"  # unique per attempt (module docstring)
         try:
-            session.rename(part, final)
-        except RemoteError:
-            # A plain rename refuses an existing target: either a concurrent delivery won the race
-            # (duplicate), or the rename failed for another reason (re-raised).
-            raced = session.size(final)
-            if raced is None:
-                raise
-            outcome = self._duplicate_or_conflict(raced, len(payload))
+            session.write(part, payload)
+            written = session.size(part)
+            if written != len(payload):
+                raise RemoteError(4)  # short or missing write: a general failure, retryable
+            try:
+                session.rename(part, final)
+            except RemoteError:
+                # A plain rename refuses an existing target: either a concurrent delivery won the race
+                # (duplicate), or the rename failed for another reason (re-raised).
+                raced = session.size(final)
+                if raced is None:
+                    raise
+                outcome = self._duplicate_or_conflict(raced, len(payload))
+                self._best_effort_remove(session, part)
+                return outcome
+        except SessionError:
             self._best_effort_remove(session, part)
-            return outcome
+            raise
         return "success"
 
     @staticmethod
@@ -181,7 +193,7 @@ class SftpLoader:
 
     @staticmethod
     def _best_effort_remove(session: SftpSession, path: str) -> None:
-        with contextlib.suppress(SessionError):  # a leftover .part is overwritten by the next attempt
+        with contextlib.suppress(SessionError):  # best effort: a dead connection cannot remove it either
             session.remove(path)
 
     def _failure(self, msg_id: str, reason: str, retryable: bool) -> DeliveryOutcome:

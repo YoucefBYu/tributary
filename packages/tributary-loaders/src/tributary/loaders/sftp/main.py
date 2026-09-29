@@ -79,7 +79,7 @@ def build_loop(a: argparse.Namespace) -> tuple[ConsumerLoop, SftpRecordHandler]:
 
     resolver = DirSecretResolver(a.secrets_dir) if a.secrets_dir else DirSecretResolver()
     credentials = resolve_credentials(config, resolver)  # fail at startup, not on the first message
-    sftp_loader = SftpLoader(config, lambda: connect(config, credentials), log=log)
+    sftp_loader = SftpLoader(config, lambda: connect(config, credentials, log), log=log)
     handler = SftpRecordHandler(sftp_loader, spec_source=spec_source, destination=a.destination)
 
     data_producer = Producer(

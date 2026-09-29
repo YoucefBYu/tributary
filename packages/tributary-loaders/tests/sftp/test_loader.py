@@ -3,6 +3,9 @@ handling, error classification and PHI-free logs. A real server is `test_integra
 
 from __future__ import annotations
 
+import re
+import threading
+
 import pytest
 from tributary.loaders.http.config import CircuitBreakerSpec
 from tributary.loaders.sftp.config import SftpDestinationConfig
@@ -126,8 +129,9 @@ def test_delivery_writes_a_part_file_then_renames_it_into_place() -> None:
     assert (outcome.success, outcome.reason) == (True, "success")
     name = f"/out/adt-{message.msg_id}.hl7"
     assert session.files == {name: message.payload}
-    ops = [c for c in session.calls if c[0] in ("write", "rename")]
-    assert ops == [("write", name + ".part"), ("rename", f"{name}.part->{name}")]
+    (write, rename) = [c for c in session.calls if c[0] in ("write", "rename")]
+    assert re.fullmatch(re.escape(name) + r"\.[0-9a-f]{16}\.part", write[1])
+    assert rename == ("rename", f"{write[1]}->{name}")
 
 
 def test_a_redelivery_is_a_duplicate_success_and_writes_nothing() -> None:
@@ -149,13 +153,60 @@ def test_a_same_named_file_of_another_size_is_a_non_retryable_conflict_not_a_suc
     assert (outcome.success, outcome.reason, outcome.retryable) == (False, "SFTP_NAME_CONFLICT", False)
 
 
-def test_a_leftover_part_file_from_a_crash_is_overwritten() -> None:
+def test_an_orphan_part_file_from_a_crash_neither_blocks_delivery_nor_is_touched() -> None:
     message = make_message()
     name = f"/out/adt-{message.msg_id}.hl7"
-    session = FakeSession({name + ".part": b"half"})
+    orphan = name + ".0123456789abcdef.part"
+    session = FakeSession({orphan: b"half"})
     outcome = loader_for(session)[0].deliver(message)
     assert outcome.success is True
-    assert session.files == {name: message.payload}
+    assert session.files == {name: message.payload, orphan: b"half"}
+
+
+def test_every_attempt_writes_its_own_part_file() -> None:
+    message = make_message()
+    session = FakeSession()
+    session.fail["rename"] = RemoteError(4)  # the first attempt fails after its write
+    loader = loader_for(session)[0]
+    assert loader.deliver(message).success is False
+    assert loader.deliver(message).success is True
+    writes = [path for op, path in session.calls if op == "write"]
+    assert len(writes) == 2 and writes[0] != writes[1]
+
+
+def test_a_failed_attempt_removes_its_own_part_file() -> None:
+    message = make_message()
+    session = FakeSession()
+    session.fail["rename"] = RemoteError(4)
+    loader_for(session)[0].deliver(message)
+    assert session.files == {}
+
+
+def test_two_writers_of_the_same_message_never_share_a_part_file() -> None:
+    """A redelivery racing a first attempt that is still in flight: with one shared `.part` name the second
+    writer truncated the first's half-written file. Each writer's bytes stay in its own file, and one
+    final file results."""
+    message = make_message(b"MSH|^~\\&|TRIBUTARY-SYNTH\rPID|1||" + b"X" * 4096)
+    both_written = threading.Barrier(2, timeout=5)
+
+    class Slow(FakeSession):
+        def write(self, path: str, data: bytes) -> None:
+            super().write(path, data)
+            both_written.wait()  # neither renames before both have written
+
+    shared = Slow()
+    loaders = [loader_for(shared)[0] for _ in range(2)]
+    outcomes: list[object] = []
+    threads = [threading.Thread(target=lambda ld=ld: outcomes.append(ld.deliver(message))) for ld in loaders]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+    writes = [path for op, path in shared.calls if op == "write"]
+    assert len(set(writes)) == 2, "each writer used its own part file"
+    name = f"/out/adt-{message.msg_id}.hl7"
+    assert shared.files == {name: message.payload}, "one final file, no part file left behind"
+    assert sorted(o.reason for o in outcomes) == ["duplicate", "success"]  # type: ignore[attr-defined]
 
 
 def test_a_lost_rename_race_is_a_duplicate_and_cleans_up_the_part_file() -> None:

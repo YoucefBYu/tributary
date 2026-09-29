@@ -36,12 +36,15 @@ from collections.abc import Collection
 from typing import Protocol
 
 import paramiko  # type: ignore[import-untyped]  # no stubs; LGPL-2.1, approved for SFTP, unmodified
+from tributary.sdk.context import Logger
 
+from ..common import NullLogger
 from ..errors import LoaderError
 from ..secrets import SecretResolver
 from .config import SftpDestinationConfig
 
 __all__ = [
+    "FILE_MODE",
     "WEAK_ALGORITHMS",
     "AuthFailedError",
     "ConnectionLostError",
@@ -67,6 +70,9 @@ WEAK_ALGORITHMS: dict[str, tuple[str, ...]] = {
     "keys": ("ssh-rsa",),
     "pubkeys": ("ssh-rsa",),
 }
+
+#: The mode a destination file is created with: owner read and write only (a payload is PHI).
+FILE_MODE = 0o600
 
 _MAX_HANDSHAKE_ATTEMPTS = 6
 _RSA_ALGORITHMS = ("ssh-rsa", "rsa-sha2-256", "rsa-sha2-512")
@@ -150,9 +156,11 @@ def _map(exc: BaseException) -> SessionError:
 
 
 class ParamikoSession:
-    def __init__(self, transport: paramiko.Transport, client: paramiko.SFTPClient) -> None:
+    def __init__(self, transport: paramiko.Transport, client: paramiko.SFTPClient, log: Logger | None = None) -> None:
         self._transport = transport
         self._client = client
+        self._log: Logger = log if log is not None else NullLogger()
+        self._chmod_warned = False
 
     def _fail(self, exc: BaseException) -> SessionError:
         """`_map`, plus one distinction it cannot make alone: paramiko raises a bare `OSError` with no
@@ -177,10 +185,24 @@ class ParamikoSession:
 
     def write(self, path: str, data: bytes) -> None:
         try:
-            with self._client.open(path, "wb") as remote:  # "wb" truncates a leftover .part from a crash
+            with self._client.open(path, "wb") as remote:
+                self._restrict_mode(remote)
                 remote.write(data)
         except (OSError, EOFError, paramiko.SSHException) as exc:
             raise self._fail(exc) from None
+
+    def _restrict_mode(self, remote: paramiko.SFTPFile) -> None:
+        """`0600` before any payload byte is written. Best effort against a server that refuses `SETSTAT`
+        (its umask then decides), but a dead connection is still a failure."""
+        try:
+            remote.chmod(FILE_MODE)
+        except (OSError, EOFError, paramiko.SSHException) as exc:
+            mapped = self._fail(exc)
+            if not isinstance(mapped, RemoteError):
+                raise mapped from None
+            if not self._chmod_warned:
+                self._chmod_warned = True
+                self._log.warning("sftp_chmod_refused", status=mapped.status)
 
     def rename(self, src: str, dst: str) -> None:
         try:
@@ -284,7 +306,7 @@ def _verified_transport(config: SftpDestinationConfig) -> paramiko.Transport:
     raise HostKeyMismatchError("server host key does not match any pinned fingerprint")
 
 
-def connect(config: SftpDestinationConfig, credentials: Credentials) -> ParamikoSession:
+def connect(config: SftpDestinationConfig, credentials: Credentials, log: Logger | None = None) -> ParamikoSession:
     """Connect, verify the host key against the pins, only then authenticate."""
     # paramiko logs the negotiated peer software version and authentication outcomes at INFO/DEBUG.
     logging.getLogger("paramiko").setLevel(logging.WARNING)
@@ -298,7 +320,7 @@ def connect(config: SftpDestinationConfig, credentials: Credentials) -> Paramiko
         if client is None or channel is None:
             raise ConnectionLostError("sftp subsystem unavailable")
         channel.settimeout(config.timeout_s)
-        return ParamikoSession(transport, client)
+        return ParamikoSession(transport, client, log)
     except SessionError:
         if transport is not None:
             transport.close()

@@ -294,3 +294,66 @@ def test_the_paramiko_logger_is_capped_at_warning(ecdsa_server: Listener, ecdsa_
     with pytest.raises(AuthFailedError):
         connect(config_for(ecdsa_server.port, [fingerprint(ecdsa_key.asbytes())]), Credentials("u", "wrong", None))
     assert logging.getLogger("paramiko").level == logging.WARNING
+
+
+class _RecordingFile:
+    def __init__(self, events: list[str], chmod_error: Exception | None = None) -> None:
+        self.events = events
+        self.chmod_error = chmod_error
+
+    def __enter__(self) -> _RecordingFile:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        pass
+
+    def chmod(self, mode: int) -> None:
+        self.events.append(f"chmod {mode:o}")
+        if self.chmod_error is not None:
+            raise self.chmod_error
+
+    def write(self, data: bytes) -> None:
+        self.events.append("write")
+
+
+class _OpeningClient:
+    def __init__(self, remote: _RecordingFile) -> None:
+        self.remote = remote
+
+    def open(self, path: str, mode: str) -> _RecordingFile:
+        self.remote.events.append(f"open {mode}")
+        return self.remote
+
+
+def test_a_destination_file_is_restricted_to_0600_before_any_payload_byte_is_written() -> None:
+    from tributary.loaders.sftp.session import FILE_MODE, ParamikoSession
+
+    events: list[str] = []
+    session = ParamikoSession(_LiveTransport(), _OpeningClient(_RecordingFile(events)))  # type: ignore[arg-type]
+    session.write("/out/x.part", b"payload")
+    assert FILE_MODE == 0o600
+    assert events == ["open wb", "chmod 600", "write"]
+
+
+def test_a_server_that_refuses_setstat_is_warned_about_once_and_still_receives_the_file() -> None:
+    from tributary.loaders.sftp.session import ParamikoSession
+    from tributary.sdk.fakes import RecordingLogger
+
+    events: list[str] = []
+    log = RecordingLogger()
+    remote = _RecordingFile(events, chmod_error=OSError("Operation unsupported"))  # no errno: an SFTP status
+    session = ParamikoSession(_LiveTransport(), _OpeningClient(remote), log)  # type: ignore[arg-type]
+    session.write("/out/a.part", b"payload")
+    session.write("/out/b.part", b"payload")
+    assert events.count("write") == 2
+    assert [r.event for r in log.records if r.event == "sftp_chmod_refused"] == ["sftp_chmod_refused"]
+
+
+def test_a_dead_connection_during_chmod_is_a_lost_connection_not_a_warning() -> None:
+    from tributary.loaders.sftp.session import ParamikoSession
+
+    remote = _RecordingFile([], chmod_error=OSError("Socket is closed"))
+    session = ParamikoSession(_DeadTransport(), _OpeningClient(remote))  # type: ignore[arg-type]
+    with pytest.raises(ConnectionLostError):
+        session.write("/out/x.part", b"payload")
+    assert "write" not in remote.events

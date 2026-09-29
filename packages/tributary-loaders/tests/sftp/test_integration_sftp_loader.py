@@ -14,6 +14,7 @@ The genuine-redelivery half (a real `ConsumerLoop` replay from an uncommitted of
 
 from __future__ import annotations
 
+import threading
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
@@ -21,6 +22,8 @@ from typing import Any
 
 import paramiko
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from testcontainers.core.container import DockerContainer
 from testcontainers.core.wait_strategies import LogMessageWaitStrategy
 from tributary.loaders.sftp.config import SftpDestinationConfig
@@ -92,11 +95,18 @@ class Server:
 @pytest.fixture(scope="module")
 def sftp(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Server]:
     base = tmp_path_factory.mktemp("sftp")
-    host_key = paramiko.RSAKey.generate(2048)
-    client_key = paramiko.RSAKey.generate(2048)
-    host_key_path, pub_path = base / "ssh_host_rsa_key", base / "client.pub"
-    host_key.write_private_key_file(str(host_key_path))
+    # An ed25519 host key, the type paramiko offers first: with an RSA pin every connection costs a probing
+    # handshake against the wrong key type first, and sshd's per-source penalty for connections that end
+    # before authentication (`PerSourcePenalties`) then starts dropping this test's connections.
+    host_key_path, pub_path = base / "ssh_host_ed25519_key", base / "client.pub"
+    host_key_path.write_bytes(
+        Ed25519PrivateKey.generate().private_bytes(
+            serialization.Encoding.PEM, serialization.PrivateFormat.OpenSSH, serialization.NoEncryption()
+        )
+    )
     host_key_path.chmod(0o600)
+    host_key = paramiko.Ed25519Key(filename=str(host_key_path))
+    client_key = paramiko.RSAKey.generate(2048)
     pub_path.write_text(f"{client_key.get_name()} {client_key.get_base64()}\n", encoding="utf-8")
     secrets = base / "secrets"
     (secrets / "pw").mkdir(parents=True)
@@ -113,7 +123,7 @@ def sftp(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Server]:
         DockerContainer(IMAGE)
         .with_exposed_ports(22)
         .with_command(f"{USER}:{PASSWORD}:::upload")
-        .with_volume_mapping(str(host_key_path), "/etc/ssh/ssh_host_rsa_key", "ro")
+        .with_volume_mapping(str(host_key_path), "/etc/ssh/ssh_host_ed25519_key", "ro")
         .with_volume_mapping(str(pub_path), f"/home/{USER}/.ssh/keys/client.pub", "ro")
         .waiting_for(LogMessageWaitStrategy("Server listening on").with_startup_timeout(60))
     )
@@ -161,17 +171,54 @@ def test_a_reprocessed_copy_with_a_new_msg_id_is_a_new_file_by_design(sftp: Serv
     loader.close()
 
 
-def test_a_real_leftover_part_file_does_not_block_delivery(sftp: Server) -> None:
+def test_an_orphan_part_file_does_not_block_delivery_and_is_left_alone(sftp: Server) -> None:
     message = message_with(b"payload after a crash\r")
     name = f"adt-{message.msg_id}.hl7"
-    part = f"/home/{USER}/upload/{name}.part"
-    result = sftp.container.exec(["sh", "-c", f"echo half > {part}; chmod 666 {part}"])  # writable by the sftp user
+    orphan = f"{name}.0123456789abcdef.part"
+    path = f"/home/{USER}/upload/{orphan}"
+    result = sftp.container.exec(["sh", "-c", f"echo half > {path}; chmod 666 {path}"])  # writable by the sftp user
     assert result.exit_code == 0
     loader = sftp.loader()
     assert loader.deliver(message).success
     assert sftp.read(name) == message.payload
-    assert name + ".part" not in sftp.listing()
+    assert [f for f in sftp.listing() if message.msg_id in f and f != orphan] == [name]  # no part of ours left
     loader.close()
+
+
+def test_a_delivered_file_is_mode_0600(sftp: Server) -> None:
+    loader = sftp.loader()
+    message = message_with(b"mode check\r")
+    assert loader.deliver(message).success
+    result = sftp.container.exec(["stat", "-c", "%a", f"/home/{USER}/upload/adt-{message.msg_id}.hl7"])
+    assert result.exit_code == 0
+    assert result.output.decode().strip() == "600"
+    loader.close()
+
+
+def test_two_loaders_racing_the_same_message_leave_one_intact_file(sftp: Server) -> None:
+    """Two real connections deliver the same message at the same moment: each writes its own part file, the
+    rename admits one, the other sees a duplicate; the directory ends with one file of the right bytes."""
+    message = message_with(b"MSH|^~\\&|TRIBUTARY-SYNTH|x\r" + b"Y" * 200_000)
+    name = f"adt-{message.msg_id}.hl7"
+    barrier = threading.Barrier(2, timeout=30)
+    outcomes: list[str] = []
+
+    def run() -> None:
+        loader = sftp.loader()
+        try:
+            barrier.wait()
+            outcomes.append(loader.deliver(message).reason)
+        finally:
+            loader.close()
+
+    threads = [threading.Thread(target=run) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(60)
+    assert sorted(outcomes) == ["duplicate", "success"]
+    assert [f for f in sftp.listing() if message.msg_id in f] == [name]
+    assert sftp.read(name) == message.payload
 
 
 def test_an_existing_file_of_another_size_is_refused_not_treated_as_a_duplicate(sftp: Server) -> None:
