@@ -65,7 +65,6 @@ from tests.support.kafka_helpers import await_broker, drain_topic, free_port, he
 from tests.support.mllp_client import is_application_accept, send_mllp
 from tests.support.processes import (
     ManagedProcess,
-    ProcessDiedError,
     spawn_clickhouse_loader,
     spawn_fhir_loader,
     spawn_mllp_receiver_from_topic,
@@ -73,18 +72,6 @@ from tests.support.processes import (
 )
 
 pytestmark = pytest.mark.integration
-
-#: Exit criterion 1 (the main test) still cannot pass at HEAD: the worker's `WorkerContext` has no
-#: `.fhir` / `.terminology`, so the real W2-3 step `tributary.content_hl7_fhir.adt` raises `AttributeError`
-#: and the message is dead-lettered (`TRANSFORM_ERROR`). Owner: platform-engineer (`tributary-runtime`,
-#: the `attach()` call site). The MLLP per-key refusal was fixed in 6ad5569. This strict xfail turns into a
-#: failure the moment the worker is fixed, so it gets removed then. With `ctx.fhir` attached in a scratch
-#: run every assertion below passed, so the test body itself is validated.
-BLOCKED = pytest.mark.xfail(
-    strict=True,
-    raises=(ProcessDiedError, AssertionError),
-    reason="worker has no ctx.fhir (platform-engineer)",
-)
 
 ENV = "dev"
 EXAMPLE = CONTRACTS_DIR / "channel-spec" / "v0" / "examples" / "valid" / "adt-mllp-to-fhir-clickhouse-mllp.json"
@@ -122,13 +109,25 @@ def _loopback(host: str) -> str:
 
 
 def build_spec(
-    *, channel: str, mllp_port: int, fhir_url: str, ch: ClickHouseContainer, table: str, with_fhir: bool = True
+    *,
+    channel: str,
+    mllp_port: int,
+    fhir_url: str,
+    ch: ClickHouseContainer,
+    table: str,
+    with_fhir: bool = True,
+    with_context: bool = True,
 ) -> dict[str, Any]:
     """The published example, retargeted (module docstring says exactly what changes and why)."""
     document = copy.deepcopy(json.loads(EXAMPLE.read_text(encoding="utf-8")))
     document["metadata"]["name"] = channel
     document["metadata"]["version"] = 1
     spec = document["spec"]
+    # Contract set 1.5: `ctx.fhir` exists only if the spec declares it (the worker loads `tributary.context`
+    # plugins for declared names only). The example must keep declaring it; the control removes it.
+    assert "fhir" in spec["pipeline"]["context"], "the published example no longer declares pipeline.context: [fhir]"
+    if not with_context:
+        del spec["pipeline"]["context"]
     spec["source"]["bind"] = "127.0.0.1"
     spec["source"]["port"] = mllp_port
     del spec["source"]["tls"]
@@ -267,6 +266,7 @@ def start_stack(
     secrets_dir: str,
     tmp_path: Path,
     with_fhir: bool,
+    with_context: bool = True,
 ) -> Stack:
     table = f"adt_events_{uuid.uuid4().hex[:8]}"
     mllp_port = free_port()
@@ -293,7 +293,13 @@ def start_stack(
             if "TOPIC_ALREADY_EXISTS" not in str(exc):
                 raise
     document = build_spec(
-        channel=channel, mllp_port=mllp_port, fhir_url=hapi_url, ch=clickhouse, table=table, with_fhir=with_fhir
+        channel=channel,
+        mllp_port=mllp_port,
+        fhir_url=hapi_url,
+        ch=clickhouse,
+        table=table,
+        with_fhir=with_fhir,
+        with_context=with_context,
     )
     producer = Producer({"bootstrap.servers": kafka, "acks": "all", "enable.idempotence": True})
     producer.produce(channels_topic(ENV), key=channel.encode(), value=json.dumps(document).encode())
@@ -419,7 +425,6 @@ def test_phi_scanner_would_catch_a_leak() -> None:
     assert phi_leaks([b'{"tb_msg_id": "0199036e-7a3e-7f00-8c21-9000001abcde", "control_id": "SYNTHMSG00008"}']) == []
 
 
-@BLOCKED
 def test_adt_flows_from_mllp_to_hapi_and_clickhouse(
     kafka: str, hapi: str, clickhouse: ClickHouseContainer, secrets_dir: str, tmp_path: Path
 ) -> None:
@@ -535,5 +540,50 @@ def test_control_a_spec_without_the_fhir_destination_fails_the_hapi_assertions(
         time.sleep(3.0)
         with pytest.raises(AssertionError, match=r"HAPI holds .* expected \(1, 1\)"):
             assert_hapi_holds_exactly(hapi, mrn=mrn, visit=visit)
+    finally:
+        stack.stop()
+
+
+def test_control_a_spec_without_the_context_declaration_dead_letters_the_fhir_branch(
+    kafka: str, hapi: str, clickhouse: ClickHouseContainer, secrets_dir: str, tmp_path: Path
+) -> None:
+    """Same flow and same FHIR destination, but `pipeline.context` removed. `ctx.fhir` is then absent, so
+    the W2-3 step fails and the FHIR branch is dead-lettered (`TRANSFORM_ERROR`); HAPI stays empty for this
+    patient while ClickHouse still gets its row. The declaration is what enables FHIR."""
+    mrn, visit = "9000888", "VN20260108-00888"
+    stack = start_stack(
+        channel="adt-control-no-context",
+        kafka=kafka,
+        hapi_url=hapi,
+        clickhouse=clickhouse,
+        secrets_dir=secrets_dir,
+        tmp_path=tmp_path,
+        with_fhir=True,
+        with_context=False,
+    )
+    try:
+        ack = send_mllp(
+            "127.0.0.1",
+            stack.mllp_port,
+            synthetic_message(mrn=mrn, visit=visit, control_id="SYNTHMSG-CTL-2"),
+            timeout_s=20.0,
+        )
+        assert is_application_accept(ack)
+        worker = stack.processes["worker"]
+
+        def dead_lettered() -> list[dict[str, Any]]:
+            worker.collect_pending()
+            return [ln for ln in worker.lines if ln.get("event") == "dead_lettered"]
+
+        assert wait_until(lambda: bool(dead_lettered()), timeout_s=60.0), (
+            f"the FHIR branch was never dead-lettered: {worker_diagnostics(stack)}"
+        )
+        letters = dead_lettered()
+        assert [(d.get("destination"), d.get("error_code")) for d in letters] == [("fhir-server", "TRANSFORM_ERROR")]
+        assert wait_until(lambda: ch_rows(clickhouse, stack.table) >= 1), (
+            f"ClickHouse did not receive its row while FHIR was dead-lettered: {worker_diagnostics(stack)}"
+        )
+        time.sleep(2.0)
+        assert hapi_count(hapi, patient_q(mrn)) == 0 and hapi_count(hapi, encounter_q(visit)) == 0
     finally:
         stack.stop()
