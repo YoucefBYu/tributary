@@ -272,6 +272,19 @@ one-line forward in `_Attached`, which fixes only the in-tree wrapper. **Give up
 gain `reply` by themselves, so `healthcare-standards-engineer` makes `attach()` of a `ReplyContext`
 a `ReplyContext` before `body: step` is lifted. Detail in `contracts/channel-spec/v0` 3.2.6.
 
+**Expired replies get a code (ruled 2026-09-29, set 1.4).** A reply skipped past its deadline was
+emitted as `replied` / `dropped` with a sentence and no code. **Options:** (a) keep that; (b) register
+`REPLY_EXPIRED` and carry it on the `dropped` event; (c) `status: error` with the code. **Criteria:**
+queryable by a stable key in the archive; no page for a backlog the engine handled correctly; `Drop`
+reasons remain a channel concept. **Chosen: (b).** (a) leaves operators grepping static text, and (c)
+turns a post-outage backlog into an error-rate alert. **Give up:** `dropped` is no longer always
+code-free. The rule is that it may carry only a registered engine skip code. Envelope README 2.3.2.
+
+**Retry groups (ruled 2026-09-29, set 1.4; applies to D2 when `retry-topic` lifts).** The shared
+per-channel `retry` topic is consumed by each destination in its own group
+`tb.<env>.<ch>.loader.<dest>`, filtering on `tb-destination`. A shared group would let one
+destination's commits skip another's retries (invariant 4). ADR-008 D9, `topics/v0` 3.4.1.
+
 ---
 
 ## 3. Consequences

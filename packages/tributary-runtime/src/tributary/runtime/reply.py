@@ -7,8 +7,8 @@ Normative sources: channel-spec README 3.2.6 ("Worker rules"), envelope README 3
 the `raw` record carries `tb-reply-partition`, so a hot reload between sync and async strands nothing.
 Three exceptions produce no reply and count it: a worker whose applied spec is transactional or has a
 splitter (`replies_skipped`), a reply past `tb-reply-deadline` plus 5 s of skew (`replies_expired`;
-the message is still processed; a `replied` event with `status: dropped` and a fixed `error_message`,
-no code, the way a `Drop` reason is carried), and a malformed or out-of-range routing header, which
+the message is still processed; a `replied` event with `status: dropped`, code `REPLY_EXPIRED` (set
+1.4: a registered engine-initiated skip) and a fixed `error_message`), and a malformed or out-of-range routing header, which
 disables the reply and **not** the message (envelope 2.3.3: a `replied` event with
 `REPLY_ROUTE_INVALID`). In every one of them the sender gets `AE` / `REPLY_TIMEOUT` from its receiver,
 which is the truthful answer: the message was committed.
@@ -53,7 +53,7 @@ from typing import Any, Literal
 
 from tributary.sdk import Message
 from tributary.sdk import headers as h
-from tributary.sdk.codes import REPLY_BODY_MISSING, REPLY_ROUTE_INVALID, TB_OUTPUT_ENVELOPE_INVALID
+from tributary.sdk.codes import REPLY_BODY_MISSING, REPLY_EXPIRED, REPLY_ROUTE_INVALID, TB_OUTPUT_ENVELOPE_INVALID
 from tributary.sdk.context import Logger
 from tributary.sdk.errors import EnvelopeError, HeaderError
 from tributary.sdk.ids import child_traceparent, new_traceparent
@@ -416,15 +416,16 @@ class ReplyPublisher:
         if self._now() > route.deadline + SKEW_ALLOWANCE:
             # The message was processed; only the answer is skipped. Nobody is waiting for it, and after
             # an outage a backlog would otherwise flood `reply` (S3: 1,026 late replies in one restart).
-            # The skip is deliberate, so its event is `dropped` with a fixed reason and no code (events/v0:
-            # a code is for `error` and `timeout`; `REPLY_TIMEOUT` is the receiver's, envelope 2.3.2).
+            # The skip is deliberate, so its event stays `dropped` (not an error-rate event), carrying the
+            # registered engine code `REPLY_EXPIRED` so it is queryable by a stable key (set 1.4, envelope
+            # 2.3.2). The sender's `REPLY_TIMEOUT` is the receiver's code, never this one.
             self.stats.expired += 1
             self._emit(
                 record,
                 channel,
                 channel_version,
                 status="dropped",
-                error_code=None,
+                error_code=REPLY_EXPIRED,
                 error_message=EXPIRED_MESSAGE,
                 correlation_id=route.correlation_id,
             )

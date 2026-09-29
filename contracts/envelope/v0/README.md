@@ -320,6 +320,19 @@ The numeric families (`HTTP_<status>`, `SFTP_<status>`, `CH_<code>`) and `PG_<cl
 Behaviour of `Reject` does not change: every new name was already under a reserved prefix. Only the
 cross-check test moves, so `ENGINE_CODES` gains all seventeen in the same commit.
 
+**Set 1.4 (2026-09-29): `REPLY_EXPIRED`.** The worker skips a reply that is past `tb-reply-deadline`
+plus the 5 s skew allowance (channel-spec README 3.2.6). Its `replied` event keeps `status: dropped`,
+because the skip is deliberate and must not count toward error-rate alerts. It now also carries
+`error_code: REPLY_EXPIRED`; until set 1.4 it carried only a sentence in `error_message`. **Why a code
+and not a `Drop`-style reason:** `Drop` reasons belong to a channel's step (`FILTERED` is the channel
+author's decision), while an expiry is an engine condition, typically a backlog after an outage (S3
+saw 1,026 late replies in one restart). Operators need to query it in the archive by a stable key.
+**The rule this sets:** a `dropped` event may carry `error_code` only when the code is a registered
+engine code for an engine-initiated skip. `Drop` reasons stay in `error_message`, unregistered. The
+events schema already allows this, so there is no schema change. **What we give up:** the "`dropped`
+never has a code" symmetry, and `ENGINE_CODES` must gain the code in the same commit, or the
+registry cross-check goes red.
+
 ### 2.3.3 Reply-routing headers: a parse failure disables the reply, not the message (set 1.2)
 
 `tb-reply-partition` and `tb-reply-deadline` on a `raw` record say where and until when to answer.

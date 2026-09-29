@@ -13,6 +13,7 @@
     { "file": "valid/partition-paused.json", "note": "Blocking retry paused a partition; triggering message id included" },
     { "file": "valid/partition-resumed.json", "note": "Partition resumed; duration_ms is the outage length" },
     { "file": "valid/reject-header-parse-error.json", "note": "Ordinary reject (envelope 2.3.1): identity was readable, one non-identity header was malformed and has been normalised on the DLQ record. attrs.bad_header names the offending header, which is safe because only REGISTERED header names can trigger a parse reject - the names are ours, the values are the sender's" },
+    { "file": "valid/replied-expired.json", "note": "Set 1.4. Sync reply skipped past tb-reply-deadline: stage replied, status dropped, error_code REPLY_EXPIRED (a registered engine skip code; a Drop reason would stay in error_message only). The message itself was processed; the sender got AE / REPLY_TIMEOUT from its receiver" },
     { "file": "valid/record-quarantined.json", "note": "kind=record: a record whose headers could not be decoded, identified by topic/partition/offset. message_id is the id minted for the DLQ quarantine wrapper, never a value read out of the broken record" }
   ],
   "invalid": [

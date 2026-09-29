@@ -67,6 +67,47 @@ def test_consumer_group_naming() -> None:
     assert topics.consumer_group("prod", "a", "pipeline", shadow="v2") == "tb.prod.a.pipeline.shadow-v2"
 
 
+def test_spec_reader_group_matches_the_contract_pattern_and_acl_prefix() -> None:
+    group = topics.spec_reader_group("dev", "adt-passthrough", "pipeline-1")
+    assert group == "tb.dev.adt-passthrough.channels.pipeline-1"
+    spec_reader = json.loads((CONTRACTS / "topics" / "v0" / "topic-defaults.json").read_text())["consumer_groups"][
+        "spec_reader"
+    ]
+    assert spec_reader["pattern"] == "tb.<env>.<channel>.channels.<instance>"
+    # The ACL is PREFIXED on `tb.<env>.<ch>.channels.` with the trailing delimiter: every group we build
+    # must sit strictly under it, so another channel's prefix can never match.
+    assert group.startswith("tb.dev.adt-passthrough.channels.") and len(group) > len("tb.dev.adt-passthrough.channels.")
+    assert not topics.spec_reader_group("dev", "adt", "p-1").startswith("tb.dev.adt-passthrough.channels.")
+
+
+def test_spec_reader_group_is_reexported_beside_the_reader() -> None:
+    from tributary.runtime import channels
+
+    assert channels.spec_reader_group is topics.spec_reader_group
+
+
+@pytest.mark.parametrize(
+    ("env", "channel", "instance"),
+    [
+        ("dev", "adt", ""),
+        ("dev", "adt", " pipeline-1"),
+        ("dev", "adt", "pipeline 1"),
+        ("dev", "adt", "pipe\nline"),
+        ("dev", "adt", "x" * 129),
+        ("dev", "a.b", "pipeline-1"),
+        ("Dev", "adt", "pipeline-1"),
+    ],
+)
+def test_spec_reader_group_rejects_bad_segments(env: str, channel: str, instance: str) -> None:
+    with pytest.raises(TopicNameError):
+        topics.spec_reader_group(env, channel, instance)
+
+
+def test_spec_reader_group_accepts_the_instance_ids_processes_default_to() -> None:
+    for instance in ("pipeline-4242", "loader-http-stub-4242", "reply-it-lab-query", "worker-2.pod:0@node"):
+        assert topics.spec_reader_group("prod", "lab-query", instance).endswith(f".channels.{instance}")
+
+
 def test_defaults_come_from_the_contract_file() -> None:
     defaults = load_topic_defaults()
     assert defaults.source == CONTRACTS / "topics" / "v0" / "topic-defaults.json"

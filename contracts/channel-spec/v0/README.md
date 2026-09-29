@@ -381,6 +381,8 @@ and here that resend is a duplicate.
 - A `Reject` or an exhausted step goes to `dlq` first; the reply follows the `dlq` callback.
 - **Expired replies are skipped:** past `tb-reply-deadline` plus 5 s of clock-skew allowance, no reply
   is produced (`replies_expired`). **The message is still processed.** Sync mode never cancels work.
+  Set 1.4: the `replied` event has `status: dropped` **and `error_code: REPLY_EXPIRED`** (envelope
+  README 2.3.2). The sender's answer is unchanged: `AE` / `REPLY_TIMEOUT` from its receiver.
 - **A malformed or out-of-range reply-routing header** (`tb-reply-partition`, `tb-reply-deadline`)
   disables the reply, not the message: the message is processed normally, no reply is produced, and a
   `replied` event carries `REPLY_ROUTE_INVALID` (amendment: renamed from `REPLY_PARTITION_INVALID` to
@@ -974,6 +976,7 @@ because a directory listing is a surface too. The loader writes `<name>.part`, t
 | `endpoint` | O | For S3-compatible stores such as MinIO. Scheme and host only; `http://` to loopback only |
 | `serverSideEncryption` | R | `AES256` or `aws:kms`; `kmsKeyId` only with `aws:kms`. **Which key, and who holds it, is ADR-004 plus a human** — this field only makes "on" mandatory |
 | `auth` | R | `access-key` (via `secretRef`) or `ambient` (workload identity or instance profile) |
+| `expectedBucketOwner` | O | **Set 1.4.** 12-digit account id (`^[0-9]{12}$`). Sent as `ExpectedBucketOwner` on every call, so a bucket re-created under another account refuses the write instead of receiving PHI. Recommended on AWS. Optional because not every S3-compatible store implements the check |
 | `fileExtension`, `timeoutMs`, `circuitBreaker` | O | |
 
 The object key is `<prefix>/<yyyy>/<mm>/<dd>/<tb-msg-id><fileExtension>`, the date from
@@ -1115,6 +1118,12 @@ when all of the following are true, and not before. The spike is `platform-engin
 destination on a **per-key channel additionally requires an explicit `acceptReordering: true`** in its
 `retry` block (additive), because invariant 5 forbids *silent* reordering and a per-key channel has
 declared that order matters; the CLI scaffolds `onExhaust: dlq-and-continue` for it (ADR-003 D3).
+**Set 1.4 adds:** the loader gains READ and WRITE on `<env>.<channel>.retry` (`topic-defaults.json`
+`security.acls.loader_retry_topic`; no role holds either today). Each destination's loader consumes
+`retry` in its own group `tb.<env>.<channel>.loader.<dest>` and skips other destinations'
+`tb-destination`. A channel-wide retry group is forbidden, because one destination's commits would
+skip another's retries (`topics/v0` 3.4.1). The spike's item 4 gains a two-destination case, with a
+shared-group control that must go red.
 
 **If the spike shows (a)'s head-of-line cost is intolerable and (b) breaks the partition budget,** the
 answer is that `retry-topic` stays refused and ADR-003 says why. That is a legitimate outcome, and the

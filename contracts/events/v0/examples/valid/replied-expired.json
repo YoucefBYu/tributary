@@ -1,0 +1,18 @@
+{
+  "v": 0,
+  "kind": "message",
+  "ts": "2026-09-29T08:14:02.517Z",
+  "channel": "lab-query",
+  "channel_version": 3,
+  "stage": "replied",
+  "status": "dropped",
+  "instance": "worker:pipeline-1@worker-2",
+  "message_id": "01923f6e-4b1a-7c2d-8e3f-5a6b7c8d9e0f",
+  "correlation_id": "01923f6e-4b1a-7d4e-9f50-61728394a5b6",
+  "topic": "prod.lab-query.raw",
+  "partition": 1,
+  "offset": 48213,
+  "error_code": "REPLY_EXPIRED",
+  "error_message": "reply past tb-reply-deadline plus the skew allowance; not produced, message processed",
+  "traceparent": "00-7d3e9f1a2b4c5d6e8f90a1b2c3d4e5f6-3c5e7a9b1d2f4a6c-01"
+}

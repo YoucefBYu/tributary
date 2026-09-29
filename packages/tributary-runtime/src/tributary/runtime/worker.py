@@ -67,7 +67,16 @@ from .reply import (
 )
 from .spec import ChannelSpec, RetryPolicy
 from .steps import Node, Resolver, build_plan, load_step
-from .topics import channels_topic, consumer_group, dlq_topic, events_topic, out_topic, raw_topic, reply_topic
+from .topics import (
+    channels_topic,
+    consumer_group,
+    dlq_topic,
+    events_topic,
+    out_topic,
+    raw_topic,
+    reply_topic,
+    spec_reader_group,
+)
 from .transactions import (
     GroupMetadataSource,
     TransactionalCommitter,
@@ -985,7 +994,7 @@ class PipelineWorker:
                 consumer_config(
                     self.settings.kafka,
                     defaults,
-                    group_id=f"tb.{env}.{channel}.channels.{self.settings.instance_id}",
+                    group_id=spec_reader_group(env, channel, self.settings.instance_id),
                     enable_partition_eof=True,
                 )
             ),

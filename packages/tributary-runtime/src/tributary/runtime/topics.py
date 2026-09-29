@@ -17,6 +17,11 @@ from .errors import TopicNameError, safe_token
 ENV = re.compile(r"^[a-z][a-z0-9-]{0,15}$")
 CHANNEL = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
 DESTINATION = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
+#: A process instance id (`TB_INSTANCE_ID`, `--instance-id`, a pod name). Looser than the name segments
+#: because it is operator-chosen, but never empty and never whitespace or control characters: the
+#: `spec_reader` group ACL is a PREFIXED grant on `tb.<env>.<ch>.channels.`, so the instance is the
+#: only free-form part of the group id.
+INSTANCE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")
 
 TopicKind = Literal["raw", "out", "retry", "dlq", "reply"]
 PlatformKind = Literal["channels", "events", "audit"]
@@ -98,6 +103,26 @@ def consumer_group(
     if shadow is not None:
         parts.append(f"shadow-{_segment('shadow label', shadow, DESTINATION)}")
     return ".".join(parts)
+
+
+def spec_reader_group(env: str, channel: str, instance: str) -> str:
+    """`tb.<env>.<channel>.channels.<instance>`: the `_tb.<env>.channels` reader's per-process group.
+
+    `contracts/topics/v0` 3.6 and `consumer_groups.spec_reader` (set 1.4). The reader uses `assign()`
+    and never commits, but librdkafka still looks up the coordinator for a configured `group.id`, so
+    the receiver, worker and loader principals hold READ on group PREFIXED `tb.<env>.<channel>.channels.`
+    and every data-plane process must build its group id here, not as an f-string. One group per
+    process, so readers never share offsets or partitions.
+    """
+    return ".".join(
+        [
+            "tb",
+            _segment("env", env, ENV),
+            _segment("channel", channel, CHANNEL),
+            "channels",
+            _segment("instance", instance, INSTANCE),
+        ]
+    )
 
 
 @dataclass(frozen=True, slots=True)

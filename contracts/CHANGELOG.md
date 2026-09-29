@@ -3,6 +3,97 @@
 Newest first. Each entry names the contract, the version, whether the change is additive or
 breaking, and the reason. Breaking changes reference an ADR.
 
+## 2026-09-29 (latest) — contract set 1.4: ACL role table reconciled with the code, super users, `expectedBucketOwner`, `REPLY_EXPIRED`
+
+**Additive for every document:** every envelope, event, channel spec and engine-kafka document valid
+under set 1.3 stays valid. One valid example gains an optional field without changing its validity.
+**No invariant changes.** The one deployment-facing change is `topics/v0` `security.acls`. It **adds**
+grants that code paths needed, **removes** grants no code uses, and **narrows** two undelimited group
+prefixes. No role loses a grant that any code in `packages/` exercises (checked by reading the
+code, not by running it). Recorded in ADR-008 D6-D9 and the ADR-003 D10 amendment.
+
+Source: `devops-engineer`'s first deny-by-default run of the Compose lite stack. The loader exited with
+`ChannelSpecError: channels topic _tb.dev.channels is not available` (its `TOPIC_AUTHORIZATION_FAILED`),
+and the worker logged `GROUP_AUTHORIZATION_FAILED` (error code 30) on its spec reader. With a temporary
+READ grant, MLLP → worker → loader ran end to end. Four queued items from the lead are included.
+
+| # | Question | Ruling and why |
+|---|---|---|
+| 1 | Data-plane roles cannot read `_tb.<env>.channels` | **Receiver, worker and loader each get READ on `_tb.<env>.channels`, plus READ on group PREFIXED `tb.<env>.<ch>.channels.`**, the spec reader's per-process group (`tb.<env>.<ch>.channels.<instance>`, built as an f-string in `worker.py` and in every `loaders/*/main.py`). The reader uses `assign()` and never commits, but librdkafka still looks up the coordinator for a configured `group.id`. WRITE stays control-plane only. **Receivers** read a spec file today (wave-1 stand-in, an invariant-3 gap), so their grant comes ahead of the migration. Named in `consumer_groups.spec_reader`. topics README 3.4.1 rule 1 |
+| 2 | Reconcile the whole table against the code | Worker: WRITE on `.retry` **removed** (nothing writes it, and under the 4.1.1 design only the loader would). Pipeline group `pipeline*` → LITERAL `pipeline` + PREFIXED `pipeline.shadow-`. **New `pipeline_worker_transactional`**: WRITE on transactional id prefix `tb.<env>.<ch>.pipeline.`, which was missing, so a transactional worker could never start on a deny-by-default broker. Kept out of the parsed string, and it fails closed. Loader: READ/WRITE on `.retry` **removed** (`retry-topic` refused, no code touches it); group `loader.<dest>*` → LITERAL `loader.<dest>` (no loader builds a shadow group). Receiver sync-reply group `replier*` → LITERAL `replier`. IDEMPOTENT_WRITE not added to worker or loader: WRITE on a topic suffices since Kafka 3.0 (KIP-679), and the lite run confirms it for both producers. Archiver unchanged, **unverified** (no package yet) |
+| 3 | `engine-kafka/v0` 6 rule 3: super users | **Amended to the implementation.** Super users: `CN=kafka` (broker, mTLS), `CN=tb-lite-users-init` (`kafka-users-init`, mTLS over the loopback `ADMIN` listener, one-shot), `tb-lite-topic-bootstrap`, `tb-lite-admin`. `tb-lite-channel-publish` is **not** one: its `control_plane` grants only. `CN=tb-lite-healthcheck` has **no ACL** (it sends only `ApiVersions`). No data-plane role and no `ANONYMOUS`. The security review judged this acceptable and tighter than the set 1.3 text. `topic-defaults.json` `security.broker.super.users` (was `TODO`) and topics README 3.4 restated to match |
+| 4 | Loaders' shared `.retry` READ across destinations | **Ruled now, applied on lift.** Offsets are per `(group, topic, partition)`, so skipping happens only if destinations **share a group**. Each destination consumes `retry` in its own group `tb.<env>.<ch>.loader.<dest>` and filters on `tb-destination`; a channel-wide retry group is forbidden, and the LITERAL group ACL enforces that at start. Rejected: a per-destination retry topic (D−1 more topics per channel against the S4 budget; grammar change). **Give up:** read amplification × destinations, and loaders read sibling destinations' retry records within one channel. topics README 3.4.1; channel-spec README 4.1.1 |
+| 5 | `expectedBucketOwner` on `s3` | **Added**, optional, `^[0-9]{12}$`. The `s3` loader already sends it when configured. Optional because some S3-compatible stores lack the check, and required would be breaking. channel-spec README 3.4.5 |
+| 6 | A code for an expired reply | **`REPLY_EXPIRED` registered**, carried as `error_code` on the `replied` event, which **keeps `status: dropped`** (a deliberate skip, not an error-rate event). Rule: `dropped` carries a code only for a registered engine-initiated skip; `Drop` reasons stay in `error_message`. No schema change (the events schema already permits it). The sender still gets `AE` / `REPLY_TIMEOUT`. Rejected: no code (not queryable by a stable key), or `status: error` (would page on a backlog the engine handled correctly). envelope README 2.3.2 |
+
+### `tributary.topics/v0`
+
+`topic-defaults.json`: `security.broker.super.users`; `security.acls` `grammar`, `reconciled_with_code`,
+`receiver`, `pipeline_worker`, `pipeline_worker_transactional` (new), `loader`, `loader_retry_topic`
+(new, not granted), `archiver_note` (new); `consumer_groups.spec_reader` (new). No value that
+`must_not_hardcode` lists changed. README: status line, section 1 `retry` row, 3.4 `super.users` row,
+**new 3.4.1**, 3.6.
+
+**ACL table diff** (lite parser output for `dev` / `adt-passthrough` / `http-stub`; + added, − removed):
+
+| Role | Change |
+|---|---|
+| receiver | + TOPIC `_tb.dev.channels` LITERAL READ; + GROUP `tb.dev.adt-passthrough.channels.` PREFIXED READ |
+| pipeline_worker | − TOPIC `dev.adt-passthrough.retry` LITERAL WRITE; − GROUP `tb.dev.adt-passthrough.pipeline` PREFIXED READ; + GROUP `tb.dev.adt-passthrough.pipeline` LITERAL READ; + GROUP `tb.dev.adt-passthrough.pipeline.shadow-` PREFIXED READ; + GROUP `tb.dev.adt-passthrough.channels.` PREFIXED READ |
+| loader | − TOPIC `dev.adt-passthrough.retry` LITERAL READ and WRITE; − GROUP `tb.dev.adt-passthrough.loader.http-stub.` PREFIXED READ; + TOPIC `_tb.dev.channels` LITERAL READ; + GROUP `tb.dev.adt-passthrough.channels.` PREFIXED READ |
+| control_plane | unchanged |
+
+### `tributary.engine-kafka/v0`
+
+README only: status line, section 1 scope table (worker produces no `retry`; the loader reads
+`_tb.<env>.channels`; the receiver will), section 6 rule 3 (super users table).
+
+### `tributary.channel-spec/v0`
+
+Schema: `$defs/s3Params.expectedBucketOwner`. README 3.2.6 (expired-reply code), 3.4.5, 4.1.1 (ACL and
+group on lift). Examples: `valid/sftp-drop-to-s3-and-sftp.json` gains `expectedBucketOwner:
+"111122223333"` (AWS's documentation placeholder account id); new
+`invalid/destination-s3-bucket-owner-not-account-id.json`, **predicted, unmeasured**:
+
+| Example | Pinned pair |
+|---|---|
+| `destination-s3-bucket-owner-not-account-id` | `$.spec.destinations[0].with.expectedBucketOwner` / `pattern` |
+
+### `tributary.envelope/v0`
+
+`error-codes.json` set 1.4: `REPLY_EXPIRED`. README 2.3.2 set 1.4 paragraph.
+
+### `tributary.events/v0`
+
+README field table (`error_code` on `dropped`). New `valid/replied-expired.json`. No schema change.
+
+### Change requests that follow
+
+- **`platform-engineer`, same commit as this contract or immediately after:** `REPLY_EXPIRED` in
+  `ENGINE_CODES`, or the registry cross-check goes red. `reply.py` emits it on the expired path.
+  Add a `spec_reader_group(env, channel, instance)` helper to `tributary.runtime.topics` and use it in
+  `worker.py`; `connector-engineer` switches the eight `loaders/*/main.py` copies of the f-string to it.
+- **`devops-engineer`:** update the three `test_bootstrap_topics.py` tests the diff above breaks
+  (receiver exact set; worker `.retry` and `pipeline` PREFIXED; loader `.retry`, `loader.http-stub.`
+  PREFIXED, and the now-inverted "no `_tb.dev.channels`" assertion). Then remove the temporary READ
+  grant, recreate the stack (`down`; ACLs are only ever added), and re-run MLLP → worker → loader.
+- **`connector-engineer`:** the eight loader copies onto `spec_reader_group`; receivers onto
+  `open_spec_source` (invariant 3), for which the grant is already in place.
+- **`qa-engineer`:** measure the counts below, and add ACL negative cases to the Compose e2e: the
+  loader cannot READ `.retry`, and a principal holding `loader.fhir` cannot join `loader.fhir-server`.
+
+### Verification owed
+
+Not run by the architect, who has no shell.
+
+- `uv run --no-project --python 3.12 --with jsonschema python contracts/validate.py`: expected
+  **150 / 0** (set 1.3's 148, unverified, + 1 channel-spec invalid + 1 events valid).
+- `validate.py --emit-expectations`: **one** new pair, above.
+- `pytest tests/conformance`: +2 cases over the set 1.3 measurement.
+- `pytest deploy/compose/topic-bootstrap`: **3 known failures** until `devops-engineer` updates them.
+- `uv run pytest packages/tributary-sdk`: red until `ENGINE_CODES` gains `REPLY_EXPIRED`.
+- `pytest packages/tributary-loaders/tests/s3`: unchanged, green; the loader already accepts the field.
+
 ## 2026-09-29 (later) — contract set 1.3.1 (patch): exact engine-Kafka key allow-list, `ctx.reply` shape, `s3` licences
 
 **Patch. No schema, example or manifest changes**, so `validate.py` and conformance counts are

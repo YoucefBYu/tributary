@@ -64,6 +64,9 @@ REPLY_BODY_MISSING: Final = "REPLY_BODY_MISSING"
 #: `tb-reply-partition` or `tb-reply-deadline` malformed on a `raw` record: the reply is disabled,
 #: the message is processed normally (envelope 2.3.3). Carried by a `replied` event only.
 REPLY_ROUTE_INVALID: Final = "REPLY_ROUTE_INVALID"
+#: Set 1.4: a reply past `tb-reply-deadline` plus the skew allowance; not produced, message processed.
+#: Carried by a `replied` event with `status: dropped` only; never a header, never sender-facing.
+REPLY_EXPIRED: Final = "REPLY_EXPIRED"
 
 # Built-in step codes. Named here so the built-ins and the reserved list cannot drift apart.
 FILTER_UNRESOLVED: Final = "FILTER_UNRESOLVED"
@@ -105,6 +108,7 @@ ENGINE_CODES: Final = frozenset(
         REPLY_UNAVAILABLE,
         REPLY_BODY_MISSING,
         REPLY_ROUTE_INVALID,
+        REPLY_EXPIRED,  # set 1.4
         # set 1.3: fixed names the wave 2 loaders emit under reserved prefixes (envelope README
         # 2.3.2 rule 2), plus the receivers' mTLS client allow-list refusal (channel-spec 3.2.7)
         "HTTP_REDIRECT_REFUSED",

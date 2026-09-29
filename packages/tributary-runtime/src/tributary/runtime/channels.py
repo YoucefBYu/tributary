@@ -26,6 +26,10 @@ from .consumer import PARTITION_EOF
 from .errors import ChannelSpecError
 from .spec import ChannelSpec
 
+# Re-exported next to `open_spec_source`: the group id every caller of the reader must configure (set
+# 1.4, `consumer_groups.spec_reader`). Defined in `topics`, with the other group names.
+from .topics import spec_reader_group as spec_reader_group
+
 
 class ChannelsConsumerLike(Protocol):
     """The slice of `confluent_kafka.Consumer` the cache uses."""

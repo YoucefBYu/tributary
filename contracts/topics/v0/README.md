@@ -1,7 +1,8 @@
 # Contract: topic naming, defaults and required configuration — v0 (draft)
 
 **Contract id:** `tributary.topics/v0`
-**Status:** Draft. Partition defaults and `session.timeout.ms` are **measured** (S4, S5, 2026-09-20) and are lower bounds from a laptop-hosted cluster; `_tb.<env>.events` partitions and audit retention are still open.
+**Status:** Draft. Partition defaults and `session.timeout.ms` are **measured** (S4, S5, 2026-09-20) and are lower bounds from a laptop-hosted cluster; `_tb.<env>.events` partitions and audit retention are still open. **Set 1.4 (2026-09-29):** ACL role table
+reconciled with the code (3.4.1), `super.users` restated, spec-reader group named (3.6).
 **Owner:** `architect`.
 **Source:** ADR-001 sections 5.3 and 6.4, refined by ADR-002.
 **Schema:** [`topic-name.schema.json`](topic-name.schema.json) · **Defaults:** [`topic-defaults.json`](topic-defaults.json) · **Examples:** [`examples/topic-names.json`](examples/topic-names.json)
@@ -29,7 +30,7 @@ Total length ≤ 249 (Kafka's limit). The grammar's worst case is 150, so there 
 |---|---|---|
 | `<env>.<ch>.raw` | Messages as received. Source of truth for replay. | ordering key |
 | `<env>.<ch>.out.<dest>` | Transformed message for one destination. | ordering key |
-| `<env>.<ch>.retry` | Non-blocking retries, shared across destinations. | ordering key |
+| `<env>.<ch>.retry` | Non-blocking retries, shared across destinations. **Unused in v0**: `retry-topic` is refused, so no role holds a grant on it (3.4.1). | ordering key |
 | `<env>.<ch>.dlq` | Exhausted retries and step failures. | `tb-msg-id` |
 | `<env>.<ch>.reply` | Short-lived synchronous replies. | `tb-correlation-id` |
 | `_tb.<env>.channels` | Compacted deployed channel specs. | channel id |
@@ -278,7 +279,7 @@ in `topic-defaults.json` under `security`.
 | Authentication | `SCRAM-SHA-512` or `OAUTHBEARER`. Never `PLAIN` on a listener without TLS. |
 | Hostname verification | `ssl.endpoint.identification.algorithm=https`. Leaving this off is the most common way a TLS Kafka deployment silently accepts a man-in-the-middle. |
 | Authorization | `StandardAuthorizer` enabled and **`allow.everyone.if.no.acl.found=false`** — deny by default. |
-| `super.users` | The topic-creation job and the control plane only. Never a data-plane component. |
+| `super.users` | **Set 1.4:** the broker's own identity, the topic-creation job, an operator admin principal, and a one-shot user-provisioning identity where one exists. **Never** a data-plane component, the control plane's channel publisher (it holds only its `control_plane` grants), or `User:ANONYMOUS`. Lite stack names: `engine-kafka/v0` 6 rule 3. |
 | Credentials | From a `secretRef` or a secrets manager. Never in a channel spec, a Compose file or an image. |
 
 ACLs are least privilege on the topic prefix `<env>.<channel>.`, so compromising one channel's
@@ -303,6 +304,76 @@ section 6); the lite profile lowers durability only (3.8), never transport secur
 **Escalated, not decided here:** the complete role model, credential rotation and key management are
 ADR-004 plus a human decision. This section fixes the minimum shape the configuration contract must
 state; it does not design the authorization model or any cryptography.
+
+#### 3.4.1 Role grants, reconciled with the code (set 1.4)
+
+**Why this exists.** The first deny-by-default run (Compose lite, ADR-008 D5) showed that the table was
+written from intent, not from the code. Every loader exited with `ChannelSpecError: channels topic
+_tb.dev.channels is not available`, which is how `open_spec_source` reports `TOPIC_AUTHORIZATION_FAILED`:
+the `loader` role had no READ on `_tb.<env>.channels`, although every loader reads its spec there
+(invariant 3). The worker logged `GROUP_AUTHORIZATION_FAILED` (error code 30) on its spec reader,
+because no role had a grant for that reader's group. With a temporary READ grant, the MLLP → worker →
+loader path ran end to end. Set 1.4 rebuilds the table from what each role's code touches.
+
+| Role | Topics | Consumer groups | Cluster / other |
+|---|---|---|---|
+| receiver | WRITE `raw`; READ `_tb.<env>.channels` (below) | `tb.<env>.<ch>.channels.` (prefixed); sync-reply only: `tb.<env>.<ch>.replier` (literal) | IDEMPOTENT_WRITE; sync-reply only: READ `reply`, never WRITE |
+| pipeline worker | READ `raw`; WRITE `out.*`, `dlq`, `_tb.<env>.events`; READ `_tb.<env>.channels`; sync-reply only: WRITE `reply` | `tb.<env>.<ch>.pipeline` (literal), `tb.<env>.<ch>.pipeline.shadow-` (prefixed), `tb.<env>.<ch>.channels.` (prefixed) | transactional channels only: WRITE on transactional id prefix `tb.<env>.<ch>.pipeline.` |
+| loader | READ `out.<dest>`; WRITE `dlq`, `_tb.<env>.events`; READ `_tb.<env>.channels` | `tb.<env>.<ch>.loader.<dest>` (literal), `tb.<env>.<ch>.channels.` (prefixed) | none |
+| control plane (channel publisher) | WRITE `_tb.<env>.channels`, `_tb.<env>.audit` | none | DESCRIBE |
+
+**Rules the table follows.**
+
+1. **Every data-plane role reads `_tb.<env>.channels`** and holds READ on its spec reader's group
+   prefix `tb.<env>.<ch>.channels.` (`consumer_groups.spec_reader`). The reader uses `assign()` and
+   never commits, but librdkafka still looks up the coordinator for a configured `group.id`, and that
+   lookup needs the group grant. **The receiver gets the same grant before it needs it:** receivers
+   still read a spec file (a wave-1 stand-in, `receivers/mllp/config.py`), which is an invariant-3
+   gap, and the migration should not wait on a second ACL round. **WRITE on `_tb.<env>.channels` stays
+   control-plane only** (`forbidden`).
+2. **Every group grant is delimited.** A PREFIXED grant ends at `.` or `-` (`...channels.`,
+   `...pipeline.shadow-`), so `tb.dev.adt.loader.fhir` cannot reach `...loader.fhir-server`. Loaders
+   get a LITERAL group: no loader builds a shadow group. The set 1.2 `replier*` becomes LITERAL
+   `replier` for the same reason.
+3. **No grant without a code path.** The worker loses WRITE on `.retry`: under the set 1.1 design
+   (channel-spec 4.1.1 item 5) the loader writes `retry`, never the worker. The loader loses READ and
+   WRITE on `.retry`, because `retry-topic` is refused and nothing touches the topic
+   (`loader_retry_topic` says what it gains on lift). `topic-bootstrap` still creates the topic.
+4. **IDEMPOTENT_WRITE on the cluster is not granted to the worker or the loader.** Since Kafka 3.0
+   (KIP-679), WRITE on any topic authorizes an idempotent producer. Evidence: on the lite run, both
+   roles' `acks=all` idempotent producers worked without it. The receiver keeps its grant; it is
+   redundant and harmless. The KIP-679 reading was not re-checked against the 4.0 source.
+5. **The transactional-id grant lives outside the parsed worker string** (`pipeline_worker_transactional`).
+   If it is missing, `init_transactions` fails before the worker consumes anything, so the channel fails
+   closed.
+
+**Accepted exposure: every data-plane principal can read every channel spec in its environment.**
+`_tb.<env>.channels` is one compacted topic keyed by channel, and a reader needs all partitions
+(`channels.py`), so the grant cannot be per channel. A spec carries no secret value (only `secretRef`
+names) and no PHI, but it does reveal topology: hosts, ports, bucket names and partner endpoints.
+**What we give up:** a compromised loader learns the shape of other channels. Per-channel spec topics
+would fix that, at one more topic per channel against the 2.2 budget; ADR-004 may revisit it.
+
+**Retry groups (ruling, applies when `retry-topic` lifts).** One `retry` topic per channel, shared
+across destinations (4.1.1 item 1), is safe **only if no two destinations share a consumer group on
+it.** Kafka keeps committed offsets per `(group, topic, partition)`. If loaders A and B used a common
+group such as `tb.<env>.<ch>.retry`, A committing past B's record would make B skip its retry. That is
+silent loss, an invariant-4 violation. Therefore:
+
+- each destination's loader consumes `retry` in **its own group**, `tb.<env>.<ch>.loader.<dest>`,
+  whether through the same consumer as `out.<dest>` or a second member of that group, and skips
+  records whose `tb-destination` is not its own. A skipped record still advances **that group's**
+  offset, which is correct;
+- a channel-wide retry group is **forbidden**. The ACL enforces this: a loader holds only its LITERAL
+  destination group, so a shared group name fails authorization at start instead of losing data;
+- lift adds one conformance test: two destinations on one channel both fail, and each gets its own
+  retries, with a broken control that shares a group and goes red.
+
+**Rejected:** a per-destination retry topic `<env>.<ch>.retry.<dest>`. It isolates by construction, but
+it adds D−1 topics per channel against the S4 partition budget, and it is a grammar change. **What we
+give up:** each loader reads every destination's retry records (read amplification × destinations on a
+low-volume topic), and a loader's principal can read retry records for sibling destinations of the same
+channel. Same channel and same PHI class, so this is accepted.
 
 ### 3.5 Encryption at rest (required)
 
@@ -341,7 +412,7 @@ For example `tb.prod.adt-to-fhir.loader.fhir-server`. A shadow deployment append
 (3.3.1), on this engine's cluster. Receivers of a sync-reply channel gain READ on
 `<env>.<channel>.reply` and on group `tb.<env>.<channel>.replier*`; the pipeline worker gains WRITE on
 `<env>.<channel>.reply` (`security.acls`). The receiver gets no WRITE on `reply`, so it cannot forge an
-answer. Every receiver process of a channel shares one principal, so targeted routing limits what a
+answer. Set 1.4 tightens the group grant to LITERAL `tb.<env>.<channel>.replier` (3.4.1 rule 2). Every receiver process of a channel shares one principal, so targeted routing limits what a
 process reads **by design, not by ACL**.
 
 **`receiver` (set 1.1, additive)** is the group of a `kafka` source (`channel-spec/v0` 3.2.5). That
@@ -349,6 +420,10 @@ group lives on the **external** cluster the source reads, under the source's own
 the engine's receiver principal — so section 3.4's ACL shape and `security.acls` gain nothing and lose
 nothing. The name is fixed here only so two deployments of one channel cannot collide on a foreign
 cluster.
+
+**Spec reader (set 1.4)** is `tb.<env>.<channel>.channels.<instance>`, one group per process, used by
+the `_tb.<env>.channels` reader (`consumer_groups.spec_reader`, 3.4.1 rule 1). It is not a `<role>` in
+the pattern above: its last segment is an instance, not a destination, and it never joins or commits.
 
 ### 3.7 These values are read from the contract, not copied into code
 

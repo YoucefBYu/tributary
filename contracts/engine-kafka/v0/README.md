@@ -4,7 +4,9 @@
 **Status:** Draft, **new in contract set 1.3 (2026-09-29)**. Additive: it fills the `TODO` that
 `topics/v0` `topic-defaults.json` `security.clients.credentials` left open, and no existing document
 changes meaning. **Set 1.3.1 (2026-09-29, patch):** section 4 rule 4 narrowed from `ssl.*`/`sasl.*`
-prefixes to an exact ten-key allow-list. Schema and examples unchanged.
+prefixes to an exact ten-key allow-list. Schema and examples unchanged. **Set 1.4 (2026-09-29):** section 1
+scope table corrected to the code (`retry` unused, the loader reads `_tb.<env>.channels`); section 6
+rule 3 restated to the implemented super users. README only.
 **Owner:** `architect`. Propose changes by message with the exact diff and impact.
 **Source:** ADR-008 (D1-D4); `topics/v0` 3.4; the W2-7 security review HIGH fixed in `e3ddee1`.
 **Schema:** [`engine-kafka.schema.json`](engine-kafka.schema.json) · **Examples:**
@@ -25,9 +27,9 @@ One document per **data-plane process**, used for **every** client that process 
 
 | Role | Clients covered |
 |---|---|
-| receiver (`mllp`, `http`, `sftp`, `kafka` source) | the `raw` producer; the sync-reply consumer (`topics/v0` 3.3.1) |
-| pipeline worker | the `raw` consumer; `out`/`retry`/`dlq`/`reply` producers; the `_tb.<env>.channels` reader; the events producer |
-| loader | the `out.<dest>`/`retry` consumer; `retry`/`dlq` producers; the events producer |
+| receiver (`mllp`, `http`, `sftp`, `kafka` source) | the `raw` producer; the sync-reply consumer (`topics/v0` 3.3.1); the `_tb.<env>.channels` reader once receivers migrate off spec files (set 1.4) |
+| pipeline worker | the `raw` consumer; `out`/`dlq`/`reply` producers; the `_tb.<env>.channels` reader; the events producer |
+| loader | the `out.<dest>` consumer; the `dlq` producer; the `_tb.<env>.channels` reader; the events producer. `retry` only when `retry-topic` lifts (`topics/v0` 3.4.1) |
 | archiver (wave 3) | the `_tb.<env>.events` consumer |
 
 **Not covered:** a `kafka` source's or destination's connection to a **foreign** cluster. That is
@@ -142,9 +144,25 @@ exception. Requirements for `deploy/compose/` (`devops-engineer`):
    key is not mounted into any component.
 3. `StandardAuthorizer`, `allow.everyone.if.no.acl.found=false`. The topic-bootstrap job applies
    the walking-skeleton channel's grants from `topic-defaults.json` `security.acls`, read from the
-   file (3.7), not restated. `super.users` is the broker and the admin principal used by
-   topic-bootstrap and channel-publish (the control-plane stand-ins), **never** `User:ANONYMOUS` and
-   never a data-plane component.
+   file (3.7), not restated. **Amended in set 1.4 to what `deploy/compose/kafka/tls-init.sh`
+   implements**, which the security review judged acceptable and tighter than the set 1.3 text:
+
+   | Principal | How it authenticates | Authority |
+   |---|---|---|
+   | `CN=kafka` (the broker) | mTLS on the loopback `CONTROLLER` and `BROKER` listeners | **super user** |
+   | `CN=tb-lite-users-init` (`kafka-users-init`) | mTLS on the loopback `ADMIN` listener (`127.0.0.1:9096`), reachable only from the broker's network namespace (`network_mode: service:kafka`) | **super user**, one-shot: creates the per-component SCRAM users from the password files and exits |
+   | `tb-lite-topic-bootstrap` | SCRAM over `SASL_SSL` | **super user**: creates topics and applies the ACLs |
+   | `tb-lite-admin` | SCRAM over `SASL_SSL` | **super user**: the operator's principal |
+   | `CN=tb-lite-healthcheck` | mTLS on the `ADMIN` listener | **no ACL at all**. It sends only `ApiVersions`, which needs no authorization, so "healthy" proves TLS, hostname verification and client-certificate authentication, and nothing more |
+   | `tb-lite-channel-publish` | SCRAM over `SASL_SSL` | **not a super user**: its `control_plane` grants only (least privilege) |
+   | `tb-lite-receiver`, `-worker`, `-loader` | SCRAM over `SASL_SSL` | their `security.acls` grants only |
+
+   **Never** `User:ANONYMOUS`, which is why no listener is `PLAINTEXT`, not even the loopback
+   controller: a PLAINTEXT controller's own requests would arrive as `ANONYMOUS`. **Never** a data-plane
+   component. The certificate identities have no password to leak. The dev CA key is deleted after
+   signing, so nothing can mint another identity. ACLs are only ever added, so a narrowed
+   `security.acls` takes effect only on a fresh broker: after `docker compose down` (the storage lives
+   in the container) or a credential regeneration, which wipes it.
 4. Every data-plane service gets `TB_ENGINE_KAFKA_FILE` pointing at a committed document like
    `valid/compose-lite-worker.json` (it holds no secret).
 5. No generated password, key or certificate is printed by the init service or reaches

@@ -65,7 +65,7 @@ events; that made `message_id` meaninglessly non-null.
 | `size_bytes` | integer ≥ 0 | no | Payload size. `0` with a claim-check. |
 | `claim_check` | string | no | Object-store URI, so the browser can fetch large content. |
 | `topic`, `partition`, `offset` | string, integer, integer | required for `kind=partition` | Also useful on message events for replay by offset. |
-| `error_code` | `^[A-Z][A-Z0-9_]{0,63}$` | no | Same vocabulary as `tb-error-code`. Required when `status` is `error` or `timeout`. |
+| `error_code` | `^[A-Z][A-Z0-9_]{0,63}$` | no | Same vocabulary as `tb-error-code`. Required when `status` is `error` or `timeout`. On `dropped` only for a registered engine code for an engine-initiated skip, today only `REPLY_EXPIRED` (set 1.4, envelope README 2.3.2); a `Drop` reason stays in `error_message`. |
 | `error_message` | string ≤ 512 | no | **Redacted, static text only.** Section 3. |
 | `duration_ms` | number ≥ 0 | no | Time spent in the stage the event closes. Lets the archiver compute stage latency without joining two events. |
 | `attrs` | object, string→string | no | Searchable metadata. Section 3. At most 16 entries and 1024 serialized bytes. `tb-usr-*` headers are **not** projected here ([envelope contract](../../envelope/v0/README.md) 2.2). |

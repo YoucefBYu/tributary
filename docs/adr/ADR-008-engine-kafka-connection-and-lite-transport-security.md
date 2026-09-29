@@ -67,6 +67,25 @@ every role and the lite stack.
 | (b) Dev-only opt-out flag (for example `TB_INSECURE_DEV_PLAINTEXT`) | **Rejected: no definition keeps it out of production.** A component cannot tell a Compose bridge from a production pod network; both are non-loopback. Tying it to `TB_PROFILE=lite` does not help, because lite is approved for "small sites that have accepted the risk" (`topics/v0` 3.1), which carry PHI. Tying it to "cluster has one broker" fails the same way. A CI grep on Helm catches only Helm. The only opt-out that cannot leak is one that does not exist |
 | (c) Shared network namespace (`network_mode: service:kafka`), so `127.0.0.1:9092` is literally loopback | Honest and cheap, but TLS, SCRAM and ACLs would first run in Helm, the wave 1 High pattern again. Weakens isolation between containers. Kept as the fallback if (a) proves unworkable, which would come back here |
 
+### D6-D9 — the ACL table meets a deny-by-default broker (added 2026-09-29, set 1.4)
+
+**Evidence.** The first run of D5 found what section 4 predicted. Every loader exited with
+`ChannelSpecError: channels topic _tb.dev.channels is not available` (`TOPIC_AUTHORIZATION_FAILED`,
+reported through `open_spec_source`). The worker logged `GROUP_AUTHORIZATION_FAILED` (error code 30)
+on its spec reader. With a temporary READ grant, MLLP → worker → loader ran end to end
+(`devops-engineer`). A read of `packages/*` then found four more defects in the table. **Criteria:**
+every grant has a code path; no code path lacks its grant; every prefix is delimited; the change stays
+parseable by the lite `topic-bootstrap`.
+
+| # | Decision | Rejected | What it gives up |
+|---|---|---|---|
+| D6 | **Receiver, worker and loader get READ on `_tb.<env>.channels` and READ on group PREFIXED `tb.<env>.<ch>.channels.`** (the spec reader's per-process group). The receiver gets it ahead of its invariant-3 migration off spec files | (a) Drop `group.id` from the reader, so no group grant is needed: cleaner, but it needs a code change, and whether `confluent-kafka` accepts a consumer without `group.id` is **unverified** here. It stays open as a later tightening. (b) Per-channel spec topics: exact isolation, one more topic per channel against the S4 budget | Every data-plane principal reads every channel spec in its environment. Specs carry no secret value and no PHI, but they reveal topology. ADR-004 may revisit |
+| D7 | **Remove grants no code uses; delimit every group prefix.** Worker loses `.retry` WRITE, loader loses `.retry` READ and WRITE. `pipeline*` → `pipeline` + `pipeline.shadow-`, `loader.<dest>*` → `loader.<dest>`, `replier*` → `replier`. Add the missing transactional-id grant for transactional channels, outside the parsed string | Keeping `.retry` "for later": a grant with no code path is the one nobody reviews when the code arrives | The lite broker keeps old grants until `down` (ACLs are only ever added) |
+| D8 | **Super users as implemented:** broker (`CN=kafka`), `kafka-users-init` (`CN=tb-lite-users-init`, loopback mTLS, one-shot), `topic-bootstrap`, `admin`. `channel-publish` gets `control_plane` grants only. The healthcheck principal has no ACL. Never a data-plane role, never `ANONYMOUS` | The set 1.3 text (channel-publish as a super user), which was looser than the implementation | A control-plane stand-in that needs a new grant needs a contract change |
+| D9 | **Retry groups, ruled now and applied when `retry-topic` lifts:** one shared `retry` topic per channel, consumed by each destination in its own `tb.<env>.<ch>.loader.<dest>` group, filtering on `tb-destination`. A channel-wide retry group is forbidden, and the LITERAL group ACL enforces it | A per-destination retry topic: isolated by construction, but D−1 more topics per channel and a grammar change | Read amplification × destinations on a low-volume topic; a loader reads sibling destinations' retry records within one channel |
+
+Detail: `topics/v0` 3.4.1, `engine-kafka/v0` 6 rule 3.
+
 ## 4. Consequences
 
 - Invariant 1: the client profile can no longer be overridden through the security map (D4).
@@ -104,3 +123,12 @@ construction. Contracts (set 1.3, additive): `engine-kafka/v0` new; `topics/v0` 
    prefixes. From reading the source, not a run, this is **not a live gap**: `RawPublisher` then builds
    `KafkaSettings`, whose `__post_init__` runs the exact-list `check_link`, so a prefix-admitted key is
    still refused. But two rule sources for one contract rule will drift. Part of follow-up 2.
+7. Set 1.4 (D6-D9): `platform-engineer` adds a `spec_reader_group` helper to `tributary.runtime.topics`;
+   `connector-engineer` uses it in the loaders and moves receivers onto `open_spec_source`;
+   `devops-engineer` updates three `test_bootstrap_topics.py` tests and re-runs the stack from `down`
+   without the temporary grant; `qa-engineer` adds ACL negative cases (`.retry`, sibling destination
+   group).
+8. **Recurring problem, recorded so it is not rediscovered:** `security.acls` is English sentences
+   parsed by regex in `bootstrap_topics.py`. A transactional-id target and any new conditional form
+   need a parser change. Moving to a structured grant list is the fix. It is breaking for that parser,
+   so it waits for ADR-004's role model rather than being done piecemeal.

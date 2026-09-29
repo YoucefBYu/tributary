@@ -165,7 +165,7 @@
       "inter.broker.listener.name": "an internal listener using SASL_SSL or mTLS",
       "authorizer.class.name": "org.apache.kafka.metadata.authorizer.StandardAuthorizer",
       "allow.everyone.if.no.acl.found": "false",
-      "super.users": "TODO deployment-specific. The topic-creation job and the control plane only; never a data-plane component.",
+      "super.users": "Set 1.4: the broker's own identity (inter-broker and controller links), the topic-creation job, an operator admin principal, and a one-shot user-provisioning identity where the deployment has one. NEVER a data-plane component, NEVER the control plane's channel publisher (it holds only its control_plane grants), NEVER User:ANONYMOUS. Principal names are deployment-specific; the lite stack's are in engine-kafka/v0 README section 6 rule 3.",
       "ssl.client.auth": "required, when using mTLS"
     },
     "clients": {
@@ -188,10 +188,15 @@
     },
     "acls": {
       "model": "Deny by default, least privilege per component, granted on the topic prefix <env>.<channel>. so one channel's compromise does not read another's traffic.",
-      "receiver": "WRITE, DESCRIBE on <env>.<channel>.raw; IDEMPOTENT_WRITE on the cluster. Set 1.2, sync-reply channels only: READ on <env>.<channel>.reply and READ on group tb.<env>.<channel>.replier*. No WRITE on reply, so a receiver cannot forge an answer",
-      "pipeline_worker": "READ on <env>.<channel>.raw; WRITE on <env>.<channel>.out.*, .retry, .dlq; WRITE on _tb.<env>.events; READ on _tb.<env>.channels; READ on group tb.<env>.<channel>.pipeline*. Set 1.2, sync-reply channels only: WRITE on <env>.<channel>.reply",
-      "loader": "READ on <env>.<channel>.out.<dest> and .retry; WRITE on .retry and .dlq; WRITE on _tb.<env>.events; READ on group tb.<env>.<channel>.loader.<dest>*",
+      "grammar": "Set 1.4. Each role string is parsed by the lite topic-bootstrap (deploy/compose/topic-bootstrap/bootstrap_topics.py parse_grants), so keep its form: a first sentence of '<OPS> on <targets>' clauses separated by ';', then only 'Set 1.2, sync-reply channels only: ...' or 'No <OP> on <kind>, so ...' sentences. A target without '*' is a LITERAL resource; a target ending '*' is PREFIXED on everything before the '*', so every prefix here ends at a '.' or '-' delimiter; 'group ' names a consumer group; 'the cluster' is the cluster resource. READ and WRITE imply DESCRIBE in Kafka's authorizer, so DESCRIBE is not listed separately.",
+      "reconciled_with_code": "Set 1.4, 2026-09-29: every grant below is one a role's code path uses, found by reading packages/tributary-runtime (worker.py, channels.py, topics.py), packages/tributary-loaders/*/main.py and packages/tributary-receivers. No role holds a grant no code uses, except the receiver's _tb.<env>.channels READ, granted ahead of its invariant-3 migration (README 3.4.1).",
+      "receiver": "WRITE, DESCRIBE on <env>.<channel>.raw; IDEMPOTENT_WRITE on the cluster; READ on _tb.<env>.channels; READ on group tb.<env>.<channel>.channels.*. Set 1.2, sync-reply channels only: READ on <env>.<channel>.reply and READ on group tb.<env>.<channel>.replier. No WRITE on reply, so a receiver cannot forge an answer",
+      "pipeline_worker": "READ on <env>.<channel>.raw; WRITE on <env>.<channel>.out.*, .dlq; WRITE on _tb.<env>.events; READ on _tb.<env>.channels; READ on group tb.<env>.<channel>.pipeline and tb.<env>.<channel>.pipeline.shadow-*; READ on group tb.<env>.<channel>.channels.*. Set 1.2, sync-reply channels only: WRITE on <env>.<channel>.reply",
+      "pipeline_worker_transactional": "Set 1.4. Only for a channel with pipeline.transactional true, in addition to pipeline_worker: WRITE on the TRANSACTIONAL_ID resource PREFIXED tb.<env>.<channel>.pipeline. (the clients.transactional_stage_producer transactional.id template). Kept out of the pipeline_worker string because the lite parser has no transactional-id target and the demo channel is not transactional; without the grant the worker fails at init_transactions with TRANSACTIONAL_ID_AUTHORIZATION_FAILED, before consuming (fail closed).",
+      "loader": "READ on <env>.<channel>.out.<dest>; WRITE on <env>.<channel>.dlq; WRITE on _tb.<env>.events; READ on _tb.<env>.channels; READ on group tb.<env>.<channel>.loader.<dest>; READ on group tb.<env>.<channel>.channels.*",
+      "loader_retry_topic": "Set 1.4, NOT GRANTED in v0: retry.policy retry-topic is refused by the schema and no code reads or writes <env>.<channel>.retry. When it lifts (channel-spec README 4.1.1), the loader gains READ, WRITE on <env>.<channel>.retry and consumes it in its OWN destination group tb.<env>.<channel>.loader.<dest>, filtering on tb-destination. A channel-wide retry group is forbidden: topics README 3.4.1.",
       "archiver": "READ on _tb.<env>.events; READ on group tb.<env>.archiver*",
+      "archiver_note": "Set 1.4: UNVERIFIED against code, because no archiver package exists yet (wave 3). Reconcile when it lands.",
       "control_plane": "WRITE on _tb.<env>.channels and _tb.<env>.audit; DESCRIBE on the cluster",
       "forbidden": "No data-plane component gets cluster-wide WRITE, DELETE or ALTER, and none gets WRITE on _tb.<env>.channels — a compromised worker must not be able to deploy a channel spec.",
       "open_question": "The complete role model, credential rotation and key management are ADR-004 plus a human decision. This block is the minimum shape that the config contract must state, not the finished model."
@@ -256,6 +261,11 @@
   "consumer_groups": {
     "pattern": "tb.<env>.<channel>.<role>[.<destination>][.shadow-<label>]",
     "roles": ["pipeline", "loader", "replier", "archiver", "receiver"],
-    "roles_note": "replier (set 1.2) = the receivers' reply-consumer group in synchronous reply mode, on this engine's cluster (clients.reply_consumer). receiver (set 1.1) = a kafka source's group on the EXTERNAL cluster it reads; README 3.6 added it in set 1.1 and this list omitted it until set 1.2"
+    "roles_note": "replier (set 1.2) = the receivers' reply-consumer group in synchronous reply mode, on this engine's cluster (clients.reply_consumer). receiver (set 1.1) = a kafka source's group on the EXTERNAL cluster it reads; README 3.6 added it in set 1.1 and this list omitted it until set 1.2",
+    "spec_reader": {
+      "$comment": "Set 1.4. The _tb.<env>.channels reader every data-plane process builds (tributary.runtime.channels.open_spec_source). It uses assign(), never subscribe(), and never commits, but librdkafka still looks up the coordinator for a configured group.id, which needs READ (implying DESCRIBE) on the group: without it the worker logged GROUP_AUTHORIZATION_FAILED (error_code 30) at start on the lite stack. One group per process, so readers never share offsets or partitions.",
+      "pattern": "tb.<env>.<channel>.channels.<instance>",
+      "acl": "READ on group PREFIXED tb.<env>.<channel>.channels. (trailing '.' delimiter), for receiver, pipeline_worker and loader"
+    }
   }
 }

@@ -42,6 +42,7 @@
           "region": "us-east-1",
           "serverSideEncryption": "aws:kms",
           "kmsKeyId": "alias/tributary-synth-lab",
+          "expectedBucketOwner": "111122223333",
           "auth": { "type": "ambient" },
           "fileExtension": ".hl7",
           "timeoutMs": 10000

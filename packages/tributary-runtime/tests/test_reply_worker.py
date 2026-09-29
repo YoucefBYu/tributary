@@ -41,7 +41,7 @@ from tributary.runtime.reply import (
 from tributary.runtime.worker import dlq_message, out_message
 from tributary.sdk import Drop, Message, Reject, splitter, step
 from tributary.sdk import headers as h
-from tributary.sdk.codes import REPLY_BODY_MISSING, REPLY_ROUTE_INVALID, TRANSFORM_ERROR
+from tributary.sdk.codes import REPLY_BODY_MISSING, REPLY_EXPIRED, REPLY_ROUTE_INVALID, TRANSFORM_ERROR
 from tributary.sdk.projection import record_projection
 
 from .reply_harness import (
@@ -283,7 +283,7 @@ def test_an_expired_reply_is_skipped_but_the_message_is_processed() -> None:
     assert r.producer.replies() == []
     assert r.replies.stats.expired == 1
     (event,) = replied(r)
-    assert (event.status, event.error_code) == ("dropped", None), "a deliberate skip: no code, like a Drop"
+    assert (event.status, event.error_code) == ("dropped", REPLY_EXPIRED), "a deliberate skip with a code"
     assert event.error_message == EXPIRED_MESSAGE and event.correlation_id is not None
     projected = event.to_dict()
     assert list(Draft202012Validator(EVENT_SCHEMA).iter_errors(projected)) == [], "valid under events/v0"

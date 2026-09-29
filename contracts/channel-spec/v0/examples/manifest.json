@@ -372,6 +372,13 @@
       "expected_json_path": "$.spec.source.tls.allowedClientSans[0]",
       "expected_validator": "pattern",
       "expectation_note": "PREDICTED by the architect (set 1.3), UNMEASURED"
+    },
+    {
+      "file": "invalid/destination-s3-bucket-owner-not-account-id.json",
+      "violates": "s3 expectedBucketOwner is a 12-digit account id; eleven digits is a typo that would make every write fail the ownership check, so it is refused at validation instead (README 3.4.5)",
+      "expected_json_path": "$.spec.destinations[0].with.expectedBucketOwner",
+      "expected_validator": "pattern",
+      "expectation_note": "PREDICTED by the architect (set 1.4), UNMEASURED"
     }
   ]
 }

@@ -965,6 +965,11 @@
           "pattern": "^[A-Za-z0-9:/_-]{1,256}$",
           "$comment": "An identifier (ARN, alias or id) of an existing KMS key, not key material. Only with aws:kms."
         },
+        "expectedBucketOwner": {
+          "type": "string",
+          "pattern": "^[0-9]{12}$",
+          "$comment": "Set 1.4. The 12-digit account id that must own 'bucket'. When set, the loader sends it as ExpectedBucketOwner on every call, so a bucket that was deleted and re-created under another account (bucket sniping) refuses the write with 403 instead of receiving PHI. Optional: an S3-compatible store that does not implement the check cannot use it, and making it required would be breaking. Not a credential."
+        },
         "auth": {
           "type": "object",
           "required": ["type"],
