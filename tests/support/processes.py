@@ -380,6 +380,40 @@ def spawn_sftp_loader(
     return proc
 
 
+def spawn_s3_loader(
+    *,
+    channel: str,
+    destination: str,
+    env: str,
+    bootstrap: str,
+    instance_id: str = "loader-e2e",
+    secrets_dir: Path | str | None = None,
+    timeout_s: float = 30.0,
+) -> ManagedProcess:
+    """`tributary.loaders.s3`'s real entry point (connector-engineer, W2-6). Same shape as
+    `spawn_clickhouse_loader`; `secrets_dir` holds `<secretRef>/access_key_id` and `secret_access_key`."""
+    args = [
+        sys.executable,
+        "-m",
+        "tributary.loaders.s3",
+        "--channel",
+        channel,
+        "--destination",
+        destination,
+        "--env",
+        env,
+        "--bootstrap",
+        bootstrap,
+        "--instance-id",
+        instance_id,
+    ]
+    if secrets_dir is not None:
+        args += ["--secrets-dir", str(secrets_dir)]
+    proc = ManagedProcess(args, env=dict(os.environ))
+    proc.wait_for_event("loader_started", timeout_s=timeout_s)
+    return proc
+
+
 def spawn_mllp_loader(
     *,
     channel: str,
