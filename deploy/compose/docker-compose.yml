@@ -215,10 +215,6 @@ services:
       - tributary.receivers.mllp
       - --channel-spec=/generated/channel.json
       - --env=dev
-      # TODO(connector-engineer migration): delete this flag once the receiver reads the bootstrap
-      # servers from TB_ENGINE_KAFKA_FILE (`--bootstrap` is a retired input; PLAINTEXT kafka:9092 no
-      # longer exists in this stack).
-      - --bootstrap=kafka:9092
     environment:
       TB_ENGINE_KAFKA_FILE: /etc/tributary/engine-kafka.json
       # kafka_publisher.py reads clients.receiver_producer (acks, idempotence, delivery timeout)
@@ -387,9 +383,6 @@ services:
       - --channel=adt-passthrough
       - --destination=http-stub
       - --env=dev
-      # TODO(connector-engineer migration): delete this flag once the loader reads the bootstrap
-      # servers from TB_ENGINE_KAFKA_FILE.
-      - --bootstrap=kafka:9092
     environment:
       TB_ENGINE_KAFKA_FILE: /etc/tributary/engine-kafka.json
       # Consumer defaults (session.timeout.ms, commit_every, ...) come from topic-defaults.json, same
