@@ -50,7 +50,7 @@ from tributary.sdk import headers as h
 
 from ..engine_kafka import engine_security_properties
 from ..envelope import build_raw_envelope
-from ..errors import ConfigError
+from ..errors import ConfigError, PermanentPublishError
 from ..keys import resolve_key
 from ..metrics import Metrics
 from ..mllp.kafka_publisher import RawPublisher, topic_name
@@ -214,6 +214,10 @@ class SftpPoller:
         t0 = time.monotonic()
         try:
             ok = await self.publisher.publish(message, timeout_s=cfg.ack_timeout_s)
+        except PermanentPublishError:
+            self.metrics.rejected_envelope += 1
+            await self._reject(session, claim, original, "envelope-invalid")
+            return 0
         except Exception:  # any failure is "not committed"; its text is never surfaced
             ok = False
         self.metrics.record_ack_latency_ms((time.monotonic() - t0) * 1000)

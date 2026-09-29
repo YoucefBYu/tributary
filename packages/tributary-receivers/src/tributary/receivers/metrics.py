@@ -37,6 +37,7 @@ class Metrics:
     poll_errors: int = 0
     partitions_halted: int = 0
     files_skipped: int = 0
+    rejected_envelope: int = 0
     commit_failures: int = 0
     offset_commits: int = 0
     publish_failures: int = 0
@@ -64,6 +65,7 @@ class Metrics:
             "poll_errors": self.poll_errors,
             "partitions_halted": self.partitions_halted,
             "files_skipped": self.files_skipped,
+            "rejected_envelope": self.rejected_envelope,
             "commit_failures": self.commit_failures,
             "offset_commits": self.offset_commits,
             "publish_failures": self.publish_failures,

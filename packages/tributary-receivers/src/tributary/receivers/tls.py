@@ -15,6 +15,8 @@ from dataclasses import dataclass
 
 from .secrets import SecretResolver
 
+#: The AEAD-only TLS 1.2 list every Tributary TLS client already pins (`ECDHE` key exchange, GCM or ChaCha20).
+AEAD_CIPHER_PIN = "ECDHE+AESGCM:ECDHE+CHACHA20"
 _MIN_VERSIONS = {"1.2": ssl.TLSVersion.TLSv1_2, "1.3": ssl.TLSVersion.TLSv1_3}
 
 
@@ -33,12 +35,14 @@ class TlsSpec:
             raise ValueError(f"tls.minVersion must be '1.2' or '1.3', not {self.min_version!r}")
 
 
-def build_ssl_context(spec: TlsSpec, resolver: SecretResolver) -> ssl.SSLContext:
+def build_ssl_context(spec: TlsSpec, resolver: SecretResolver, *, cipher_pin: str | None = None) -> ssl.SSLContext:
     """A server `SSLContext` for `spec`. `clientAuth: required` verifies the peer certificate against
     `ca.crt` under the same `secretRef`; there is no fallback to `CERT_OPTIONAL` — a spec author who
     wants that must say `clientAuth: none` and enforce authentication some other way, explicitly."""
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.minimum_version = _MIN_VERSIONS[spec.min_version]
+    if cipher_pin is not None:
+        ctx.set_ciphers(cipher_pin)  # TLS 1.2 and below only; TLS 1.3 suites are all AEAD already
     ctx.load_cert_chain(
         certfile=str(resolver.resolve_file(spec.secret_ref, "tls.crt")),
         keyfile=str(resolver.resolve_file(spec.secret_ref, "tls.key")),

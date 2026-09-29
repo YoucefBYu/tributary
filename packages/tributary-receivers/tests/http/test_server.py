@@ -55,6 +55,15 @@ def settings(**overrides: object) -> HttpSettings:
     return replace(base, **overrides)  # type: ignore[arg-type]
 
 
+async def eventually(predicate: Callable[[], bool], timeout_s: float = 5.0) -> None:
+    """Poll instead of sleeping a guessed time: returns as soon as `predicate` holds, fails at the deadline."""
+    deadline = asyncio.get_running_loop().time() + timeout_s
+    while not predicate():
+        if asyncio.get_running_loop().time() > deadline:
+            raise AssertionError("condition not reached in time")
+        await asyncio.sleep(0.01)
+
+
 class FakePublisher:
     def __init__(self, outcome: bool = True) -> None:
         self.calls: list[Message] = []
@@ -449,8 +458,7 @@ def test_half_open_connection_is_closed_by_the_idle_timeout() -> None:
     async def client(port: int, srv: HttpServer) -> None:
         r, w = await asyncio.open_connection("127.0.0.1", port)
         assert await asyncio.wait_for(r.read(1), 3) == b""
-        await asyncio.sleep(0.05)
-        assert srv.metrics.connections_open == 0
+        await eventually(lambda: srv.metrics.connections_open == 0)
         w.close()
 
     asyncio.run(run(settings(idle_timeout_s=0.3), FakePublisher(), client))
@@ -464,8 +472,8 @@ def test_body_cut_short_is_never_published_or_acked() -> None:
         w.write(request(BODY[:10], length=len(BODY)))
         await w.drain()
         w.close()
-        await asyncio.sleep(0.3)
-        assert pub.calls == [] and srv.metrics.acked == 0 and srv.metrics.connections_open == 0
+        await eventually(lambda: srv.metrics.connections_open == 0)
+        assert pub.calls == [] and srv.metrics.acked == 0
 
     asyncio.run(run(settings(), pub, client))
 
@@ -481,7 +489,7 @@ def test_peer_reset_mid_request_does_not_harm_the_next_request() -> None:
         s.sendall(request()[:30])
         s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
         s.close()  # RST
-        await asyncio.sleep(0.1)
+        await eventually(lambda: srv.metrics.connections_open == 0)
         assert (await post(port, request()))[0] == 202
         assert srv.metrics.connections_open == 0
 
@@ -498,8 +506,7 @@ def test_peer_gone_before_the_response_is_written_is_a_duplicate_not_a_loss() ->
         await asyncio.wait_for(pub.entered.wait(), 3)
         w.close()  # sender gives up; the record is committed anyway, the sender will re-send
         pub.release()
-        await asyncio.sleep(0.3)
-        assert srv.metrics.connections_open == 0
+        await eventually(lambda: srv.metrics.connections_open == 0 and srv.metrics.acked == 1)
 
     asyncio.run(run(settings(), pub, client))
 
@@ -507,7 +514,7 @@ def test_peer_gone_before_the_response_is_written_is_a_duplicate_not_a_loss() ->
 def test_max_conns_refuses_extra_connection() -> None:
     async def client(port: int, srv: HttpServer) -> None:
         _r1, w1 = await asyncio.open_connection("127.0.0.1", port)
-        await asyncio.sleep(0.1)
+        await eventually(lambda: srv.metrics.connections_open == 1)
         r2, w2 = await asyncio.open_connection("127.0.0.1", port)
         assert await asyncio.wait_for(r2.read(1), 2) == b""
         assert srv.metrics.connections_refused == 1
@@ -548,7 +555,7 @@ def test_a_connection_blocked_in_publish_does_not_block_another() -> None:
 
     async def client(port: int, srv: HttpServer) -> None:
         held = asyncio.create_task(post(port, request(b'{"k":"HOLD"}')))
-        await asyncio.sleep(0.2)
+        await eventually(lambda: pub.calls == 1)  # the held request is inside publish
         assert (await post(port, request()))[0] == 202
         assert not held.done()
         pub.gate.set()
@@ -585,10 +592,9 @@ def test_budget_is_reserved_before_the_body_is_read() -> None:
         _r, w = await asyncio.open_connection("127.0.0.1", port)
         w.write(request(b"", length=5000))
         await w.drain()
-        await asyncio.sleep(0.2)
-        assert srv.budget.used_bytes == 5000
+        await eventually(lambda: srv.budget.used_bytes == 5000)
         w.close()
-        await asyncio.sleep(0.3)
+        await eventually(lambda: srv.budget.used_bytes == 0)
         assert srv.budget.used_bytes == 0  # released when the peer went away
 
     asyncio.run(run(settings(max_message_bytes=5000, queue_max_bytes=6000), pub, client))
@@ -660,3 +666,58 @@ def test_tls_with_mtls_required_rejects_a_client_without_a_certificate(tmp_path:
         w.close()
 
     asyncio.run(run(cfg, pub, client, resolver=DirSecretResolver(tmp_path)))
+
+
+class BudgetAware:
+    """Refuses (like a real produce would time out) when handed less than most of the ACK budget."""
+
+    def __init__(self, ack_timeout_s: float) -> None:
+        self.full = ack_timeout_s
+        self.given: list[float] = []
+
+    async def publish(self, message: Message, *, timeout_s: float) -> bool:
+        self.given.append(timeout_s)
+        return timeout_s > self.full * 0.8
+
+
+def test_a_slow_upload_does_not_consume_the_ack_budget() -> None:
+    pub = BudgetAware(0.5)
+
+    async def client(port: int, srv: HttpServer) -> None:
+        r, w = await asyncio.open_connection("127.0.0.1", port)
+        data = request()
+        w.write(data[:-10])
+        await w.drain()
+        await asyncio.sleep(0.8)  # deliberate pacing: longer than the whole ACK timeout
+        w.write(data[-10:])
+        await w.drain()
+        assert (await read_response(r))[0] == 202  # healthy Kafka, so 202, not a 503 that duplicates on retry
+        w.close()
+
+    asyncio.run(run(settings(ack_timeout_s=0.5, idle_timeout_s=2.0, request_timeout_s=3.0), pub, client))
+    assert pub.given[0] > 0.4
+
+
+def test_a_permanently_unproducible_record_is_422_without_retry_after_not_503() -> None:
+    from tributary.receivers.errors import PermanentPublishError
+
+    class Invalid:
+        async def publish(self, message: Message, *, timeout_s: float) -> bool:
+            raise PermanentPublishError("x")
+
+    async def client(port: int, srv: HttpServer) -> None:
+        status, headers, _ = await post(port, request())
+        assert status == 422 and "retry-after" not in headers
+        assert srv.metrics.rejected_envelope == 1 and srv.metrics.nacked_unavailable == 0
+        assert srv.budget.used_bytes == 0
+
+    asyncio.run(run(settings(), Invalid(), client))
+
+
+def test_the_tls_listener_offers_only_aead_ecdhe_ciphers() -> None:
+    from tributary.receivers.tls import AEAD_CIPHER_PIN
+
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.set_ciphers(AEAD_CIPHER_PIN)
+    tls12 = [c["name"] for c in ctx.get_ciphers() if c["protocol"] == "TLSv1.2"]
+    assert tls12 and all(name.startswith("ECDHE-") and ("GCM" in name or "CHACHA20" in name) for name in tls12)

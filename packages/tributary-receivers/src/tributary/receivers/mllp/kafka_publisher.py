@@ -36,6 +36,8 @@ from tributary.sdk import headers as h
 from tributary.sdk.errors import EnvelopeError
 from tributary.sdk.projection import Ordering, validate_for_produce
 
+from ..errors import PermanentPublishError
+
 _ENV = re.compile(r"^[a-z][a-z0-9-]{0,15}$")
 _CHANNEL = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
 
@@ -142,7 +144,8 @@ class RawPublisher:
         self._producer.flush(timeout_s)
 
     async def publish(self, message: Message, *, timeout_s: float) -> bool:
-        """`True` once committed, `False` on any failure, a full local queue, or `timeout_s`
+        """Raises `PermanentPublishError` for a record that breaks the envelope contract (retrying cannot
+        help). Otherwise `True` once committed, `False` on any failure, a full local queue, or `timeout_s`
         elapsing first — every one of those is "not committed," so every one of them is a NACK,
         never a dropped message that was silently ACKed (invariant 1)."""
         loop = self._loop
@@ -153,7 +156,8 @@ class RawPublisher:
             # takes a null key, `per-key` refuses a record whose key did not resolve (invariant 5).
             validate_for_produce(message, topic_class="raw", ordering=self._ordering)
         except EnvelopeError:
-            return False  # never produce a record that would fail the envelope contract
+            # Never produce a record that would fail the envelope contract. Not `False`: that means "try again".
+            raise PermanentPublishError("record breaks the envelope contract") from None
         future: asyncio.Future[bool] = loop.create_future()
 
         def on_delivery(err: object, _msg: object) -> None:

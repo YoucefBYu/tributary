@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Callable
 from dataclasses import replace
 from typing import Any
 
@@ -92,6 +93,15 @@ class FakeConsumer:
 
     def close(self) -> None:
         self.closed = True
+
+
+async def eventually(predicate: Callable[[], bool], timeout_s: float = 5.0) -> None:
+    """Poll instead of sleeping a guessed time: returns as soon as `predicate` holds, fails at the deadline."""
+    deadline = asyncio.get_running_loop().time() + timeout_s
+    while not predicate():
+        if asyncio.get_running_loop().time() > deadline:
+            raise AssertionError("condition not reached in time")
+        await asyncio.sleep(0.01)
 
 
 class Publisher:
@@ -386,7 +396,7 @@ def test_run_closes_after_committing_pending_offsets() -> None:
     async def go() -> None:
         stop = asyncio.Event()
         task = asyncio.create_task(rx.run(stop))
-        await asyncio.sleep(0.1)
+        await eventually(lambda: rx.metrics.acked == 1)
         stop.set()
         await asyncio.wait_for(task, 3)
 
@@ -403,3 +413,17 @@ def test_payload_key_and_headers_never_reach_logs_or_metrics(caplog: pytest.LogC
     blob = caplog.text + json.dumps(rx.metrics.snapshot())
     for forbidden in ("KEYSYNTH", "HDRSYNTH", "SYNTH-1", "TRIBUTARY-SYNTH"):
         assert forbidden not in blob
+
+
+def test_a_permanently_unproducible_record_halts_its_partition_instead_of_backing_off() -> None:
+    from tributary.receivers.errors import PermanentPublishError
+
+    class Invalid:
+        async def publish(self, message: Message, *, timeout_s: float) -> bool:
+            raise PermanentPublishError("x")
+
+    c = FakeConsumer()
+    c.queue = [FakeMsg(0, 4)]
+    rx = KafkaSourceReceiver(settings(commit_every=1), Invalid(), c, clock=Clock())
+    drive(rx, 1)
+    assert rx.halted == {0: 4} and c.seeks == [] and c.commits == [] and rx.metrics.rejected_envelope == 1

@@ -17,6 +17,13 @@ class ConfigError(ReceiverError):
     unsupported-in-this-wave configuration. Raised at startup, before any socket is opened."""
 
 
+class PermanentPublishError(ReceiverError):
+    """The record can never be produced as built (it breaks the envelope contract). Unlike a broker outage,
+    retrying the same input cannot succeed, so callers must not answer it as "Kafka unavailable"
+    (HTTP 503 + Retry-After, an SFTP file left for the next poll, a Kafka-source backoff). The message
+    carries no value."""
+
+
 class BindError(ReceiverError):
     """Refused to bind: the bind rule (no wildcard default, no plaintext on a non-loopback
     address) rejected the requested address, or the address is otherwise not ours to use."""

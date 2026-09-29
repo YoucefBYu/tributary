@@ -11,6 +11,12 @@ in batches (`commit_every`, the topics contract's value, and at most `commit_flu
 first uncommitted record), which is this source's replay window: after an unclean death, up to that many
 already-published records are re-published under new `tb-msg-id`s (README 3.2.2 "Duplicates at ingest").
 
+**Publish timeouts can duplicate.** A produce that outlives `ack.timeoutMs` is reported as refused, but it
+is not cancelled in librdkafka and may still be delivered later (`delivery.timeout.ms` is longer). The
+source record is then re-read and re-published under a new `tb-msg-id`, so `raw` can hold two records for
+one source record. At-least-once, never loss; loader idempotency on `tb-msg-id` does not absorb it
+(README 3.2.2 "Duplicates at ingest").
+
 **Kafka unavailable** (the engine's `raw` cluster refuses): nothing is committed; every assigned
 partition is paused, the failed record's partition is sought back to it, and consumption resumes after
 an exponential backoff. The source consumer keeps polling while paused, so the group does not
@@ -46,7 +52,7 @@ from tributary.sdk import Message
 
 from ..engine_kafka import engine_security_properties
 from ..envelope import build_raw_envelope
-from ..errors import ReceiverError
+from ..errors import PermanentPublishError, ReceiverError
 from ..keys import resolve_key
 from ..metrics import Metrics
 from ..mllp.kafka_publisher import RawPublisher, topic_name
@@ -207,6 +213,10 @@ class KafkaSourceReceiver:
         t0 = time.monotonic()
         try:
             ok = await self.publisher.publish(message, timeout_s=self.cfg.ack_timeout_s)
+        except PermanentPublishError:
+            self.metrics.rejected_envelope += 1
+            self._halt(partition, offset, "envelope-invalid")  # D16: retrying cannot help
+            return
         except Exception:  # any failure is "not committed"; its text is never surfaced
             ok = False
         self.metrics.record_ack_latency_ms((time.monotonic() - t0) * 1000)

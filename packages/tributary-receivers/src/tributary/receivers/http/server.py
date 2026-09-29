@@ -36,14 +36,14 @@ from tributary.sdk import headers as h
 from ..backpressure import ByteBudget
 from ..engine_kafka import engine_security_properties
 from ..envelope import build_raw_envelope
-from ..errors import ConfigError
+from ..errors import ConfigError, PermanentPublishError
 from ..keys import resolve_key
 from ..metrics import Metrics
 from ..mllp.kafka_publisher import RawPublisher, topic_name
 from ..net import is_loopback, require_safe_bind
 from ..payload import well_formed
 from ..secrets import DirSecretResolver, SecretResolver
-from ..tls import build_ssl_context
+from ..tls import AEAD_CIPHER_PIN, build_ssl_context
 from .config import HttpSettings, http_settings_from_channel_spec
 
 __all__ = ["HttpServer", "HttpSettings", "serve_from_channel_spec"]
@@ -121,7 +121,7 @@ class HttpServer:
         resolver = secret_resolver or DirSecretResolver()
         self._ssl_context: ssl.SSLContext | None = None
         if cfg.tls is not None:
-            self._ssl_context = build_ssl_context(cfg.tls, resolver)
+            self._ssl_context = build_ssl_context(cfg.tls, resolver, cipher_pin=AEAD_CIPHER_PIN)
         self._bearer_tokens: tuple[bytes, ...] = ()
         if cfg.auth.mode == "bearer":
             if cfg.auth.secret_ref is None:
@@ -215,6 +215,9 @@ class HttpServer:
             t0 = time.monotonic()
             try:
                 ok = await self.publisher.publish(message, timeout_s=timeout)
+            except PermanentPublishError:
+                self.metrics.rejected_envelope += 1
+                raise _HttpError(422, "Unprocessable Content") from None  # retrying cannot help: no Retry-After
             except Exception:  # any failure is "not committed"; its text is never surfaced
                 ok = False
             self.metrics.record_ack_latency_ms((time.monotonic() - t0) * 1000)
@@ -254,7 +257,6 @@ class HttpServer:
 
         # Reserved before the body is read, so N slow connections cannot buffer N x maxMessageBytes
         # outside the byte budget. A wait longer than the ACK timeout is a `queue-full` refusal.
-        ack_deadline = time.monotonic() + self.cfg.ack_timeout_s
         if not await self.budget.reserve(content_length, self.cfg.ack_timeout_s):
             self.metrics.nacked_queue_full += 1
             raise _HttpError(503, "Service Unavailable", retry_after_s=1.0)
@@ -285,6 +287,9 @@ class HttpServer:
             )
             msg_id = message.require(h.TB_MSG_ID)
             ctx["msg_id"] = msg_id
+            # The ACK budget starts now, once the body is in: a slow upload must not eat it and turn a
+            # healthy Kafka into a 503 (whose retry would duplicate the message).
+            ack_deadline = time.monotonic() + self.cfg.ack_timeout_s
             ok = await self._publish(message, ack_deadline)
         finally:
             await self.budget.release(content_length)

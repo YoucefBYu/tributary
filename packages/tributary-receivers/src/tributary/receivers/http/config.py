@@ -10,6 +10,23 @@ README 3.2.3: "It is an ingest endpoint, not a FHIR server" -- one fixed `POST` 
 channel is an `http` source whose `accept` includes `application/fhir+json`; there is no separate
 `fhir` source type in the contract (3.0's table lists only `mllp`, `http`, `sftp`, `kafka`), so this
 module is also what a "FHIR receiver" is built from.
+
+Known gaps, stated rather than hidden:
+
+* `auth: mtls` authenticates that the client certificate chains to the trust bundle in `tls.secretRef`.
+  Every certificate that chains is accepted: the channel-spec has no field for a per-channel subject or
+  SAN allow-list, so one channel cannot be limited to one sender. Contract proposal (architect): an
+  optional `tls.allowedSubjects` (list of exact certificate subject or SAN strings), enforced after the
+  handshake. Not implemented, since an unapproved field must not be invented here.
+* `ack.nackOn: spec-invalid` is schema-valid but refused at startup, as `mllp` does: it means "NACK
+  because the channel spec became invalid", and nothing in this wave watches the spec after start-up
+  (no `_tb.<env>.channels` consumption in a receiver), so accepting it would promise a NACK that can
+  never fire. Refusing it is intended until that watcher exists; the architect may overrule.
+* Publish timeouts can duplicate: a 503 after `ack.timeoutMs` does not cancel the produce already handed
+  to librdkafka, which may still be delivered when the broker returns (`delivery.timeout.ms` is longer
+  than the ACK timeout). The sender's retry then lands a second record under a new `tb-msg-id`.
+  At-least-once, never loss; downstream idempotency keyed on `tb-msg-id` does not absorb it
+  (README 3.2.2 "Duplicates at ingest").
 """
 
 from __future__ import annotations

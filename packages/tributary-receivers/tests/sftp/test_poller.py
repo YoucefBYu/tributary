@@ -10,6 +10,7 @@ import json
 import logging
 import posixpath
 import threading
+from collections.abc import Callable
 from dataclasses import replace
 
 import pytest
@@ -99,6 +100,15 @@ class FakeSession:
 
     def names(self, directory: str) -> list[str]:
         return sorted(posixpath.basename(p) for p in self.files if posixpath.dirname(p) == directory)
+
+
+async def eventually(predicate: Callable[[], bool], timeout_s: float = 5.0) -> None:
+    """Poll instead of sleeping a guessed time: returns as soon as `predicate` holds, fails at the deadline."""
+    deadline = asyncio.get_running_loop().time() + timeout_s
+    while not predicate():
+        if asyncio.get_running_loop().time() > deadline:
+            raise AssertionError("condition not reached in time")
+        await asyncio.sleep(0.01)
 
 
 class Recorder:
@@ -381,9 +391,9 @@ def test_run_loop_polls_until_stopped() -> None:
     async def go() -> None:
         stop = asyncio.Event()
         task = asyncio.create_task(p.run(stop))
-        await asyncio.sleep(0.3)
+        await eventually(lambda: len(pub.calls) == 1)
         s.put("b.hl7", HL7)
-        await asyncio.sleep(0.3)
+        await eventually(lambda: len(pub.calls) == 2)
         stop.set()
         await asyncio.wait_for(task, 2)
 
@@ -436,3 +446,17 @@ def test_undecodable_names_are_counted_and_do_not_stop_the_cycle() -> None:
     s.put("a.hl7", HL7)
     p = poller(settings(), Recorder(), s)
     assert asyncio.run(p.poll_once()) == 1 and p.metrics.files_skipped == 2
+
+
+def test_a_permanently_unproducible_file_is_rejected_not_left_for_the_next_poll() -> None:
+    from tributary.receivers.errors import PermanentPublishError
+
+    class Invalid:
+        async def publish(self, message: Message, *, timeout_s: float) -> bool:
+            raise PermanentPublishError("x")
+
+    s = FakeSession()
+    s.put("a.hl7", HL7)
+    p = poller(settings(), Invalid(), s)
+    assert asyncio.run(p.poll_once()) == 0
+    assert s.names(REJECT) == ["a.hl7"] and s.names(DIR) == [] and p.metrics.rejected_envelope == 1
