@@ -37,8 +37,10 @@ from typing import Any
 
 from tributary.runtime import load_engine_kafka_or_exit
 from tributary.runtime.logs import JsonLogger
+from tributary.sdk.keys import HL7_CONTENT_TYPE
 
 from ..backpressure import BudgetExceeded, ByteBudget
+from ..keys import resolve_key
 from ..metrics import Metrics
 from ..net import require_safe_bind
 from ..secrets import DirSecretResolver, SecretResolver
@@ -157,7 +159,7 @@ class MllpServer:
             w.close()
         return self.budget.used_messages == 0
 
-    async def _publish(self, frame: bytes, remote: str, deadline: float, cfg: MllpSettings) -> bool:
+    async def _publish(self, frame: bytes, remote: str, deadline: float, cfg: MllpSettings, key: bytes | None) -> bool:
         try:
             async with self._inflight:
                 timeout = max(deadline - time.monotonic(), 0.001)
@@ -166,7 +168,7 @@ class MllpServer:
                     channel_version=cfg.channel_version,  # the spec this frame was admitted under
                     source=f"mllp:{cfg.instance}@{remote}",
                     payload=frame,
-                    key=None,  # ordering: none is the only mode this wave supports (config.py)
+                    key=key,  # `ordering: none` -> None; `per-key` -> the evaluated key, record key only
                 )
                 t0 = time.monotonic()
                 ok = await self.publisher.publish(message, timeout_s=timeout)
@@ -271,6 +273,14 @@ class MllpServer:
                         self.metrics.nacked_parse_error += 1
                         await q.put((cid, "parse-error", None))
                         continue
+                    # Per-key channels: the key is evaluated from the message before anything is queued. An
+                    # unresolved key is a parse-error NACK (README 4.3), never a null key or a default: that
+                    # would put one patient's messages on different partitions and reorder them (invariant 5).
+                    outcome = resolve_key(cfg.key_expression, payload=frame, content_type=HL7_CONTENT_TYPE)
+                    if outcome.reason is not None:
+                        self.metrics.nacked_parse_error += 1
+                        await q.put((cid, "parse-error", None))
+                        continue
                     try:
                         reserved = await self.budget.reserve(len(frame), max(deadline - time.monotonic(), 0))
                     except BudgetExceeded:
@@ -292,7 +302,7 @@ class MllpServer:
                         refused = True
                         break
                     conn.pending += 1
-                    task = asyncio.ensure_future(self._publish(frame, remote, deadline, cfg))
+                    task = asyncio.ensure_future(self._publish(frame, remote, deadline, cfg, outcome.key))
                     await q.put((cid, task, len(frame)))
                 if refused:
                     break
@@ -422,7 +432,12 @@ def main() -> None:
 
     def make_publisher(cfg: MllpSettings) -> RawPublisher:
         publisher = RawPublisher(
-            kafka, topic, linger_ms=cfg.linger_ms, queue_max_messages=cfg.max_inflight * 2, topic_defaults=defaults
+            kafka,
+            topic,
+            linger_ms=cfg.linger_ms,
+            queue_max_messages=cfg.max_inflight * 2,
+            topic_defaults=defaults,
+            ordering="per-key" if cfg.key_expression is not None else "none",
         )
         publisher.start(asyncio.get_running_loop())
         return publisher

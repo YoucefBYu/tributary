@@ -122,6 +122,7 @@ class MllpRunner:
         self._server: MllpServer | None = None
         self._retired: list[MllpServer] = []
         self._publisher: RawPublisher | None = None
+        self._publisher_ordering = "none"
         self._rejected_version: int | None = None
         self._start_failure: tuple[MllpSettings, float | None] | None = None
         self._poll_failing = False
@@ -282,8 +283,14 @@ class MllpRunner:
             if failed_cfg == cfg and (retry_at is None or now < retry_at):
                 return
         try:
+            if self._publisher is not None and self._publisher_ordering != cfg.ordering:
+                # Redeployed after a tombstone with a different ordering: the producer's key rule is fixed
+                # at construction, so it is rebuilt (flushing what the old one still holds).
+                old, self._publisher = self._publisher, None
+                await asyncio.to_thread(old.close)
             if self._publisher is None:
                 self._publisher = self._make_publisher(cfg)
+                self._publisher_ordering = cfg.ordering
             server = self._make_server(cfg, self._publisher, self.metrics)
             listener = await server.start()
         except OSError as exc:

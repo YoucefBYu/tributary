@@ -75,8 +75,8 @@ def channels(kafka: str) -> str:
     return kafka
 
 
-def make_channel(kafka: str, name: str) -> str:
-    create_topics_with_retry(kafka, [NewTopic(raw_topic(ENV, name), 1, 1)])
+def make_channel(kafka: str, name: str, partitions: int = 1) -> str:
+    create_topics_with_retry(kafka, [NewTopic(raw_topic(ENV, name), partitions, 1)])
     return name
 
 
@@ -280,3 +280,51 @@ def test_removing_a_san_from_the_allow_list_closes_the_open_mtls_session(
     finally:
         fresh.close()
     assert control_ids(drain_topic(kafka, raw_topic(ENV, channel), partitions=1, expected=1)) == ["REV-1"]
+
+
+def keyed(cid: str, mrn: str) -> bytes:
+    return (
+        f"MSH|^~\\&|TRIBUTARY-SYNTH|SPIKE|||20260101000000||ADT^A01|{cid}|P|2.5\r"
+        f"PID|1||{mrn}^^^SPIKE^MR||TESTPATIENT^SYNTHETIC||19700101|U\r"
+    ).encode()
+
+
+def test_per_key_channel_puts_one_patient_on_one_partition_in_send_order(
+    channels: str, receivers: list[ManagedProcess]
+) -> None:
+    kafka, channel, port = channels, make_channel(channels, "spec-perkey", partitions=3), free_port()
+    doc = spec(channel, port, 1, ["parse-error", "queue-full"])
+    doc["spec"]["ordering"] = "per-key"
+    doc["spec"]["partitionKey"] = "hl7:PID.3[5:MR].1"
+    doc["spec"]["partitions"] = 3
+    publish_channel_spec(kafka, ENV, channel, doc)
+    proc = start_mllp_receiver(channel=channel, env=ENV, bootstrap=kafka, instance="mllp-perkey")
+    receivers.append(proc)
+    proc.wait_for_event("listening", timeout_s=60)
+
+    patients = [f"SYNTHMRN-{n}" for n in range(6)]
+    sent: list[tuple[str, str]] = []  # (patient, control id) in send order
+    with socket.create_connection(("127.0.0.1", port), timeout=15) as sock:
+        for i in range(60):
+            patient = patients[i % len(patients)]
+            cid = f"PK-{i:03d}"
+            assert exchange(sock, keyed(cid, patient)) == "AA"
+            sent.append((patient, cid))
+        # an unresolved key (no PID) is a NACK, never published keyless
+        no_pid = b"MSH|^~\\&|TRIBUTARY-SYNTH|SPIKE|||20260101000000||ADT^A01|PK-NOKEY|P|2.5\r"
+        assert exchange(sock, no_pid) == "AR"
+
+    records = drain_topic(kafka, raw_topic(ENV, channel), partitions=3, expected=len(sent))
+    assert len(records) == len(sent) and "PK-NOKEY" not in control_ids(records)
+    by_patient: dict[bytes, list[Any]] = {}
+    for r in records:
+        by_patient.setdefault(r.key(), []).append(r)
+    assert set(by_patient) == {p.encode() for p in patients}
+    for key, recs in by_patient.items():
+        assert len({r.partition() for r in recs}) == 1, "one patient must stay on one partition"
+        recs.sort(key=lambda r: r.offset())
+        expected = [cid for patient, cid in sent if patient.encode() == key]
+        assert control_ids(recs) == expected, "and in the order it was sent"
+        assert all(key not in v for r in recs for _, v in (r.headers() or []))  # the key is record key only
+    assert len({recs[0].partition() for recs in by_patient.values()}) > 1  # the keys really spread out
+    assert not any(b"SYNTHMRN" in line for line in proc.raw)  # nothing keyed reached a log line

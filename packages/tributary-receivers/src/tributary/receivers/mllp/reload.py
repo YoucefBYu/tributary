@@ -24,6 +24,7 @@ keeps serving.
 | Setting | Why it cannot change in place |
 |---|---|
 | `source.bind`, `source.port` | the listening socket is bound to them; rebinding would drop the listener |
+| `spec.ordering`, `spec.partitionKey` | the raw producer's ordering rule is fixed at construction, and a key that changes under a running channel would move one patient between partitions and reorder them silently (invariant 5) |
 | `source.tls` presence, `secretRef`, `clientAuth`, `minVersion` | the `SSLContext` (certificate, key, minimum version, client-auth mode) is built once; certificate paths come from the secrets mount |
 
 The supervisor must restart the process on exit 0 (`restart: always` / `unless-stopped`, a Kubernetes
@@ -42,7 +43,7 @@ from __future__ import annotations
 
 from .config import MllpSettings
 
-RESTART_REQUIRED_FIELDS = ("bind", "port", "tls")
+RESTART_REQUIRED_FIELDS = ("bind", "port", "tls", "partition_key")
 
 LIVE_FIELDS = (
     "channel_version",
@@ -57,7 +58,7 @@ LIVE_FIELDS = (
 
 def restart_required_fields(old: MllpSettings, new: MllpSettings) -> list[str]:
     """The restart-only fields that differ. `tls` counts only its non-allow-list part."""
-    changed = [name for name in ("bind", "port") if getattr(old, name) != getattr(new, name)]
+    changed = [name for name in ("bind", "port", "partition_key") if getattr(old, name) != getattr(new, name)]
     if _tls_without_allow_list(old) != _tls_without_allow_list(new):
         changed.append("tls")
     return changed

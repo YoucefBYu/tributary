@@ -23,9 +23,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from tributary.runtime.spec import ChannelSpec
+from tributary.sdk.keys import KeyExpression
 
 from ..backpressure import DEFAULT_MAX_BYTES
 from ..errors import ConfigError
+from ..keys import key_expression_from_spec
 from ..tls import TlsSpec
 
 #: `ack.nackOn` conditions this v0 receiver can actually produce. `spec-invalid` is in the contract's
@@ -62,6 +64,11 @@ class MllpSettings:
     tls_handshake_timeout_s: float = 10.0
     conn_pipeline: int = 256
     max_inflight: int = 5000
+    #: `spec.ordering` and, for `per-key`, the parsed `spec.partitionKey` (`tributary.sdk.keys`, the one shared
+    #: evaluator, README 4.3). Fixed for the life of the process: `mllp/reload.py`.
+    ordering: str = "none"
+    partition_key: str | None = None
+    key_expression: KeyExpression | None = None
     linger_ms: int = 5  # matches contracts/topics/v0 clients.receiver_producer.linger.ms
     # No delivery_timeout_ms field: that value is `acks`/`enable.idempotence`'s sibling in the
     # topics contract's must_not_hardcode list, and RawPublisher reads it from the contract
@@ -71,6 +78,8 @@ class MllpSettings:
         # Every numeric value is checked here, once, so a spec that reaches a *serving* receiver is
         # refused as a `ConfigError` before anything is applied (a zero `queue.maxBytes` used to reach
         # `ByteBudget.set_limits` and raise mid-update).
+        if (self.ordering == "per-key") != (self.key_expression is not None):
+            raise ConfigError(f"channel {self.channel!r}: ordering per-key needs a key expression, none forbids one")
         for name in ("queue_max_bytes", "max_message_bytes"):
             _positive_int(getattr(self, name), name, self.channel)
         if self.queue_max_messages is not None:
@@ -116,6 +125,7 @@ def mllp_settings_from_channel_spec(spec: Mapping[str, Any], *, env: str, instan
         int(metadata.get("version", 0)),
         _require(body, "ordering", "spec"),
         _require(body, "source", "spec"),
+        partition_key=body.get("partitionKey"),
         env=env,
         instance=instance,
     )
@@ -125,17 +135,32 @@ def mllp_settings_from_spec(spec: ChannelSpec, *, env: str, instance: str = "mll
     """Build `MllpSettings` from the runtime's parsed spec (the `_tb.<env>.channels` record)."""
     if not spec.source:
         raise ConfigError(f"channel {spec.name!r}: spec.source is absent")
-    return _settings(spec.name, spec.version, spec.ordering, spec.source, env=env, instance=instance)
+    return _settings(
+        spec.name,
+        spec.version,
+        spec.ordering,
+        spec.source,
+        partition_key=spec.partition_key,
+        env=env,
+        instance=instance,
+    )
 
 
 def _settings(
-    channel: str, channel_version: int, ordering: str, source: Mapping[str, Any], *, env: str, instance: str
+    channel: str,
+    channel_version: int,
+    ordering: str,
+    source: Mapping[str, Any],
+    *,
+    partition_key: str | None,
+    env: str,
+    instance: str,
 ) -> MllpSettings:
-    if ordering != "none":
-        raise ConfigError(
-            f"channel {channel!r}: ordering {ordering!r} is not supported by this receiver yet — "
-            "per-key ordering needs the keyExpression evaluator (W2-4); ordering: none only in v0"
-        )
+    # `per-key` (invariant 5): the key expression is parsed and source-checked here, so a malformed or
+    # inapplicable locator is a `ConfigError`, never a per-message surprise (`receivers/keys.py`).
+    key_expression = key_expression_from_spec(
+        {"ordering": ordering, "partitionKey": partition_key}, channel=channel, source_type="mllp"
+    )
 
     if source.get("type") != "mllp":
         raise ConfigError(f"channel {channel!r}: source.type is {source.get('type')!r}, not 'mllp'")
@@ -188,4 +213,7 @@ def _settings(
         queue_max_messages=queue.get("maxMessages"),
         env=env,
         instance=instance,
+        ordering=ordering,
+        partition_key=partition_key,
+        key_expression=key_expression,
     )

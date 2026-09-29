@@ -624,3 +624,71 @@ def test_a_bad_contracts_dir_exits_2_without_a_traceback(
     assert exc.value.code == 2 and "Traceback" not in err and str(tmp_path) not in err
     lines = [json.loads(x) for x in err.splitlines() if "startup_refused" in x]
     assert len(lines) == 1 and lines[0]["code"] == "CONFIG_INVALID"
+
+
+# -- ordering: per-key (README 4.3, invariant 5) -----------------------------------------------------
+
+
+def keyed(cid: str, mrn: str) -> bytes:
+    return (
+        f"MSH|^~\\&|TRIBUTARY-SYNTH|SPIKE|||20260101000000||ADT^A01|{cid}|P|2.5\r"
+        f"PID|1||{mrn}^^^SPIKE^MR||TESTPATIENT^SYNTHETIC||19700101|U\r"
+    ).encode()
+
+
+def keyed_spec(version: int = 1, **kw: Any) -> dict[str, Any]:
+    doc = spec_doc(version, **kw)
+    doc["spec"]["ordering"] = "per-key"
+    doc["spec"]["partitionKey"] = "hl7:PID.3[5:MR].1"
+    return doc
+
+
+def test_per_key_channel_sets_the_record_key_and_only_the_record_key() -> None:
+    async def scenario(h: Harness) -> None:
+        port = await h.listening_port()
+        assert await send(port, keyed("K1", "SYNTHMRN-A")) == "AA"
+        assert await send(port, keyed("K2", "SYNTHMRN-B")) == "AA"
+        assert await send(port, keyed("K3", "SYNTHMRN-A")) == "AA"
+        keys = [m.key for m in h.publisher.calls]
+        assert keys == [b"SYNTHMRN-A", b"SYNTHMRN-B", b"SYNTHMRN-A"]
+        for m in h.publisher.calls:  # the key is PHI: never in a header
+            assert all(b"SYNTHMRN" not in v.encode() for v in m.headers.values())
+
+    h = run(scenario, FakeFeed(parse(keyed_spec())))
+    assert "SYNTHMRN" not in repr(h.log.events) + repr(h.emitted)
+
+
+def test_an_unresolved_key_is_a_parse_error_nack_never_a_keyless_publish() -> None:
+    async def scenario(h: Harness) -> None:
+        port = await h.listening_port()
+        no_pid = b"MSH|^~\\&|TRIBUTARY-SYNTH|SPIKE|||20260101000000||ADT^A01|K1|P|2.5\r"
+        empty = keyed("K2", "").replace(b"^^^SPIKE^MR", b"^^^SPIKE^MR")
+        wrong_type = keyed("K3", "SYNTHMRN-A").replace(b"^MR|", b"^XX|")
+        for payload in (no_pid, empty, wrong_type):
+            assert await send(port, payload) == "AR"
+        assert h.publisher.calls == []
+        assert h.runner.server is not None and h.runner.server.metrics.nacked_parse_error == 3
+        assert await send(port, keyed("K4", "SYNTHMRN-A")) == "AA"  # the channel is fine
+
+    run(scenario, FakeFeed(parse(keyed_spec())))
+
+
+def test_unresolved_key_is_refused_even_when_parse_error_is_not_in_nack_on() -> None:
+    async def scenario(h: Harness) -> None:
+        port = await h.listening_port()
+        assert await send(port, adt("K1")) == "AR"  # no PID at all
+        assert h.publisher.calls == []
+
+    run(scenario, FakeFeed(parse(keyed_spec(nack_on=["queue-full"]))))
+
+
+def test_changing_the_partition_key_is_restart_only() -> None:
+    async def scenario(h: Harness) -> None:
+        await h.listening_port()
+        doc = keyed_spec(2)
+        doc["spec"]["partitionKey"] = "hl7:PID.3[5:MR].1"
+        h.feed.spec = parse({**doc, "spec": {**doc["spec"], "partitionKey": "hl7:PID.18"}})
+        await h.until(lambda: h.runner.restart_requested)
+
+    h = run(scenario, FakeFeed(parse(keyed_spec(1))))
+    assert h.log.of("spec_restart_required")[0]["fields"] == "partition_key"

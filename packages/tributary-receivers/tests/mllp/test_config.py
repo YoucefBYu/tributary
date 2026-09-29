@@ -41,9 +41,26 @@ def test_published_spec_carries_its_version() -> None:
 
 
 @pytest.mark.parametrize("example", ["adt-to-fhir-per-key-mtls.json", "published-with-version.json"])
-def test_per_key_ordering_is_refused_in_v0(example: str) -> None:
-    with pytest.raises(ConfigError, match="ordering"):
-        mllp_settings_from_channel_spec(load(example), env="dev")
+def test_per_key_ordering_builds_a_key_expression(example: str) -> None:
+    cfg = mllp_settings_from_channel_spec(load(example), env="dev")
+    assert cfg.ordering == "per-key" and cfg.key_expression is not None and cfg.partition_key
+
+
+@pytest.mark.parametrize(
+    "key", ["json:/a/b", "header:x-tenant", "record:key", "xpath:/a", "hl7:NOPE", "hl7:PID.3[2]", ""]
+)
+def test_a_per_key_expression_this_source_cannot_honour_is_a_config_error(key: str) -> None:
+    spec = load("adt-to-fhir-per-key-mtls.json")
+    spec["spec"]["partitionKey"] = key
+    with pytest.raises(ConfigError):
+        mllp_settings_from_channel_spec(spec, env="dev")
+
+
+def test_per_key_without_a_key_is_a_config_error() -> None:
+    spec = load("adt-to-fhir-per-key-mtls.json")
+    del spec["spec"]["partitionKey"]
+    with pytest.raises(ConfigError, match="partitionKey"):
+        mllp_settings_from_channel_spec(spec, env="dev")
 
 
 def test_spec_invalid_in_nack_on_is_refused_rather_than_silently_ignored() -> None:
