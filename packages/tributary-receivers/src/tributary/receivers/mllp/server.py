@@ -28,26 +28,27 @@ import argparse
 import asyncio
 import json
 import os
+import signal
 import ssl
 import sys
 import time
-from typing import Any
 
 from tributary.runtime import load_engine_kafka_or_exit
-from tributary.runtime.clients import KafkaSettings
 from tributary.runtime.logs import JsonLogger
 
-from ..backpressure import ByteBudget
+from ..backpressure import BudgetExceeded, ByteBudget
 from ..metrics import Metrics
 from ..net import require_safe_bind
 from ..secrets import DirSecretResolver, SecretResolver
 from ..tls import AEAD_CIPHER_PIN, build_ssl_context, log_peer_refused, peer_san_allowed
 from .ack import build_ack
-from .config import MllpSettings, mllp_settings_from_channel_spec
+from .config import MllpSettings
 from .framing import Fatal, FrameParser, Oversize, control_id, looks_like_hl7
-from .kafka_publisher import RawPublisher, build_raw_envelope, topic_name
+from .kafka_publisher import RawPublisher, build_raw_envelope
+from .kafka_publisher import topic_name as raw_topic_name
+from .reload import restart_required_fields
 
-__all__ = ["MllpServer", "MllpSettings", "serve_from_channel_spec"]
+__all__ = ["MllpServer", "MllpSettings"]
 
 READ_CHUNK = 65536
 
@@ -72,10 +73,52 @@ class MllpServer:
         self.budget = ByteBudget(cfg.queue_max_bytes, cfg.queue_max_messages)
         self._inflight = asyncio.Semaphore(cfg.max_inflight)
         self._ssl_context: ssl.SSLContext | None = None
+        self._listener: asyncio.base_events.Server | None = None
+        self._writers: set[asyncio.StreamWriter] = set()
+        self._refusal: str | None = None  # set by `stop_accepting`: the fixed NACK text for later frames
         if cfg.tls is not None:
             self._ssl_context = build_ssl_context(
                 cfg.tls, secret_resolver or DirSecretResolver(), cipher_pin=AEAD_CIPHER_PIN
             )
+
+    @property
+    def open_connections(self) -> int:
+        return len(self._writers)
+
+    @property
+    def accepting(self) -> bool:
+        return self._refusal is None
+
+    async def apply_settings(self, new: MllpSettings) -> None:
+        """Apply a live spec update (`mllp/reload.py` lists what may change). `bind`, `port` and the TLS
+        context cannot: the caller must have checked `restart_required_fields` and refuses here too.
+
+        Everything up to the final `await` is one step on the event loop, so no frame is ever read
+        with a message-size limit that the byte budget cannot hold."""
+        if restart_required_fields(self.cfg, new):
+            raise ValueError("settings changed a field that needs a restart")
+        self.budget.set_limits(new.queue_max_bytes, new.queue_max_messages)
+        self.cfg = new
+        await self.budget.wake()
+
+    def stop_accepting(self, reason: str) -> None:
+        """Close the listener and NACK (`AR`, text `reason`, a fixed string) every frame that arrives
+        afterwards on a connection still open. Frames already read and published are untouched: their ACK
+        is still written (invariant 1). Idempotent; the first reason wins."""
+        if self._refusal is None:
+            self._refusal = reason
+        if self._listener is not None:
+            self._listener.close()
+
+    async def drain(self, timeout_s: float) -> bool:
+        """Wait, bounded, until every frame this server admitted has had its ACK written, then close every
+        connection. True when nothing was left in flight."""
+        deadline = time.monotonic() + timeout_s
+        while self.budget.used_messages and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        for w in list(self._writers):
+            w.close()
+        return self.budget.used_messages == 0
 
     async def _publish(self, frame: bytes, remote: str, deadline: float) -> bool:
         try:
@@ -127,7 +170,7 @@ class MllpServer:
     async def handle(self, r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         peer = w.get_extra_info("peername")
         remote = f"{peer[0]}:{peer[1]}" if peer else "unknown"
-        if self.metrics.connections_open >= self.cfg.max_conns:
+        if self._refusal is not None or self.metrics.connections_open >= self.cfg.max_conns:
             self.metrics.connections_refused += 1
             w.close()
             return
@@ -141,6 +184,7 @@ class MllpServer:
                 return
         self.metrics.connections_total += 1
         self.metrics.connections_open += 1
+        self._writers.add(w)
         parser = FrameParser(self.cfg.max_message_bytes)
         # Bounded independently of ByteBudget (defense in depth: see the module docstring). A full
         # q means the ack_writer has fallen behind flushing ACKs to this peer; q.put then
@@ -152,7 +196,18 @@ class MllpServer:
                 chunk = await asyncio.wait_for(r.read(READ_CHUNK), self.cfg.idle_timeout_s)
                 if not chunk:
                     break  # peer closed; any partial frame is discarded, never ACKed
+                parser.set_max_size(self.cfg.max_message_bytes)  # live spec update
+                refused = False
                 for frame in parser.feed(chunk):
+                    if self._refusal is not None and not isinstance(frame, Fatal):
+                        # The channel stopped accepting after this connection opened. Nothing of this frame
+                        # is published; the sender is told, then the connection closes.
+                        self.metrics.nacked_not_accepting += 1
+                        await q.put(
+                            (frame.cid if isinstance(frame, Oversize) else control_id(frame), self._refusal, None)
+                        )
+                        refused = True
+                        break
                     if isinstance(frame, Fatal):
                         self.metrics.nacked_oversize += 1
                         await q.put(("", "oversize", None))
@@ -168,13 +223,22 @@ class MllpServer:
                         self.metrics.nacked_parse_error += 1
                         await q.put((cid, "parse-error", None))
                         continue
-                    reserved = await self.budget.reserve(len(frame), max(deadline - time.monotonic(), 0))
+                    try:
+                        reserved = await self.budget.reserve(len(frame), max(deadline - time.monotonic(), 0))
+                    except BudgetExceeded:
+                        # Only reachable if a live update shrank the queue below a frame already admitted
+                        # by the parser; `apply_settings` makes that a single step, so treat it as oversize.
+                        self.metrics.nacked_oversize += 1
+                        await q.put((cid, "oversize", None))
+                        continue
                     if not reserved:
                         self.metrics.nacked_queue_full += 1
                         await q.put((cid, "queue-full", None))
                         continue
                     task = asyncio.ensure_future(self._publish(frame, remote, deadline))
                     await q.put((cid, task, len(frame)))
+                if refused:
+                    break
         except (TimeoutError, ConnectionError, OSError, ssl.SSLError):
             pass  # idle timeout, reset, half-open detected by the idle timer, or a TLS failure
         finally:
@@ -184,6 +248,7 @@ class MllpServer:
             except (TimeoutError, asyncio.CancelledError):
                 writer_task.cancel()
             self.metrics.connections_open -= 1
+            self._writers.discard(w)
             w.close()
 
     async def start(self) -> asyncio.base_events.Server:
@@ -191,7 +256,7 @@ class MllpServer:
         (asyncio calls the handler after the handshake), so it does not count against `max_conns`. Half-open
         handshakes are bounded by `tls_handshake_timeout_s` and the listen backlog; a plaintext-to-TLS flood
         is the operator's edge-firewall concern. Counting them needs a custom protocol factory, not done."""
-        return await asyncio.start_server(
+        self._listener = await asyncio.start_server(
             self.handle,
             self.cfg.bind,
             self.cfg.port,
@@ -199,53 +264,7 @@ class MllpServer:
             backlog=1024,
             ssl_handshake_timeout=self.cfg.tls_handshake_timeout_s if self._ssl_context else None,
         )
-
-
-async def serve_from_channel_spec(
-    spec: dict[str, Any],
-    *,
-    env: str,
-    kafka: KafkaSettings,
-    instance: str = "mllp-0",
-    secret_resolver: SecretResolver | None = None,
-    metrics_file: str | None = None,
-) -> None:
-    """Load, bind and serve forever. The coroutine to run from `python -m tributary.receivers.mllp`
-    and the one an integration test drives with a real Kafka cluster."""
-    cfg = mllp_settings_from_channel_spec(spec, env=env, instance=instance)
-    topic = topic_name(cfg.env, cfg.channel)
-    publisher = RawPublisher(
-        kafka,
-        topic,
-        linger_ms=cfg.linger_ms,
-        queue_max_messages=cfg.max_inflight * 2,
-    )
-    publisher.start(asyncio.get_running_loop())
-    metrics = Metrics()
-    server = MllpServer(cfg, publisher, metrics=metrics, secret_resolver=secret_resolver)
-    try:
-        asyncio_server = await server.start()
-        bound_port = asyncio_server.sockets[0].getsockname()[1]
-        print(
-            json.dumps(
-                {
-                    "event": "listening",
-                    "channel": cfg.channel,
-                    "topic": topic,
-                    "port": bound_port,
-                    "tls": cfg.tls is not None,
-                }
-            ),
-            flush=True,
-        )
-        async with asyncio_server:
-            while True:
-                await asyncio.sleep(5)
-                if metrics_file:
-                    with open(metrics_file, "w") as f:
-                        json.dump(metrics.snapshot(), f)
-    finally:
-        publisher.close()
+        return self._listener
 
 
 def emit_lite_profile_warning(*, profile: str) -> None:
@@ -269,14 +288,33 @@ def emit_lite_profile_warning(*, profile: str) -> None:
 
 
 def main() -> None:
+    """`python -m tributary.receivers.mllp --channel <name> --env <env>`.
+
+    The channel spec is read from the compacted `_tb.<env>.channels` topic over the engine Kafka link
+    (invariant 3); there is no file input. The listener opens only after a valid spec for `--channel` has
+    been read. Exit codes: 0 after SIGTERM/SIGINT or after a spec change that needs a restart (the
+    supervisor restarts on 0), 2 for a refused startup configuration."""
+    from confluent_kafka import Consumer
+    from tributary.runtime.channels import open_spec_source
+    from tributary.runtime.clients import consumer_config
+    from tributary.runtime.config import load_topic_defaults
+    from tributary.runtime.topics import channels_topic
+
+    from ..startup import refuse_retired_channel_spec_flag, spec_reader_group_or_exit
+    from .runner import LiveSpecFeed, MllpRunner, RunnerOptions, SpecFeed
+
+    argv = sys.argv[1:]
+    log = JsonLogger("receiver-mllp")
     # Before parse_args: argparse echoes an unknown flag's value to stderr, so a retired
     # --bootstrap / --engine-security must reach the ENGINE_KAFKA_RETIRED_INPUT refusal first.
-    kafka = load_engine_kafka_or_exit(argv=sys.argv[1:], log=JsonLogger("receiver-mllp"))
+    kafka = load_engine_kafka_or_exit(argv=argv, log=log)
+    refuse_retired_channel_spec_flag(argv, log)
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--channel-spec", required=True, help="path to a contracts/channel-spec/v0 JSON document")
+    p.add_argument("--channel", required=True, help="the deployed channel name (spec.metadata.name)")
     p.add_argument("--env", required=True, help="the topic-name env segment, e.g. 'dev' or 'prod'")
     p.add_argument("--instance", default="mllp-0", help="this process's identity, for tb-source")
     p.add_argument("--secrets-dir", help="overrides TB_SECRETS_DIR / the default secrets mount")
+    p.add_argument("--contracts-dir", help="overrides TB_CONTRACTS_DIR / the default contracts/ search")
     p.add_argument("--metrics-file")
     p.add_argument(
         "--profile",
@@ -284,25 +322,56 @@ def main() -> None:
         choices=["lite", "production"],
         help="topic-defaults.json profile in use; 'lite' emits the mandatory RF=1 startup warning",
     )
-    a = p.parse_args()
+    a = p.parse_args(argv)
     emit_lite_profile_warning(profile=a.profile)
-    with open(a.channel_spec, encoding="utf-8") as f:
-        spec = json.load(f)
+    # Operator input is validated (and refused without being echoed) before it becomes a log field.
+    spec_group = spec_reader_group_or_exit(a.env, a.channel, a.instance, log)
+    log = JsonLogger("receiver-mllp", base={"channel": a.channel, "instance": a.instance})
+    defaults = load_topic_defaults(a.contracts_dir)
     resolver = DirSecretResolver(a.secrets_dir) if a.secrets_dir else None
-    coro = serve_from_channel_spec(
-        spec,
-        env=a.env,
-        kafka=kafka,
-        instance=a.instance,
-        secret_resolver=resolver,
+    topic = raw_topic_name(a.env, a.channel)
+
+    def open_feed() -> SpecFeed:
+        consumer = Consumer(consumer_config(kafka, defaults, group_id=spec_group, enable_partition_eof=True))
+        try:
+            source = open_spec_source(channel=a.channel, consumer=consumer, topic=channels_topic(a.env), log=log)
+        except BaseException:
+            consumer.close()
+            raise
+        return LiveSpecFeed(source, a.channel)
+
+    def make_publisher(cfg: MllpSettings) -> RawPublisher:
+        publisher = RawPublisher(
+            kafka, topic, linger_ms=cfg.linger_ms, queue_max_messages=cfg.max_inflight * 2, topic_defaults=defaults
+        )
+        publisher.start(asyncio.get_running_loop())
+        return publisher
+
+    def make_server(cfg: MllpSettings, publisher: RawPublisher, metrics: Metrics) -> MllpServer:
+        return MllpServer(cfg, publisher, metrics=metrics, secret_resolver=resolver)
+
+    runner = MllpRunner(
+        open_feed=open_feed,
+        make_publisher=make_publisher,
+        make_server=make_server,
+        options=RunnerOptions(env=a.env, instance=a.instance, topic=topic),
+        log=log,
         metrics_file=a.metrics_file,
     )
+
+    async def run() -> int:
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, runner.request_stop)
+        return await runner.run()
+
     try:
         import uvloop  # type: ignore[import-not-found]  # no Windows wheel; optional on this platform
     except ImportError:
-        asyncio.run(coro)
+        code = asyncio.run(run())
     else:
-        uvloop.run(coro)
+        code = uvloop.run(run())
+    raise SystemExit(code)
 
 
 if __name__ == "__main__":

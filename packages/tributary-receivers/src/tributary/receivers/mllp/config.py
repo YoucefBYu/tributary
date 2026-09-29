@@ -10,11 +10,10 @@ this wave's receiver cannot yet honour, and it refuses to start rather than sile
 same "specified and quietly not applied" mistake the gate report flagged twice in Phase 0 spike code
 (gate report 6, findings 1 and 2).
 
-There is no `tributary-runtime` yet (W1-4) to consume `_tb.<env>.channels` and hand this receiver its
-spec, so v0's entry point is a JSON file: the published (or, for `ordering: none` walking-skeleton
-channels, the authored) form, loaded with the standard library's `json`. This is a wave-1 stand-in,
-not a contract: once the runtime exists, whatever feeds it a parsed spec `dict` replaces the file read
-in `mllp/server.py`'s `main`, and everything below this line is unchanged.
+The spec arrives as a parsed `tributary.runtime.spec.ChannelSpec` from the live `_tb.<env>.channels`
+reader (`mllp_settings_from_spec`), not from a file: invariant 3 and `mllp/reload.py` (which settings
+apply live and which need a restart). `mllp_settings_from_channel_spec` keeps the published-document
+shape for tests and tools; both share `_settings`.
 """
 
 from __future__ import annotations
@@ -22,6 +21,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
+
+from tributary.runtime.spec import ChannelSpec
 
 from ..backpressure import DEFAULT_MAX_BYTES
 from ..errors import ConfigError
@@ -93,17 +94,33 @@ def mllp_settings_from_channel_spec(spec: Mapping[str, Any], *, env: str, instan
     this receiver cannot honour; never silently ignores a field the schema allows."""
     metadata = _require(spec, "metadata", "channel spec")
     channel = _require(metadata, "name", "metadata")
-    channel_version = metadata.get("version", 0)
-
     body = _require(spec, "spec", "channel spec")
-    ordering = _require(body, "ordering", "spec")
+    return _settings(
+        channel,
+        int(metadata.get("version", 0)),
+        _require(body, "ordering", "spec"),
+        _require(body, "source", "spec"),
+        env=env,
+        instance=instance,
+    )
+
+
+def mllp_settings_from_spec(spec: ChannelSpec, *, env: str, instance: str = "mllp-0") -> MllpSettings:
+    """Build `MllpSettings` from the runtime's parsed spec (the `_tb.<env>.channels` record)."""
+    if not spec.source:
+        raise ConfigError(f"channel {spec.name!r}: spec.source is absent")
+    return _settings(spec.name, spec.version, spec.ordering, spec.source, env=env, instance=instance)
+
+
+def _settings(
+    channel: str, channel_version: int, ordering: str, source: Mapping[str, Any], *, env: str, instance: str
+) -> MllpSettings:
     if ordering != "none":
         raise ConfigError(
             f"channel {channel!r}: ordering {ordering!r} is not supported by this receiver yet — "
             "per-key ordering needs the keyExpression evaluator (W2-4); ordering: none only in v0"
         )
 
-    source = _require(body, "source", "spec")
     if source.get("type") != "mllp":
         raise ConfigError(f"channel {channel!r}: source.type is {source.get('type')!r}, not 'mllp'")
 
@@ -144,7 +161,7 @@ def mllp_settings_from_channel_spec(spec: Mapping[str, Any], *, env: str, instan
 
     return MllpSettings(
         channel=channel,
-        channel_version=int(channel_version),
+        channel_version=channel_version,
         bind=_require(source, "bind", "source"),
         port=_require(source, "port", "source"),
         tls=tls,

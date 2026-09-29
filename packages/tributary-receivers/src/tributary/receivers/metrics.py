@@ -32,6 +32,7 @@ class Metrics:
     nacked_oversize: int = 0
     nacked_queue_full: int = 0
     nacked_unavailable: int = 0
+    nacked_not_accepting: int = 0  # channel undeployed or receiver shutting down
     rejected_auth: int = 0
     rejected_peer_not_allowed: int = 0  # TLS_PEER_NOT_ALLOWED
     rejected_content_type: int = 0
@@ -61,6 +62,7 @@ class Metrics:
             "nacked_oversize": self.nacked_oversize,
             "nacked_queue_full": self.nacked_queue_full,
             "nacked_unavailable": self.nacked_unavailable,
+            "nacked_not_accepting": self.nacked_not_accepting,
             "rejected_auth": self.rejected_auth,
             "rejected_peer_not_allowed": self.rejected_peer_not_allowed,
             "rejected_content_type": self.rejected_content_type,

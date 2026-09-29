@@ -62,6 +62,22 @@ class ByteBudget:
     def used_messages(self) -> int:
         return self._used_messages
 
+    def set_limits(self, max_bytes: int, max_messages: int | None) -> None:
+        """Change the limits in place (a live spec update). Synchronous on purpose: on the single event
+        loop thread it is atomic with respect to every coroutine, so a caller can change these and the
+        matching message-size limit in one step. Reservations already held are kept; a shrink only makes
+        later reservations wait. Follow with `await wake()` so waiters re-check."""
+        if max_bytes < 1:
+            raise ValueError("max_bytes must be positive")
+        if max_messages is not None and max_messages < 1:
+            raise ValueError("max_messages must be positive when set")
+        self._max_bytes = max_bytes
+        self._max_messages = max_messages
+
+    async def wake(self) -> None:
+        async with self._cond:
+            self._cond.notify_all()
+
     async def reserve(self, n_bytes: int, timeout: float) -> bool:
         """Reserve `n_bytes` within `timeout` seconds. `True` and the budget is charged; `False` on
         timeout and nothing is charged. Never raises for an ordinary full queue."""

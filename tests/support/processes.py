@@ -59,6 +59,9 @@ class ManagedProcess:
         self._queue: queue.Queue[bytes | None] = queue.Queue()
         self._eof = False
         self.lines: list[dict[str, Any]] = []
+        #: Every raw output line, JSON or not (a traceback, a stray print), for log-scanning assertions
+        #: such as the e2e "no PHI in any captured log line" check. Filled as lines are drained.
+        self.raw: list[bytes] = []
         assert self.process.stdout is not None
         self._reader = threading.Thread(target=_pump, args=(self.process.stdout, self._queue), daemon=True)
         self._reader.start()
@@ -91,6 +94,7 @@ class ManagedProcess:
                 self._eof = True
                 self._kill_quietly()
                 raise ProcessDiedError(f"{self.args!r} closed its output before emitting {event!r}: {self.lines!r}")
+            self.raw.append(raw)
             try:
                 record = json.loads(raw)
             except json.JSONDecodeError:
@@ -122,6 +126,7 @@ class ManagedProcess:
             if raw is None:
                 self._eof = True
                 break
+            self.raw.append(raw)
             try:
                 record = json.loads(raw)
             except json.JSONDecodeError:
@@ -146,20 +151,41 @@ class ManagedProcess:
 def spawn_mllp_receiver(
     *, channel_spec: Path, env: str, bootstrap: str, instance: str = "mllp-e2e", timeout_s: float = 30.0
 ) -> ManagedProcess:
-    proc = ManagedProcess(
-        [
-            sys.executable,
-            "-m",
-            "tributary.receivers.mllp",
-            "--channel-spec",
-            str(channel_spec),
-            "--env",
-            env,
-            "--instance",
-            instance,
-        ],
-        env=engine_kafka_env(bootstrap),
+    """The real receiver, reading its spec from `_tb.<env>.channels` (invariant 3): the document in
+    `channel_spec` is published there first. See `tests.support.mllp_receiver`."""
+    from tests.support.mllp_receiver import spawn_mllp_receiver_with_spec_file
+
+    return spawn_mllp_receiver_with_spec_file(
+        channel_spec=channel_spec, env=env, bootstrap=bootstrap, instance=instance, timeout_s=timeout_s
     )
+
+
+def spawn_mllp_receiver_from_topic(
+    *,
+    channel: str,
+    env: str,
+    bootstrap: str,
+    instance: str = "mllp-e2e",
+    secrets_dir: Path | str | None = None,
+    timeout_s: float = 30.0,
+) -> ManagedProcess:
+    """The receiver in its post-migration form: `--channel <name>`, the spec read from the compacted
+    `_tb.<env>.channels` topic (invariant 3). `--channel-spec` is retired at HEAD (`CHANNEL_SPEC_FLAG_RETIRED`),
+    so `spawn_mllp_receiver` above no longer starts. The spec must be published before this is called."""
+    args = [
+        sys.executable,
+        "-m",
+        "tributary.receivers.mllp",
+        "--channel",
+        channel,
+        "--env",
+        env,
+        "--instance",
+        instance,
+    ]
+    if secrets_dir is not None:
+        args += ["--secrets-dir", str(secrets_dir)]
+    proc = ManagedProcess(args, env=engine_kafka_env(bootstrap))
     proc.wait_for_event("listening", timeout_s=timeout_s)
     return proc
 
@@ -458,7 +484,13 @@ worker.run()
 
 
 def spawn_pipeline_worker(
-    *, env: str, channel: str, bootstrap: str, instance_id: str, timeout_s: float = 30.0
+    *,
+    env: str,
+    channel: str,
+    bootstrap: str,
+    instance_id: str,
+    timeout_s: float = 30.0,
+    extra_env: dict[str, str] | None = None,
 ) -> ManagedProcess:
     """A real worker process, resolving its step exactly as a deployed one would: no
     `steps_override`, so `tributary.runtime.steps.load_step` runs for real against whatever
@@ -473,7 +505,7 @@ def spawn_pipeline_worker(
     """
     proc = ManagedProcess(
         [sys.executable, "-c", WORKER_PROGRAM, env, channel, bootstrap, instance_id],
-        env=dict(os.environ),
+        env={**os.environ, **(extra_env or {})},
     )
     proc.wait_for_event("worker_started", timeout_s=timeout_s)
     return proc
