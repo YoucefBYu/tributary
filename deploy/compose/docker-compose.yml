@@ -32,15 +32,15 @@
 # ClickHouse and PostgreSQL below are still no-auth and PLAINTEXT: fine ONLY because their ports are
 # loopback-bound and nothing here ever carries real patient data. Production topology is Helm.
 #
-# Storage is intentionally ephemeral (no named volumes for data, except Kafka's: see `kafka-data`), matching spikes/common/docker-compose.yml:
-# `stop`/`start` keeps a container's data, `down` starts clean. Avoids the root-owned volume
+# Storage is intentionally ephemeral (no named volumes for data, Kafka's included), matching
+# spikes/common/docker-compose.yml: `stop`/`start` keeps a container's data, `down` starts clean. Avoids the root-owned volume
 # permission trap on Windows/WSL2 too. Add named volumes yourself for a longer-lived local sandbox.
 
 name: tributary-lite
 
 services:
   kafka-tls-init:
-    # One-shot, runs as root for the shortest possible time to write the two secret volumes and chown
+    # One-shot, runs as root for the shortest possible time to write the secret volume and chown
     # them to the uids that read them (apache/kafka 1000, the app images 10001). Uses the Kafka image
     # only because it carries bash and openssl; see kafka/tls-init.sh for what it writes and what it
     # never prints. Idempotent: existing valid credentials are kept.
@@ -48,7 +48,7 @@ services:
     container_name: tb-kafka-tls-init
     user: root
     restart: "no"
-    # Writes two directories in a local volume and needs nothing else: no network, and only the
+    # Writes files in one local volume and needs nothing else: no network, and only the
     # capabilities to create files, chown them to the reading uid, and override modes it set itself.
     network_mode: none
     cap_drop: [ALL]
@@ -57,7 +57,6 @@ services:
     volumes:
       - ./kafka/tls-init.sh:/opt/tb/tls-init.sh:ro
       - kafka-secrets:/secrets
-      - kafka-data:/var/lib/kafka/data
     read_only: true
     tmpfs:
       - /tmp
@@ -77,14 +76,14 @@ services:
       kafka-tls-init:
         condition: service_completed_successfully
     # Our own entrypoint (deploy/compose/kafka/start-broker.sh), not the image's env-var configurator:
-    # it starts the broker on the storage kafka-tls-init formatted (with the per-component SCRAM
-    # users) and the server.properties it generated (listeners, JAAS, ACL settings, cipher pin).
+    # it starts the broker on the server.properties kafka-tls-init generated (listeners, ACL settings,
+    # cipher pin), wiping storage first when the credentials regenerated. The SCRAM users are created
+    # afterwards by kafka-users-init, from password files.
     entrypoint: ["/bin/bash", "/opt/tb/start-broker.sh"]
     ports:
       - "127.0.0.1:19092:19092"   # SASL_SSL; the certificate carries IP:127.0.0.1
     volumes:
       - ./kafka/start-broker.sh:/opt/tb/start-broker.sh:ro
-      - kafka-data:/var/lib/kafka/data
       - type: volume
         source: kafka-secrets
         target: /etc/tributary/broker
@@ -96,19 +95,90 @@ services:
       # internal-topic replication factors) are in the generated server.properties now, because the
       # broker no longer starts through the image's KAFKA_* env-var configurator: see the "lite profile"
       # block in kafka/tls-init.sh. Only the JVM heap is still an environment variable.
-      # No JMX. NOT empty: kafka-run-class.sh treats an empty value as "unset" and substitutes its
-      # unauthenticated, unencrypted defaults (`jmxremote.authenticate=false`, `ssl=false`); with
-      # JMX_PORT unset no remote port opens, but an explicit `false` leaves nothing to switch on.
-      KAFKA_JMX_OPTS: "-Dcom.sun.management.jmxremote=false"
+      # No JMX agent. NOT empty, and NOT a `-Dcom.sun.management.*` flag: the launcher treats an empty
+      # value as "unset" and installs its unauthenticated defaults, and the JVM starts the agent (with a
+      # local RMI connector) for ANY `com.sun.management.*` property, even `=false`. This neutral flag
+      # also disables the attach mechanism (jcmd, jconsole).
+      KAFKA_JMX_OPTS: "-XX:+DisableAttachMechanism"
       KAFKA_HEAP_OPTS: ${TB_KAFKA_HEAP:--Xmx512M -Xms512M}
     healthcheck:
-      # Authenticated over the real SASL_SSL listener as an ACL-less healthcheck principal, so "healthy" proves
-      # TLS, hostname verification and SCRAM all work. 127.0.0.1 is in the certificate SANs.
-      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server 127.0.0.1:9094 --command-config /etc/tributary/broker/healthcheck.properties >/dev/null 2>&1 || exit 1"]
+      # Mutual TLS over the broker's loopback admin listener as an ACL-less certificate principal, so
+      # "healthy" proves TLS, hostname verification and client-certificate authentication work.
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server 127.0.0.1:9096 --command-config /etc/tributary/broker/healthcheck.properties >/dev/null 2>&1 || exit 1"]
       interval: 5s
       timeout: 5s
       retries: 24
       start_period: 15s
+
+  kafka-users-init:
+    # Creates the per-component SCRAM users on the running broker. It shares the broker's network
+    # namespace so it can reach the loopback-only admin listener (client certificate required), and
+    # reads each password from that component's own secret file, so no password is ever a command-line
+    # argument or in any properties file (the kafka container never has them at all). Same image as
+    # topic-bootstrap. Runs once per `up`; an upsert is idempotent.
+    build:
+      context: ./topic-bootstrap
+      additional_contexts:
+        common: ./common
+    container_name: tb-kafka-users-init
+    restart: "no"
+    network_mode: service:kafka
+    entrypoint: ["python", "add_scram_users.py"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      TB_SCRAM_SECRETS: tb-lite-receiver,tb-lite-worker,tb-lite-loader,tb-lite-channel-publish,tb-lite-topic-bootstrap,tb-lite-admin
+    volumes:
+      - type: volume
+        source: kafka-secrets
+        target: /var/run/secrets/tributary/users-init
+        read_only: true
+        volume:
+          subpath: users-init
+      - type: volume
+        source: kafka-secrets
+        target: /var/run/secrets/tributary/tb-lite-kafka-ca
+        read_only: true
+        volume:
+          subpath: tb-lite-kafka-ca
+      - type: volume
+        source: kafka-secrets
+        target: /var/run/secrets/tributary/tb-lite-receiver
+        read_only: true
+        volume:
+          subpath: tb-lite-receiver
+      - type: volume
+        source: kafka-secrets
+        target: /var/run/secrets/tributary/tb-lite-worker
+        read_only: true
+        volume:
+          subpath: tb-lite-worker
+      - type: volume
+        source: kafka-secrets
+        target: /var/run/secrets/tributary/tb-lite-loader
+        read_only: true
+        volume:
+          subpath: tb-lite-loader
+      - type: volume
+        source: kafka-secrets
+        target: /var/run/secrets/tributary/tb-lite-channel-publish
+        read_only: true
+        volume:
+          subpath: tb-lite-channel-publish
+      - type: volume
+        source: kafka-secrets
+        target: /var/run/secrets/tributary/tb-lite-topic-bootstrap
+        read_only: true
+        volume:
+          subpath: tb-lite-topic-bootstrap
+      - type: volume
+        source: kafka-secrets
+        target: /var/run/secrets/tributary/tb-lite-admin
+        read_only: true
+        volume:
+          subpath: tb-lite-admin
+    read_only: true
 
   clickhouse:
     # Apache-2.0.
@@ -168,6 +238,8 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+      kafka-users-init:
+        condition: service_completed_successfully
     volumes:
       # Read the contract, don't copy it: `topic-defaults.json` `must_not_hardcode` (architect,
       # 2026-09-22) -- every partition count and per-class config comes from this file at container
@@ -431,7 +503,3 @@ volumes:
   # Both survive `down` (that is what keeps the broker's SCRAM users and the files in step); reset
   # them with `docker compose down -v`.
   kafka-secrets:
-  # Broker storage. It lives in a volume because kafka-tls-init formats it (seeding the SCRAM users) in
-  # an isolated one-shot with no network, so no password is ever visible in the broker's `ps`. It
-  # therefore survives `down` like the credentials do; `down -v` resets both together.
-  kafka-data:

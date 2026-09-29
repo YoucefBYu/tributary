@@ -13,7 +13,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir --require-hashes -r requirements.txt \
     && rm requirements.txt
-COPY bootstrap_topics.py .
+COPY bootstrap_topics.py add_scram_users.py .
 # Shared with channel-publish via the compose `additional_contexts: common` (deploy/compose/common).
 COPY --from=common kafka_conn.py .
 

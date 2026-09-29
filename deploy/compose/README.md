@@ -23,7 +23,7 @@ container network is not loopback, and every data-plane process refuses PLAINTEX
 broker.
 
 - `kafka-tls-init` writes, at `up`, a dev CA (its key is deleted right after signing; the CA has no
-  nameConstraints, which is acceptable only because nothing can use it afterwards), a broker certificate (SANs `kafka`, `localhost`, `127.0.0.1`) and one random
+  nameConstraints, acceptable only because nothing can use it afterwards), a broker certificate (SANs `kafka`, `localhost`, `127.0.0.1`) and one random
   SCRAM-SHA-512 user per component (`tb-lite-receiver`, `-worker`, `-loader`, `-channel-publish`,
   `-topic-bootstrap`, `-admin`, plus an ACL-less `-healthcheck`) into the `kafka-secrets` volume. Nothing is committed, baked into an
   image or printed. It is idempotent: valid credentials are kept, and regenerated (and the broker's
@@ -36,14 +36,17 @@ broker.
   control-plane stand-in) creates the topics and applies each role's grants, parsed from
   `contracts/topics/v0/topic-defaults.json` `security.acls` (not restated). The receiver can write
   `raw` only; nothing but the control-plane stand-in can write `_tb.dev.channels`.
-- ACLs are only ever added. Narrowing `security.acls` in the contract does not remove an old grant until
-  the broker's storage is reformatted (new credentials, or `docker compose down -v`).
-- The broker's own identity is a client certificate (controller and inter-broker links are SSL with
-  required client certificates, on the broker's loopback), so it has no password. The component users
-  are seeded when `kafka-tls-init` formats the broker's storage (`kafka-storage format --add-scram`
-  takes passwords as arguments, so that runs in the init one-shot: no network, no other process). The
-  broker container never has a password in `ps`, and JMX is off. Storage therefore lives in the
-  `kafka-data` volume and survives `down`; `down -v` resets it with the credentials.
+- ACLs are only ever added. Narrowing `security.acls` in the contract does not remove an old grant from
+  a running broker. Broker storage is the container's own filesystem, so `docker compose down` (which
+  removes the container) starts clean; `down -v` also regenerates the credentials. Regenerated
+  credentials also wipe and reformat the storage on the next start.
+- The broker's own identity is a client certificate, not a password: the controller, inter-broker and
+  admin listeners are SSL with required client certificates, each on the broker's loopback. The SCRAM
+  users are created after start by `kafka-users-init` (`topic-bootstrap/add_scram_users.py`), which
+  shares the broker's network namespace to reach the loopback admin listener and reads each password
+  from that component's own secret file. No password is ever a process argument (not in a container's
+  `ps`, not in the host's), nor in a properties file, and the broker container never has them. The
+  healthcheck is an ACL-less certificate principal. JMX is off (`-XX:+DisableAttachMechanism`).
 - Clients pin `ECDHE+AESGCM:ECDHE+CHACHA20` and verify the hostname; the broker allows TLS 1.2/1.3
   AEAD suites only. The controller and inter-broker links are `SASL_SSL` on the broker's own loopback.
 
@@ -51,7 +54,8 @@ broker.
 
 | Service | Image | Reachable at | Notes |
 |---|---|---|---|
-| `kafka-tls-init` | `apache/kafka:4.0.0` (for openssl) | n/a (runs once, exits 0) | generates the dev CA, broker certificate and one SCRAM-SHA-512 user per component into Compose volumes; see "Kafka security" |
+| `kafka-tls-init` | `apache/kafka:4.0.0` (for openssl) | n/a (runs once, exits 0) | generates the dev CA, certificates and one SCRAM-SHA-512 password per component into a Compose volume; see "Kafka security" |
+| `kafka-users-init` | built from `topic-bootstrap/` | n/a (runs once, exits 0) | creates those SCRAM users on the broker, from the password files |
 | `kafka` | `apache/kafka:4.0.0` | `127.0.0.1:19092` (host, SASL_SSL), `kafka:9094` (containers, SASL_SSL) | KRaft, single node, **SASL_SSL only, deny-by-default ACLs**, **lite profile: RF=1, min.insync.replicas=1** |
 | `clickhouse` | `clickhouse/clickhouse-server:24.8-alpine` | `127.0.0.1:8123` (HTTP), `127.0.0.1:9000` (native) | empty archive; nothing writes to it yet |
 | `postgres` | `postgres:16-alpine` | `127.0.0.1:5432` (db/user `tributary`, no password: `trust` auth) | empty control-plane DB; nothing writes to it yet |
