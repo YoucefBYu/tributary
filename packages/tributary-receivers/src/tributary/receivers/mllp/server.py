@@ -269,6 +269,9 @@ def emit_lite_profile_warning(*, profile: str) -> None:
 
 
 def main() -> None:
+    # Before parse_args: argparse echoes an unknown flag's value to stderr, so a retired
+    # --bootstrap / --engine-security must reach the ENGINE_KAFKA_RETIRED_INPUT refusal first.
+    kafka = load_engine_kafka_or_exit(argv=sys.argv[1:], log=JsonLogger("receiver-mllp"))
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--channel-spec", required=True, help="path to a contracts/channel-spec/v0 JSON document")
     p.add_argument("--env", required=True, help="the topic-name env segment, e.g. 'dev' or 'prod'")
@@ -282,7 +285,6 @@ def main() -> None:
         help="topic-defaults.json profile in use; 'lite' emits the mandatory RF=1 startup warning",
     )
     a = p.parse_args()
-    kafka = load_engine_kafka_or_exit(argv=sys.argv[1:], log=JsonLogger("receiver-mllp"))
     emit_lite_profile_warning(profile=a.profile)
     with open(a.channel_spec, encoding="utf-8") as f:
         spec = json.load(f)

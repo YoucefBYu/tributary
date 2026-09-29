@@ -64,3 +64,61 @@ def test_retired_bootstrap_environment_exits_2(
     with pytest.raises(SystemExit) as exc:
         entry()
     _refused(exc, capsys, "ENGINE_KAFKA_RETIRED_INPUT")
+
+
+RETIRED_FLAG_VALUE = "SYNTH-RETIRED-VALUE-91c2"
+
+
+@pytest.mark.parametrize("entry", LOADERS, indirect=True)
+@pytest.mark.parametrize("flag", ["--bootstrap", "--engine-security"])
+@pytest.mark.parametrize("form", ["separate", "equals"])
+def test_retired_flag_is_refused_before_argparse_and_not_echoed(
+    entry: Callable[[], None],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    flag: str,
+    form: str,
+) -> None:
+    monkeypatch.setenv("TB_ENGINE_KAFKA_FILE", str(write_engine_kafka_file(tmp_path, "127.0.0.1:9092")))
+    extra = [f"{flag}={RETIRED_FLAG_VALUE}"] if form == "equals" else [flag, RETIRED_FLAG_VALUE]
+    monkeypatch.setattr("sys.argv", ["prog", "--channel", "c", "--destination", "d", "--env", "dev", *extra])
+    with pytest.raises(SystemExit) as exc:
+        entry()
+    err = capsys.readouterr()
+    assert RETIRED_FLAG_VALUE not in err.err + err.out
+    assert "unrecognized arguments" not in err.err
+    assert exc.value.code == 2
+    lines = [json.loads(x) for x in err.err.splitlines() if "startup_refused" in x]
+    assert len(lines) == 1 and lines[0]["code"] == "ENGINE_KAFKA_RETIRED_INPUT"
+
+
+@pytest.mark.parametrize("entry", LOADERS, indirect=True)
+@pytest.mark.parametrize("instance", ["_bad", "has space", "a/b", "x" * 129, "SYNTH-PHI\nMARKER"])
+def test_bad_instance_id_exits_2_with_one_phi_free_line(
+    entry: Callable[[], None],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    instance: str,
+) -> None:
+    monkeypatch.setenv("TB_ENGINE_KAFKA_FILE", str(write_engine_kafka_file(tmp_path, "127.0.0.1:9092")))
+    monkeypatch.setattr(
+        "sys.argv", ["prog", "--channel", "c", "--destination", "d", "--env", "dev", "--instance-id", instance]
+    )
+    with pytest.raises(SystemExit) as exc:
+        entry()
+    err = capsys.readouterr().err
+    assert exc.value.code == 2
+    assert "Traceback" not in err and "MARKER" not in err
+    lines = [json.loads(x) for x in err.splitlines() if "startup_refused" in x]
+    assert len(lines) == 1 and lines[0]["code"] == "TOPIC_NAME_INVALID"
+
+
+def test_spec_reader_group_is_inside_the_acl_granted_prefix() -> None:
+    from tributary.loaders.startup import spec_reader_group_or_exit
+    from tributary.runtime.logs import JsonLogger
+
+    group = spec_reader_group_or_exit("dev", "adt-passthrough", "loader-http-stub-42", JsonLogger("t"))
+    assert group == "tb.dev.adt-passthrough.channels.loader-http-stub-42"
+    assert group.startswith("tb.dev.adt-passthrough.channels.")  # ACL PREFIXED grant, topics README 3.4.1

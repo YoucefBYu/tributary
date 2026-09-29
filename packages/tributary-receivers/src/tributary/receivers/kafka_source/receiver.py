@@ -362,6 +362,9 @@ async def serve_from_channel_spec(
 
 
 def main() -> None:
+    # Before parse_args: argparse echoes an unknown flag's value to stderr, so a retired
+    # --bootstrap / --engine-security must reach the ENGINE_KAFKA_RETIRED_INPUT refusal first.
+    kafka = load_engine_kafka_or_exit(argv=sys.argv[1:], log=JsonLogger("receiver-kafka-source"))
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--channel-spec", required=True)
     p.add_argument("--env", required=True)
@@ -369,7 +372,6 @@ def main() -> None:
     p.add_argument("--secrets-dir")
     p.add_argument("--metrics-file")
     a = p.parse_args()
-    kafka = load_engine_kafka_or_exit(argv=sys.argv[1:], log=JsonLogger("receiver-kafka-source"))
     logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(message)s")
     with open(a.channel_spec, encoding="utf-8") as f:
         spec = json.load(f)

@@ -31,6 +31,7 @@ from functools import lru_cache
 
 from tributary.runtime.clients import KafkaSettings, producer_config
 from tributary.runtime.config import TopicDefaults, load_topic_defaults
+from tributary.runtime.errors import KafkaSecurityError
 from tributary.sdk import Message, ids
 from tributary.sdk import headers as h
 from tributary.sdk.errors import EnvelopeError
@@ -75,6 +76,9 @@ def build_raw_envelope(
     )
 
 
+_SSL_CLIENT_CERT_KEYS = ("ssl.certificate.location", "ssl.key.location")
+
+
 @lru_cache(maxsize=1)
 def _cached_topic_defaults() -> TopicDefaults:
     """Read `contracts/topics/v0/topic-defaults.json` once per process. `load_topic_defaults`
@@ -111,6 +115,12 @@ class RawPublisher:
         client_id_prefix: str = "mllp-receiver",
     ) -> None:
         from confluent_kafka import Producer  # lazy: unit tests need no broker client
+
+        # `parse_engine_kafka` requires a client certificate for SSL, but an embedded caller can build
+        # server-auth-only `KafkaSettings` directly. The receiver principal authenticates by mTLS
+        # (contracts/engine-kafka/v0), so refuse here rather than connect anonymously-by-cert.
+        if kafka.protocol == "SSL" and not all(k in kafka.security for k in _SSL_CLIENT_CERT_KEYS):
+            raise KafkaSecurityError("security.protocol SSL requires ssl.certificate.location and ssl.key.location")
 
         self.topic = topic
         self._ordering: Ordering = ordering

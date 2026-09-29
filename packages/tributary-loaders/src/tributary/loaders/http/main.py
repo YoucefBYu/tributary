@@ -39,6 +39,7 @@ from tributary.runtime.worker import KafkaDlqWriter
 from tributary.sdk.context import Logger
 
 from ..secrets import DirSecretResolver
+from ..startup import spec_reader_group_or_exit
 from .config import http_destination_config_from_destination
 from .handler import HttpRecordHandler
 from .loader import HttpLoader
@@ -67,13 +68,14 @@ def build_loop(a: argparse.Namespace, kafka_settings: KafkaSettings) -> tuple[Co
     log = JsonLogger(f"loader-{a.destination}", base={"channel": a.channel, "destination": a.destination})
     emit_lite_profile_warning(log, profile=a.profile)
 
+    spec_group = spec_reader_group_or_exit(a.env, a.channel, instance, log)
     spec_source = open_spec_source(
         channel=a.channel,
         consumer=Consumer(
             consumer_config(
                 kafka_settings,
                 defaults,
-                group_id=f"tb.{a.env}.{a.channel}.channels.{instance}",
+                group_id=spec_group,
                 enable_partition_eof=True,
             )
         ),
@@ -141,6 +143,9 @@ def build_loop(a: argparse.Namespace, kafka_settings: KafkaSettings) -> tuple[Co
 
 
 def main() -> None:
+    # Before parse_args: argparse echoes an unknown flag's value to stderr, so a retired
+    # --bootstrap / --engine-security must reach the ENGINE_KAFKA_RETIRED_INPUT refusal first.
+    kafka_settings = load_engine_kafka_or_exit(argv=sys.argv[1:], log=JsonLogger("loader-http"))
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--channel", required=True, help="the deployed channel name (spec.metadata.name)")
     p.add_argument("--destination", required=True, help="the spec.destinations[].name to load")
@@ -155,7 +160,6 @@ def main() -> None:
         help="topic-defaults.json profile in use; 'lite' emits the mandatory RF=1 startup warning",
     )
     a = p.parse_args()
-    kafka_settings = load_engine_kafka_or_exit(argv=sys.argv[1:], log=JsonLogger(f"loader-{a.destination}"))
     loop, handler = build_loop(a, kafka_settings)
 
     def _shutdown(signum: int, _frame: object) -> None:

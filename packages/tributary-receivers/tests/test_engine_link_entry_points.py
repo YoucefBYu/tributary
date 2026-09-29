@@ -74,3 +74,28 @@ def test_retired_bootstrap_environment_exits_2(
     with pytest.raises(SystemExit) as exc:
         entry()
     _refused(exc, capsys, "ENGINE_KAFKA_RETIRED_INPUT")
+
+
+RETIRED_FLAG_VALUE = "SYNTH-RETIRED-VALUE-91c2"
+
+
+@pytest.mark.parametrize("entry", ENTRY_POINTS, indirect=True)
+@pytest.mark.parametrize("flag", ["--bootstrap", "--engine-security"])
+@pytest.mark.parametrize("form", ["separate", "equals"])
+def test_retired_flag_is_refused_before_argparse_and_not_echoed(
+    entry: Callable[..., None],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    flag: str,
+    form: str,
+) -> None:
+    monkeypatch.setenv("TB_ENGINE_KAFKA_FILE", str(write_engine_kafka_file(tmp_path, "127.0.0.1:9092")))
+    with pytest.raises(SystemExit) as exc:
+        entry(*([f"{flag}={RETIRED_FLAG_VALUE}"] if form == "equals" else [flag, RETIRED_FLAG_VALUE]))
+    err = capsys.readouterr()
+    assert RETIRED_FLAG_VALUE not in err.err + err.out
+    assert "unrecognized arguments" not in err.err
+    assert exc.value.code == 2
+    lines = [json.loads(x) for x in err.err.splitlines() if "startup_refused" in x]
+    assert len(lines) == 1 and lines[0]["code"] == "ENGINE_KAFKA_RETIRED_INPUT"
