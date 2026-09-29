@@ -14,6 +14,7 @@ import dataclasses
 import io
 import json
 import re
+from collections import Counter
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any
@@ -262,36 +263,37 @@ def _valid_ipv4(host: str) -> bool:
     return True
 
 
-OUTCOMES: dict[tuple[bool, bool], int] = {}
-
-
-@settings(max_examples=1500, deadline=None, suppress_health_check=[HealthCheck.too_slow])
-@given(doc=documents())
-def test_the_runtime_validator_never_accepts_what_the_schema_refuses(doc: dict[str, Any]) -> None:
+def test_the_runtime_validator_never_accepts_what_the_schema_refuses() -> None:
     """Accepts => schema accepts. Where the schema accepts and the runtime refuses, the document has one
-    of the documented stricter features and nothing else explains it."""
-    schema_ok = not list(Draft202012Validator(SCHEMA).iter_errors(doc))
-    try:
-        ek.parse_engine_kafka(doc)
-        runtime_ok = True
-    except EngineKafkaError as exc:
-        runtime_ok = False
-        assert PASSWORD_MARKER not in str(exc)
-    OUTCOMES[(schema_ok, runtime_ok)] = OUTCOMES.get((schema_ok, runtime_ok), 0) + 1
-    if runtime_ok:
-        assert schema_ok, doc
-    elif schema_ok:
-        assert _runtime_stricter(doc), doc
+    of the documented stricter features and nothing else explains it.
 
+    The control is in the same test, over the same run: a generator that only produced refusals would
+    pass the property vacuously. (It used to be a second test reading a module-level dict, which skipped
+    when run alone and could run on another xdist worker than the property.)
+    """
+    outcomes: Counter[tuple[bool, bool]] = Counter()
 
-def test_the_differential_reached_every_outcome_it_can() -> None:
-    """A control: a generator that only produced refusals would pass the property above vacuously."""
-    if not OUTCOMES:
-        pytest.skip("run together with the property test")
-    assert OUTCOMES.get((True, True), 0) >= 100
-    assert OUTCOMES.get((False, False), 0) >= 100
-    assert OUTCOMES.get((True, False), 0) >= 10  # the documented stricter rules were exercised
-    assert OUTCOMES.get((False, True), 0) == 0
+    @settings(max_examples=1500, deadline=None, suppress_health_check=[HealthCheck.too_slow], database=None)
+    @given(doc=documents())
+    def the_property(doc: dict[str, Any]) -> None:
+        schema_ok = not list(Draft202012Validator(SCHEMA).iter_errors(doc))
+        try:
+            ek.parse_engine_kafka(doc)
+            runtime_ok = True
+        except EngineKafkaError as exc:
+            runtime_ok = False
+            assert PASSWORD_MARKER not in str(exc)
+        outcomes[(schema_ok, runtime_ok)] += 1
+        if runtime_ok:
+            assert schema_ok, doc
+        elif schema_ok:
+            assert _runtime_stricter(doc), doc
+
+    the_property()
+    assert outcomes[(True, True)] >= 100, outcomes
+    assert outcomes[(False, False)] >= 100, outcomes
+    assert outcomes[(True, False)] >= 10, outcomes  # the documented stricter rules were exercised
+    assert outcomes[(False, True)] == 0, outcomes
 
 
 # --- the loader ---------------------------------------------------------------------------------------
