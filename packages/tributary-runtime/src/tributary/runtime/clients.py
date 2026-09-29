@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .config import TopicDefaults
+from .errors import KafkaSecurityError
 from .kafka_security import check_link, split_bootstrap
 from .spec import ChannelSpec
 
@@ -69,8 +70,9 @@ class KafkaSettings:
     reads `TB_ENGINE_KAFKA_FILE` and returns one. Direct construction remains for the kafka source's
     foreign connection and for tests, and gets the same checks.
 
-    `security` is copied into a `SecurityProperties`, so a caller cannot mutate it after the check, and
-    its `repr` never shows a value. The `*_config` builders below apply it **first** and the contract's
+    `security` is copied into a `SecurityProperties` **before** the check, and the check runs on that
+    copy, so neither a later mutation nor a mapping that answers `get` differently from its contents can
+    change what was checked. Its `repr` never shows a value. The `*_config` builders below apply it **first** and the contract's
     client profile last, so it could not override `acks` or `enable.idempotence` even if the allow-list
     were widened (ADR-008 D4).
     """
@@ -79,8 +81,15 @@ class KafkaSettings:
     security: Mapping[str, Any] = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
-        check_link(self.bootstrap_servers, self.security)
-        object.__setattr__(self, "security", SecurityProperties(self.security))
+        # Copy first, then check the copy, then keep the copy: a `Mapping` (or `dict` subclass) whose
+        # `get` answers differently from its contents cannot pass the check with other values stored.
+        if type(self.bootstrap_servers) is not str:
+            raise KafkaSecurityError("bootstrap servers must be a plain str")
+        if not isinstance(self.security, Mapping):
+            raise KafkaSecurityError("the security map is not a mapping")
+        frozen = SecurityProperties(self.security)
+        check_link(self.bootstrap_servers, frozen)
+        object.__setattr__(self, "security", frozen)
 
     @property
     def protocol(self) -> str:

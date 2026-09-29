@@ -23,8 +23,8 @@ it, ADR-008 D3). Everything below is also exported from `tributary.runtime`.
 **Error codes** (`EngineKafkaError.code`, stable): `ENGINE_KAFKA_RETIRED_INPUT` (a retired variable or
 flag is present), `ENGINE_KAFKA_FILE_UNSET`, `ENGINE_KAFKA_FILE_UNREADABLE` (relative, unreadable or
 oversized), `ENGINE_KAFKA_DOCUMENT_INVALID` (not JSON, or not `engine-kafka/v0`),
-`ENGINE_KAFKA_SECRET_UNRESOLVED` (a `secretRef` key is missing, empty, oversized, not UTF-8, or the
-resolver raised) and
+`ENGINE_KAFKA_SECRET_UNRESOLVED` (a `secretRef` key is missing, unreadable, empty, group- or
+world-writable, oversized, not UTF-8, holds a control character, or the resolver raised) and
 `ENGINE_KAFKA_LINK_REFUSED` (the resolved map broke a `KafkaSettings` link rule). A `KafkaSecurityError`
 raised directly has `KAFKA_LINK_REFUSED`.
 
@@ -87,7 +87,7 @@ import json
 import os
 import re
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Literal, NoReturn
@@ -103,7 +103,7 @@ from .kafka_security import (
     split_bootstrap,
 )
 from .logs import JsonLogger
-from .secrets import DirSecretResolver, SecretResolutionError, SecretResolver
+from .secrets import DirSecretResolver, SecretResolutionError, SecretResolver, describe_failure
 
 __all__ = [
     "API_VERSION",
@@ -327,36 +327,54 @@ def parse_engine_kafka(document: object) -> EngineKafkaConnection:
 
 
 def engine_kafka_settings(connection: EngineKafkaConnection, resolver: SecretResolver) -> KafkaSettings:
-    """Resolve `connection`'s secrets and build validated `KafkaSettings` (section 4 rules 2-4)."""
+    """Resolve `connection`'s secrets and build validated `KafkaSettings` (section 4 rules 2-4).
+
+    Whatever a resolver raises, the refusal is rebuilt here from the `secretRef` name, the key name and,
+    for a `SecretResolutionError`, its enumerated reason. The resolver's own message is never repeated:
+    a caller-supplied resolver is free to put a path or a value in one.
+    """
     security: dict[str, Any] = {"security.protocol": connection.protocol}
-    try:
-        if connection.protocol != "PLAINTEXT":
-            security["enable.ssl.certificate.verification"] = True
-            security["ssl.endpoint.identification.algorithm"] = "https"
-            security["ssl.cipher.suites"] = PINNED_CIPHER_SUITES
-            if connection.tls_secret_ref is not None:
-                security["ssl.ca.location"] = str(resolver.resolve_file(connection.tls_secret_ref, "ca.crt"))
-            if connection.secret_ref is None:  # parse_engine_kafka requires it; fail closed regardless
-                raise EngineKafkaError(f"{connection.protocol} has no secretRef", code="ENGINE_KAFKA_DOCUMENT_INVALID")
-            if connection.protocol == "SASL_SSL":
-                security["sasl.mechanism"] = SCRAM_SHA_512
-                security["sasl.username"] = resolver.resolve_text(connection.secret_ref, "username")
-                security["sasl.password"] = resolver.resolve_text(connection.secret_ref, "password")
-            else:
-                security["ssl.certificate.location"] = str(resolver.resolve_file(connection.secret_ref, "tls.crt"))
-                security["ssl.key.location"] = str(resolver.resolve_file(connection.secret_ref, "tls.key"))
-    except SecretResolutionError as exc:
-        raise EngineKafkaError(f"cannot resolve the engine Kafka credentials: {exc}", code=_SECRET_UNRESOLVED) from None
-    except OSError as exc:  # a caller-supplied resolver may raise FileNotFoundError and friends
-        raise EngineKafkaError(
-            f"cannot resolve the engine Kafka credentials ({type(exc).__name__}); "
-            "check the secretRef directories under TB_SECRETS_DIR",
-            code=_SECRET_UNRESOLVED,
-        ) from None
+    if connection.protocol != "PLAINTEXT":
+        security["enable.ssl.certificate.verification"] = True
+        security["ssl.endpoint.identification.algorithm"] = "https"
+        security["ssl.cipher.suites"] = PINNED_CIPHER_SUITES
+        if connection.tls_secret_ref is not None:
+            security["ssl.ca.location"] = _resolve(resolver.resolve_file, connection.tls_secret_ref, "ca.crt")
+        if connection.secret_ref is None:  # parse_engine_kafka requires it; fail closed regardless
+            raise EngineKafkaError(
+                "an SSL or SASL_SSL connection has no secretRef", code="ENGINE_KAFKA_DOCUMENT_INVALID"
+            )
+        if connection.protocol == "SASL_SSL":
+            security["sasl.mechanism"] = SCRAM_SHA_512
+            security["sasl.username"] = _resolve(resolver.resolve_text, connection.secret_ref, "username")
+            security["sasl.password"] = _resolve(resolver.resolve_text, connection.secret_ref, "password")
+        else:
+            security["ssl.certificate.location"] = _resolve(resolver.resolve_file, connection.secret_ref, "tls.crt")
+            security["ssl.key.location"] = _resolve(resolver.resolve_file, connection.secret_ref, "tls.key")
     try:
         return KafkaSettings(bootstrap_servers=",".join(connection.bootstrap_servers), security=security)
     except KafkaSecurityError as exc:  # e.g. a resolver that returned an empty password
+        # KafkaSecurityError messages are fixed sentences (kafka_security module doc), tested with markers.
         raise EngineKafkaError(f"engine Kafka link refused: {exc}", code="ENGINE_KAFKA_LINK_REFUSED") from None
+
+
+def _resolve(call: Callable[[str, str], object], ref: str, key: str) -> Any:
+    """One resolver call; any failure becomes a fixed `ENGINE_KAFKA_SECRET_UNRESOLVED` refusal."""
+    # A hand-built EngineKafkaConnection skips parse_engine_kafka: re-check the ref is a contract name.
+    name = f"{ref if _SECRET_REF.fullmatch(ref) else '<invalid secretRef>'}/{safe_token(key)}"
+    try:
+        value = call(ref, key)
+    except SecretResolutionError as exc:
+        raise EngineKafkaError(
+            f"engine Kafka secretRef key {name} {describe_failure(exc.reason)} (under TB_SECRETS_DIR)",
+            code=_SECRET_UNRESOLVED,
+        ) from None
+    except Exception as exc:  # a foreign resolver's error text may hold a path or a value
+        raise EngineKafkaError(
+            f"engine Kafka secretRef key {name} could not be resolved ({safe_token(type(exc).__name__)})",
+            code=_SECRET_UNRESOLVED,
+        ) from None
+    return str(value) if isinstance(value, Path) else value
 
 
 def _invalid(path: str, rule: str) -> EngineKafkaError:

@@ -888,6 +888,40 @@ def test_a_logger_that_refuses_the_reason_still_gets_one_line_and_exit_2() -> No
     assert picky.lines == [{"event": "startup_refused", "error": "EngineKafkaError", "code": "ENGINE_KAFKA_FILE_UNSET"}]
 
 
+def test_every_reason_fits_the_log_guard() -> None:
+    """The longest fixed sentences, with the longest names the contract allows, are under 256 characters,
+    so the fallback above (reason dropped) is never what an operator sees for a real refusal."""
+    from tributary.sdk.guards import MAX_LOG_VALUE_CHARS
+
+    longest_ref = "a" + "b" * 63
+    connection = ek.EngineKafkaConnection(("kafka:9093",), "SASL_SSL", "SCRAM-SHA-512", longest_ref, longest_ref)
+
+    class Raising:
+        def resolve_file(self, ref: str, key: str) -> Path:
+            raise SecretResolutionError(ref, key, "control-character")
+
+        def resolve_text(self, ref: str, key: str) -> str:
+            raise SecretResolutionError(ref, key, "control-character")
+
+    with pytest.raises(EngineKafkaError) as refused:
+        ek.engine_kafka_settings(connection, Raising())
+    messages = [str(refused.value)]
+    for stray in ({"acks": "1"}, {"sasl.username": "bad\x00"}):
+        with pytest.raises(KafkaSecurityError) as direct:
+            KafkaSettings("kafka:9093", {**SASL_SSL, **stray})
+        messages.append("engine Kafka link refused: " + str(direct.value))
+    messages.append(str(_invalid_plaintext()))
+    assert all(len(message) <= MAX_LOG_VALUE_CHARS for message in messages), max(messages, key=len)
+
+
+def _invalid_plaintext() -> EngineKafkaError:
+    try:
+        ek.parse_engine_kafka(document("PLAINTEXT", ["kafka-remote.synth:9092"]))
+    except EngineKafkaError as exc:
+        return exc
+    raise AssertionError("not refused")
+
+
 def test_the_package_exports_the_entry_point_api() -> None:
     import tributary.runtime as runtime
     from tributary.runtime import secrets

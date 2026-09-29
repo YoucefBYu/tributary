@@ -8,7 +8,8 @@ the kafka source's foreign connection, a test) can hand librdkafka a configurati
   security map, so it can neither redirect the link past the loopback check nor weaken invariant 1;
 * speaks `PLAINTEXT` to anything but a loopback broker (rule 1). **There is no opt-out**;
 * speaks TLS without broker verification, hostname verification and the AEAD cipher pin (rule 2);
-* uses SASL without a SCRAM-SHA-512 username and password (rule 3).
+* uses SASL without a SCRAM-SHA-512 username and password (rule 3), or with one that holds a control
+  character.
 
 The allow-list is **narrower than rule 4's `ssl.*`**: only the `ssl.*` properties a `secretRef` resolves
 to are accepted. librdkafka's `ssl.engine.location` and `ssl.providers` load a shared object into the
@@ -20,7 +21,9 @@ because the per-component ACLs need a principal) live in `engine_kafka`, because
 builds `KafkaSettings` for a foreign cluster, where server-authenticated `SSL` is valid (ADR-007 D11).
 
 Error messages name a rule, a property name from the allow-list, or an entry index. Never a host, a
-credential, a path, or a key the caller supplied (invariant 6, CLAUDE.md "no secrets").
+credential, a path, or a key the caller supplied (invariant 6, CLAUDE.md "no secrets"). Every message is
+a fixed sentence: no caller-supplied string is formatted into one (`tests/test_engine_kafka.py` plants a
+marker in every value and key position and checks each refusal).
 """
 
 from __future__ import annotations
@@ -122,12 +125,11 @@ def check_link(bootstrap_servers: str, security: Mapping[str, Any]) -> None:
     stray = sum(1 for key in security if key not in SECURITY_KEYS)
     if stray:
         raise KafkaSecurityError(
-            f"the security map carries {stray} key(s) outside the allow-list; it may hold only "
-            "security.protocol, sasl.mechanism/username/password, enable.ssl.certificate.verification and "
-            "the ssl.* verification, CA and client-certificate properties (engine-kafka/v0 4 rule 4)"
+            f"the security map carries {stray} key(s) outside the allow-list (security.protocol, sasl.*, "
+            "ssl.* verification, CA and client certificate only; engine-kafka/v0 4 rule 4)"
         )
     protocol = security.get("security.protocol", "PLAINTEXT")
-    if protocol not in PROTOCOLS:
+    if not isinstance(protocol, str) or protocol not in PROTOCOLS:  # a list is unhashable: TypeError
         raise KafkaSecurityError("security.protocol must be PLAINTEXT (loopback only), SSL or SASL_SSL")
 
     if protocol == "PLAINTEXT":
@@ -163,6 +165,13 @@ def check_link(bootstrap_servers: str, security: Mapping[str, Any]) -> None:
         raise KafkaSecurityError("SASL_SSL requires sasl.mechanism SCRAM-SHA-512")
     if not (_non_empty_str(security.get("sasl.username")) and _non_empty_str(security.get("sasl.password"))):
         raise KafkaSecurityError("SASL_SSL has no username or password (engine-kafka/v0 4 rule 3)")
+    if any(_has_control(security[key]) for key in ("sasl.username", "sasl.password")):
+        # librdkafka reads a C string: a NUL silently truncates the credential, a CR/LF is a file mistake.
+        raise KafkaSecurityError("SASL_SSL username or password contains a control character")
+
+
+def _has_control(value: object) -> bool:
+    return isinstance(value, str) and any(ord(c) < 0x20 or ord(c) == 0x7F for c in value)
 
 
 def _non_empty_str(value: object) -> bool:

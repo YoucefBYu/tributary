@@ -132,6 +132,7 @@ def pki(tmp_path_factory: pytest.TempPathFactory) -> Pki:
         (root / ref).mkdir(parents=True)
         for key, value in files.items():
             (root / ref / key).write_text(value, encoding="utf-8")
+            (root / ref / key).chmod(0o600)  # whatever the umask: group- or world-writable is refused
     return Pki(certs=certs, secrets=root)
 
 
