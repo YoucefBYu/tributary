@@ -31,7 +31,7 @@ consulted first, same as `postgresql`.
 
 ## Error codes (README 3.4 table: `CH_<numeric code>`)
 
-* `TIMEOUT` — `client.py`'s `send` raised `TransportError` from a `TimeoutError`, or the request timed
+* `TIMEOUT` — `client.py`'s `send` raised `TransportTimeout` (a socket timeout or the overall deadline), or the request timed
   out establishing a connection. Retryable. (A query that ClickHouse itself judges too slow comes back
   as an ordinary HTTP error with `X-ClickHouse-Exception-Code: 159` — `CH_159` below, not this.)
 * `CONNECT_FAILED` — `client.py`'s `TransportError` from anything else (DNS failure, connection

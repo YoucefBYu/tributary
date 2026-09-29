@@ -18,13 +18,9 @@ from the loader's own explicit `INSERT INTO ... (tb_msg_id, ...)` column list (`
 `_insert_statement` never names it), so the server computes that column's default -- a genuine two-second
 `sleepEachRow` -- for every row this loader inserts. With `timeoutMs` set below that, the loader's first
 delivery attempt genuinely reaches the server, genuinely blocks past its own client-side deadline, and
-`client.py`'s `send` genuinely raises (confirmed empirically -- see the note below -- always as
-`TransportError`/`CONNECT_FAILED`, never as the bare `TimeoutError`/`TIMEOUT` `loader.py`'s own module
-docstring says a timeout produces: `client.py` catches `TimeoutError` and re-raises it as `TransportError`
-unconditionally, so `loader.py`'s `except TimeoutError:` branch immediately above `except TransportError:`
-is unreachable dead code for a real timeout. Flagged for connector-engineer; this test asserts the
-classification actually observed, `CONNECT_FAILED`, not the one the docstring claims). Either way the
-failure is retryable, so the real `ConsumerLoop._pause_and_rewind`/`_resume_due_partitions` blocking-retry
+`client.py`'s `send` genuinely raises a `TransportTimeout`, which `loader.py` reports as `TIMEOUT`
+(retryable; since 16785df a timeout is no longer folded into `CONNECT_FAILED`). The failure is retryable, so the
+real `ConsumerLoop._pause_and_rewind`/`_resume_due_partitions` blocking-retry
 cycle fires (`partition_paused`, `assert_fault_fired`) -- not a second in-process call. This test then
 removes the slow default (`ALTER TABLE ... MODIFY COLUMN slow_gate ... DEFAULT 0`) so the SAME record,
 redelivered from the SAME still-uncommitted offset, lands quickly.
@@ -32,7 +28,7 @@ redelivered from the SAME still-uncommitted offset, lands quickly.
 **Why `FINAL`, and why a plain count is not evidence of anything.** Because the first attempt's INSERT
 was never aborted server-side (only this loader's client gave up waiting for the response -- README
 3.4.3's "deduplication is eventual"), it can still land in the background after the client already
-reported `CONNECT_FAILED` and after the redelivered second attempt also lands: `SELECT count()` (no
+reported `TIMEOUT` and after the redelivered second attempt also lands: `SELECT count()` (no
 `FINAL`) over this table can show more than one physical row for a while. `SELECT count() FROM t FINAL`
 is what this test's invariant-4 assertion is built on, exactly as README 3.4.3 requires and exactly as
 `test_duplicate_delivery_produces_one_row_after_final`'s own module docstring does.
@@ -228,14 +224,13 @@ def test_a_blocking_retry_redelivers_from_the_uncommitted_offset_and_final_shows
     try:
         # The fault, confirmed rather than assumed: the loader must actually observe a real,
         # server-genuine delay past its own client-side deadline and enter blocking retry before a
-        # later successful insert can be trusted as a genuine redelivery of the same offset. The
-        # observed code is CONNECT_FAILED, not the TIMEOUT the loader's own module docstring claims a
-        # timeout produces -- see this module's docstring; asserted here as what the loader actually
-        # does today, not what it says it does.
+        # later successful insert can be trusted as a genuine redelivery of the same offset. A client-side
+        # timeout is exactly `TIMEOUT`, retryable (module docstring); no other code is accepted.
+        # `partition_paused` is only emitted for a retryable failure and carries no `retryable` key.
         paused = loader.wait_for_event("partition_paused", timeout_s=30.0)
         assert_fault_fired(
-            paused.get("error_code") == "CONNECT_FAILED" and bool(paused.get("retryable", True)),
-            description=f"expected a retryable transport failure while the slow gate was armed, got {paused!r}",
+            paused.get("error_code") == "TIMEOUT" and paused.get("retryable", True) is not False,
+            description=f"expected a retryable TIMEOUT while the slow gate was armed, got {paused!r}",
         )
 
         # Disarm the fault: the next attempt (and only the next attempt) must actually complete inside
