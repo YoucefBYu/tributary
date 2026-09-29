@@ -37,7 +37,7 @@ import subprocess
 import sys
 import tempfile
 import tomllib
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -60,6 +60,35 @@ MPL_APPROVED: dict[str, str] = {
     "hypothesis": "non-runtime",
     "pathspec": "non-runtime",
     "certifi": "non-runtime",
+}
+
+# certifi, runtime scope: HUMAN-APPROVED 2026-09-28 (ADR-001 2.3, its own decision, not an extension of the
+#   2026-09-23 one above): unmodified, in the runtime, only as clickhouse-connect's dependency in the
+#   archiver. Modelled like LGPL_APPROVED's `importers_of`: a package approved "non-runtime" above may
+#   ALSO be in the runtime closure, but only when every workspace member that pulls it in is listed
+#   here. `tributary-archiver` does not exist yet; until it does, certifi in the runtime closure by any
+#   member still fails, which is correct. `tributary-loaders` must never gain it.
+MPL_RUNTIME_IMPORTERS: dict[str, frozenset[str]] = {
+    "certifi": frozenset({"tributary-archiver"}),
+}
+
+# Bundled licence files: package metadata says nothing about them. botocore declares Apache-2.0 and
+# still ships `botocore/cacert.pem`, Mozilla CA data under MPL-2.0 (found by security-reviewer, not by
+# this script, 2026-09-29). Any file whose NAME is in BUNDLED_FILE_NAMES, inside any installed package,
+# must be approved below, keyed on (package, path inside the package):
+#   * botocore: human-approved 2026-09-29 (ADR-001 2.3, its own decision), unmodified, runtime, the
+#     `s3` loader in tributary-loaders only. Any other member pulling botocore into the runtime fails.
+#   * certifi: the 2026-09-28 archiver approval above covers its `cacert.pem` (the CA bundle is what
+#     certifi *is*), archiver only. In the dev group it does not ship, so it is not in the runtime.
+# An approval names the workspace members allowed to import the package into their runtime closure. A
+# package that is not in the runtime closure at all (dev group, build requires) never ships the file,
+# so it passes on scope; the file must still be known here, so a new bundled file needs a human.
+# It reads file NAMES, not contents: it cannot see an unmodified file that was edited, and it cannot see
+# a licensed file under a name not listed. Extend BUNDLED_FILE_NAMES when a new kind is found.
+BUNDLED_FILE_NAMES: frozenset[str] = frozenset({"cacert.pem"})
+BUNDLED_LICENCE_FILES: dict[tuple[str, str], tuple[str, frozenset[str]]] = {
+    ("botocore", "botocore/cacert.pem"): ("MPL-2.0", frozenset({"tributary-loaders"})),
+    ("certifi", "certifi/cacert.pem"): ("MPL-2.0", frozenset({"tributary-archiver"})),
 }
 
 # paramiko: LGPL-2.1, human-approved 2026-09-24, unmodified dependency, for SFTP support -- but only
@@ -202,7 +231,15 @@ def classify(
         if mpl_scope == "runtime" and not in_runtime:
             return "fail", detail + f" (approved runtime-only, but not in the runtime closure: {name!r} moved)"
         if mpl_scope == "non-runtime" and in_runtime:
-            return "fail", detail + f" (approved non-runtime only, but now in the runtime closure: {name!r} moved)"
+            scoped = MPL_RUNTIME_IMPORTERS.get(name)
+            if scoped is None or not importer_names:
+                return "fail", detail + f" (approved non-runtime only, but now in the runtime closure: {name!r} moved)"
+            extra_importers = importer_names - scoped
+            if extra_importers:
+                return "fail", (
+                    detail + f" (runtime approval covers only {sorted(scoped)},"
+                    f" but also imported by {sorted(extra_importers)})"
+                )
         # Same reasoning as the LGPL strip above: an AND/OR-ed extra term still needs checking.
         found = [_strip_approved_terms(x, MPL_PATTERN) for x in found]
         found = [x for x in found if x]
@@ -215,6 +252,47 @@ def classify(
 
     ok = any(_terms_ok(x) for x in found)
     return (status if ok else "fail"), detail
+
+
+def bundled_files(dist: md.Distribution) -> list[str]:
+    """Paths (POSIX, relative to site-packages) of every known bundled-licence file in `dist`."""
+    return sorted(
+        {PurePosixPath(str(f)).as_posix() for f in dist.files or [] if PurePosixPath(str(f)).name in BUNDLED_FILE_NAMES}
+    )
+
+
+def check_bundled(
+    name: str,
+    files: list[str],
+    *,
+    runtime_names: frozenset[str] = frozenset(),
+    importer_names: frozenset[str] = frozenset(),
+) -> list[str]:
+    """Failure messages for `name`'s bundled-licence `files` (empty list: all fine).
+
+    A file passes only if (package, path) is in BUNDLED_LICENCE_FILES AND either the package is outside
+    the runtime closure (it never ships) or every workspace member importing it is an approved one.
+    Unknown importers (an empty set for a runtime package) fail: the check cannot vouch for a scope it
+    could not compute."""
+    problems: list[str] = []
+    for path in files:
+        approval = BUNDLED_LICENCE_FILES.get((name, path))
+        if approval is None:
+            problems.append(
+                f"{name}: bundled {path} is not approved (known bundled-licence file, needs a human decision)"
+            )
+            continue
+        licence, allowed = approval
+        if name not in runtime_names:
+            continue
+        if not importer_names:
+            problems.append(f"{name}: bundled {path} ({licence}) is in the runtime but no importer was resolved")
+        elif extra := importer_names - allowed:
+            problems.append(
+                f"{name}: bundled {path} ({licence}) is approved only as imported by {sorted(allowed)},"
+                f" but also imported by {sorted(extra)}"
+            )
+    return problems
 
 
 def build_requires() -> list[str]:
@@ -309,17 +387,24 @@ def main() -> int:
         tdir = Path(tmp)
         resolve(tdir)
         runtime_names = runtime_closure_names()
-        # Only computed for names an LGPL approval actually scopes by importer: a `uv export
-        # --package` call per workspace member per name would be wasted work for the rest of the
-        # closure, which never consults `importer_names`.
-        lgpl_importers = {name: importers_of(name) for name in LGPL_APPROVED}
+        # Only computed for names an approval actually scopes by importer (LGPL, runtime MPL, bundled
+        # files): a `uv export --package` call per workspace member per name would be wasted work for
+        # the rest of the closure, which never consults `importer_names`.
+        scoped_names = set(LGPL_APPROVED) | set(MPL_RUNTIME_IMPORTERS) | {n for n, _ in BUNDLED_LICENCE_FILES}
+        importers = {name: importers_of(name) for name in scoped_names}
         components, failures = [], []
         for dist in sorted(md.distributions(path=[str(tdir / "site")]), key=lambda d: _norm(d.metadata["Name"])):
             name, version = _norm(dist.metadata["Name"]), dist.version
             status, detail = classify(
-                name, dist, runtime_names=runtime_names, importer_names=lgpl_importers.get(name, frozenset())
+                name, dist, runtime_names=runtime_names, importer_names=importers.get(name, frozenset())
             )
             print(f"{status:12} {name}=={version}  [{detail}]")
+            bundled = bundled_files(dist)
+            if bundled:
+                print(f"{'bundled':12} {name}: {', '.join(bundled)}")
+            failures += check_bundled(
+                name, bundled, runtime_names=runtime_names, importer_names=importers.get(name, frozenset())
+            )
             components.append(
                 {
                     "type": "library",

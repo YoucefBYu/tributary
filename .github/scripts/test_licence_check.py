@@ -194,3 +194,98 @@ def test_resolve_covers_a_member_the_dev_group_does_not_yet_list() -> None:
     names = {lc._norm(r.split("==", 1)[0]) for r in reqs}
     assert "fhir-resources" in names
     assert "fhir-core" in names
+
+
+# --- bundled licence files (ADR-001 2.3, botocore approval 2026-09-29) ---------------------------------
+
+LOADERS = frozenset({"tributary-loaders"})
+
+
+def test_botocore_bundled_cacert_is_approved_for_loaders_only() -> None:
+    files = ["botocore/cacert.pem"]
+    runtime = frozenset({"botocore"})
+    assert lc.check_bundled("botocore", files, runtime_names=runtime, importer_names=LOADERS) == []
+
+
+def test_botocore_pulled_in_by_another_member_fails() -> None:
+    problems = lc.check_bundled(
+        "botocore",
+        ["botocore/cacert.pem"],
+        runtime_names=frozenset({"botocore"}),
+        importer_names=LOADERS | {"tributary-receivers"},
+    )
+    assert len(problems) == 1
+    assert "tributary-receivers" in problems[0]
+
+
+def test_botocore_in_runtime_with_no_resolved_importer_fails_closed() -> None:
+    assert lc.check_bundled("botocore", ["botocore/cacert.pem"], runtime_names=frozenset({"botocore"}))
+
+
+def test_certifi_bundle_is_archiver_only_in_the_runtime() -> None:
+    files = ["certifi/cacert.pem"]
+    runtime = frozenset({"certifi"})
+    assert (
+        lc.check_bundled("certifi", files, runtime_names=runtime, importer_names=frozenset({"tributary-archiver"}))
+        == []
+    )
+    # Loaders must never gain certifi (ADR-001 2.3, 2026-09-28).
+    assert lc.check_bundled("certifi", files, runtime_names=runtime, importer_names=LOADERS)
+    # Dev group only: never ships, so scope passes (today's testcontainers path).
+    assert lc.check_bundled("certifi", files, runtime_names=frozenset()) == []
+
+
+@pytest.mark.parametrize(
+    ("name", "path"),
+    [
+        ("requests", "requests/cacert.pem"),  # an unknown package shipping a CA bundle
+        ("pip", "pip/_vendor/certifi/cacert.pem"),  # a vendored copy
+        ("botocore", "botocore/vendored/cacert.pem"),  # right package, path not the approved one
+        ("certifi", "certifi/extra/cacert.pem"),
+    ],
+)
+def test_unknown_bundled_cacert_fails_even_outside_the_runtime(name: str, path: str) -> None:
+    assert lc.check_bundled(name, [path], runtime_names=frozenset(), importer_names=frozenset())
+
+
+def test_botocore_licence_metadata_alone_does_not_approve_its_bundle() -> None:
+    """The gap the security-reviewer found: metadata says Apache-2.0, so `classify` passes, and only
+    the bundled-file check can see the MPL data."""
+    dist = FakeDist("botocore", **{"License-Expression": "Apache-2.0"})
+    assert lc.classify("botocore", dist, runtime_names=frozenset({"botocore"}))[0] == "ok"
+    assert lc.check_bundled("botocore", ["botocore/cacert.pem"], runtime_names=frozenset({"botocore"}))
+
+
+def test_bundled_files_finds_them_from_the_record(tmp_path: Path) -> None:
+    class Recorded(FakeDist):
+        @property
+        def files(self) -> list[md.PackagePath]:  # type: ignore[override]
+            return [md.PackagePath("botocore/cacert.pem"), md.PackagePath("botocore/__init__.py")]
+
+    assert lc.bundled_files(Recorded("botocore")) == ["botocore/cacert.pem"]
+    assert lc.bundled_files(FakeDist("plain")) == []
+
+
+def test_certifi_runtime_mpl_scope_is_archiver_only() -> None:
+    """certifi is approved non-runtime; the 2026-09-28 decision adds the archiver's runtime. The scope
+    is per importer, like paramiko's, and a runtime arrival by anyone else still fails."""
+    mpl = {"License-Expression": "MPL-2.0"}
+    runtime = frozenset({"certifi"})
+    archiver = frozenset({"tributary-archiver"})
+    assert lc.classify("certifi", FakeDist("certifi", **mpl), runtime_names=runtime, importer_names=archiver)[0] == (
+        "mpl-approved"
+    )
+    status, detail = lc.classify(
+        "certifi", FakeDist("certifi", **mpl), runtime_names=runtime, importer_names=archiver | LOADERS
+    )
+    assert status == "fail"
+    assert "tributary-loaders" in detail
+    # No importer information, or a different member: still the old "moved" failure.
+    assert lc.classify("certifi", FakeDist("certifi", **mpl), runtime_names=runtime)[0] == "fail"
+    assert (
+        lc.classify("certifi", FakeDist("certifi", **mpl), runtime_names=runtime, importer_names=LOADERS)[0] == "fail"
+    )
+    # Nothing else gained a runtime scope.
+    assert {"certifi": archiver} == lc.MPL_RUNTIME_IMPORTERS
+    status, _ = lc.classify("hypothesis", FakeDist("hypothesis", **mpl), runtime_names=frozenset({"hypothesis"}))
+    assert status == "fail"
