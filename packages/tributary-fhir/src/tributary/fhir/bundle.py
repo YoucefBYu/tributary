@@ -174,10 +174,28 @@ class LocalFhir:
 
     `id_factory` is injected (`sequential_id_factory` for tests and golden files, `uuid_id_factory` by
     default) so `fullUrl` values are reproducible wherever a test needs them to be.
+
+    `stable_entries=True` makes the `fullUrl` a function of the entry's request (method and conditional
+    URL), not of the call count: the first call for a request draws from `id_factory`, and a repeat call
+    for the same request returns the same `fullUrl`. A worker keeps one `ctx.fhir` across in-place step
+    retries, so without this a retry after a partial first attempt would keep counting and emit a Bundle
+    whose bytes differ from a clean run of the same message (W2-3 redelivery idempotency). The cost is
+    that two entries with the same request in one message share a `fullUrl`; that Bundle is invalid
+    anyway (a transaction may not target one conditional key twice).
     """
 
-    def __init__(self, *, id_factory: Callable[[], str] | None = None) -> None:
+    def __init__(self, *, id_factory: Callable[[], str] | None = None, stable_entries: bool = False) -> None:
         self._id_factory = id_factory or uuid_id_factory()
+        self._stable = stable_entries
+        self._issued: dict[tuple[str, str], str] = {}
+
+    def _full_url(self, method: str, url: str) -> str:
+        if not self._stable:
+            return self._id_factory()
+        key = (method, url)
+        if key not in self._issued:
+            self._issued[key] = self._id_factory()
+        return self._issued[key]
 
     def upsert(self, resource: Resource, *, identifier: Identifier | None = None) -> BundleEntry:
         """A conditional `PUT` entry, keyed on `identifier` or the resource's own first `identifier`.
@@ -198,7 +216,7 @@ class LocalFhir:
             raise BundleEntryError(resource_type, "no identifier given and the resource has none of its own")
         url = _conditional_url(resource_type, key)
         return BundleEntry(
-            fullUrl=self._id_factory(), resource=resource, request=BundleEntryRequest(method="PUT", url=url)
+            fullUrl=self._full_url("PUT", url), resource=resource, request=BundleEntryRequest(method="PUT", url=url)
         )
 
     def create(self, resource: Resource, *, identifier: Identifier | None = None) -> BundleEntry:
@@ -207,12 +225,11 @@ class LocalFhir:
         key = identifier or _first_identifier(resource)
         if key is None:
             raise BundleEntryError(resource_type, "no identifier given and the resource has none of its own")
+        condition = f"identifier={_identifier_token(key)}"
         return BundleEntry(
-            fullUrl=self._id_factory(),
+            fullUrl=self._full_url("POST", f"{resource_type}?{condition}"),
             resource=resource,
-            request=BundleEntryRequest(
-                method="POST", url=resource_type, ifNoneExist=f"identifier={_identifier_token(key)}"
-            ),
+            request=BundleEntryRequest(method="POST", url=resource_type, ifNoneExist=condition),
         )
 
     def delete(self, resource_type: str, *, identifier: Identifier) -> BundleEntry:

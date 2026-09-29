@@ -19,6 +19,10 @@ dependencies = [
 # Gives a bundle the `fhir_ctx` fixture with no conftest, the same mechanism as tributary-sdk's.
 tributary_fhir = "tributary.fhir.pytest_plugin"
 
+[project.entry-points."tributary.context"]
+# The worker loads this factory at start-up and wraps each branch's ctx (tributary.runtime.extensions).
+fhir = "tributary.fhir.runtime:context_extension"
+
 [build-system]
 requires = ["hatchling==1.27.0"]
 build-backend = "hatchling.build"

@@ -175,3 +175,12 @@ def test_conditional_url_leaves_ordinary_uri_shaped_systems_readable() -> None:
     fhir = LocalFhir(id_factory=sequential_id_factory())
     entry = fhir.upsert(_patient(Identifier(system=TB_MESSAGE_SYSTEM, value="0199-msg:encounter")))
     assert entry.request.url == f"Patient?identifier={TB_MESSAGE_SYSTEM}|0199-msg:encounter"
+
+
+def test_stable_entries_reuse_the_full_url_for_a_repeated_request() -> None:
+    fhir = LocalFhir(id_factory=sequential_id_factory(), stable_entries=True)
+    key = Identifier(system="urn:t", value="1")
+    first = fhir.upsert(Patient(), identifier=key)
+    other = fhir.create(Patient(), identifier=key)
+    assert fhir.upsert(Patient(), identifier=key).fullUrl == first.fullUrl
+    assert fhir.create(Patient(), identifier=key).fullUrl == other.fullUrl != first.fullUrl
