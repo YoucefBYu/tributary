@@ -42,6 +42,8 @@ class FakeSession:
         self.fail_remove = False
         self.lock = threading.Lock()
         self.closed = 0
+        self.undecodable_names = 0
+        self.symlinks: set[str] = set()
 
     def put(self, name: str, data: bytes, *, directory: str = DIR, mtime: float = 0.0) -> None:
         path = posixpath.join(directory, name)
@@ -67,6 +69,12 @@ class FakeSession:
             self.files[dst] = self.files.pop(src)
             self.mtimes[dst] = self.mtimes.pop(src, 0.0)
             self.log.append(("rename", posixpath.dirname(dst)))
+
+    def is_regular_file(self, path: str) -> bool:
+        with self.lock:
+            if path not in self.files:
+                raise RemoteNotFoundError("gone")
+            return path not in self.symlinks
 
     def read_bounded(self, path: str, max_bytes: int) -> bytes | None:
         with self.lock:
@@ -399,3 +407,32 @@ def test_file_names_and_payload_never_reach_logs_metrics_or_reprs(caplog: pytest
     assert "SMITH" not in repr(RemoteEntry(PHI_NAME, 1, 0.0, True))
     committed = next(e for e in events if e["event"] == "sftp_committed")
     assert committed["tb_msg_id"] == pub.calls[0].headers["tb-msg-id"]
+
+
+def test_a_claim_swapped_for_a_symlink_is_rejected_and_never_read() -> None:
+    class Swapping(FakeSession):
+        def rename(self, src: str, dst: str) -> None:
+            super().rename(src, dst)
+            if posixpath.basename(dst).startswith(CLAIM_PREFIX):
+                self.symlinks.add(dst)  # the sender swaps the file for a link right after we claim it
+
+        def read_bounded(self, path: str, max_bytes: int) -> bytes | None:
+            raise AssertionError("a symlink must never be read")
+
+    s = Swapping()
+    s.put("a.hl7", HL7)
+    pub = Recorder()
+    assert asyncio.run(poller(settings(), pub, s).poll_once()) == 0
+    assert pub.calls == [] and s.names(REJECT) == ["a.hl7"]
+
+
+def test_undecodable_names_are_counted_and_do_not_stop_the_cycle() -> None:
+    class Skipping(FakeSession):
+        def list_dir(self, directory: str, limit: int) -> list[RemoteEntry]:
+            self.undecodable_names += 2
+            return super().list_dir(directory, limit)
+
+    s = Skipping()
+    s.put("a.hl7", HL7)
+    p = poller(settings(), Recorder(), s)
+    assert asyncio.run(p.poll_once()) == 1 and p.metrics.files_skipped == 2

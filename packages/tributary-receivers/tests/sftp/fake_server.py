@@ -34,8 +34,9 @@ class _Fs(paramiko.SFTPServerInterface):  # type: ignore[misc]
     def list_folder(self, path: str) -> Any:
         try:
             out = []
-            for name in os.listdir(self._p(path)):
-                attr = paramiko.SFTPAttributes.from_stat(os.stat(os.path.join(self._p(path), name)), name)
+            # bytes names, so a non-UTF-8 file name reaches the wire as the raw bytes it is on disk
+            for name in os.listdir(os.fsencode(self._p(path))):
+                attr = paramiko.SFTPAttributes.from_stat(os.lstat(os.path.join(os.fsencode(self._p(path)), name)), name)
                 out.append(attr)
             return out
         except OSError as exc:
@@ -47,7 +48,11 @@ class _Fs(paramiko.SFTPServerInterface):  # type: ignore[misc]
         except OSError as exc:
             return paramiko.SFTPServer.convert_errno(exc.errno)
 
-    lstat = stat
+    def lstat(self, path: str) -> Any:
+        try:
+            return paramiko.SFTPAttributes.from_stat(os.lstat(self._p(path)))
+        except OSError as exc:
+            return paramiko.SFTPServer.convert_errno(exc.errno)
 
     def open(self, path: str, flags: int, attr: Any) -> Any:
         try:
@@ -107,7 +112,9 @@ class _Auth(paramiko.ServerInterface):  # type: ignore[misc]
 class FakeSftpServer:
     """`with FakeSftpServer(root, host_keys) as srv:` then connect to `srv.port`."""
 
-    def __init__(self, root: Path, host_keys: list[paramiko.PKey]) -> None:
+    def __init__(self, root: Path, host_keys: list[paramiko.PKey], *, ciphers: tuple[str, ...] | None = None) -> None:
+        self.ciphers = ciphers
+        self.negotiated: list[dict[str, str]] = []
         self.root = root
         self.host_keys = host_keys
         self.auth_attempts = 0
@@ -138,6 +145,8 @@ class FakeSftpServer:
             t = paramiko.Transport(conn)
             for key in self.host_keys:
                 t.add_server_key(key)
+            if self.ciphers is not None:
+                t.get_security_options().ciphers = self.ciphers
             t.set_subsystem_handler("sftp", paramiko.SFTPServer, _Fs)
             try:
                 t.start_server(server=_Auth(self))

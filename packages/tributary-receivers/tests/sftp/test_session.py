@@ -5,6 +5,7 @@ host, key-type fallback, and the real protocol behaviour of rename/read/remove."
 from __future__ import annotations
 
 import asyncio
+import os
 from dataclasses import replace
 from pathlib import Path
 
@@ -13,11 +14,13 @@ import pytest
 from tributary.receivers.secrets import DirSecretResolver
 from tributary.receivers.sftp.poller import CLAIM_PREFIX, SftpPoller
 from tributary.receivers.sftp.session import (
+    DISABLED_ALGORITHMS,
     HostKeyMismatchError,
     RemoteExistsError,
     RemoteNotFoundError,
     SessionError,
     connect,
+    disabled_algorithms,
     fingerprint,
     verify_host_key,
 )
@@ -226,3 +229,73 @@ def test_two_pollers_on_one_real_sftp_directory_ingest_each_file_exactly_once(
     payloads = [m.payload for m in rec_a.calls + rec_b.calls]
     assert len(payloads) == 30 and len(set(payloads)) == 30
     assert list((root / "in").iterdir()) == []  # every file committed, none stranded under a claim name
+
+
+def test_a_non_utf8_file_name_is_skipped_and_counted_not_fatal(
+    root: Path, ed25519: paramiko.PKey, secrets: DirSecretResolver
+) -> None:
+    (root / "in" / "good.hl7").write_bytes(HL7)
+    try:
+        (root / "in").joinpath(os.fsdecode(b"bad-\xff\xfe.hl7")).write_bytes(b"x")
+    except OSError:
+        pytest.skip("filesystem refuses non-UTF-8 names")
+    with FakeSftpServer(root, [ed25519]) as srv:
+        session = connect(cfg_for(srv, [pin(ed25519)]), secrets)
+        try:
+            entries = session.list_dir("/in", 100)
+            assert [e.name for e in entries] == ["good.hl7"] and session.undecodable_names == 1
+        finally:
+            session.close()
+
+
+def test_is_regular_file_uses_lstat_and_does_not_follow_links(
+    root: Path, ed25519: paramiko.PKey, secrets: DirSecretResolver
+) -> None:
+    (root / "in" / "real.hl7").write_bytes(HL7)
+    (root / "in" / "link.hl7").symlink_to(root / "in" / "real.hl7")
+    with FakeSftpServer(root, [ed25519]) as srv:
+        session = connect(cfg_for(srv, [pin(ed25519)]), secrets)
+        try:
+            assert session.is_regular_file("/in/real.hl7") is True
+            assert session.is_regular_file("/in/link.hl7") is False
+            with pytest.raises(RemoteNotFoundError):
+                session.is_regular_file("/in/none.hl7")
+        finally:
+            session.close()
+
+
+def test_disabled_algorithm_set_is_pinned() -> None:
+    d = disabled_algorithms([])
+    assert set(d["ciphers"]) == {"3des-cbc", "aes128-cbc", "aes192-cbc", "aes256-cbc"}
+    assert set(d["kex"]) == {
+        "diffie-hellman-group1-sha1",
+        "diffie-hellman-group14-sha1",
+        "diffie-hellman-group-exchange-sha1",
+    }
+    assert set(d["macs"]) == {"hmac-md5", "hmac-md5-96", "hmac-sha1", "hmac-sha1-96"}
+    assert d["keys"] == ["ssh-rsa"] and d["pubkeys"] == ["ssh-rsa"]
+    assert "ssh-ed25519" in disabled_algorithms(["ssh-ed25519"])["keys"]
+
+
+def test_negotiated_algorithms_are_never_from_the_disabled_set(
+    root: Path, ed25519: paramiko.PKey, secrets: DirSecretResolver
+) -> None:
+    with FakeSftpServer(root, [ed25519]) as srv:
+        session = connect(cfg_for(srv, [pin(ed25519)]), secrets)
+        try:
+            t = session._transport
+            assert t.remote_cipher not in DISABLED_ALGORITHMS["ciphers"]
+            assert t.local_cipher not in DISABLED_ALGORITHMS["ciphers"]
+            assert t.kex_engine.__class__.__name__ not in {"KexGroup1", "KexGroup14", "KexGex"}
+            assert t.local_mac not in DISABLED_ALGORITHMS["macs"]
+        finally:
+            session.close()
+
+
+@pytest.mark.parametrize("weak", ["aes128-cbc", "aes256-cbc", "3des-cbc"])
+def test_a_server_that_only_offers_a_weak_cipher_is_refused(
+    root: Path, ed25519: paramiko.PKey, secrets: DirSecretResolver, weak: str
+) -> None:
+    with FakeSftpServer(root, [ed25519], ciphers=(weak,)) as srv, pytest.raises(SessionError):
+        connect(cfg_for(srv, [pin(ed25519)]), secrets)
+    assert srv.auth_attempts == 0

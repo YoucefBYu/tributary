@@ -123,7 +123,12 @@ class SftpPoller:
 
     async def _cycle(self, session: SftpSession) -> int:
         cfg = self.cfg
+        skipped_before = session.undecodable_names
         entries = await asyncio.to_thread(session.list_dir, cfg.directory, cfg.max_listing)
+        skipped = session.undecodable_names - skipped_before
+        if skipped:  # names that are not valid UTF-8 are skipped, never fatal (and never logged)
+            self.metrics.files_skipped += skipped
+            _event("sftp_names_skipped", channel=self.cfg.channel, count=skipped)
         own_claims: list[str] = []
         candidates: list[RemoteEntry] = []
         now = self._clock()
@@ -167,9 +172,16 @@ class SftpPoller:
         claim = posixpath.join(cfg.directory, claim_name)
         self.metrics.messages_received += 1
         try:
-            payload = await asyncio.to_thread(session.read_bounded, claim, cfg.max_message_bytes)
+            # lstat, not stat: a claim swapped for a symlink must not be followed (it would read a file the
+            # sender never meant to send). A non-regular claim is refused like any other bad input.
+            regular = await asyncio.to_thread(session.is_regular_file, claim)
+            payload = await asyncio.to_thread(session.read_bounded, claim, cfg.max_message_bytes) if regular else b""
         except RemoteNotFoundError:
             return 0  # vanished under us: nothing to commit and nothing to lose
+        if not regular:
+            self.metrics.nacked_parse_error += 1
+            await self._reject(session, claim, original, "not-regular-file")
+            return 0
         if payload is None:
             self.metrics.nacked_oversize += 1
             await self._reject(session, claim, original, "oversize")

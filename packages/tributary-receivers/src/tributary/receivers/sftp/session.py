@@ -19,6 +19,7 @@ import contextlib
 import errno
 import hashlib
 import hmac
+import logging
 import socket
 import stat
 from collections.abc import Collection
@@ -26,6 +27,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 import paramiko  # type: ignore[import-untyped]  # no stubs; LGPL-2.1, approved, unmodified
+from paramiko.sftp import CMD_CLOSE, CMD_OPENDIR, CMD_READDIR  # type: ignore[import-untyped]
 
 from ..errors import ReceiverError
 from ..secrets import SecretResolver
@@ -76,8 +78,12 @@ class RemoteEntry:
 
 
 class SftpSession(Protocol):
+    #: Directory entries whose names were not valid UTF-8 and were skipped, cumulative for this session.
+    undecodable_names: int
+
     def list_dir(self, directory: str, limit: int) -> list[RemoteEntry]: ...
     def rename(self, src: str, dst: str) -> None: ...
+    def is_regular_file(self, path: str) -> bool: ...
     def read_bounded(self, path: str, max_bytes: int) -> bytes | None: ...
     def remove(self, path: str) -> None: ...
     def exists(self, path: str) -> bool: ...
@@ -100,25 +106,57 @@ class ParamikoSession:
     def __init__(self, transport: paramiko.Transport, client: paramiko.SFTPClient) -> None:
         self._transport = transport
         self._client = client
+        self.undecodable_names = 0
 
     def list_dir(self, directory: str, limit: int) -> list[RemoteEntry]:
+        """At most `limit` entries. Names are decoded here rather than by paramiko (whose decode of a
+        non-UTF-8 name raises and would abort the whole listing, stopping the poller on one bad file): an
+        entry whose name is not valid UTF-8 is skipped and counted in `undecodable_names`."""
         out: list[RemoteEntry] = []
+        handle = None
         try:
-            for attrs in self._client.listdir_iter(directory):
-                if len(out) >= limit:
-                    break  # a hostile or huge listing is cut off, never held in full
-                mode = attrs.st_mode
-                out.append(
-                    RemoteEntry(
-                        name=attrs.filename,
-                        size=attrs.st_size or 0,
-                        mtime=float(attrs.st_mtime or 0),
-                        is_regular=mode is not None and stat.S_ISREG(mode),
+            _, msg = self._client._request(CMD_OPENDIR, directory)
+            handle = msg.get_string()
+            while len(out) < limit:
+                try:
+                    _, msg = self._client._request(CMD_READDIR, handle)
+                except EOFError:
+                    break
+                for _ in range(msg.get_int()):
+                    raw_name = msg.get_string()
+                    msg.get_string()  # longname: unused, and a second place a name could appear
+                    attrs = paramiko.SFTPAttributes._from_msg(msg)
+                    try:
+                        name = raw_name.decode("utf-8")
+                    except UnicodeDecodeError:
+                        self.undecodable_names += 1
+                        continue
+                    if name in (".", ".."):
+                        continue
+                    mode = attrs.st_mode
+                    out.append(
+                        RemoteEntry(
+                            name=name,
+                            size=attrs.st_size or 0,
+                            mtime=float(attrs.st_mtime or 0),
+                            is_regular=mode is not None and stat.S_ISREG(mode),
+                        )
                     )
-                )
         except (TimeoutError, OSError, EOFError, paramiko.SSHException) as exc:
             raise self._map(exc) from None
-        return out
+        finally:
+            if handle is not None:
+                with contextlib.suppress(Exception):
+                    self._client._request(CMD_CLOSE, handle)
+        return out[:limit]
+
+    def is_regular_file(self, path: str) -> bool:
+        """`lstat` (never follows a symlink): a claim that was swapped for a link is not a regular file."""
+        try:
+            mode = self._client.lstat(path).st_mode
+        except (TimeoutError, OSError, EOFError, paramiko.SSHException) as exc:
+            raise self._map(exc) from None
+        return mode is not None and stat.S_ISREG(mode)
 
     @staticmethod
     def _map(exc: BaseException) -> SessionError:
@@ -194,10 +232,32 @@ def _load_key(resolver: SecretResolver, ref: str) -> paramiko.PKey:
         raise SessionError("private key could not be loaded") from None
 
 
+#: Algorithms paramiko still offers that are weak or SHA-1 based; a server that can negotiate nothing else
+#: is refused rather than talked down to. What remains: AES-CTR/GCM and ChaCha20 ciphers, curve25519/ECDH/DH
+#: group14+-sha2 key exchange, hmac-sha2-* and ETM MACs, ed25519/ECDSA/rsa-sha2 keys.
+DISABLED_ALGORITHMS: dict[str, tuple[str, ...]] = {
+    "ciphers": ("3des-cbc", "aes128-cbc", "aes192-cbc", "aes256-cbc"),
+    "kex": (
+        "diffie-hellman-group1-sha1",
+        "diffie-hellman-group14-sha1",
+        "diffie-hellman-group-exchange-sha1",
+    ),
+    "macs": ("hmac-md5", "hmac-md5-96", "hmac-sha1", "hmac-sha1-96"),
+    "keys": ("ssh-rsa",),  # server host key signature: RSA with SHA-1 (rsa-sha2-* stays)
+    "pubkeys": ("ssh-rsa",),  # our client-auth signature: same
+}
+
+
+def disabled_algorithms(extra_host_key_types: list[str]) -> dict[str, list[str]]:
+    merged = {kind: list(names) for kind, names in DISABLED_ALGORITHMS.items()}
+    merged["keys"] += [name for name in extra_host_key_types if name not in merged["keys"]]
+    return merged
+
+
 def _handshake(cfg: SftpSettings, disabled_keys: list[str]) -> paramiko.Transport:
     sock = socket.create_connection((cfg.host, cfg.port), timeout=cfg.connect_timeout_s)
     try:
-        transport = paramiko.Transport(sock, disabled_algorithms={"keys": disabled_keys} if disabled_keys else None)
+        transport = paramiko.Transport(sock, disabled_algorithms=disabled_algorithms(disabled_keys))
         transport.banner_timeout = cfg.connect_timeout_s
         transport.handshake_timeout = cfg.connect_timeout_s
         transport.auth_timeout = cfg.connect_timeout_s
@@ -234,6 +294,7 @@ def _verified_transport(cfg: SftpSettings) -> paramiko.Transport:
 def connect(cfg: SftpSettings, resolver: SecretResolver) -> ParamikoSession:
     """Connect, pin-verify the host key, then authenticate. Raises `HostKeyMismatchError` (nothing
     sent to the host) or `SessionError`."""
+    logging.getLogger("paramiko").setLevel(logging.WARNING)  # its INFO/DEBUG lines can carry paths and names
     transport: paramiko.Transport | None = None
     try:
         transport = _verified_transport(cfg)
