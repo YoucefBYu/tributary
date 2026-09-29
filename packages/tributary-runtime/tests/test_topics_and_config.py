@@ -185,3 +185,16 @@ def test_a_contract_without_profiles_is_a_refusal_to_start(tmp_path: Path) -> No
 
     with pytest.raises(ConfigError):
         load_topic_defaults(root)
+
+
+def test_kafka_settings_repr_never_shows_the_security_block() -> None:
+    """Receivers security review: `security` carries SCRAM passwords, and a repr reaches tracebacks."""
+    from tributary.runtime.clients import KafkaSettings
+
+    settings = KafkaSettings(
+        bootstrap_servers="broker:9093",
+        security={"sasl.mechanism": "SCRAM-SHA-512", "sasl.password": "SYNTH-SECRET-MARKER"},
+    )
+    assert "SYNTH-SECRET-MARKER" not in repr(settings)
+    assert "SYNTH-SECRET-MARKER" not in str(settings)
+    assert "broker:9093" in repr(settings)

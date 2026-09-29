@@ -35,10 +35,13 @@ class KafkaSettings:
     `ssl.*` without this module knowing about them. `contracts/topics/v0` 3.4 requires SASL_SSL or
     mTLS on any listener a non-local client can reach; PLAINTEXT is a loopback-only lite affordance,
     and nothing here defaults it on.
+
+    `security` is excluded from `repr`: it holds `sasl.password` (SCRAM) and key material, and a
+    dataclass repr reaches tracebacks, test output and any log line that formats the settings.
     """
 
     bootstrap_servers: str
-    security: Mapping[str, Any] = field(default_factory=dict)
+    security: Mapping[str, Any] = field(default_factory=dict, repr=False)
 
 
 def max_poll_interval_ms(spec: ChannelSpec) -> int:
