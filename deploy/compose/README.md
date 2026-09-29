@@ -22,10 +22,10 @@ Kafka runs on `SASL_SSL` exactly like production. There is no PLAINTEXT listener
 container network is not loopback, and every data-plane process refuses PLAINTEXT to a non-loopback
 broker.
 
-- `kafka-tls-init` writes, at `up`, a dev CA (the key lives in its own volume, `kafka-ca-private`, that
-  no component mounts), a broker certificate (SANs `kafka`, `localhost`, `127.0.0.1`) and one random
+- `kafka-tls-init` writes, at `up`, a dev CA (its key is deleted right after signing; the CA has no
+  nameConstraints, which is acceptable only because nothing can use it afterwards), a broker certificate (SANs `kafka`, `localhost`, `127.0.0.1`) and one random
   SCRAM-SHA-512 user per component (`tb-lite-receiver`, `-worker`, `-loader`, `-channel-publish`,
-  `-topic-bootstrap`, `-admin`) into the `kafka-secrets` volume. Nothing is committed, baked into an
+  `-topic-bootstrap`, `-admin`, plus an ACL-less `-healthcheck`) into the `kafka-secrets` volume. Nothing is committed, baked into an
   image or printed. It is idempotent: valid credentials are kept, and regenerated (and the broker's
   storage reformatted to match) when they have under 7 days left or the script changed. Reset
   everything with `docker compose down -v`.
@@ -36,6 +36,14 @@ broker.
   control-plane stand-in) creates the topics and applies each role's grants, parsed from
   `contracts/topics/v0/topic-defaults.json` `security.acls` (not restated). The receiver can write
   `raw` only; nothing but the control-plane stand-in can write `_tb.dev.channels`.
+- ACLs are only ever added. Narrowing `security.acls` in the contract does not remove an old grant until
+  the broker's storage is reformatted (new credentials, or `docker compose down -v`).
+- The broker's own identity is a client certificate (controller and inter-broker links are SSL with
+  required client certificates, on the broker's loopback), so it has no password. The component users
+  are seeded when `kafka-tls-init` formats the broker's storage (`kafka-storage format --add-scram`
+  takes passwords as arguments, so that runs in the init one-shot: no network, no other process). The
+  broker container never has a password in `ps`, and JMX is off. Storage therefore lives in the
+  `kafka-data` volume and survives `down`; `down -v` resets it with the credentials.
 - Clients pin `ECDHE+AESGCM:ECDHE+CHACHA20` and verify the hostname; the broker allows TLS 1.2/1.3
   AEAD suites only. The controller and inter-broker links are `SASL_SSL` on the broker's own loopback.
 

@@ -113,7 +113,7 @@ def test_unclean_leader_election_is_always_pinned_false(defaults: dict) -> None:
 
 # --- ACLs (ADR-008 D5): parsed from the contract's security.acls, deny by default otherwise ----------
 
-from bootstrap_topics import derive_acls, parse_grants, parse_principals  # noqa: E402
+from bootstrap_topics import check_forbidden, derive_acls, parse_grants, parse_principals  # noqa: E402
 
 ENV, CHANNEL, DESTS = "dev", "adt-passthrough", ("http-stub",)
 
@@ -151,7 +151,8 @@ def test_loader_grants_are_per_destination(defaults: dict) -> None:  # type: ign
     g = _grants(defaults, "loader")
     assert ("TOPIC", "dev.adt-passthrough.out.http-stub", "LITERAL", "READ") in g
     assert ("TOPIC", "dev.adt-passthrough.retry", "LITERAL", "READ") in g
-    assert ("GROUP", "tb.dev.adt-passthrough.loader.http-stub", "PREFIXED", "READ") in g
+    assert ("GROUP", "tb.dev.adt-passthrough.loader.http-stub", "LITERAL", "READ") in g
+    assert ("GROUP", "tb.dev.adt-passthrough.loader.http-stub.", "PREFIXED", "READ") in g
     assert not any(n.startswith("_tb.dev.channels") for _, n, _, _ in g)
 
 
@@ -182,3 +183,112 @@ def test_every_component_role_exists_in_the_contract(defaults: dict) -> None:  #
         destinations=DESTS,
     )
     assert {p for p, _ in acls} == {"User:r", "User:w", "User:l", "User:c"}
+
+
+def test_destination_group_grant_does_not_cover_a_sibling_destination() -> None:
+    """`loader.<dest>*` with no delimiter made a grant for `fhir` also cover `fhir-backup`."""
+    grants = parse_grants(
+        "READ on group tb.<env>.<channel>.loader.<dest>*", env=ENV, channel=CHANNEL, destinations=("fhir",)
+    )
+    assert {(g.name, g.pattern) for g in grants} == {
+        ("tb.dev.adt-passthrough.loader.fhir", "LITERAL"),
+        ("tb.dev.adt-passthrough.loader.fhir.", "PREFIXED"),
+    }
+    sibling = "tb.dev.adt-passthrough.loader.fhir-backup"
+    assert not any(g.name == sibling or (g.pattern == "PREFIXED" and sibling.startswith(g.name)) for g in grants)
+
+
+def test_extra_sentence_that_is_not_a_known_form_raises() -> None:
+    """A dropped restriction becomes an unconditional grant, so an unknown sentence is an error."""
+    with pytest.raises(ValueError, match="sentence"):
+        parse_grants("READ on <env>.<channel>.raw. Only from 10.0.0.0/8", env=ENV, channel=CHANNEL, destinations=DESTS)
+
+
+def test_sync_reply_sentence_is_recognised_and_not_granted() -> None:
+    g = parse_grants(
+        "READ on <env>.<channel>.raw. Set 1.2, sync-reply channels only: WRITE on <env>.<channel>.reply",
+        env=ENV,
+        channel=CHANNEL,
+        destinations=DESTS,
+    )
+    assert [(x.name, x.operation) for x in g] == [("dev.adt-passthrough.raw", "READ")]
+
+
+def test_prohibition_sentence_is_enforced_against_the_grants() -> None:
+    ok = parse_grants(
+        "WRITE on <env>.<channel>.raw. No WRITE on reply, so nobody forges",
+        env=ENV,
+        channel=CHANNEL,
+        destinations=DESTS,
+    )
+    assert ok
+    with pytest.raises(ValueError, match="prohibits"):
+        parse_grants(
+            "WRITE on <env>.<channel>.reply. No WRITE on reply, so nobody forges",
+            env=ENV,
+            channel=CHANNEL,
+            destinations=DESTS,
+        )
+    with pytest.raises(ValueError, match="prohibits"):  # a prefix grant that reaches it
+        parse_grants("ALL on <env>.<channel>.*. No WRITE on reply", env=ENV, channel=CHANNEL, destinations=DESTS)
+
+
+def test_unknown_operation_raises() -> None:
+    with pytest.raises(ValueError, match="operation"):
+        parse_grants("SUPERPOWER on the cluster", env=ENV, channel=CHANNEL, destinations=DESTS)
+
+
+@pytest.mark.parametrize(
+    "text", ["ALL on the cluster", "WRITE on the cluster", "ALTER on the cluster", "DELETE on the cluster"]
+)
+def test_forbidden_cluster_wide_grants_are_refused_for_data_plane(text: str) -> None:
+    grants = parse_grants(text, env=ENV, channel=CHANNEL, destinations=DESTS)
+    for component in ("receiver", "worker", "loader"):
+        with pytest.raises(ValueError, match="forbidden"):
+            check_forbidden(component, grants, env=ENV)
+    check_forbidden("channel-publish", grants, env=ENV)  # the control-plane stand-in is not data plane
+
+
+@pytest.mark.parametrize(
+    "text", ["WRITE on _tb.<env>.channels", "ALL on _tb.<env>.channels", "WRITE on _tb.*", "WRITE on *"]
+)
+def test_write_on_channels_is_refused_for_data_plane(text: str) -> None:
+    grants = parse_grants(text, env=ENV, channel=CHANNEL, destinations=DESTS)
+    with pytest.raises(ValueError, match="forbidden"):
+        check_forbidden("worker", grants, env=ENV)
+
+
+def test_derive_acls_applies_the_forbidden_check(defaults: dict) -> None:  # type: ignore[type-arg]
+    bad = {
+        **defaults,
+        "security": {
+            **defaults["security"],
+            "acls": {**defaults["security"]["acls"], "pipeline_worker": "WRITE on _tb.<env>.channels"},
+        },
+    }
+    with pytest.raises(ValueError, match="forbidden"):
+        derive_acls(bad, env=ENV, channel=CHANNEL, destinations=DESTS, principals={"worker": "User:w"})
+
+
+def test_the_contract_still_states_what_check_forbidden_enforces(defaults: dict) -> None:  # type: ignore[type-arg]
+    text = defaults["security"]["acls"]["forbidden"]
+    assert all(word in text for word in ("WRITE", "DELETE", "ALTER", "_tb.<env>.channels"))
+
+
+@pytest.mark.parametrize(
+    "text", ["receiver=*", "receiver=User:*", "receiver=", "nobody=x", "receiver=a,worker=a", "receiver=a b"]
+)
+def test_bad_principals_are_refused(text: str) -> None:
+    with pytest.raises(ValueError):
+        parse_principals(text)
+
+
+def test_derive_acls_refuses_a_shared_principal(defaults: dict) -> None:  # type: ignore[type-arg]
+    with pytest.raises(ValueError, match="one principal"):
+        derive_acls(
+            defaults,
+            env=ENV,
+            channel=CHANNEL,
+            destinations=DESTS,
+            principals={"receiver": "User:x", "worker": "User:x"},
+        )
