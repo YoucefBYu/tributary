@@ -20,6 +20,7 @@ import contextlib
 import json
 import os
 import queue
+import signal
 import subprocess
 import sys
 import threading
@@ -55,6 +56,9 @@ class ManagedProcess:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             env=env,
+            # Its own session and process group: a signal aimed at this process (or at a grandchild it
+            # started) can only ever reach its own group, never pytest's.
+            start_new_session=True,
         )
         self._queue: queue.Queue[bytes | None] = queue.Queue()
         self._eof = False
@@ -66,6 +70,21 @@ class ManagedProcess:
         self._reader = threading.Thread(target=_pump, args=(self.process.stdout, self._queue), daemon=True)
         self._reader.start()
 
+    def _signal_group(self, sig: int) -> None:
+        """Signal this child's own process group, and never pytest's.
+
+        The group id is the child's pid (`start_new_session`); the guard refuses anything else, so a
+        wrong value (0, or pytest's own group) can not turn a teardown into `killpg` on the test runner.
+        A process that already exited is left alone: its pid could since have been reused.
+        """
+        if self.process.poll() is not None:
+            return
+        pgid = self.process.pid
+        if pgid <= 1 or pgid == os.getpid() or pgid == os.getpgrp():
+            raise RuntimeError("refusing to signal a process group that may be the test runner's")
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(pgid, sig)
+
     def _kill_quietly(self) -> None:
         """Best-effort cleanup before `wait_for_event` raises: a process that is still alive when the
         wait gives up (slow to start, or wedged before ever emitting the event) would otherwise leak
@@ -74,7 +93,7 @@ class ManagedProcess:
         block's `terminate_and_wait()` call, since that call is usually written to depend on the very
         variable this constructor's return value would have been assigned to."""
         with contextlib.suppress(Exception):  # best effort; the process may already be gone
-            self.process.kill()
+            self._signal_group(signal.SIGKILL)
             self.process.wait(timeout=5.0)
 
     def wait_for_event(self, event: str, *, timeout_s: float = 30.0) -> dict[str, Any]:
@@ -136,12 +155,11 @@ class ManagedProcess:
         return collected
 
     def kill_and_wait(self, timeout_s: float = 30.0) -> int:
-        self.process.kill()
+        self._signal_group(signal.SIGKILL)
         return self.process.wait(timeout=timeout_s)
 
     def terminate_and_wait(self, timeout_s: float = 15.0) -> int:
-        if self.process.poll() is None:
-            self.process.terminate()
+        self._signal_group(signal.SIGTERM)
         try:
             return self.process.wait(timeout=timeout_s)
         except subprocess.TimeoutExpired:
