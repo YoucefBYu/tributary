@@ -36,6 +36,7 @@ _PREFIX = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}(/[a-z0-9][a-z0-9_-]{0,63}){0,7}
 _REGION = re.compile(r"^[a-z0-9-]{1,32}$")
 _KMS_KEY = re.compile(r"^[A-Za-z0-9:/_-]{1,256}$")
 _EXTENSION = re.compile(r"^\.[a-z0-9]{1,8}$")
+_ACCOUNT_ID = re.compile(r"^[0-9]{12}$")
 
 __all__ = [
     "SUPPORTED_AUTH_TYPES",
@@ -76,6 +77,11 @@ class S3DestinationConfig:
     max_delay_ms: int
     max_attempts: int
     on_exhaust: str
+    #: The 12-digit AWS account id that must own the bucket (`x-amz-expected-bucket-owner`): a request to
+    #: a bucket owned by anyone else is refused by S3, so a typo or a bucket-name takeover cannot receive
+    #: the payload. **Not yet a field of `$defs/s3Params`** (the schema has `additionalProperties: false`);
+    #: honoured here when a spec carries `with.expectedBucketOwner`, proposed to the architect.
+    expected_bucket_owner: str | None = None
 
 
 def _require(mapping: Mapping[str, Any], key: str) -> Any:
@@ -154,6 +160,10 @@ def s3_destination_config_from_destination(channel: str, destination: Destinatio
     if auth["type"] == "ambient" and secret_ref is not None:
         raise ConfigError(f"destination {name!r}: auth ambient takes credentials from the environment, no secretRef")
 
+    owner = params.get("expectedBucketOwner")
+    if owner is not None and (not isinstance(owner, str) or not _ACCOUNT_ID.fullmatch(owner)):
+        raise ConfigError(f"destination {name!r}: with.expectedBucketOwner must be a 12-digit account id")
+
     extension = params.get("fileExtension", "")
     if not isinstance(extension, str) or (extension and not _EXTENSION.fullmatch(extension)):
         raise ConfigError(f"destination {name!r}: with.fileExtension must look like '.hl7'")
@@ -189,6 +199,7 @@ def s3_destination_config_from_destination(channel: str, destination: Destinatio
         max_delay_ms=retry.max_delay_ms,
         max_attempts=retry.max_attempts,
         on_exhaust=retry.on_exhaust,
+        expected_bucket_owner=owner,
     )
 
 

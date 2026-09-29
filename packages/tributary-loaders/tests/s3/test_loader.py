@@ -179,8 +179,8 @@ def test_a_store_without_conditional_put_falls_back_to_an_idempotent_overwrite_o
     first = loader.deliver(message)
     assert (first.success, first.reason) == (True, "success")
     assert loader.conditional_put_supported is False
-    second = loader.deliver(message)  # overwrite-idempotent: same key, same bytes
-    assert second.success is True
+    second = loader.deliver(message)  # HEAD finds the same size: a duplicate, nothing rewritten
+    assert (second.success, second.reason) == (True, "duplicate")
     assert len(client.objects) == 1
     assert next(iter(client.objects.values())) == message.payload
     conditional_attempts = [a for op, a in client.calls if op == "put" and "IfNoneMatch" in a]
@@ -200,7 +200,7 @@ def test_a_store_without_conditional_put_falls_back_to_an_idempotent_overwrite_o
         ("ConditionalRequestConflict", 409, "S3_CONDITIONAL_REQUEST_CONFLICT", True),
         ("EntityTooLarge", 400, "S3_ENTITY_TOO_LARGE", False),
         ("OperationAborted", 409, "S3_OPERATION_ABORTED", True),
-        ("Whatever", 502, "S3_WHATEVER", True),
+        ("Whatever", 502, "S3_UNKNOWN", True),
     ],
 )
 def test_store_errors_map_to_codes_and_retryability(code: str, status: int, reason: str, retryable: bool) -> None:
@@ -320,3 +320,114 @@ def test_logs_and_outcomes_carry_no_payload_key_or_store_message() -> None:
     dumped = repr(log.records) + repr(outcome)
     assert PHI_MARKER not in dumped
     assert "adt/2026" not in dumped and ".hl7" not in dumped and "bkt" not in dumped
+
+
+# -- the NotImplemented fallback, ExpectedBucketOwner, bounded error codes (code and security review) -----
+
+
+def test_the_fallback_never_overwrites_an_object_of_another_size() -> None:
+    client = FakeClient(conditional=False)
+    message = make_message()
+    foreign = b"someone else's object, different length"
+    client.objects[object_key(make_config(), message)] = foreign
+    outcome = loader_for(client).deliver(message)
+    assert (outcome.success, outcome.reason, outcome.retryable) == (False, "S3_KEY_CONFLICT", False)
+    assert client.objects[object_key(make_config(), message)] == foreign
+    assert [op for op, args in client.calls if op == "put" and "IfNoneMatch" not in args] == []
+
+
+def test_concurrent_redelivery_on_a_store_without_conditional_put_converges_on_one_object() -> None:
+    """Two loaders both see 'absent' at HEAD and both write (the documented HEAD-then-PUT window): the
+    same bytes to the same key, so the bucket holds one object and both deliveries succeed."""
+    client = FakeClient(conditional=False)
+    barrier = threading.Barrier(2, timeout=5)
+    real_head = client.head_object
+
+    def head_then_wait(**kwargs: Any) -> dict[str, Any]:
+        try:
+            return real_head(**kwargs)
+        finally:
+            barrier.wait()  # both HEADs return before either PUT starts
+
+    client.head_object = head_then_wait  # type: ignore[method-assign]
+    message = make_message()
+    outcomes: list[Any] = []
+    threads = [
+        threading.Thread(target=lambda: outcomes.append(loader_for(client, timeout_s=5.0).deliver(message)))
+        for _ in range(2)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+    assert [o.success for o in outcomes] == [True, True]
+    assert list(client.objects.values()) == [message.payload]
+
+
+def test_the_documented_limit_a_foreign_object_created_inside_the_head_put_window_is_overwritten() -> None:
+    """Stated, not hidden (module docstring): without a conditional put nothing can prevent this."""
+    client = FakeClient(conditional=False)
+    message = make_message()
+    key = object_key(make_config(), message)
+    real_head = client.head_object
+
+    def head_then_foreign_write(**kwargs: Any) -> dict[str, Any]:
+        try:
+            return real_head(**kwargs)
+        finally:
+            client.objects[key] = b"foreign"
+
+    client.head_object = head_then_foreign_write  # type: ignore[method-assign]
+    assert loader_for(client).deliver(message).success is True
+    assert client.objects[key] == message.payload
+
+
+def test_the_conditional_put_is_tried_again_after_the_reprobe_interval() -> None:
+    from tributary.loaders.s3.loader import REPROBE_AFTER_S
+
+    now = [1000.0]
+    client = FakeClient(conditional=False)
+    loader = S3Loader(make_config(), client, clock=lambda: now[0])
+    loader.deliver(make_message())
+    assert loader.conditional_put_supported is False
+    loader.deliver(make_message())
+    assert len([1 for op, a in client.calls if op == "put" and "IfNoneMatch" in a]) == 1
+    now[0] += REPROBE_AFTER_S + 1
+    assert loader.conditional_put_supported is True
+    client.conditional = True  # the gateway's 501 was transient
+    loader.deliver(make_message())
+    assert len([1 for op, a in client.calls if op == "put" and "IfNoneMatch" in a]) == 2
+    assert loader.conditional_put_supported is True
+
+
+def test_expected_bucket_owner_is_sent_on_put_and_head_when_configured() -> None:
+    client = FakeClient()
+    loader = loader_for(client, expected_bucket_owner="123456789012")
+    message = make_message()
+    loader.deliver(message)
+    loader.deliver(message)  # the duplicate path HEADs
+    assert {op for op, _ in client.calls} == {"put", "head"}
+    assert all(args["ExpectedBucketOwner"] == "123456789012" for _, args in client.calls)
+
+
+def test_expected_bucket_owner_is_absent_when_not_configured() -> None:
+    client = FakeClient()
+    loader_for(client).deliver(make_message())
+    assert all("ExpectedBucketOwner" not in args for _, args in client.calls)
+
+
+def test_a_store_cannot_mint_unbounded_metric_keys_through_error_codes() -> None:
+    client = FakeClient()
+    loader = loader_for(client, circuit_breaker=CircuitBreakerSpec(10_000, 30.0))
+    for i in range(50):
+        client.raises["put"] = [client_error(f"Evil{i}Code", 400)]
+        loader.deliver(make_message())
+    keys = {k for k in loader.metrics.snapshot() if k.startswith("delivery_")}
+    assert keys == {"delivery_S3_UNKNOWN"}
+    assert loader.metrics.snapshot()["delivery_S3_UNKNOWN"] == 50
+
+
+def test_known_error_codes_are_all_plain_tokens() -> None:
+    from tributary.loaders.s3.loader import KNOWN_ERROR_CODES
+
+    assert all(s3_error_code(code) != "S3_UNKNOWN" for code in KNOWN_ERROR_CODES)

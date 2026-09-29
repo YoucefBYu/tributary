@@ -144,3 +144,15 @@ def test_bad_region_extension_and_timeout_are_refused() -> None:
         build({"fileExtension": "hl7"})
     with pytest.raises(ConfigError, match="timeoutMs"):
         build({"timeoutMs": 0})
+
+
+def test_expected_bucket_owner_is_optional_and_a_12_digit_account_id() -> None:
+    assert build().expected_bucket_owner is None
+    assert build({"expectedBucketOwner": "123456789012"}).expected_bucket_owner == "123456789012"
+
+
+@pytest.mark.parametrize("owner", ["12345", "1234567890123", "abcdefghijkl", 123456789012, ""])
+def test_a_bad_expected_bucket_owner_is_refused_without_echoing_it(owner: object) -> None:
+    with pytest.raises(ConfigError, match="expectedBucketOwner") as exc_info:
+        build({"expectedBucketOwner": owner})
+    assert "abcdefghijkl" not in str(exc_info.value)

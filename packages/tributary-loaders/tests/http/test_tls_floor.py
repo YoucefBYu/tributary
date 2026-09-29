@@ -120,6 +120,7 @@ def test_a_cbc_only_server_is_refused_at_the_handshake(serve: Callable[..., int]
     assert not isinstance(exc_info.value, TlsVerificationError)
 
 
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
 def test_a_tls_1_1_server_is_refused_at_the_handshake(serve: Callable[..., int]) -> None:
     try:
         port = serve("DEFAULT:@SECLEVEL=0", version=ssl.TLSVersion.TLSv1_1)

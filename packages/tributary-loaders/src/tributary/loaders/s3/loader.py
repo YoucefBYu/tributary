@@ -18,12 +18,19 @@ The key is a pure function of `tb-msg-id` and `tb-received-at`, so a redelivery 
   message, which is `S3_KEY_CONFLICT`, non-retryable, never a silent success. A concurrent conditional
   write that the store cannot order answers `409`, retryable.
 * **Where the store does not implement it** (`501 NotImplemented`, e.g. an older S3-compatible server)
-  the loader remembers that and falls back to an unconditional `PutObject` of the same bytes to the same
-  key. That is **overwrite-idempotent**: the same message rewrites the same object with identical content,
-  so the sink converges, but the store never reports the duplicate and an out-of-band change to the object
-  between two deliveries would be overwritten. Stores that silently ignore `If-None-Match` behave the same
-  way. Both are stated here rather than hidden; the duplicate test proves the outcome (one object,
-  identical bytes) either way.
+  the loader remembers that for `REPROBE_AFTER_S` (5 minutes, then it tries the conditional put again, so
+  one transient `501` from a gateway does not degrade the destination for the life of the process) and
+  falls back to **`HEAD`, then an unconditional `PutObject`** of the same bytes to the same key:
+  an existing object of the payload's size is a duplicate (`reason="duplicate"`, no write), one of another
+  size is `S3_KEY_CONFLICT` (non-retryable, never overwritten); only an absent key is written.
+  **What this does not give (code review, Medium).** `HEAD` then `PUT` is not atomic. Two deliveries of the
+  same message racing (a redelivery while the first attempt is still in flight, or two loader instances
+  after a rebalance) can both see "absent" and both write. That is safe for the sink: both write the
+  same bytes to the same key, so the object converges and the bucket holds one object for the message id.
+  It is *not* safe against a *foreign* object created at the key inside that window, which the second
+  writer overwrites (with versioning on, the earlier version is kept). Stores that silently ignore
+  `If-None-Match` while answering `200` behave like the conditional path but never report the duplicate.
+  All of this is stated rather than hidden; the duplicate tests prove one object and identical bytes.
 
 `tests/s3/test_integration_s3_loader.py` proves it against MinIO, and
 `tests/integration/test_s3_loader_duplicate_delivery_uncommitted_redelivery.py` through a real
@@ -32,7 +39,10 @@ The key is a pure function of `tb-msg-id` and `tb-received-at`, so a redelivery 
 ## Outcomes (README 3.4 table: `S3_<ERROR_CODE>`)
 
 `S3_<ERROR_CODE>` is the store's error *code* (`AccessDenied` becomes `S3_ACCESS_DENIED`), taken only if it
-is a plain alphanumeric token, upper-snake-cased; the response *message* is never read. Retryable: `5xx`,
+is one of the codes in `KNOWN_ERROR_CODES` (S3's documented error list, plus the bare status codes a `HEAD`
+carries), upper-snake-cased; **anything else is `S3_UNKNOWN`**, so a store cannot mint an unbounded set of
+metric keys (architect ruling). The response *message* is never read. Retryability is decided from the
+status and the raw code, not from the reported name. Retryable: `5xx`,
 `408`, `429`, `409`, and the throttling codes (`SlowDown`, `RequestTimeout`, `InternalError`,
 `ServiceUnavailable`). Everything else (`AccessDenied`, `NoSuchBucket`, `InvalidAccessKeyId`, ...) is not.
 
@@ -57,6 +67,7 @@ from __future__ import annotations
 
 import re
 import threading
+import time
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
@@ -71,18 +82,49 @@ from .config import S3DestinationConfig
 
 _MSG_ID = re.compile(r"^[A-Za-z0-9-]{1,64}$")
 _CODE = re.compile(r"^[A-Za-z0-9]{1,48}$")
+#: S3's documented error codes ("Error responses" in the S3 API reference), the throttling codes botocore
+#: also surfaces, and the bare HTTP status codes a `HEAD` response carries (it has no body). The only
+#: strings that ever become a metric key or a `tb-error-code`; everything else is `S3_UNKNOWN`.
+KNOWN_ERROR_CODES = frozenset(
+    {
+        "AccessDenied", "AccountProblem", "AllAccessDisabled", "AmbiguousGrantByEmailAddress",
+        "AuthorizationHeaderMalformed", "BadDigest", "BucketAlreadyExists", "BucketAlreadyOwnedByYou",
+        "BucketNotEmpty", "ConditionalRequestConflict", "CredentialsNotSupported", "EntityTooLarge",
+        "EntityTooSmall", "ExpiredToken", "IllegalLocationConstraintException", "IncompleteBody",
+        "IncorrectNumberOfFilesInPostRequest", "InlineDataTooLarge", "InternalError", "InvalidAccessKeyId",
+        "InvalidArgument", "InvalidBucketName", "InvalidBucketState", "InvalidDigest",
+        "InvalidEncryptionAlgorithmError", "InvalidLocationConstraint", "InvalidObjectState", "InvalidPart",
+        "InvalidPartOrder", "InvalidPolicyDocument", "InvalidRange", "InvalidRequest", "InvalidSecurity",
+        "InvalidToken", "InvalidURI", "KeyTooLongError", "MalformedPOSTRequest", "MalformedXML",
+        "MaxMessageLengthExceeded", "MaxPostPreDataLengthExceededError", "MetadataTooLarge",
+        "MethodNotAllowed", "MissingContentLength", "MissingRequestBodyError", "MissingSecurityHeader",
+        "NoSuchBucket", "NoSuchBucketPolicy", "NoSuchKey", "NoSuchLifecycleConfiguration", "NoSuchUpload",
+        "NoSuchVersion", "NotFound", "NotImplemented", "NotSignedUp", "OperationAborted", "PermanentRedirect",
+        "PreconditionFailed", "Redirect", "RequestIsNotMultiPartContent", "RequestTimeout",
+        "RequestTimeTooSkewed", "RequestTorrentOfBucketError", "RestoreAlreadyInProgress",
+        "ServerSideEncryptionConfigurationNotFoundError", "ServiceUnavailable", "SignatureDoesNotMatch",
+        "SlowDown", "TemporaryRedirect", "Throttling", "ThrottlingException", "TokenRefreshRequired",
+        "TooManyBuckets", "UnexpectedContent", "UnresolvableGrantByEmailAddress", "UserKeyMustBeSpecified",
+        "XAmzContentSHA256Mismatch",
+        "400", "403", "404", "405", "409", "412", "500", "501", "503",
+    }
+)  # fmt: skip
 _CAMEL = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
 _RETRYABLE_CODES = frozenset(
     {"SlowDown", "RequestTimeout", "InternalError", "ServiceUnavailable", "Throttling", "ThrottlingException"}
 )
-_NOT_IMPLEMENTED = "NotImplemented"
+_NOT_FOUND = frozenset({"S3_404", "S3_NOT_FOUND", "S3_NO_SUCH_KEY"})  # a HEAD 404 has no body: code "404"
+
+#: How long a `501 NotImplemented` keeps the loader on the unconditional path before it tries the
+#: conditional put again.
+REPROBE_AFTER_S = 300.0
 
 #: Slack over `timeoutMs` for the overall deadline: botocore's connect and read timeouts are each
 #: `timeoutMs`, so a healthy-but-slow call can legitimately take a little longer than one of them.
 DEADLINE_SLACK_S = 1.0
 MAX_WORKERS = 2
 
-__all__ = ["S3Api", "S3Loader", "object_key", "s3_error_code"]
+__all__ = ["KNOWN_ERROR_CODES", "S3Api", "S3Loader", "object_key", "s3_error_code"]
 
 
 class S3Api(Protocol):
@@ -106,8 +148,8 @@ def object_key(config: S3DestinationConfig, message: Message) -> str:
 
 
 def s3_error_code(raw: object) -> str:
-    """`S3_<UPPER_SNAKE>` from a store error code, only if it is a plain alphanumeric token."""
-    if not isinstance(raw, str) or not _CODE.fullmatch(raw):
+    """`S3_<UPPER_SNAKE>` from a store error code, only if it is in `KNOWN_ERROR_CODES`."""
+    if not isinstance(raw, str) or not _CODE.fullmatch(raw) or raw not in KNOWN_ERROR_CODES:
         return "S3_UNKNOWN"
     return "S3_" + _CAMEL.sub("_", raw).upper()
 
@@ -140,13 +182,14 @@ class S3Loader:
             if clock is not None
             else CircuitBreaker(spec.failure_threshold, spec.open_seconds)
         )
-        self._conditional = True  # flips to False once the store answers NotImplemented
+        self._clock: Callable[[], float] = clock if clock is not None else time.monotonic
+        self._unconditional_until = 0.0  # set once the store answers NotImplemented (module docstring)
         self._executor = ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="s3-loader")
         self._slots = threading.BoundedSemaphore(MAX_WORKERS)
 
     @property
     def conditional_put_supported(self) -> bool:
-        return self._conditional
+        return self._clock() >= self._unconditional_until
 
     # -- one bounded call ------------------------------------------------------------------------
 
@@ -238,11 +281,19 @@ class S3Loader:
         }
         if self.config.kms_key_id is not None:
             args["SSEKMSKeyId"] = self.config.kms_key_id
+        if self.config.expected_bucket_owner is not None:
+            args["ExpectedBucketOwner"] = self.config.expected_bucket_owner
+        return args
+
+    def _head_args(self, key: str) -> dict[str, Any]:
+        args: dict[str, Any] = {"Bucket": self.config.bucket, "Key": key}
+        if self.config.expected_bucket_owner is not None:
+            args["ExpectedBucketOwner"] = self.config.expected_bucket_owner
         return args
 
     def _put(self, message: Message, key: str, payload: bytes) -> str:
         args = self._put_args(message, key, payload)
-        if self._conditional:
+        if self.conditional_put_supported:
             try:
                 self._call(self._client.put_object, IfNoneMatch="*", **args)
                 return "success"
@@ -251,10 +302,23 @@ class S3Loader:
                 if failure.reason == "S3_PRECONDITION_FAILED":
                     return self._duplicate_or_conflict(key, len(payload))
                 if failure.reason == "S3_NOT_IMPLEMENTED":
-                    self._conditional = False
+                    self._unconditional_until = self._clock() + REPROBE_AFTER_S
                     self._log.info("if_none_match_unsupported", destination=self.config.destination)
                 else:
                     raise failure from None
+        return self._put_unconditional(key, args, len(payload))
+
+    def _put_unconditional(self, key: str, args: dict[str, Any], payload_size: int) -> str:
+        """The store has no conditional put: `HEAD` first so an existing object is a duplicate or a conflict,
+        never silently overwritten; write only an absent key. Not atomic (module docstring)."""
+        try:
+            head = self._call(self._client.head_object, **self._head_args(key))
+        except Exception as exc:
+            failure = self._classify(exc)
+            if failure.reason not in _NOT_FOUND:
+                raise failure from None
+        else:
+            return self._judge_existing(head, payload_size)
         try:
             self._call(self._client.put_object, **args)
         except Exception as exc:
@@ -263,12 +327,16 @@ class S3Loader:
 
     def _duplicate_or_conflict(self, key: str, payload_size: int) -> str:
         try:
-            head = self._call(self._client.head_object, Bucket=self.config.bucket, Key=key)
+            head = self._call(self._client.head_object, **self._head_args(key))
         except Exception as exc:
             failure = self._classify(exc)
-            if failure.reason in ("S3_404", "S3_NOT_FOUND", "S3_NO_SUCH_KEY"):  # a HEAD 404 has no body: code "404"
+            if failure.reason in _NOT_FOUND:
                 raise _Failure("S3_KEY_VANISHED", True) from None  # deleted between the 412 and the HEAD
             raise failure from None
+        return self._judge_existing(head, payload_size)
+
+    @staticmethod
+    def _judge_existing(head: object, payload_size: int) -> str:
         size = head.get("ContentLength") if isinstance(head, dict) else None
         if size == payload_size:
             return "duplicate"
