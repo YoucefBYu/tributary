@@ -32,8 +32,11 @@
 # ClickHouse and PostgreSQL below are still no-auth and PLAINTEXT: fine ONLY because their ports are
 # loopback-bound and nothing here ever carries real patient data. Production topology is Helm.
 #
-# Storage is intentionally ephemeral (no named volumes for data, Kafka's included), matching
-# spikes/common/docker-compose.yml: `stop`/`start` keeps a container's data, `down` starts clean. Avoids the root-owned volume
+# Storage is intentionally ephemeral (no named volumes for data). Kafka's data directory is a tmpfs: the
+# image declares it a VOLUME, so without the tmpfs it would be an anonymous volume that outlives `down`,
+# and with it every ACL and SCRAM user ever added. `stop`/`start` therefore also starts Kafka clean (the
+# broker is re-formatted, topics are re-created by the one-shots at the next `up`). Other services keep
+# their container filesystem across `stop`/`start`, and `down` starts clean. Avoids the root-owned volume
 # permission trap on Windows/WSL2 too. Add named volumes yourself for a longer-lived local sandbox.
 
 name: tributary-lite
@@ -80,6 +83,16 @@ services:
     # cipher pin), wiping storage first when the credentials regenerated. The SCRAM users are created
     # afterwards by kafka-users-init, from password files.
     entrypoint: ["/bin/bash", "/opt/tb/start-broker.sh"]
+    # The broker is non-root and binds ports above 1024: it needs no capability, and must not gain one.
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      # KRaft storage. Explicit tmpfs, because the image's `VOLUME /var/lib/kafka/data` would otherwise
+      # make an anonymous volume that survives `down`.
+      - /var/lib/kafka/data:size=1g,uid=1000,gid=1000,mode=0700
+      # The image declares two more VOLUMEs (empty here); tmpfs keeps them from becoming anonymous volumes.
+      - /etc/kafka/secrets:size=1m
+      - /mnt/shared/config:size=1m
     ports:
       - "127.0.0.1:19092:19092"   # SASL_SSL; the certificate carries IP:127.0.0.1
     volumes:
@@ -102,9 +115,10 @@ services:
       KAFKA_JMX_OPTS: "-XX:+DisableAttachMechanism"
       KAFKA_HEAP_OPTS: ${TB_KAFKA_HEAP:--Xmx512M -Xms512M}
     healthcheck:
-      # Mutual TLS over the broker's loopback admin listener as an ACL-less certificate principal, so
+      # /tmp/tb-ready is written by start-broker.sh once it has granted kafka-users-init its ACL, so
+      # "healthy" also means "users can now be created". Then: mutual TLS over the broker's loopback admin listener as an ACL-less certificate principal, so
       # "healthy" proves TLS, hostname verification and client-certificate authentication work.
-      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server 127.0.0.1:9096 --command-config /etc/tributary/broker/healthcheck.properties >/dev/null 2>&1 || exit 1"]
+      test: ["CMD-SHELL", "test -f /tmp/tb-ready && /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server 127.0.0.1:9096 --command-config /etc/tributary/broker/healthcheck.properties >/dev/null 2>&1 || exit 1"]
       interval: 5s
       timeout: 5s
       retries: 24
@@ -123,6 +137,8 @@ services:
     container_name: tb-kafka-users-init
     restart: "no"
     network_mode: service:kafka
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
     entrypoint: ["python", "add_scram_users.py"]
     depends_on:
       kafka:
@@ -500,6 +516,6 @@ volumes:
   channel-spec-published:
   # Generated at `up` by kafka-tls-init; NEVER committed. `kafka-secrets` is mounted per component by
   # subpath (read-only). The CA private key is never stored: it is deleted right after signing.
-  # Both survive `down` (that is what keeps the broker's SCRAM users and the files in step); reset
-  # them with `docker compose down -v`.
+  # It survives `down`, which keeps the credential files and the credentials the broker is re-seeded
+  # with in step; reset it with `docker compose down -v`. The broker's own storage does not survive.
   kafka-secrets:

@@ -126,10 +126,13 @@ def _grants(defaults: dict, role: str) -> set[tuple[str, str, str, str]]:  # typ
 
 
 def test_receiver_may_write_raw_only(defaults: dict) -> None:  # type: ignore[type-arg]
+    # Set 1.4: READ on the channels topic and its group prefix, ahead of the receiver's invariant-3 migration.
     assert _grants(defaults, "receiver") == {
         ("TOPIC", "dev.adt-passthrough.raw", "LITERAL", "WRITE"),
         ("TOPIC", "dev.adt-passthrough.raw", "LITERAL", "DESCRIBE"),
         ("CLUSTER", "kafka-cluster", "LITERAL", "IDEMPOTENT_WRITE"),
+        ("TOPIC", "_tb.dev.channels", "LITERAL", "READ"),
+        ("GROUP", "tb.dev.adt-passthrough.channels.", "PREFIXED", "READ"),
     }
 
 
@@ -137,11 +140,14 @@ def test_worker_grants_and_no_write_on_channels(defaults: dict) -> None:  # type
     g = _grants(defaults, "pipeline_worker")
     assert ("TOPIC", "dev.adt-passthrough.raw", "LITERAL", "READ") in g
     assert ("TOPIC", "dev.adt-passthrough.out.", "PREFIXED", "WRITE") in g
-    assert ("TOPIC", "dev.adt-passthrough.retry", "LITERAL", "WRITE") in g
     assert ("TOPIC", "dev.adt-passthrough.dlq", "LITERAL", "WRITE") in g
     assert ("TOPIC", "_tb.dev.events", "LITERAL", "WRITE") in g
     assert ("TOPIC", "_tb.dev.channels", "LITERAL", "READ") in g
-    assert ("GROUP", "tb.dev.adt-passthrough.pipeline", "PREFIXED", "READ") in g
+    # Set 1.4: group grants are delimited, and the unused `.retry` grants are gone.
+    assert ("GROUP", "tb.dev.adt-passthrough.pipeline", "LITERAL", "READ") in g
+    assert ("GROUP", "tb.dev.adt-passthrough.pipeline.shadow-", "PREFIXED", "READ") in g
+    assert ("GROUP", "tb.dev.adt-passthrough.channels.", "PREFIXED", "READ") in g
+    assert not any(n.endswith(".retry") for _, n, _, _ in g)
     # A compromised worker must not be able to deploy a channel spec (topics README 3.4).
     assert not any(n == "_tb.dev.channels" and op == "WRITE" for _, n, _, op in g)
     assert not any(op in {"DELETE", "ALTER"} for *_, op in g)
@@ -150,10 +156,31 @@ def test_worker_grants_and_no_write_on_channels(defaults: dict) -> None:  # type
 def test_loader_grants_are_per_destination(defaults: dict) -> None:  # type: ignore[type-arg]
     g = _grants(defaults, "loader")
     assert ("TOPIC", "dev.adt-passthrough.out.http-stub", "LITERAL", "READ") in g
-    assert ("TOPIC", "dev.adt-passthrough.retry", "LITERAL", "READ") in g
+    assert ("TOPIC", "dev.adt-passthrough.dlq", "LITERAL", "WRITE") in g
+    assert ("TOPIC", "_tb.dev.channels", "LITERAL", "READ") in g
     assert ("GROUP", "tb.dev.adt-passthrough.loader.http-stub", "LITERAL", "READ") in g
-    assert ("GROUP", "tb.dev.adt-passthrough.loader.http-stub.", "PREFIXED", "READ") in g
-    assert not any(n.startswith("_tb.dev.channels") for _, n, _, _ in g)
+    assert ("GROUP", "tb.dev.adt-passthrough.channels.", "PREFIXED", "READ") in g
+    # Nothing on retry (retry-topic is not in v0), nothing writable on the channels topic.
+    assert not any(n.endswith(".retry") for _, n, _, _ in g)
+    assert not any(n == "_tb.dev.channels" and op == "WRITE" for _, n, _, op in g)
+    # A second destination gets its own group, and never a prefix that reaches the first's.
+    other = {
+        (x.name, x.pattern)
+        for x in parse_grants(defaults["security"]["acls"]["loader"], env=ENV, channel=CHANNEL, destinations=("fhir",))
+    }
+    assert ("tb.dev.adt-passthrough.loader.fhir", "LITERAL") in other
+    assert ("tb.dev.adt-passthrough.loader.http-stub", "LITERAL") not in other
+
+
+def test_transactional_channels_fail_loudly_not_silently(defaults: dict) -> None:  # type: ignore[type-arg]
+    """Set 1.4 keeps the TRANSACTIONAL_ID grant out of `pipeline_worker` because this parser has no such
+    target. A transactional channel must therefore be refused here, never bootstrapped without it (the
+    worker would fail at init_transactions with TRANSACTIONAL_ID_AUTHORIZATION_FAILED)."""
+    assert "pipeline_worker_transactional" in defaults["security"]["acls"]
+    with pytest.raises(ValueError, match="transactional"):
+        derive_acls(
+            defaults, env=ENV, channel=CHANNEL, destinations=DESTS, principals={"worker": "User:w"}, transactional=True
+        )
 
 
 def test_control_plane_stand_in_writes_channels(defaults: dict) -> None:  # type: ignore[type-arg]

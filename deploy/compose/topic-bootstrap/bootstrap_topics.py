@@ -155,9 +155,24 @@ def check_forbidden(component: str, grants: list[Grant], *, env: str) -> None:
 
 
 def derive_acls(
-    defaults: dict[str, Any], *, env: str, channel: str, destinations: tuple[str, ...], principals: dict[str, str]
+    defaults: dict[str, Any],
+    *,
+    env: str,
+    channel: str,
+    destinations: tuple[str, ...],
+    principals: dict[str, str],
+    transactional: bool = False,
 ) -> list[tuple[str, Grant]]:
-    """(principal, grant) for every component in `principals` (component -> `User:<name>`)."""
+    """(principal, grant) for every component in `principals` (component -> `User:<name>`).
+
+    `transactional`: the channel has `pipeline.transactional: true`. Contract set 1.4 puts the worker's
+    TRANSACTIONAL_ID grant in a separate `pipeline_worker_transactional` key because this parser has no
+    transactional-id target; so a transactional channel is refused rather than bootstrapped without it."""
+    if transactional:
+        raise ValueError(
+            "transactional channels are not supported by the lite bootstrap: "
+            "security.acls.pipeline_worker_transactional needs a TRANSACTIONAL_ID target"
+        )
     users = list(principals.values())
     if len(set(users)) != len(users):
         raise ValueError("two components are mapped to one principal")

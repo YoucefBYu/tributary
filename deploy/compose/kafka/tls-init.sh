@@ -18,7 +18,9 @@
 # Identities that are certificates, not passwords (no secret to leak, nothing in a properties file):
 #   CN=kafka                 the broker: controller and inter-broker links (super user)
 #   CN=tb-lite-users-init    creates the SCRAM users over the broker's LOOPBACK admin listener (9096),
-#                            reached only through the broker's own network namespace (super user)
+#                            reached only through the broker's own network namespace. NOT a super user:
+#                            start-broker.sh grants it ALTER on the cluster, which is all
+#                            AlterUserScramCredentials needs
 #   CN=tb-lite-healthcheck   the healthcheck; no ACL at all
 #
 # The CA private key exists only in a temporary directory for the seconds it takes to sign those
@@ -144,16 +146,13 @@ ssl.endpoint.identification.algorithm=https
 ssl.enabled.protocols=TLSv1.3,TLSv1.2
 ssl.cipher.suites=$SUITES
 # ACLs are only ever ADDED by topic-bootstrap, so a narrowed contract leaves old grants in place for
-# the life of the broker's storage. The storage is the broker container's own filesystem and is
-# wiped when the credentials regenerate, so \`docker compose down\` (which removes the container)
-# starts clean.
+# the life of the broker's storage, which is a tmpfs (docker-compose.yml): any stop starts clean.
 
-# Deny by default. super.users: the broker and the one-shot that creates SCRAM users (both by
-# certificate), the topic-creation job (the control-plane stand-in) and the operator's admin
-# principal. Never User:ANONYMOUS, never a data-plane component.
+# Deny by default. super.users: the broker (by certificate), the topic-creation job (the
+# control-plane stand-in) and the operator's admin principal. Never User:ANONYMOUS, never a data-plane component.
 authorizer.class.name=org.apache.kafka.metadata.authorizer.StandardAuthorizer
 allow.everyone.if.no.acl.found=false
-super.users=User:CN=kafka;User:CN=tb-lite-users-init;User:tb-lite-topic-bootstrap;User:tb-lite-admin
+super.users=User:CN=kafka;User:tb-lite-topic-bootstrap;User:tb-lite-admin
 
 log.dirs=/var/lib/kafka/data
 
@@ -186,6 +185,18 @@ ssl.truststore.location=/etc/tributary/broker/ca.crt
 ssl.endpoint.identification.algorithm=https
 PROPS
 chmod 0400 "$B/healthcheck.properties"
+
+# The broker's own admin client (its certificate, the super user): used once by start-broker.sh to grant
+# kafka-users-init its single ACL.
+cat >"$B/broker-client.properties" <<PROPS
+security.protocol=SSL
+ssl.keystore.type=PEM
+ssl.keystore.location=/etc/tributary/broker/broker.pem
+ssl.truststore.type=PEM
+ssl.truststore.location=/etc/tributary/broker/ca.crt
+ssl.endpoint.identification.algorithm=https
+PROPS
+chmod 0400 "$B/broker-client.properties"
 chown -R "$BROKER_UID:$BROKER_UID" "$B"
 
 # The generation marker is written last: a half-finished run is never taken for a valid one.

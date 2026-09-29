@@ -38,18 +38,18 @@ broker.
   `contracts/topics/v0/topic-defaults.json` `security.acls` (not restated). The receiver can write
   `raw` only; nothing but the control-plane stand-in can write `_tb.dev.channels`.
 - ACLs are only ever added. Narrowing `security.acls` in the contract does not remove an old grant from
-  a running broker. Broker storage is the container's own filesystem, so `docker compose down` (which
-  removes the container) starts clean; `down -v` also regenerates the credentials. Regenerated
-  credentials also wipe and reformat the storage on the next start.
+  a running broker. Broker storage is a tmpfs, so any stop or `down` starts the broker clean, and
+  `down -v` also regenerates the credentials. (Regenerated credentials also force a reformat.)
 - The broker's own identity is a client certificate, not a password: the controller, inter-broker and
   admin listeners are SSL with required client certificates, each on the broker's loopback. The SCRAM
-  users are created after start by `kafka-users-init` (`topic-bootstrap/add_scram_users.py`), which
+  users are created after start by `kafka-users-init` (`topic-bootstrap/add_scram_users.py`, granted only ALTER on the cluster, not a super
+  user), which
   shares the broker's network namespace to reach the loopback admin listener and reads each password
   from that component's own secret file. No password is ever a process argument (not in a container's
   `ps`, not in the host's), nor in a properties file, and the broker container never has them. The
   healthcheck is an ACL-less certificate principal. JMX is off (`-XX:+DisableAttachMechanism`).
 - Clients pin `ECDHE+AESGCM:ECDHE+CHACHA20` and verify the hostname; the broker allows TLS 1.2/1.3
-  AEAD suites only. The controller and inter-broker links are `SASL_SSL` on the broker's own loopback.
+  AEAD suites only. The controller, inter-broker and admin links are SSL with required client certificates, on the broker's own loopback.
 
 ## What's running
 
@@ -131,7 +131,7 @@ variable defaulting to a warning is not.
 
 ## Design notes
 
-- **No named volumes for data.** `stop`/`start` preserves a container's data; `down` starts clean.
+- **No named volumes for data.** `stop`/`start` preserves a container's data (Kafka's is a tmpfs: it starts clean each time); `down` starts clean.
   This avoids the root-owned-volume permission trap on Windows/WSL2 (`spikes/common/docker-compose.yml`
   hit the same thing, and `channel-spec-volume-init` below exists because a *different* named volume
   hit it anyway) and keeps the "under two minutes" bar honest. Add your own volumes for a longer-lived
