@@ -23,7 +23,7 @@ from tributary.runtime.errors import ChannelSpecError
 from tributary.runtime.spec import ChannelSpec, Destination
 
 from ..errors import ConfigError
-from ..http.config import SUPPORTED_AUTH_TYPES, AuthSpec, CircuitBreakerSpec
+from ..http.config import SUPPORTED_AUTH_TYPES, AuthSpec, CircuitBreakerSpec, check_static_headers
 
 #: `idempotency.technique` values this loader accepts (README 5.1, the `fhir` row).
 SUPPORTED_IDEMPOTENCY_TECHNIQUES = frozenset({"conditional-update", "idempotency-key-header", "none"})
@@ -146,7 +146,7 @@ def fhir_destination_config_from_destination(channel: str, destination: Destinat
     if not isinstance(timeout_ms, int) or isinstance(timeout_ms, bool) or timeout_ms < 1:
         raise ConfigError(f"destination {name!r}: with.timeoutMs must be a positive integer")
 
-    headers = dict(params.get("headers") or {})
+    headers = check_static_headers(name, params.get("headers") or {})
     for header_name in headers:
         if header_name.lower() in _FORBIDDEN_STATIC_HEADERS:
             raise ConfigError(

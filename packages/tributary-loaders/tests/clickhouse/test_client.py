@@ -7,7 +7,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from tributary.loaders.clickhouse.client import transport_from_config
+from tributary.loaders.clickhouse.client import TransportTimeout, transport_from_config
 from tributary.loaders.clickhouse.config import (
     ChAuthSpec,
     ChTlsSpec,
@@ -257,6 +257,6 @@ def test_read_capped_stops_at_the_deadline_even_under_the_byte_limit() -> None:
             return b"x" * min(n, 10)  # always returns data, so only the deadline check can stop this
 
     deadline = time.monotonic() - 1  # already passed
-    body = _read_capped(SlowReadable(), limit=10_000_000, deadline=deadline)
-    assert body == b""
+    with pytest.raises(TransportTimeout):
+        _read_capped(SlowReadable(), limit=10_000_000, deadline=deadline)
     assert calls["n"] == 0

@@ -319,3 +319,75 @@ def test_an_issue_code_outside_the_fhir_vocabulary_is_not_logged() -> None:
     body = json.dumps({"resourceType": "OperationOutcome", "issue": [{"code": PHI_MARKER}]}).encode()
     FhirLoader(make_config(), send=FakeSend(Response(400, {}, body)), log=log).deliver(make_message())
     assert PHI_MARKER not in repr(log.records)
+
+
+# -- duplicate observation, bounded retry, secret hygiene (code and security review) -------------------
+
+
+def test_a_2xx_where_no_entry_was_created_is_counted_as_a_duplicate_and_is_a_success() -> None:
+    send = FakeSend(Response(200, {}, response_bundle(["200 OK", "200 OK"])))
+    loader = FhirLoader(make_config(), send=send)
+    outcome = loader.deliver(make_message())
+    assert outcome.success is True and outcome.reason == "duplicate"
+    assert loader.metrics.snapshot()["delivery_duplicate"] == 1
+
+
+def test_a_2xx_where_an_entry_was_created_is_a_plain_success() -> None:
+    loader = FhirLoader(make_config(), send=FakeSend(ok()))
+    assert loader.deliver(make_message()).reason == "success"
+    assert "delivery_duplicate" not in loader.metrics.snapshot()
+
+
+def _cfg_no_conditional(technique: str) -> FhirDestinationConfig:
+    header = "Idempotency-Key" if technique == "idempotency-key-header" else None
+    return make_config(
+        idempotency_technique=technique, idempotency_header=header, circuit_breaker=CircuitBreakerSpec(100, 30.0)
+    )
+
+
+@pytest.mark.parametrize("technique", ["none", "idempotency-key-header"])
+def test_retry_stops_after_the_cap_when_entries_are_not_proven_idempotent(technique: str) -> None:
+    from tributary.loaders.fhir.loader import MAX_UNPROTECTED_ATTEMPTS
+
+    plain_post = bundle([{"request": {"method": "POST", "url": "Patient"}, "resource": {"resourceType": "Patient"}}])
+    send = FakeSend(TransportTimeout("timed out"))
+    loader = FhirLoader(_cfg_no_conditional(technique), send=send)
+    message = make_message(plain_post)
+    retryable = [loader.deliver(message).retryable for _ in range(MAX_UNPROTECTED_ATTEMPTS + 2)]
+    assert retryable == [True] * (MAX_UNPROTECTED_ATTEMPTS - 1) + [False] * 3
+    assert loader.deliver(message).reason == "TIMEOUT"  # the code is unchanged; only retryability is
+
+
+def test_the_cap_does_not_apply_to_conditional_update_entries() -> None:
+    send = FakeSend(TransportTimeout("timed out"))
+    loader = FhirLoader(make_config(circuit_breaker=CircuitBreakerSpec(100, 30.0)), send=send)
+    message = make_message()
+    assert all(loader.deliver(message).retryable for _ in range(10))
+
+
+def test_the_cap_counts_per_message_and_resets_on_success() -> None:
+    plain_post = bundle([{"request": {"method": "POST", "url": "Patient"}, "resource": {"resourceType": "Patient"}}])
+    created = Response(200, {}, response_bundle(["201 Created"]))
+    loader = FhirLoader(
+        _cfg_no_conditional("none"), send=FakeSend(TransportTimeout("t"), TransportTimeout("t"), created)
+    )
+    first, second = make_message(plain_post), make_message(plain_post)
+    assert loader.deliver(first).retryable and loader.deliver(first).retryable
+    assert loader.deliver(first).success  # a success resets the count
+    loader2 = FhirLoader(_cfg_no_conditional("none"), send=FakeSend(TransportTimeout("t")))
+    for _ in range(2):
+        loader2.deliver(first)
+    assert loader2.deliver(second).retryable is True  # a different message starts at zero
+
+
+@pytest.mark.parametrize("auth_type", ["bearer", "basic"])
+def test_a_secret_with_a_control_character_is_refused_at_startup_without_echoing_it(auth_type: str) -> None:
+    from tributary.loaders.secrets import SecretFormatError
+
+    class NewlineResolver(FakeResolver):
+        def resolve_text(self, ref: str, key: str) -> str:
+            return "user:pass-" + CRED_MARKER + "\nX-Injected: 1"
+
+    with pytest.raises(SecretFormatError) as exc_info:
+        FhirLoader(make_config(auth=AuthSpec(auth_type, "ref")), secret_resolver=NewlineResolver(), send=FakeSend(ok()))
+    assert CRED_MARKER not in str(exc_info.value)

@@ -30,8 +30,27 @@ case), `idempotency-key-header`, or `none`:
   top of the entries' own conditions.
 * `none`: no loader-side behaviour; the schema requires a `note`.
 
+**Bounded retry without conditional entries (code review, Medium).** Under `idempotency-key-header` and
+`none` the loader cannot know a retry is harmless: a Bundle of plain `POST`s that timed out may already
+have been applied, and every further blocking retry (`maxAttempts` allows 1000) can add another copy.
+So for these two techniques the loader stops asking for a retry after `MAX_UNPROTECTED_ATTEMPTS` (3)
+requests for the same `tb-msg-id`: the outcome keeps its error code but becomes non-retryable, and the
+runtime then applies `onExhaust` (dead-letter, or halt the partition). The worst case is three copies
+of an ambiguous write, visible and operator-handled, instead of hundreds. `conditional-update` is not
+capped: its entries are proven idempotent per message. The counter is per process and per record (a
+restart, or the next record, starts again).
+
+**`duplicate` is an observation, never a decision.** A `2xx` in which no entry answered `201 Created`
+(every entry `200`, which is what a server says for a conditional update or `ifNoneExist` that matched an
+existing resource) is counted as `reason="duplicate"` (metric `delivery_duplicate`) and is a success either
+way. A first delivery that only updates resources which already existed reads the same, so the counter is
+an upper bound on redeliveries, not a proof of one.
+
 `tests/fhir/test_integration_fhir_loader.py` proves it against a real HAPI FHIR server: the same Bundle
-delivered twice leaves exactly one Patient and one Encounter.
+delivered twice leaves exactly one Patient and one Encounter, and
+`tests/integration/test_fhir_loader_duplicate_delivery_uncommitted_redelivery.py` proves it through a
+real `ConsumerLoop` replay: the loader process is SIGKILLed after HAPI applied the Bundle and before the
+offset was committed, and a second process redelivers it.
 
 ## Classifying the outcome (README 3.4.2, and rule 1 of 3.4: nothing is success by default)
 
@@ -71,7 +90,7 @@ from tributary.sdk.context import Logger
 from ..common import CircuitBreaker, DeliveryOutcome, LoaderMetrics, NullLogger, State
 from ..http.client import Request, Response, TlsVerificationError, TransportError, TransportTimeout, stdlib_send
 from ..http.config import AuthSpec
-from ..secrets import SecretResolver
+from ..secrets import SecretResolver, reject_control_characters
 from .config import FhirDestinationConfig
 
 #: A transaction-response carries one small `response` object per entry (the request Bundle is at most
@@ -92,7 +111,18 @@ ISSUE_TYPE_CODES = frozenset(
 
 _RETRYABLE_STATUSES = frozenset({408, 409, 429})
 
-__all__ = ["BundleShapeError", "FhirLoader", "check_transaction_bundle", "classify_status"]
+#: Requests sent for one `tb-msg-id` before a retryable failure stops being retryable, for the techniques
+#: that give the loader no per-message proof of idempotency (module docstring).
+MAX_UNPROTECTED_ATTEMPTS = 3
+
+__all__ = [
+    "MAX_UNPROTECTED_ATTEMPTS",
+    "BundleShapeError",
+    "FhirLoader",
+    "check_transaction_bundle",
+    "classify_status",
+    "judge_transaction_response",
+]
 
 
 class BundleShapeError(Exception):
@@ -153,12 +183,20 @@ class _EntryVerdict:
     retryable: bool = False
     index: int | None = None
     status: int | None = None
+    #: On success: some entry answered `201` (a resource was created), i.e. this was not a redelivery.
+    created: bool = False
 
 
 def check_transaction_response(body: bytes, *, expected_entries: int) -> _EntryVerdict | None:
     """Return `None` if `body` is a valid, fully successful `transaction-response`; otherwise a verdict
     (`ok=False`) for a failed entry, or `_EntryVerdict(ok=False, index=None)` when the body is not a
     usable response at all."""
+    verdict = judge_transaction_response(body, expected_entries=expected_entries)
+    return None if verdict.ok else verdict
+
+
+def judge_transaction_response(body: bytes, *, expected_entries: int) -> _EntryVerdict:
+    """As `check_transaction_response`, but a success is `_EntryVerdict(ok=True, created=...)`."""
     try:
         document = json.loads(body)
     except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
@@ -172,6 +210,7 @@ def check_transaction_response(body: bytes, *, expected_entries: int) -> _EntryV
     entries = document.get("entry")
     if not isinstance(entries, list) or len(entries) != expected_entries:
         return _EntryVerdict(ok=False, retryable=True)
+    created = False
     for index, entry in enumerate(entries):
         response = entry.get("response") if isinstance(entry, dict) else None
         status = response.get("status") if isinstance(response, dict) else None
@@ -182,7 +221,8 @@ def check_transaction_response(body: bytes, *, expected_entries: int) -> _EntryV
         if code >= 400 or code < 200:
             retryable = code in _RETRYABLE_STATUSES or 500 <= code < 600
             return _EntryVerdict(ok=False, retryable=retryable, index=index, status=code)
-    return None
+        created = created or code == 201
+    return _EntryVerdict(ok=True, created=created)
 
 
 def _issue_code(body: bytes) -> str | None:
@@ -202,10 +242,10 @@ def _issue_code(body: bytes) -> str | None:
 
 def _auth_header(auth: AuthSpec, resolver: SecretResolver) -> tuple[str, str]:
     if auth.type == "basic":
-        creds = resolver.resolve_text(auth.secret_ref, "credentials")  # "user:pass"
+        creds = reject_control_characters(resolver.resolve_text(auth.secret_ref, "credentials"))  # "user:pass"
         return "Authorization", "Basic " + base64.b64encode(creds.encode("utf-8")).decode("ascii")
     if auth.type == "bearer":
-        return "Authorization", "Bearer " + resolver.resolve_text(auth.secret_ref, "token")
+        return "Authorization", "Bearer " + reject_control_characters(resolver.resolve_text(auth.secret_ref, "token"))
     raise ValueError(f"unsupported auth type {auth.type!r}")  # config.py refuses this at load time
 
 
@@ -226,6 +266,8 @@ class FhirLoader:
         self.breaker = CircuitBreaker(
             config.circuit_breaker.failure_threshold, config.circuit_breaker.open_seconds, clock=clock
         )
+        self._sent_for: str | None = None  # the msg id `_sent_count` counts requests for
+        self._sent_count = 0
         # Resolved once, at startup (README 3.4 rule 4); never logged, never in an exception.
         self._auth: tuple[str, str] | None = None
         if config.auth is not None:
@@ -277,6 +319,9 @@ class FhirLoader:
             timeout_s=self.config.timeout_s,
             max_response_bytes=MAX_RESPONSE_BYTES,
         )
+        if self._sent_for != msg_id:
+            self._sent_for, self._sent_count = msg_id, 0
+        self._sent_count += 1
         try:
             response = self._send(request)
         except TransportTimeout:
@@ -299,8 +344,8 @@ class FhirLoader:
 
         if response.truncated:
             return self._failure(msg_id, "FHIR_RESPONSE_INVALID", retryable=True, status_code=response.status_code)
-        verdict = check_transaction_response(response.body, expected_entries=expected)
-        if verdict is not None:
+        verdict = judge_transaction_response(response.body, expected_entries=expected)
+        if not verdict.ok:
             if verdict.index is None:
                 return self._failure(msg_id, "FHIR_RESPONSE_INVALID", retryable=True, status_code=response.status_code)
             return self._failure(
@@ -317,8 +362,10 @@ class FhirLoader:
         if was_half_open:
             self.metrics.circuit_closes += 1
             self._log.info("circuit_closed", destination=self.config.destination)
-        self.metrics.record("success")
-        return DeliveryOutcome(success=True, reason="success", retryable=False, detail=str(response.status_code))
+        self._sent_for = None
+        reason = "success" if verdict.created else "duplicate"
+        self.metrics.record(reason)
+        return DeliveryOutcome(success=True, reason=reason, retryable=False, detail=str(response.status_code))
 
     def _failure(self, msg_id: str, reason: str, *, retryable: bool, **fields: Any) -> DeliveryOutcome:
         was_open = self.breaker.state is State.OPEN
@@ -326,6 +373,15 @@ class FhirLoader:
         # is this message's problem, not an outage.
         if retryable or reason == "TLS_VERIFY_FAILED":
             self.breaker.record_failure()
+        if (
+            retryable
+            and self.config.idempotency_technique != "conditional-update"
+            and self._sent_for == msg_id
+            and self._sent_count >= MAX_UNPROTECTED_ATTEMPTS
+        ):
+            # Module docstring: without per-entry idempotency every retry may add a copy.
+            retryable = False
+            fields["retry_cap"] = MAX_UNPROTECTED_ATTEMPTS
         if not was_open and self.breaker.state is State.OPEN:
             self.metrics.circuit_opens += 1
             self._log.warning("circuit_open", destination=self.config.destination, reason=reason)

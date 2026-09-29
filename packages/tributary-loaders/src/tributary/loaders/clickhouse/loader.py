@@ -71,7 +71,7 @@ from tributary.sdk import Message
 from tributary.sdk.context import Logger
 
 from ..common import CircuitBreaker, DeliveryOutcome, LoaderMetrics, NullLogger, State
-from .client import ClickhouseTransport, Response, TlsVerificationError, TransportError
+from .client import ClickhouseTransport, Response, TlsVerificationError, TransportError, TransportTimeout
 from .config import ClickhouseDestinationConfig
 
 DEFAULT_FAILURE_THRESHOLD = 5
@@ -243,7 +243,7 @@ class ClickhouseLoader:
         statement = _insert_statement(self.config.table, self.config.id_column, row, msg_id)
         try:
             response = self._transport.send(statement, timeout_s=self.config.timeout_s)
-        except TimeoutError:
+        except (TimeoutError, TransportTimeout):
             return self._record_failure(msg_id, "TIMEOUT", retryable=True)
         except TlsVerificationError:
             return self._record_failure(msg_id, "TLS_VERIFY_FAILED", retryable=False)

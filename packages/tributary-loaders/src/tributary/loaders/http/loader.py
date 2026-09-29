@@ -62,7 +62,7 @@ from typing import Literal
 from tributary.sdk import Message
 from tributary.sdk.context import Logger
 
-from ..secrets import SecretResolver
+from ..secrets import SecretResolver, reject_control_characters
 from .circuit_breaker import CircuitBreaker, State
 from .client import Request, Response, TlsVerificationError, TransportError, stdlib_send
 from .config import AuthSpec, HttpDestinationConfig
@@ -131,10 +131,10 @@ def _auth_header(auth: AuthSpec, resolver: SecretResolver) -> tuple[str, str]:
     if auth.type == "basic":
         import base64
 
-        creds = resolver.resolve_text(auth.secret_ref, "credentials")  # "user:pass"
+        creds = reject_control_characters(resolver.resolve_text(auth.secret_ref, "credentials"))  # "user:pass"
         return "Authorization", "Basic " + base64.b64encode(creds.encode("utf-8")).decode("ascii")
     if auth.type == "bearer":
-        token = resolver.resolve_text(auth.secret_ref, "token")
+        token = reject_control_characters(resolver.resolve_text(auth.secret_ref, "token"))
         return "Authorization", f"Bearer {token}"
     raise ValueError(f"unsupported auth type {auth.type!r}")  # config.py already refuses this at load time
 

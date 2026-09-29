@@ -43,12 +43,14 @@ def test_builds_from_a_valid_destination() -> None:
     assert cfg.idempotency_technique == "conditional-update"
 
 
-def test_the_published_example_is_refused_only_for_its_oauth2_auth() -> None:
+def test_the_published_example_builds() -> None:
+    """The architect changed the example's auth from `oauth2-client-credentials` (unsupported in wave 2)
+    to `bearer` in contract set 1.3, so the published example is now loadable as written."""
     spec = json.loads((EXAMPLES / "adt-mllp-to-fhir-clickhouse-mllp.json").read_text(encoding="utf-8"))
     spec["metadata"].setdefault("version", 0)
     destination = ChannelSpec.from_document(spec).destination("fhir-server")
-    with pytest.raises(ConfigError, match="oauth2-client-credentials"):
-        fhir_destination_config_from_destination("c", destination)
+    cfg = fhir_destination_config_from_destination("c", destination)
+    assert cfg.auth is not None and cfg.auth.type == "bearer"
 
 
 def test_empty_circuit_breaker_block_means_configured_with_defaults() -> None:
@@ -117,3 +119,10 @@ def test_missing_timeout_is_refused() -> None:
     params = {"timeoutMs": 0}
     with pytest.raises(ConfigError, match="timeoutMs"):
         build(params)
+
+
+@pytest.mark.parametrize("value", ["a\nb", "a\rb", "a\x00b"])
+def test_a_static_header_with_a_control_character_is_refused_without_echoing_it(value: str) -> None:
+    with pytest.raises(ConfigError, match="control character") as exc_info:
+        build({"headers": {"X-Trace": value}})
+    assert "X-Trace" not in str(exc_info.value)

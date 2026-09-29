@@ -56,6 +56,7 @@ is caught and re-raised as `TransportError` rather than escaping untyped (code r
 
 from __future__ import annotations
 
+import http.client
 import ssl
 import time
 import urllib.error
@@ -63,6 +64,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 
+from ..deadline import DeadlineHTTPHandler, DeadlineHTTPSHandler, DeadlineRequest, Watchdog
 from ..secrets import SecretResolver
 from .config import ChAuthSpec, ChTlsSpec, ClickhouseDestinationConfig
 
@@ -82,6 +84,11 @@ class TransportError(Exception):
     """The request never got a response at all: DNS failure, connection refused, a timeout, or an
     I/O error while reading one. Always retryable (`loader.py`'s classification), never the server's
     own answer."""
+
+
+class TransportTimeout(TransportError):
+    """`TransportError` whose cause was a timeout (connect, a read, or the overall deadline). Still
+    retryable; `loader.py` reports it `TIMEOUT` rather than `CONNECT_FAILED`."""
 
 
 class TlsVerificationError(Exception):
@@ -117,8 +124,9 @@ def _build_ssl_context(tls: ChTlsSpec, auth: ChAuthSpec, resolver: SecretResolve
 
 
 def _read_capped(readable: object, *, limit: int, deadline: float) -> bytes:
-    """Reads at most `limit` bytes, stopping early once `deadline` (a `time.monotonic()` value) has
-    passed even if the peer keeps trickling data (module docstring)."""
+    """Reads at most `limit` bytes; raises `TransportTimeout` once `deadline` (a `time.monotonic()` value)
+    has passed even if the peer keeps trickling data (module docstring). A partial body is never returned:
+    it is not an answer to the INSERT."""
     # `read1`, not `read`: `HTTPResponse.read(n)` loops until it has `n` bytes or EOF, so a trickling
     # peer would hold one call open and the deadline check below would never run.
     read = getattr(readable, "read1", None) or readable.read  # type: ignore[attr-defined]
@@ -126,7 +134,7 @@ def _read_capped(readable: object, *, limit: int, deadline: float) -> bytes:
     total = 0
     while total < limit:
         if time.monotonic() > deadline:
-            break
+            raise TransportTimeout("timed out")
         chunk = read(min(65536, limit - total))
         if not chunk:
             break
@@ -150,20 +158,40 @@ class ClickhouseTransport:
     opener: urllib.request.OpenerDirector = field(repr=False)
 
     def send(self, sql: bytes, *, timeout_s: float) -> Response:
-        deadline = time.monotonic() + timeout_s
+        # Same two-layer bound as `http/client.py`: `Watchdog` shuts the socket at the overall deadline
+        # (status line, headers and body), `_read_capped` also checks it between reads.
+        watchdog = Watchdog(timeout_s)
+        try:
+            response = self._send_once(sql, timeout_s=timeout_s, watchdog=watchdog)
+            if watchdog.fired:
+                # Headers or body cut short by the deadline: a partial answer is never a verdict on the
+                # INSERT (the retry is idempotent, so timing out is always safe).
+                raise TransportTimeout("timed out")
+            return response
+        except TransportError as exc:
+            if watchdog.fired and not isinstance(exc, TransportTimeout):
+                raise TransportTimeout("timed out") from None
+            raise
+        finally:
+            watchdog.cancel()
+
+    def _send_once(self, sql: bytes, *, timeout_s: float, watchdog: Watchdog) -> Response:
+        deadline = watchdog.deadline
         headers = {**self.auth_headers, "Connection": "close", "Content-Type": "text/plain; charset=utf-8"}
-        request = urllib.request.Request(self.base_url, data=sql, headers=headers, method="POST")  # noqa: S310
+        request = DeadlineRequest(self.base_url, data=sql, headers=headers, method="POST", watchdog=watchdog)
         try:
             with self.opener.open(request, timeout=timeout_s) as resp:
+                watchdog.headers_complete()
                 body = _read_capped(resp, limit=_MAX_BODY_BYTES, deadline=deadline)
                 return Response(resp.status, dict(resp.headers), body)
         except urllib.error.HTTPError as exc:
             # A non-2xx IS a response (ClickHouse's own error reporting, module docstring): read it for
             # classification rather than let it surface as a bare exception.
+            watchdog.headers_complete()
             try:
                 body = _read_capped(exc, limit=_MAX_BODY_BYTES, deadline=deadline)
-            except OSError as read_exc:
-                raise TransportError(str(read_exc)) from read_exc
+            except (OSError, http.client.HTTPException) as read_exc:
+                raise _transport_error(read_exc) from None
             return Response(exc.code, dict(exc.headers or {}), body)
         except urllib.error.URLError as exc:
             # `urlopen` wraps a handshake failure in `URLError(reason=...)` rather than letting the
@@ -176,14 +204,29 @@ class ClickhouseTransport:
             # Every other `ssl.SSLError` (`SSLEOFError`, `SSLZeroReturnError`, ...), raised mid-read on
             # a reset connection, is transient and stays a retryable `TransportError`.
             if isinstance(exc.reason, ssl.SSLCertVerificationError):
-                raise TlsVerificationError(str(exc.reason)) from exc
-            raise TransportError(str(exc)) from exc
-        except ssl.SSLCertVerificationError as exc:
+                raise TlsVerificationError("certificate verification failed") from None
+            cause = exc.reason if isinstance(exc.reason, BaseException) else exc
+            raise _transport_error(cause) from None
+        except ssl.SSLCertVerificationError:
             # In case a certificate failure is ever raised directly rather than wrapped in URLError
             # (not observed against a real connection, but cheap defence in depth).
-            raise TlsVerificationError(str(exc)) from exc
+            raise TlsVerificationError("certificate verification failed") from None
         except (ssl.SSLError, TimeoutError, OSError) as exc:
-            raise TransportError(str(exc)) from exc
+            raise _transport_error(exc) from None
+        except http.client.HTTPException as exc:
+            # A malformed status line is quoted verbatim by `BadStatusLine`: peer text, never echoed.
+            raise TransportError(f"malformed response ({type(exc).__name__})") from None
+        except ValueError:
+            # `http.client` quotes a whole rejected header value (`X-ClickHouse-Key` here) in its error.
+            raise TransportError("request is malformed") from None
+
+
+def _transport_error(cause: BaseException) -> TransportError:
+    """Fixed phrase and the exception class only (an `OSError`'s text can carry a peer address, a
+    `URLError`'s the URL)."""
+    if isinstance(cause, TimeoutError):
+        return TransportTimeout("timed out")
+    return TransportError(f"transport failure ({type(cause).__name__})")
 
 
 def transport_from_config(config: ClickhouseDestinationConfig, resolver: SecretResolver) -> ClickhouseTransport:
@@ -199,6 +242,6 @@ def transport_from_config(config: ClickhouseDestinationConfig, resolver: SecretR
     opener = urllib.request.build_opener(
         _NoRedirectHandler,
         urllib.request.ProxyHandler({}),  # never pick up HTTP_PROXY/HTTPS_PROXY (code review, High)
-        urllib.request.HTTPSHandler(context=ssl_context) if ssl_context is not None else urllib.request.HTTPHandler(),
+        DeadlineHTTPSHandler(ssl_context) if ssl_context is not None else DeadlineHTTPHandler(),
     )
     return ClickhouseTransport(base_url, auth_headers, opener)
