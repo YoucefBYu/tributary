@@ -2,7 +2,8 @@
 
 **Contract id:** `tributary.topics/v0`
 **Status:** Draft. Partition defaults and `session.timeout.ms` are **measured** (S4, S5, 2026-09-20) and are lower bounds from a laptop-hosted cluster; `_tb.<env>.events` partitions and audit retention are still open. **Set 1.4 (2026-09-29):** ACL role table
-reconciled with the code (3.4.1), `super.users` restated, spec-reader group named (3.6).
+reconciled with the code (3.4.1), `super.users` restated, spec-reader group named (3.6). **Set 1.4.1
+(patch):** 3.4 `super.users` row: a user-provisioning identity is no longer a super user.
 **Owner:** `architect`.
 **Source:** ADR-001 sections 5.3 and 6.4, refined by ADR-002.
 **Schema:** [`topic-name.schema.json`](topic-name.schema.json) · **Defaults:** [`topic-defaults.json`](topic-defaults.json) · **Examples:** [`examples/topic-names.json`](examples/topic-names.json)
@@ -279,7 +280,7 @@ in `topic-defaults.json` under `security`.
 | Authentication | `SCRAM-SHA-512` or `OAUTHBEARER`. Never `PLAIN` on a listener without TLS. |
 | Hostname verification | `ssl.endpoint.identification.algorithm=https`. Leaving this off is the most common way a TLS Kafka deployment silently accepts a man-in-the-middle. |
 | Authorization | `StandardAuthorizer` enabled and **`allow.everyone.if.no.acl.found=false`** — deny by default. |
-| `super.users` | **Set 1.4:** the broker's own identity, the topic-creation job, an operator admin principal, and a one-shot user-provisioning identity where one exists. **Never** a data-plane component, the control plane's channel publisher (it holds only its `control_plane` grants), or `User:ANONYMOUS`. Lite stack names: `engine-kafka/v0` 6 rule 3. |
+| `super.users` | **Set 1.4.1:** the broker's own identity, the topic-creation job and an operator admin principal. A user-provisioning identity, where one exists, is **not** a super user: it gets only ALTER on CLUSTER, which is what `AlterUserScramCredentials` needs. That grant also authorises `CreateAcls`, so treat its key as super-user-grade. **Never** a data-plane component, the control plane's channel publisher (it holds only its `control_plane` grants), or `User:ANONYMOUS`. Lite stack names: `engine-kafka/v0` 6 rule 3. |
 | Credentials | From a `secretRef` or a secrets manager. Never in a channel spec, a Compose file or an image. |
 
 ACLs are least privilege on the topic prefix `<env>.<channel>.`, so compromising one channel's

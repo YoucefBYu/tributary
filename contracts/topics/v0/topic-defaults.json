@@ -165,7 +165,7 @@
       "inter.broker.listener.name": "an internal listener using SASL_SSL or mTLS",
       "authorizer.class.name": "org.apache.kafka.metadata.authorizer.StandardAuthorizer",
       "allow.everyone.if.no.acl.found": "false",
-      "super.users": "Set 1.4: the broker's own identity (inter-broker and controller links), the topic-creation job, an operator admin principal, and a one-shot user-provisioning identity where the deployment has one. NEVER a data-plane component, NEVER the control plane's channel publisher (it holds only its control_plane grants), NEVER User:ANONYMOUS. Principal names are deployment-specific; the lite stack's are in engine-kafka/v0 README section 6 rule 3.",
+      "super.users": "Set 1.4.1: the broker's own identity (inter-broker and controller links), the topic-creation job and an operator admin principal. A one-shot user-provisioning identity, where the deployment has one, is NOT a super user: it holds only ALTER on CLUSTER (what AlterUserScramCredentials needs; the same grant authorises CreateAcls, so its key is super-user-grade). NEVER a data-plane component, NEVER the control plane's channel publisher (it holds only its control_plane grants), NEVER User:ANONYMOUS. Principal names are deployment-specific; the lite stack's are in engine-kafka/v0 README section 6 rule 3.",
       "ssl.client.auth": "required, when using mTLS"
     },
     "clients": {

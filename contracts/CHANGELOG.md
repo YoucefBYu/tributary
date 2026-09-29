@@ -3,7 +3,36 @@
 Newest first. Each entry names the contract, the version, whether the change is additive or
 breaking, and the reason. Breaking changes reference an ADR.
 
-## 2026-09-29 (latest) — contract set 1.4: ACL role table reconciled with the code, super users, `expectedBucketOwner`, `REPLY_EXPIRED`
+## 2026-09-29 (latest) — contract set 1.4.1 (patch): `kafka-users-init` is not a super user
+
+**Additive, documentation only. No schema, example or manifest changes. No invariant changes.** Expected
+`validate.py` stays **150 / 0**, unverified: the architect has no shell, and `validate.py` does not
+read `topic-defaults.json`. Source: `devops-engineer`, `5495498`. Checked against
+`deploy/compose/kafka/tls-init.sh` (`super.users=User:CN=kafka;User:tb-lite-topic-bootstrap;User:tb-lite-admin`)
+and `start-broker.sh` (`kafka-acls --add --allow-principal User:CN=tb-lite-users-init --operation Alter
+--cluster`, run with `broker-client.properties` on `127.0.0.1:9096` before `/tmp/tb-ready`). The
+checks were done by reading the files, not by a run.
+
+| # | Change | Why |
+|---|---|---|
+| 1 | Super users: broker (`CN=kafka`), `tb-lite-topic-bootstrap`, `tb-lite-admin`. **`CN=tb-lite-users-init` is removed**: it holds only ALTER on CLUSTER, granted by `start-broker.sh` with the broker certificate | ALTER on CLUSTER is what `AlterUserScramCredentials` needs. Set 1.4 made the provisioning identity a super user, which is more than it needs |
+| 2 | Recorded caveat: ALTER on CLUSTER also authorises `CreateAcls` and `DeleteAcls` (Kafka "Authorization and ACLs" operations table, API keys 30, 31, 51). The identity can still grant itself more, so its key stays super-user-grade | Calling the grant "least privilege" without this caveat would overstate it. The gain is real: every further right now needs an explicit, listable ACL write |
+
+### `tributary.topics/v0`
+
+README: status line, 3.4 `super.users` row. `topic-defaults.json`: the **description string**
+`security.broker.super.users`. This is the one non-README edit. No code or test reads that key
+(`bootstrap_topics.py` reads only `security.acls`, and `validate.py` does not load the file; checked
+by reading, not by a run), and no `must_not_hardcode` value changed.
+
+### `tributary.engine-kafka/v0`
+
+README only: status line, section 6 rule 3 (table row, `super.users` value, ALTER-on-CLUSTER note).
+
+ADR-008 D8 amended; follow-up 9 (optional: revoke the grant after provisioning; fix the
+`add_scram_users.py` docstring).
+
+## 2026-09-29 — contract set 1.4: ACL role table reconciled with the code, super users, `expectedBucketOwner`, `REPLY_EXPIRED`
 
 **Additive for every document:** every envelope, event, channel spec and engine-kafka document valid
 under set 1.3 stays valid. One valid example gains an optional field without changing its validity.

@@ -159,6 +159,27 @@ wave's exit criteria here.
   - `connector-engineer`: loaders onto the helper; receivers onto `open_spec_source`.
   - `qa-engineer`: `validate.py` **150 / 0**, one predicted pair, conformance +2; ACL negative cases
     in the Compose e2e.
+- **Set 1.4.1 (patch, 2026-09-29, documentation only, counts unchanged: `validate.py` still 150 / 0,
+  unverified).** `kafka-users-init` is no longer a super user. It holds only ALTER on CLUSTER
+  (`5495498`; checked by reading `tls-init.sh` and `start-broker.sh`). Super users are now the broker,
+  `topic-bootstrap` and `admin`. **Caveat:** ALTER on CLUSTER also authorises `CreateAcls`, so the key
+  stays super-user-grade (ADR-008 D8). One non-README edit: the `topic-defaults.json`
+  `security.broker.super.users` description string, which no code reads. Optional follow-up for
+  `devops-engineer` (ADR-008 follow-up 9): revoke the grant once the SCRAM users exist, and fix the
+  `add_scram_users.py` docstring, which still says "a super user".
+- **OPEN, wave 2: invariant 3 is broken on every receiver. Owner: `connector-engineer`, started
+  2026-09-29 with `mllp`.** `mllp`, `http`, `sftp` and `kafka_source` all take a required
+  `--channel-spec <file>` (confirmed by grep; none calls `open_spec_source`). So each needs a file that
+  someone other than `_tb.<env>.channels` supplies. Workers and loaders already read the topic.
+  - **No contract change is needed.** Set 1.4 already grants receivers READ on `_tb.<env>.channels` and
+    the spec-reader group, and `tributary.runtime.channels.open_spec_source` and
+    `tributary.runtime.topics.spec_reader_group` exist.
+  - **Scope:** read the spec from the topic at start and retire `--channel-spec`. Live reload of a
+    running receiver stays out of scope, and `nackOn: spec-invalid` stays reserved (ADR-007 D19).
+  - **Done when:** all four receivers start from `_tb.<env>.channels` alone, with a test that a
+    receiver given no spec file starts, and an integration test against the deny-by-default Compose
+    ACLs.
+  - Wave 2 does not exit with this open.
 - **Waiting on teammates:** final W2-2 signatures after the conditions (`healthcare-standards-engineer`);
   the `retry-topic` spike report (`platform-engineer`). The first model result has pause-until-due at
   p50 lateness of about 515 s at production tiers, which is option (a)'s head-of-line cost made
@@ -381,6 +402,8 @@ All six filed and synthesised. Full threshold table with evidence ratings quoted
 | 2026-09-29 | **Retry groups ruled ahead of `retry-topic`:** a shared per-channel `retry` topic, each destination in its own `loader.<dest>` group, filtering on `tb-destination`; a channel-wide group is forbidden and the ACL enforces it. Rejected: per-destination retry topics (budget, grammar) | ADR-008 D9, ADR-003 D10 amendment, channel-spec README 4.1.1 |
 | 2026-09-29 | **`REPLY_EXPIRED` registered;** the event stays `status: dropped`. A `dropped` event may carry only a registered engine skip code. Rejected: no code (not queryable), `status: error` (pages on a correctly handled backlog) | envelope README 2.3.2, ADR-003 D10 amendment |
 | 2026-09-29 | **`s3` `expectedBucketOwner` added** (optional, 12 digits); the loader already sends it | channel-spec README 3.4.5 |
+| 2026-09-29 | **Set 1.4.1: `kafka-users-init` is not a super user** (amends the super-users row above). It holds only ALTER on CLUSTER, granted by `start-broker.sh` with the broker certificate (`5495498`). Super users: broker (`CN=kafka`), `topic-bootstrap`, `admin`. Recorded, not hidden: ALTER on CLUSTER also authorises `CreateAcls`/`DeleteAcls`, so escalation needs one explicit, listable ACL write. Rejected: keeping the set 1.4 super-user text, which is looser than the code. **Give up:** nothing functional. The key stays super-user-grade, and revoking the grant after provisioning is optional | ADR-008 D8 and follow-up 9, `engine-kafka/v0` 6 rule 3, `topics/v0` 3.4 |
+| 2026-09-29 | **Receivers' `--channel-spec` files are an invariant-3 defect, not a stand-in to keep.** They are to be migrated to `_tb.<env>.channels` in wave 2, starting with `mllp` (`connector-engineer`). No contract change: set 1.4 grants already cover it. Live reload stays out of scope (ADR-007 D19) | ADR-008 D6, invariant 3 |
 
 ## Open questions for the human
 

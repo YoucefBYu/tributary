@@ -6,7 +6,8 @@
 changes meaning. **Set 1.3.1 (2026-09-29, patch):** section 4 rule 4 narrowed from `ssl.*`/`sasl.*`
 prefixes to an exact ten-key allow-list. Schema and examples unchanged. **Set 1.4 (2026-09-29):** section 1
 scope table corrected to the code (`retry` unused, the loader reads `_tb.<env>.channels`); section 6
-rule 3 restated to the implemented super users. README only.
+rule 3 restated to the implemented super users. README only. **Set 1.4.1 (2026-09-29, patch):** section 6
+rule 3: `kafka-users-init` is no longer a super user, only ALTER on CLUSTER (`5495498`). README only.
 **Owner:** `architect`. Propose changes by message with the exact diff and impact.
 **Source:** ADR-008 (D1-D4); `topics/v0` 3.4; the W2-7 security review HIGH fixed in `e3ddee1`.
 **Schema:** [`engine-kafka.schema.json`](engine-kafka.schema.json) · **Examples:**
@@ -145,12 +146,14 @@ exception. Requirements for `deploy/compose/` (`devops-engineer`):
 3. `StandardAuthorizer`, `allow.everyone.if.no.acl.found=false`. The topic-bootstrap job applies
    the walking-skeleton channel's grants from `topic-defaults.json` `security.acls`, read from the
    file (3.7), not restated. **Amended in set 1.4 to what `deploy/compose/kafka/tls-init.sh`
-   implements**, which the security review judged acceptable and tighter than the set 1.3 text:
+   implements**, which the security review judged acceptable and tighter than the set 1.3 text.
+   **Amended again in set 1.4.1** to the least-privilege grant in `5495498`. The broker's
+   `super.users` is exactly `User:CN=kafka;User:tb-lite-topic-bootstrap;User:tb-lite-admin`:
 
    | Principal | How it authenticates | Authority |
    |---|---|---|
-   | `CN=kafka` (the broker) | mTLS on the loopback `CONTROLLER` and `BROKER` listeners | **super user** |
-   | `CN=tb-lite-users-init` (`kafka-users-init`) | mTLS on the loopback `ADMIN` listener (`127.0.0.1:9096`), reachable only from the broker's network namespace (`network_mode: service:kafka`) | **super user**, one-shot: creates the per-component SCRAM users from the password files and exits |
+   | `CN=kafka` (the broker) | mTLS on the loopback `CONTROLLER` and `BROKER` listeners, and as an admin client on `ADMIN` | **super user** |
+   | `CN=tb-lite-users-init` (`kafka-users-init`) | mTLS on the loopback `ADMIN` listener (`127.0.0.1:9096`), reachable only from the broker's network namespace (`network_mode: service:kafka`) | **not a super user.** Holds **only ALTER on CLUSTER**, the one grant `AlterUserScramCredentials` requires. One-shot: creates the per-component SCRAM users from the password files and exits. `start-broker.sh` grants the ACL with the broker's own certificate (`CN=kafka`, over `ADMIN`) **before** the broker reports ready, so `kafka-users-init` never runs without it. The broker is stopped if the grant fails |
    | `tb-lite-topic-bootstrap` | SCRAM over `SASL_SSL` | **super user**: creates topics and applies the ACLs |
    | `tb-lite-admin` | SCRAM over `SASL_SSL` | **super user**: the operator's principal |
    | `CN=tb-lite-healthcheck` | mTLS on the `ADMIN` listener | **no ACL at all**. It sends only `ApiVersions`, which needs no authorization, so "healthy" proves TLS, hostname verification and client-certificate authentication, and nothing more |
@@ -163,6 +166,17 @@ exception. Requirements for `deploy/compose/` (`devops-engineer`):
    signing, so nothing can mint another identity. ACLs are only ever added, so a narrowed
    `security.acls` takes effect only on a fresh broker: after `docker compose down` (the storage lives
    in the container) or a credential regeneration, which wipes it.
+
+   **What ALTER on CLUSTER still allows (set 1.4.1).** Kafka authorises `CreateAcls` and
+   `DeleteAcls` with the same grant as `AlterUserScramCredentials` (ALTER on CLUSTER; Kafka
+   "Authorization and ACLs", operations table). So `CN=tb-lite-users-init` can still **grant itself or
+   anyone further rights**. The change from a super user is real but bounded: every other right now
+   needs an explicit ACL write that stays visible in `kafka-acls --list`, instead of silently
+   bypassing authorization. Treat its key as super-user-grade. Three things bound it: the
+   key is mounted only into `kafka-users-init`, the listener is reachable only from the broker's
+   network namespace, and the grant is stored with the broker's storage. That storage is wiped on
+   `down` and on credential regeneration. The grant is **not** revoked when the one-shot exits.
+   Revoking it is a permitted tightening and needs no contract change.
 4. Every data-plane service gets `TB_ENGINE_KAFKA_FILE` pointing at a committed document like
    `valid/compose-lite-worker.json` (it holds no secret).
 5. No generated password, key or certificate is printed by the init service or reaches
