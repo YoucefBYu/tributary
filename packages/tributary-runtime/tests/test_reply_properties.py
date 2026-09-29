@@ -1,12 +1,23 @@
 """W2-8 property tests (proposal section 7, extended to `AE` by the architect's amendment).
 
+**Scope: this proves the rules on the model, not on a receiver.** The answer property runs against
+`tributary.runtime.sync_answer.SyncRequest`, a pure state machine. It fixes what the answers must be. It
+does not show that any receiver gives them: that holds only for a receiver that delegates to
+`SyncRequest`, or one this property is run against (`violations` takes a factory, so a receiver's
+pending-map entry can be adapted to the same five events) with a broken-receiver control that goes red.
+Until then the invariant-1 risk row for W2-8 stays open.
+
 **Answer property.** Over random interleavings of the receiver's `raw` delivery callback, reply records
 (`accepted`, `rejected`, absent status, unknown status), the reply timer, a revoke of the advertised
 partition and a sender disconnect, every request gets **exactly one** resolution, and neither `AA` nor
-`AE` is ever given before the successful `raw` callback. Also: `AR` never follows a successful callback,
-and `AA` needs an `accepted` reply. Three broken implementations are the controls, and each must be
-caught: one that answers on the reply alone (the proposal's control), one that answers `AE` on a revoke
-before the callback (what the amendment forbids), and one that trusts an absent status.
+`AE` is ever given before the successful `raw` callback. Also: `AR` never follows a successful callback;
+the answer is exactly what an independently written oracle derives from its cause, so `AA` needs the
+**first** reply to be `accepted`, a reply-derived `AE` carries the first reply's code, a timer `AE` is
+`REPLY_TIMEOUT` and a revoke `AE` is `REPLY_ROUTE_LOST`. Seven broken implementations are the controls,
+and each must be caught: one that answers on the reply alone (the proposal's control), one that answers
+`AE` on a revoke before the callback (what the amendment forbids), one that trusts an absent status, one
+that lets the last held reply win, one that swaps the timer and revoke codes, one that answers `AA` for
+an unrecognised status, and one that answers a failed commit from a held reply instead of `AR`.
 
 **Worker property.** Over random pipeline and per-destination outcomes (ok, drop, `Reject`, raise), a
 sync record gets exactly one reply; it is produced after every `out` and `dlq` record and after a flush
@@ -69,17 +80,44 @@ def drive(request: SyncRequest, event: str) -> Resolution | None:
     raise AssertionError(event)
 
 
+def oracle(cause: str, first_reply: str | None, revoked: bool) -> Resolution | None:
+    """The one right answer, written from channel-spec 3.2.6's table without reading `SyncRequest`.
+
+    `cause` is the event that resolved the request. A reply-derived answer comes from the **first**
+    reply (held before the callback or received after it): `AA` only for `accepted`, else `AE` with that
+    reply's own code. A revoke answers `REPLY_ROUTE_LOST`, the timer `REPLY_TIMEOUT`. `None`: nothing
+    justifies an answer at this event.
+    """
+    if cause == "disconnect":
+        return Resolution(answer=None)
+    if cause == "commit_failed":
+        return Resolution("AR")
+    if cause == "timeout":
+        return Resolution("AE", REPLY_TIMEOUT)
+    if cause == "revoke":
+        return Resolution("AE", REPLY_ROUTE_LOST)
+    if first_reply is not None:  # cause is a reply, or the callback releasing a held one
+        status, code = REPLIES[first_reply]
+        return Resolution("AA") if status == "accepted" else Resolution("AE", code)
+    if cause == "commit_ok" and revoked:  # the callback releasing a held revoke
+        return Resolution("AE", REPLY_ROUTE_LOST)
+    return None
+
+
 def violations(trace: list[str], factory: Callable[[], SyncRequest]) -> list[str]:
     """Every broken rule in one run of `trace`. Empty means the implementation held."""
     request = factory()
     found: list[str] = []
     resolutions: list[Resolution] = []
     committed = False
-    accepted_seen = False
     disconnected = False
+    revoked = False
+    first_reply: str | None = None
     for event in trace:
         committed = committed or event == "commit_ok"
-        accepted_seen = accepted_seen or event == "reply_accepted"
+        if first_reply is None and event in REPLIES and not resolutions:
+            first_reply = event
+        revoked = revoked or (event == "revoke" and not resolutions)
         resolution = drive(request, event)
         disconnected = disconnected or event == "disconnect"
         if resolution is None:
@@ -89,10 +127,13 @@ def violations(trace: list[str], factory: Callable[[], SyncRequest]) -> list[str
             found.append(f"{resolution.answer} before the raw callback succeeded (invariant 1)")
         if resolution.answer == "AR" and committed:
             found.append("AR after a confirmed commit: tells the sender a resend is safe when it is not")
-        if resolution.answer == "AA" and not accepted_seen:
-            found.append("AA without an accepted reply")
+        if resolution.answer == "AA" and first_reply != "reply_accepted":
+            found.append("AA without the first reply being accepted")
         if resolution.answer is not None and disconnected:
             found.append("an answer written to a sender that had gone")
+        expected = oracle(event, first_reply, revoked)
+        if len(resolutions) == 1 and resolution != expected:
+            found.append(f"{resolution} where the rules give {expected} (cause {event})")
     if len(resolutions) != 1:
         found.append(f"{len(resolutions)} resolutions, expected exactly one")
     return found
@@ -131,7 +172,58 @@ class TrustsAbsentStatus(SyncRequest):
         return super().reply_received("accepted" if status is None else status, code)
 
 
-@pytest.mark.parametrize("broken", [AnswersOnReplyAlone, AnswersRevokeEagerly, TrustsAbsentStatus])
+class LastReplyWins(SyncRequest):
+    """A later reply overwrites the one held before the callback (the rule is: the first one counts)."""
+
+    def reply_received(self, status: str | None, code: str | None) -> Resolution | None:
+        if self.resolved or self._committed:
+            return super().reply_received(status, code)
+        self._reply = None  # forget the held one, so the base class holds this one instead
+        return super().reply_received(status, code)
+
+
+class SwapsAeCodes(SyncRequest):
+    """The timer answers `REPLY_ROUTE_LOST` and a revoke `REPLY_TIMEOUT`: right answer, wrong code."""
+
+    def reply_timed_out(self) -> Resolution | None:
+        resolved = super().reply_timed_out()
+        return None if resolved is None else self._resolve(Resolution("AE", REPLY_ROUTE_LOST))
+
+    def partition_revoked(self) -> Resolution | None:
+        resolved = super().partition_revoked()
+        return None if resolved is None else self._resolve(Resolution("AE", REPLY_TIMEOUT))
+
+
+class TrustsUnrecognisedStatus(SyncRequest):
+    """`AA` for any status that is not `rejected` or `failed`, so `partially-accepted` becomes `AA`."""
+
+    def reply_received(self, status: str | None, code: str | None) -> Resolution | None:
+        trusted = "accepted" if status not in (None, "rejected", "failed") else status
+        return super().reply_received(trusted, code)
+
+
+class AnswersHeldReplyOnFailedCommit(SyncRequest):
+    """A reply held before the callback is answered even when the callback then fails (never `AR`)."""
+
+    def commit_failed(self) -> Resolution | None:
+        if not self.resolved and self._committed is None and self._reply is not None:
+            self._committed = False
+            return self._resolve(answer_for_reply(self._reply.status, self._reply.code))
+        return super().commit_failed()
+
+
+BROKEN = [
+    AnswersOnReplyAlone,
+    AnswersRevokeEagerly,
+    TrustsAbsentStatus,
+    LastReplyWins,
+    SwapsAeCodes,
+    TrustsUnrecognisedStatus,
+    AnswersHeldReplyOnFailedCommit,
+]
+
+
+@pytest.mark.parametrize("broken", BROKEN)
 def test_each_broken_receiver_is_caught(broken: type[SyncRequest]) -> None:
     """A property that cannot go red is not evidence (PHASE-0-DECISION section 4)."""
     counterexample = find(traces(), lambda trace: bool(violations(trace, broken)), settings=settings(max_examples=5000))
@@ -160,6 +252,27 @@ def test_the_documented_answers() -> None:
     unknown = SyncRequest()
     unknown.commit_succeeded()
     assert unknown.reply_received("partially-accepted", "SOME_CODE") == Resolution("AE", "SOME_CODE")
+
+    first_counts = SyncRequest()
+    assert first_counts.reply_received("rejected", "LAB_QUERY_UNSUPPORTED") is None
+    assert first_counts.reply_received("accepted", None) is None, "a second reply is ignored"
+    assert first_counts.commit_succeeded() == Resolution("AE", "LAB_QUERY_UNSUPPORTED")
+
+
+@pytest.mark.parametrize(
+    ("broken", "trace"),
+    [
+        (LastReplyWins, ["reply_rejected", "reply_accepted", "commit_ok", "timeout"]),
+        (SwapsAeCodes, ["commit_ok", "timeout"]),
+        (SwapsAeCodes, ["commit_ok", "revoke", "timeout"]),
+        (TrustsUnrecognisedStatus, ["commit_ok", "reply_unknown", "timeout"]),
+        (AnswersHeldReplyOnFailedCommit, ["reply_accepted", "commit_failed", "timeout"]),
+    ],
+)
+def test_the_new_controls_fail_on_their_minimal_traces(broken: type[SyncRequest], trace: list[str]) -> None:
+    """Each named trace breaks exactly the rule its control is about, and the model passes it."""
+    assert violations(trace, broken)
+    assert violations(trace, SyncRequest) == []
 
 
 # -- the worker ------------------------------------------------------------------------------------

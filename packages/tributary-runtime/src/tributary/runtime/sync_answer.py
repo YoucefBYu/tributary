@@ -7,6 +7,10 @@ at most once. It has no clock, no socket and no Kafka, so the W2-8 property test
 interleaving through it; the receiver's pending map (connector-engineer) owns timers, the correlation
 lookup and `maxPending`, and is meant to delegate the decision here.
 
+**What the property test proves is this model, not a receiver.** A receiver keeps these rules only if
+it delegates to `SyncRequest`, or if `tests/test_reply_properties.py::violations` is run against an
+adapter of its own pending-map entry, with a broken-receiver control that goes red.
+
 The rules, each from the amended contract:
 
 * `AR` = commit not confirmed (resend is safe). `AE` = committed (resend duplicates). `AA` = committed
