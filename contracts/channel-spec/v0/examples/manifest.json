@@ -44,7 +44,7 @@
         "connector:destination/clickhouse (W2-6)",
         "connector:destination/mllp (W2-6)"
       ],
-      "note": "Set 1.1. Wave 2 exit criterion 1 shape: per-key MLLP with mTLS to a FHIR transaction destination, a ClickHouse row destination and an MLLP forward, each sink getting its own payload through destination steps. Set 1.3: the fhir destination's auth changed from the reserved oauth2-client-credentials to bearer (ADR-007 D20), and connector:destination/fhir removed because the fhir loader is Built (README 3.0)"
+      "note": "Set 1.1. Wave 2 exit criterion 1 shape: per-key MLLP with mTLS to a FHIR transaction destination, a ClickHouse row destination and an MLLP forward, each sink getting its own payload through destination steps. Set 1.3: the fhir destination's auth changed from the reserved oauth2-client-credentials to bearer (ADR-007 D20), and connector:destination/fhir removed because the fhir loader is Built (README 3.0). Set 1.5: declares pipeline.context [fhir], because its FHIR destination step uses ctx.fhir; the worker loads only declared context extensions (README 3.3.4, ADR-007 D21). tests/e2e derives the exit-criterion-1 spec from this file, so the declaration reaches that test too"
     },
     {
       "file": "valid/http-fhir-ingest-to-fhir-and-postgresql.json",
@@ -379,6 +379,27 @@
       "expected_json_path": "$.spec.destinations[0].with.expectedBucketOwner",
       "expected_validator": "pattern",
       "expectation_note": "PREDICTED by the architect (set 1.4), UNMEASURED"
+    },
+    {
+      "file": "invalid/pipeline-context-unregistered.json",
+      "violates": "pipeline.context may name only a capability in contracts/context-extension/v0/capabilities.json; 'fhirr' is the typosquat shape the registry exists to refuse, and the worker would refuse it again at load (ADR-007 D21)",
+      "expected_json_path": "$.spec.pipeline.context[0]",
+      "expected_validator": "enum",
+      "expectation_note": "PREDICTED by the architect (set 1.5), UNMEASURED"
+    },
+    {
+      "file": "invalid/pipeline-context-duplicate.json",
+      "violates": "pipeline.context is a set; a repeated capability is a spec error, never silently collapsed",
+      "expected_json_path": "$.spec.pipeline.context",
+      "expected_validator": "uniqueItems",
+      "expectation_note": "PREDICTED by the architect (set 1.5), UNMEASURED. First use of uniqueItems in the channel-spec examples, so the least certain of the three"
+    },
+    {
+      "file": "invalid/pipeline-context-empty.json",
+      "violates": "an empty pipeline.context is refused: 'no capabilities' has one spelling, omitting the field",
+      "expected_json_path": "$.spec.pipeline.context",
+      "expected_validator": "minItems",
+      "expectation_note": "PREDICTED by the architect (set 1.5), UNMEASURED"
     }
   ]
 }

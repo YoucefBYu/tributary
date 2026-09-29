@@ -23,22 +23,22 @@ from typing import Any, cast
 import orjson
 import pytest
 from tributary.fhir import LocalFhir, LocalTerminology, attach, message_id_factory
-from tributary.runtime.clients import KafkaSettings
 from tributary.runtime.context import ContextExtension, WorkerContext
+from tributary.runtime.errors import ChannelSpecError
 from tributary.runtime.events import RecordingEmitter
 from tributary.runtime.executor import PipelineExecutor, StepFailure
 from tributary.runtime.extensions import (
     ENTRY_POINT_GROUP,
     ContextExtensionError,
+    ContextResolver,
     LoadedExtension,
-    load_context_extensions,
     verify_extension,
 )
 from tributary.runtime.logs import JsonLogger
 from tributary.runtime.producer import RecordProducer
 from tributary.runtime.records import ConsumedRecord
 from tributary.runtime.spec import ChannelSpec
-from tributary.runtime.worker import PipelineHandler, PipelineWorker, WorkerSettings
+from tributary.runtime.worker import PipelineHandler
 from tributary.sdk import Message, ReplyContext, step
 from tributary.sdk.codes import TRANSFORM_ERROR
 from tributary.sdk.context import Context, KeyValueStore, Logger, SecretStore
@@ -63,10 +63,18 @@ def fhir_extension(base: Context, message: Message) -> Context:
     return attach(base, fhir=LocalFhir(id_factory=message_id_factory(message.msg_id)), terminology=LocalTerminology())
 
 
-def channel(*, pipeline: list[dict[str, Any]], destination_steps: list[dict[str, Any]] | None = None) -> ChannelSpec:
+def channel(
+    *,
+    pipeline: list[dict[str, Any]],
+    destination_steps: list[dict[str, Any]] | None = None,
+    context: list[str] | None = None,
+    version: int = 4,
+) -> ChannelSpec:
     document = json.loads((EXAMPLES / "walking-skeleton-loopback.json").read_text(encoding="utf-8"))
-    document["metadata"] = {**document["metadata"], "version": 4}
+    document["metadata"] = {**document["metadata"], "version": version}
     document["spec"]["pipeline"]["steps"] = pipeline
+    if context is not None:
+        document["spec"]["pipeline"]["context"] = context
     if destination_steps is not None:
         document["spec"]["destinations"][0]["steps"] = destination_steps
     return ChannelSpec.from_document(document)
@@ -82,7 +90,7 @@ def handler(
     emitter: RecordingEmitter,
     spec: ChannelSpec,
     *,
-    extensions: tuple[ContextExtension, ...],
+    extensions: tuple[ContextExtension, ...] | None = None,
     stream: io.StringIO,
 ) -> PipelineHandler:
     return PipelineHandler(
@@ -107,14 +115,13 @@ def produced_bundle(producer: FakeProducer) -> tuple[dict[str, Any], dict[str, s
 
 
 def test_the_real_adt_step_produces_a_bundle_through_the_worker() -> None:
-    """Exit criterion 1's worker half: `uses:` resolves the real entry points, the step gets `ctx.fhir`
-    from the extension, and the `out` record is a FHIR transaction Bundle rather than a dead letter."""
+    """Exit criterion 1's worker half, on the production path: the spec declares `context: [fhir]`, the
+    worker resolves `tributary-fhir`'s real entry point, `uses:` resolves the real steps, and the `out`
+    record is a FHIR transaction Bundle rather than a dead letter."""
     producer, emitter, stream = FakeProducer(), RecordingEmitter(), io.StringIO()
     record = adt_record()
 
-    handler(producer, emitter, channel(pipeline=[PARSE, ADT]), extensions=(fhir_extension,), stream=stream).handle(
-        record
-    )
+    handler(producer, emitter, channel(pipeline=[PARSE, ADT], context=["fhir"]), stream=stream).handle(record)
 
     bundle, headers = produced_bundle(producer)
     assert bundle["resourceType"] == "Bundle"
@@ -128,6 +135,11 @@ def test_the_real_adt_step_produces_a_bundle_through_the_worker() -> None:
     assert [entry["fullUrl"] for entry in bundle["entry"]] == [expected(), expected()]
     logged = stream.getvalue()
     assert not [marker for marker in PHI_MARKERS if marker in logged], "invariant 6: no PHI in worker logs"
+    loaded = [line for line in map(orjson.loads, logged.splitlines()) if line["event"] == "context_extension_loaded"]
+    assert [(line["extension"], line["distribution"], line["channel_version"]) for line in loaded] == [
+        ("fhir", "tributary-fhir", 4)
+    ]
+    assert loaded[0]["channel"] == "adt-passthrough" and loaded[0]["version"]
 
 
 def test_a_redelivered_record_produces_a_byte_identical_bundle() -> None:
@@ -140,8 +152,7 @@ def test_a_redelivered_record_produces_a_byte_identical_bundle() -> None:
         handler(
             producer,
             RecordingEmitter(),
-            channel(pipeline=[PARSE, ADT]),
-            extensions=(fhir_extension,),
+            channel(pipeline=[PARSE, ADT], context=["fhir"]),
             stream=io.StringIO(),
         ).handle(record)
         payloads.append(producer.produced[0][2])
@@ -152,23 +163,31 @@ def test_destination_steps_get_ctx_fhir_too() -> None:
     """The exit-criterion channel maps in `destinations[].steps`, on the destination's own fork."""
     producer, emitter = FakeProducer(), RecordingEmitter()
     spec = channel(
-        pipeline=[{"name": "passthrough", "uses": "tributary.core.passthrough"}], destination_steps=[PARSE, ADT]
+        pipeline=[{"name": "passthrough", "uses": "tributary.core.passthrough"}],
+        destination_steps=[PARSE, ADT],
+        context=["fhir"],
     )
 
-    handler(producer, emitter, spec, extensions=(fhir_extension,), stream=io.StringIO()).handle(adt_record())
+    handler(producer, emitter, spec, stream=io.StringIO()).handle(adt_record())
 
     bundle, headers = produced_bundle(producer)
     assert bundle["type"] == "transaction"
     assert headers["tb-destination"] == "http-stub"
 
 
-def test_without_an_extension_the_adt_step_is_dead_lettered_as_before() -> None:
-    """The bug, pinned: with no `ctx.fhir` the step raises `AttributeError` on every attempt and the loop
+def test_a_channel_that_does_not_declare_fhir_does_not_get_it() -> None:
+    """L1, and README 3.3.4's known failure mode: `tributary-fhir` is installed, but a spec without
+    `context: [fhir]` loads nothing, so the step raises `AttributeError` on every attempt and the loop
     dead-letters the record as TRANSFORM_ERROR. Only the exception's type name survives, never its text."""
+    stream = io.StringIO()
     with pytest.raises(StepFailure) as failure:
-        handler(
-            FakeProducer(), RecordingEmitter(), channel(pipeline=[PARSE, ADT]), extensions=(), stream=io.StringIO()
-        ).handle(adt_record())
+        handler(FakeProducer(), RecordingEmitter(), channel(pipeline=[PARSE, ADT]), stream=stream).handle(adt_record())
+    skipped = [
+        line for line in map(orjson.loads, stream.getvalue().splitlines()) if line["event"].startswith("context_")
+    ]
+    assert [(line["event"], line["extension"], line["reason"]) for line in skipped] == [
+        ("context_extension_skipped", "fhir", "not-declared")
+    ]
     assert failure.value.error_code == TRANSFORM_ERROR
     assert failure.value.exception_type == "AttributeError"
     assert failure.value.step_name == "to-fhir"
@@ -261,53 +280,32 @@ def test_a_reply_from_a_failed_attempt_is_discarded_before_the_retry_through_the
     assert ctx.reply_body is not None
 
 
-# -- discovery and the startup probe ---------------------------------------------------------------
+# -- resolution: only declared, registered, correctly distributed extensions (context-extension/v0 L1-L5) --
 
 
 @dataclass
 class FakeDist:
     name: str
+    version: str = "0.0.0"
 
 
 @dataclass
 class FakePoint:
-    """Duck-types `importlib.metadata.EntryPoint`: `name`, `dist`, `load()`."""
+    """Duck-types `importlib.metadata.EntryPoint`: `name`, `value`, `dist` and `load()`, counting loads."""
 
     name: str
     target: Callable[[], Any]
     dist: FakeDist | None = None
+    value: str = "pkg.module:factory"
+    loads: int = 0
 
     def load(self) -> Any:
+        self.loads += 1
         return self.target()
-
-
-def points(*items: FakePoint) -> list[EntryPoint]:
-    return cast("list[EntryPoint]", list(items))
 
 
 def factory_of(extension: ContextExtension) -> Callable[[], Any]:
     return lambda: lambda: extension
-
-
-def test_discovery_loads_verifies_and_logs_every_extension_in_name_order() -> None:
-    stream = io.StringIO()
-    loaded = load_context_extensions(
-        log=JsonLogger("worker", stream=stream),
-        points=points(
-            FakePoint("zeta", factory_of(fhir_extension), FakeDist("pkg-z")),
-            FakePoint("fhir", factory_of(fhir_extension), FakeDist("tributary-fhir")),
-        ),
-    )
-    assert [extension.name for extension in loaded] == ["fhir", "zeta"]
-    lines = [orjson.loads(line) for line in stream.getvalue().splitlines()]
-    assert [(line["event"], line["extension"], line["distribution"]) for line in lines] == [
-        ("context_extension_loaded", "fhir", "tributary-fhir"),
-        ("context_extension_loaded", "zeta", "pkg-z"),
-    ]
-
-
-def test_no_installed_extension_is_not_an_error() -> None:
-    assert load_context_extensions(points=[]) == ()
 
 
 def _raise(exc: BaseException) -> Callable[[], Any]:
@@ -317,35 +315,183 @@ def _raise(exc: BaseException) -> Callable[[], Any]:
     return boom
 
 
+def fhir_point(target: Callable[[], Any] | None = None, *, dist: str = "tributary-fhir") -> FakePoint:
+    return FakePoint("fhir", target or factory_of(fhir_extension), FakeDist(dist, "1.2.3"))
+
+
+def resolver(*installed: FakePoint, stream: io.StringIO | None = None) -> ContextResolver:
+    return ContextResolver(
+        log=JsonLogger("worker", stream=stream if stream is not None else io.StringIO(), level="debug"),
+        points=lambda: cast("list[EntryPoint]", list(installed)),
+    )
+
+
+def lines(stream: io.StringIO) -> list[dict[str, Any]]:
+    return [orjson.loads(line) for line in stream.getvalue().splitlines()]
+
+
+def declaring_fhir(version: int = 4) -> ChannelSpec:
+    return channel(pipeline=[PARSE, ADT], context=["fhir"], version=version)
+
+
+def test_a_declared_capability_is_loaded_from_its_registered_distribution_and_logged() -> None:
+    stream = io.StringIO()
+    point = fhir_point()
+    extensions = resolver(point, stream=stream).resolve(declaring_fhir())
+    assert extensions == (fhir_extension,) and point.loads == 1
+    assert lines(stream) == [
+        {
+            **lines(stream)[0],
+            "event": "context_extension_loaded",
+            "extension": "fhir",
+            "distribution": "tributary-fhir",
+            "version": "1.2.3",
+            "channel": "adt-passthrough",
+            "channel_version": 4,
+        }
+    ]
+
+
+def test_an_undeclared_registrant_is_never_imported() -> None:
+    """L1: a transitive dependency registering the group runs nothing, even if importing it would raise."""
+    stream = io.StringIO()
+    rogue = FakePoint("telemetry", _raise(RuntimeError("would run at import")), FakeDist("some-transitive-dep"))
+    installed_fhir = fhir_point(_raise(RuntimeError("must not be imported either")))
+    assert resolver(rogue, installed_fhir, stream=stream).resolve(channel(pipeline=[PARSE])) == ()
+    assert rogue.loads == 0 and installed_fhir.loads == 0
+    assert sorted((line["extension"], line["reason"], line["level"]) for line in lines(stream)) == [
+        ("fhir", "not-declared", "info"),
+        ("telemetry", "unregistered", "warning"),
+    ]
+    assert all(line["event"] == "context_extension_skipped" for line in lines(stream))
+
+
+def test_an_unregistered_name_in_a_spec_is_refused() -> None:
+    """L2 at parse time: the runtime is lenient about unknown fields, never about a capability."""
+    with pytest.raises(ChannelSpecError, match="not a registered capability"):
+        channel(pipeline=[PARSE], context=["dicom"])
+
+
 @pytest.mark.parametrize(
-    ("point", "match"),
+    ("context", "match"), [([], "non-empty array"), (["fhir", "fhir"], "twice"), (["FHIR"], "names")]
+)
+def test_malformed_pipeline_context_is_refused(context: list[str], match: str) -> None:
+    with pytest.raises(ChannelSpecError, match=match):
+        channel(pipeline=[PARSE], context=context)
+
+
+def test_a_non_list_pipeline_context_is_refused() -> None:
+    with pytest.raises(ChannelSpecError, match="non-empty array"):
+        channel(pipeline=[PARSE], context=cast(Any, "fhir"))
+
+
+def test_a_declared_capability_from_the_wrong_distribution_is_refused_without_importing_it() -> None:
+    """A typosquat named `fhir` while `tributary-fhir` is absent (context-extension/v0 section 5)."""
+    stream = io.StringIO()
+    squat = fhir_point(dist="tributary_fhirr")
+    with pytest.raises(ContextExtensionError, match="registered to tributary-fhir"):
+        resolver(squat, stream=stream).resolve(declaring_fhir())
+    assert squat.loads == 0
+    assert [(line["reason"], line["level"]) for line in lines(stream)] == [("distribution-mismatch", "warning")]
+
+
+def test_a_declared_capability_registered_twice_is_refused() -> None:
+    """A typosquat named `fhir` alongside the real `tributary-fhir`: ambiguous, so neither is imported."""
+    real, squat = fhir_point(), fhir_point(dist="fhir-tools")
+    with pytest.raises(ContextExtensionError, match="more than one distribution"):
+        resolver(real, squat).resolve(declaring_fhir())
+    assert real.loads == 0 and squat.loads == 0
+
+
+def test_a_declared_capability_that_is_not_installed_is_refused() -> None:
+    with pytest.raises(ContextExtensionError, match="not installed"):
+        resolver().resolve(declaring_fhir())
+
+
+def test_the_distribution_name_is_compared_pep503_normalised() -> None:
+    assert resolver(fhir_point(dist="Tributary_FHIR")).resolve(declaring_fhir()) == (fhir_extension,)
+
+
+def test_the_factory_runs_once_per_process_and_loaded_is_logged_per_version() -> None:
+    stream = io.StringIO()
+    point = fhir_point()
+    subject = resolver(point, stream=stream)
+    subject.resolve(declaring_fhir(4))
+    subject.resolve(declaring_fhir(5))
+    assert point.loads == 1
+    assert [line["channel_version"] for line in lines(stream)] == [4, 5]
+
+
+@pytest.mark.parametrize(
+    ("target", "match"),
     [
-        (FakePoint("fhir", _raise(ImportError("SYNTHPATIENT^ALPHA"))), "cannot load .* ImportError"),
-        (FakePoint("fhir", _raise(SystemExit(3))), "cannot load .* SystemExit"),
-        (FakePoint("fhir", lambda: "not callable"), "not a callable factory"),
-        (FakePoint("fhir", lambda: _raise(RuntimeError("SYNTHPATIENT^ALPHA"))), "failed to start: RuntimeError"),
-        (FakePoint("fhir", lambda: lambda: 42), "did not return a callable"),
+        (_raise(ImportError("SYNTHPATIENT^ALPHA")), "cannot load .* ImportError"),
+        (_raise(SystemExit(3)), "cannot load .* SystemExit"),
+        (lambda: "not callable", "not a callable factory"),
+        (lambda: _raise(RuntimeError("SYNTHPATIENT^ALPHA")), "failed to start: RuntimeError"),
+        (lambda: lambda: 42, "did not return a callable"),
     ],
 )
-def test_an_extension_that_cannot_be_built_refuses_the_worker(point: FakePoint, match: str) -> None:
+def test_a_declared_extension_that_cannot_be_built_refuses_the_spec(target: Callable[[], Any], match: str) -> None:
     """Never skipped: a skipped extension is the original bug again, one AttributeError per message."""
     with pytest.raises(ContextExtensionError, match=match) as refused:
-        load_context_extensions(points=points(point))
+        resolver(fhir_point(target)).resolve(declaring_fhir())
+    assert isinstance(refused.value, ChannelSpecError), "refused like an unresolvable `uses` step"
     assert "SYNTHPATIENT" not in str(refused.value), "the exception's own text is never repeated"
 
 
-def test_two_distributions_registering_one_name_are_refused() -> None:
-    with pytest.raises(ContextExtensionError, match="more than one distribution"):
-        load_context_extensions(
-            points=points(FakePoint("fhir", factory_of(fhir_extension)), FakePoint("fhir", factory_of(fhir_extension)))
-        )
+def test_a_refused_context_on_hot_reload_keeps_the_previous_version_running() -> None:
+    """L6: resolved with the steps, all or nothing; the running plan survives a refused version."""
+    specs = [declaring_fhir(4)]
+    stream = io.StringIO()
+    subject = PipelineHandler(
+        env="dev",
+        spec_provider=lambda: specs[-1],
+        producer=RecordProducer(FakeProducer(), log=JsonLogger("test", stream=stream)),
+        emitter=RecordingEmitter(),
+        log=JsonLogger("worker", stream=stream),
+        instance="worker:test@localhost",
+        context_resolver=resolver(fhir_point(), stream=stream),
+    )
+    subject.prepare(specs[0])
+    specs.append(channel(pipeline=[PARSE, ADT], context=["fhir"], version=5))
+    subject._context_resolver = resolver(stream=stream)  # the capability vanished from the image
+    subject.handle(adt_record())  # still version 4, still with ctx.fhir
+    assert [line["event"] for line in lines(stream)].count("channel_spec_refused") == 1
 
 
-class _NoReply:
-    """A wrapper written against `Context` only: delegates everything except `reply`."""
+def test_the_worker_refuses_to_start_on_an_unresolvable_context() -> None:
+    """At startup there is no previous version: `prepare` raises and the worker does not consume."""
+    subject = PipelineHandler(
+        env="dev",
+        spec_provider=declaring_fhir,
+        producer=RecordProducer(FakeProducer(), log=JsonLogger("test", stream=io.StringIO())),
+        emitter=RecordingEmitter(),
+        log=JsonLogger("worker", stream=io.StringIO()),
+        instance="worker:test@localhost",
+        context_resolver=resolver(),
+    )
+    with pytest.raises(ContextExtensionError):
+        subject.prepare(declaring_fhir())
+
+
+def test_the_real_tributary_fhir_registrant_resolves_and_passes_the_probe() -> None:
+    """fb644c3: `tributary-fhir` registers `fhir`; resolution through real entry-point metadata."""
+    registered = {point.name: point for point in entry_points(group=ENTRY_POINT_GROUP)}
+    assert "fhir" in registered
+    (extension,) = ContextResolver(log=JsonLogger("t", stream=io.StringIO())).resolve(declaring_fhir())
+    view = extension(worker_ctx(extensions=()), make_message(b"{}"))
+    assert hasattr(view, "fhir") and hasattr(view, "terminology")
+
+
+# -- the probe (L3) ---------------------------------------------------------------------------------
+
+
+class _Delegating:
+    """A correct wrapper, written against `ReplyContext`. The subclasses below each break one rule."""
 
     def __init__(self, base: Context) -> None:
-        self._base = base
+        self._base = cast(ReplyContext, base)
 
     channel = property(lambda self: self._base.channel)
     channel_version = property(lambda self: self._base.channel_version)
@@ -385,38 +531,61 @@ class _NoReply:
     def usr_headers(self) -> Mapping[str, str]:
         return self._base.usr_headers()
 
+    def reply(self, body: bytes, *, content_type: str) -> None:
+        self._base.reply(body, content_type=content_type)
 
-class _SwallowsAttrs(_NoReply):
-    def set_attr(self, name: str, value: str) -> None:
-        return None
+
+class _NoReply(_Delegating):
+    reply = None  # type: ignore[assignment]
+
+
+class _ReplyReturnsNone(_Delegating):
+    """The security review's Medium: `isinstance` passes, but the body goes nowhere."""
 
     def reply(self, body: bytes, *, content_type: str) -> None:
         return None
 
 
-class _OwnVars(_SwallowsAttrs):
+class _ReplySwallowsErrors(_Delegating):
+    """Forwards, but hides the destination refusal, so N destinations could each answer."""
+
+    def reply(self, body: bytes, *, content_type: str) -> None:
+        try:
+            self._base.reply(body, content_type=content_type)
+        except Exception:
+            return None
+
+
+class _OwnLog(_Delegating):
+    @property
+    def log(self) -> Logger:
+        return JsonLogger("plugin", stream=io.StringIO())
+
+
+class _OwnSecrets(_Delegating):
+    @property
+    def secrets(self) -> SecretStore:
+        return self._base.secrets.__class__()  # type: ignore[call-arg]
+
+
+class _OwnVars(_Delegating):
     def __init__(self, base: Context) -> None:
         super().__init__(base)
         self._own: dict[str, object] = {}
-
-    def set_attr(self, name: str, value: str) -> None:
-        self._base.set_attr(name, value)
-
-    def set_usr(self, name: str, value: str) -> None:
-        self._base.set_usr(name, value)
 
     @property
     def vars(self) -> MutableMapping[str, object]:
         return self._own
 
 
-class _SwallowsUsr(_OwnVars):
-    def set_usr(self, name: str, value: str) -> None:
+class _SwallowsAttrs(_Delegating):
+    def set_attr(self, name: str, value: str) -> None:
         return None
 
-    @property
-    def vars(self) -> MutableMapping[str, object]:
-        return self._base.vars
+
+class _SwallowsUsr(_Delegating):
+    def set_usr(self, name: str, value: str) -> None:
+        return None
 
 
 def _probe_raises(base: Context, message: Message) -> Context:
@@ -424,58 +593,33 @@ def _probe_raises(base: Context, message: Message) -> Context:
 
 
 @pytest.mark.parametrize(
-    ("extension", "match"),
+    ("wrapper", "match"),
     [
         (lambda base, message: object(), "not a Context"),
         (lambda base, message: _NoReply(base), "dropped `reply`"),
+        (lambda base, message: _ReplyReturnsNone(base), "does not forward `reply`"),
+        (lambda base, message: _ReplySwallowsErrors(base), "destination context, which must raise"),
+        (lambda base, message: _OwnLog(base), "own `log`"),
+        (lambda base, message: _OwnSecrets(base), "own `secrets`"),
+        (lambda base, message: _OwnVars(base), "own `vars`"),
         (lambda base, message: _SwallowsAttrs(base), "set_attr"),
         (lambda base, message: _SwallowsUsr(base), "set_usr"),
-        (lambda base, message: _OwnVars(base), "vars"),
         (_probe_raises, "failed its probe: KeyError"),
     ],
 )
-def test_the_probe_refuses_a_wrapper_that_breaks_what_the_worker_reads(extension: Any, match: str) -> None:
-    """attrs feed events, tb-usr-* feed record headers, vars carry the parsed message between steps, and
-    reply is the synchronous answer. A wrapper that loses any of them is refused before consuming."""
+def test_the_probe_refuses_a_wrapper_that_breaks_what_the_worker_reads(wrapper: Any, match: str) -> None:
+    """attrs feed events, tb-usr-* feed record headers, vars carry the parsed message between steps,
+    reply is the synchronous answer, and log/secrets must be the worker's own objects (P1, L3)."""
     with pytest.raises(ContextExtensionError, match=match) as refused:
-        verify_extension(LoadedExtension(name="bad", distribution="pkg", extend=extension))
+        verify_extension(LoadedExtension(name="bad", distribution="pkg", version="1", extend=wrapper))
     assert "SYNTHPATIENT" not in str(refused.value)
 
 
-def test_the_real_attach_passes_the_probe() -> None:
-    verify_extension(LoadedExtension(name="fhir", distribution="tributary-fhir", extend=fhir_extension))
+def test_a_correct_wrapper_and_the_real_attach_pass_the_probe() -> None:
+    for extend in (lambda base, message: _Delegating(base), fhir_extension):
+        verify_extension(LoadedExtension(name="ok", distribution="pkg", version="1", extend=extend))
 
 
-def test_a_refused_extension_stops_the_worker_before_any_kafka_client(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Discovery runs in `PipelineWorker.build` right after the profile warning, before the channels
-    reader: this test has no broker, so reaching a client constructor would fail differently."""
-
-    def refuse(**_: object) -> tuple[LoadedExtension, ...]:
-        raise ContextExtensionError("context extension fhir failed to start: RuntimeError")
-
-    monkeypatch.setattr("tributary.runtime.worker.load_context_extensions", refuse)
-    worker = PipelineWorker(
-        WorkerSettings(
-            env="dev",
-            channel="adt-passthrough",
-            kafka=KafkaSettings(bootstrap_servers="127.0.0.1:9092"),
-            instance_id="pipeline-1",
-            profile="production",
-        ),
-        log=JsonLogger("worker", stream=io.StringIO()),
-    )
-    with pytest.raises(ContextExtensionError):
-        worker.build()
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason="ask to healthcare-standards-engineer: tributary-fhir registers `fhir` in the tributary.context "
-    "entry-point group (platform-engineer handoff, 2026-09-29). Remove this marker when it lands.",
-)
-def test_tributary_fhir_registers_its_context_extension() -> None:
-    registered = {point.name: point for point in entry_points(group=ENTRY_POINT_GROUP)}
-    assert "fhir" in registered
-    extension = load_context_extensions(points=[registered["fhir"]])[0]
-    view = extension.extend(worker_ctx(extensions=()), make_message(b"{}"))
-    assert hasattr(view, "fhir") and hasattr(view, "terminology")
+def test_a_probe_failure_refuses_the_spec_through_the_resolver() -> None:
+    with pytest.raises(ContextExtensionError, match="does not forward `reply`"):
+        resolver(fhir_point(factory_of(lambda base, message: _ReplyReturnsNone(base)))).resolve(declaring_fhir())

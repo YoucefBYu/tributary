@@ -29,7 +29,7 @@ from tributary.sdk.codes import TRANSFORM_ERROR
 from tributary.sdk.context import Logger
 from tributary.sdk.errors import TributaryError, safe_token
 
-from .context import WorkerContext
+from .context import ContextExtension, WorkerContext
 
 #: Envelope 2.3.2: a step that exhausts `stepRetries` dead-letters as `TRANSFORM_ERROR`. Wave 1 to the
 #: first W2-5 build emitted `STEP_ERROR`, which stays registered as reserved so old records stay readable.
@@ -327,3 +327,5 @@ class ChannelPlan:
     destinations: Mapping[str, PipelineExecutor]
     step_retries: int
     stats: StepStats
+    #: The version's resolved `pipeline.context` extensions, in wrapping order (`extensions.py`).
+    context: tuple[ContextExtension, ...] = ()

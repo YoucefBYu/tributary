@@ -3,7 +3,82 @@
 Newest first. Each entry names the contract, the version, whether the change is additive or
 breaking, and the reason. Breaking changes reference an ADR.
 
-## 2026-09-29 (latest) — contract set 1.4.1 (patch): `kafka-users-init` is not a super user
+## 2026-09-29 (latest) — contract set 1.5: context extensions load only when the spec declares them
+
+**Additive for every document.** Every channel spec valid under set 1.4 stays valid, because
+`pipeline.context` is optional. One valid example gains the field and stays valid. **No invariant
+changes.** **Runtime behaviour does change**: once `platform-engineer` lands L1, a channel that omits
+`context` no longer receives installed extensions. Nothing deployed relies on the old behaviour. It
+arrived in `fb60f3a` on this wave branch, and the one channel that uses `ctx.fhir` (the
+exit-criterion-1 example) now declares it.
+
+Source: `security-reviewer` High on `fb60f3a`. Any installed distribution that registered
+`tributary.context`, including a transitive or typosquatted one, ran in every worker with the full
+payload and `ctx.secrets`, while `tributary.steps` loads only names the reviewed spec references
+(`steps.py:78`). The start-up probe checks delegation. It cannot enforce invariants 6 or 7. Decisions
+and what they give up: **ADR-007 D21-D22**.
+
+| # | Question | Ruling and why |
+|---|---|---|
+| 1 | Where the allow-list lives | **In the channel spec (`spec.pipeline.context`), with each name pinned to one distribution by a contract registry.** The worker imports only declared entry points and refuses a spec whose name is unregistered, duplicated or supplied by another distribution. Deployment config (env var or file) is **rejected** as the allow-list: invisible to the spec reviewer, it varies per deployment so "what code ran" is not answerable from `tb-channel-version`, and each worker serves one channel, so it would restate the spec. Invariant 3 holds either way (the spec comes from `_tb.<env>.channels`). Per-step declaration is **rejected**: steps on one branch share one wrapped view (one `ctx.fhir` per message, W2-2) |
+| 2 | Record the group as a contract | **New `context-extension/v0`**: entry-point group and name grammar, the factory `() -> ContextExtension`, `ContextExtension = Callable[[Context, Message], Context]` (a `ReplyContext` in, a `ReplyContext` out), loading rules L1-L7, plugin obligations P1-P7 (delegate with `log`/`secrets`/`vars`/`kv` identity; no own logger; no global mutable state; no side effects outside `ctx`, no I/O in set 1.x; deterministic per message; fake shipped; import side-effect free) |
+| 3 | Loaded log line | **`context_extension_loaded` carries `extension`, `distribution`, `version`, `channel`, `channel_version`.** New `context_extension_skipped` with `reason` (`not-declared` info; `unregistered`, `distribution-mismatch` warning) makes a surprise registrant in the image visible without importing it |
+
+### `tributary.context-extension/v0` (new)
+
+`README.md` and `capabilities.json` (registry: `fhir` → `tributary-fhir`, `ctx.fhir` and
+`ctx.terminology`). Not in `FILE_CONTRACTS`: it validates no instances. `validate.py` gains
+`check_context_registry()`, which exits non-zero if the schema enum and the registry differ. It adds
+no check to the count.
+
+### `tributary.channel-spec/v0`
+
+Schema: `$defs/pipeline.properties.context` (array, 1-8, `uniqueItems`, items `enum: ["fhir"]`).
+The top-level description is updated. README: status line, section 2 row, 3.3 table row, **new 3.3.4**.
+Example `valid/adt-mllp-to-fhir-clickhouse-mllp.json` gains `"context": ["fhir"]`, and `tests/e2e`
+derives the exit-criterion-1 spec from it. Three invalid examples, **predicted, unmeasured**:
+
+| Example | Pinned pair |
+|---|---|
+| `pipeline-context-unregistered` | `$.spec.pipeline.context[0]` / `enum` |
+| `pipeline-context-duplicate` | `$.spec.pipeline.context` / `uniqueItems` (first use here; least certain) |
+| `pipeline-context-empty` | `$.spec.pipeline.context` / `minItems` |
+
+### Change requests that follow
+
+- **`platform-engineer`** (owner of `extensions.py`, `worker.py`, `spec.py`):
+  - parse `pipeline.context`, refusing a non-list or unknown name, and resolve it with the steps per
+    channel version (L1, L2, L6); move loading after the spec is read;
+  - never `load()` an undeclared name, and pin the distribution against a runtime copy of the
+    registry, with a two-way test against `capabilities.json`;
+  - the probe calls `reply` for real and checks `base.reply_body`, expects `reply` to raise on the
+    destination context, and checks `view.log is base.log` and `view.secrets is base.secrets` (L3);
+  - log lines per L5, with `version` from `point.dist.version`.
+  - Tests: an undeclared registrant whose import would raise is never imported; a typosquat
+    duplicate and a wrong distribution are each refused; a wrapper that copies `log` fails the probe.
+- **`healthcare-standards-engineer`:** P1-P7 for `tributary-fhir`. The code already delegates by
+  identity (`_Attached`, read, not run). Add tests for `log`/`secrets` identity and for `reply`
+  forwarding over `FakeContext`. Update the `runtime.py` docstring ("loaded when a channel declares
+  `fhir`"). Document on `tributary.content_hl7_fhir.adt` (and `oru`) that the step needs
+  `context: [fhir]`.
+- **`qa-engineer`:** the exit-criterion-1 spec declares `fhir`, inherited from the example. Add an
+  assertion in `build_spec` that it does, and a control with `context` removed that must dead-letter
+  the FHIR branch. Measure the counts below.
+- Optional, **`devops-engineer`:** fail the image build if any installed `tributary.context`
+  registrant is not in `capabilities.json` (ADR-007 follow-up 15).
+
+### Verification owed
+
+Not run by the architect, who has no shell.
+
+- `uv run --no-project --python 3.12 --with jsonschema python contracts/validate.py`: expected
+  **153 / 0** (set 1.4's 150, unverified, + 3 channel-spec invalid).
+- `validate.py --emit-expectations`: the three pairs above.
+- `pytest tests/conformance`: +3 cases over the set 1.4 measurement.
+- The runtime corpus test: unchanged. `adt-mllp-to-fhir-clickhouse-mllp.json` stays `runnable: false`
+  for its existing `requires`, and today's runtime ignores `context` (lenient parse, `spec.py`).
+
+## 2026-09-29 — contract set 1.4.1 (patch): `kafka-users-init` is not a super user
 
 **Additive, documentation only. No schema, example or manifest changes. No invariant changes.** Expected
 `validate.py` stays **150 / 0**, unverified: the architect has no shell, and `validate.py` does not

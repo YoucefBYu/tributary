@@ -6,7 +6,9 @@ adds the wave 2 connector types, per-destination steps and the key-expression se
 additive**: every document valid under 1.0 is still valid. **Set 1.2 (2026-09-28) adds the optional
 `source.reply` block for synchronous reply mode (3.2.6), also additive.** **Set 1.3 (2026-09-29)
 adds the optional `tls.allowedClientSans` (3.2.7) and writes down which values are schema-valid but
-refused at component startup (3.2.8, 3.4.1), also additive.** Breaking changes create `../v1/`.
+refused at component startup (3.2.8, 3.4.1), also additive.** **Set 1.5 (2026-09-29) adds the
+optional `pipeline.context` (3.3.4), which declares the context extensions a channel loads, also
+additive.** Breaking changes create `../v1/`.
 **Owner:** `architect`. Propose changes by message with the exact diff and impact.
 **Source:** ADR-001 sections 6.1 and 6.4, ADR-003 D1/D3/D4/D6, ADR-007 (D1-D9, and D10-D17 for set
 1.1), Phase 0 gate section 7.1.
@@ -109,6 +111,7 @@ schema is expressed there.
 | **Set 1.2:** `source.reply` only on `mllp` and `http`; every field bounded; `after` accepts `routed` only | Invariant 1 — sync mode changes what the sender waits for, never when the commit happens (3.2.6) |
 | **Set 1.2:** `source.reply` with `pipeline.transactional: true` is refused | A reply outside the transaction could answer `AA` for aborted work (3.2.6) |
 | **Set 1.3:** `tls.allowedClientSans` only with `clientAuth: required`; entries are typed `dns:`/`uri:` names with no wildcard | One CA's certificates must not open every mTLS channel (3.2.7) |
+| **Set 1.5:** `pipeline.context` lists registered capability names only, at least one, no duplicates | Only reviewed, declared plugin code runs beside the steps (3.3.4; `context-extension/v0`) |
 
 ---
 
@@ -534,6 +537,7 @@ says so.
 | `steps` | R | 1-32. Each step has `name` plus **exactly one** of `uses` (a registered step) or `ref` (a dotted path in the bundle), plus optional `with`. |
 | `stepRetries` | O | In-place retries before the DLQ (ADR-003 D4). Default 3 — a **judgement, unmeasured**: S5 exercised the DLQ path, not the retry count. |
 | `transactional` | O | Kafka transactions on the `raw` → `out.<dest>` hop (ADR-003 D6). Opt-in, default false. |
+| `context` | O | **Set 1.5.** Registered context capabilities the channel's steps need, e.g. `[fhir]`. Only these extensions load (3.3.4). |
 
 `with` takes scalars and flat arrays of scalars. No nested objects: a nested structure is where
 configuration turns into a program the runtime has to interpret. Property names that denote a
@@ -793,6 +797,32 @@ Known-answer vectors, for parent `01923a7b-4c5d-7e6f-8a9b-0c1d2e3f4a5b`:
 not recompute them. The test's own cross-check reuses the implementation's formula, so an **independent**
 recomputation (a few lines of `hashlib`) is part of verifying this section. If they disagree, the
 layout above wins, and both the table and the implementation are defects.
+
+#### 3.3.4 `pipeline.context`: which context extensions a channel loads (set 1.5)
+
+```yaml
+pipeline:
+  bundle: ghcr.io/example/adt-integration@sha256:<64 hex>
+  context: [fhir]            # ctx.fhir and ctx.terminology, from tributary-fhir only
+  steps: [...]
+```
+
+- **Optional.** Absent means the channel gets **no** context extensions. `[]` is refused (one
+  spelling for "none"), and so are duplicates. Order carries no meaning.
+- **Items are registered capability names** (`contracts/context-extension/v0/capabilities.json`);
+  set 1.5 registers `fhir`. The schema enum and the registry are kept identical by `validate.py`.
+- **Scope: every step the worker runs for this channel**, including `destinations[].steps`. The
+  exit-criterion-1 example uses `ctx.fhir` in a destination step and declares it here.
+- **The worker loads only these** `tributary.context` entry points, each from its registered
+  distribution, and refuses the spec otherwise (context-extension README section 2, L1-L2). A
+  refused spec keeps the previous version running, as for an unresolvable `uses` step.
+- **Why in the spec** (ADR-007 D21): it is how `uses` already works (`steps.py` loads only names the
+  spec references). A reviewer sees in the spec diff what code runs beside the steps, and "what code
+  ran" stays answerable from `tb-channel-version` alone.
+- **Failure mode to know:** a step that uses `ctx.fhir` on a channel that did not declare `fhir`
+  raises `AttributeError` on every message and dead-letters it (`STEP_ERROR`), loudly but late. Until
+  steps declare their own capability needs (ADR-007 follow-up 14), declaring `context` correctly is
+  the spec author's job. The runtime cannot infer it.
 
 ### 3.4 `spec.destinations`
 

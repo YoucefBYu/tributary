@@ -21,6 +21,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from .capabilities import CAPABILITIES, NAME_PATTERN
 from .errors import ChannelSpecError, safe_token
 from .topics import CHANNEL, DESTINATION
 
@@ -87,6 +88,9 @@ class Pipeline:
     steps: tuple[StepRef, ...]
     step_retries: int = DEFAULT_STEP_RETRIES
     transactional: bool = False
+    #: `pipeline.context` (set 1.5, README 3.3.4): registered capability names, sorted, no duplicates.
+    #: Empty when absent. Only these `tributary.context` extensions are loaded (`extensions.py`).
+    context: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -221,7 +225,29 @@ def _pipeline(channel: str, block: Mapping[str, Any]) -> Pipeline:
         if isinstance(step_retries, int) and not isinstance(step_retries, bool)
         else DEFAULT_STEP_RETRIES,
         transactional=bool(block.get("transactional", False)),
+        context=_context(channel, block),
     )
+
+
+def _context(channel: str, block: Mapping[str, Any]) -> tuple[str, ...]:
+    """`pipeline.context`. Not lenient: a capability the runtime cannot satisfy refuses the spec, since
+    dropping it would dead-letter every message on `AttributeError` (context-extension/v0 section 2)."""
+    if "context" not in block:
+        return ()
+    value = block["context"]
+    where = f"channel {safe_token(channel)}: spec.pipeline.context"
+    if not isinstance(value, list) or not value:
+        raise ChannelSpecError(f"{where} must be a non-empty array (omit it for no capabilities)")
+    names: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not NAME_PATTERN.fullmatch(item):
+            raise ChannelSpecError(f"{where} items must be capability names")
+        if item not in CAPABILITIES:
+            raise ChannelSpecError(f"{where} names {safe_token(item)}, which is not a registered capability")
+        if item in names:
+            raise ChannelSpecError(f"{where} names {safe_token(item)} twice")
+        names.append(item)
+    return tuple(sorted(names))  # L4: a set; wrapping order is by name
 
 
 def _step(channel: str, block: Mapping[str, Any]) -> StepRef:

@@ -13,6 +13,7 @@ for approval before implementing.
 | Lifecycle events (`_tb.<env>.events`) | v0 | Draft | [`events/v0/README.md`](events/v0/README.md) | `events/v0/event.schema.json` |
 | Channel spec (source, steps, destinations, ordering, retry) | v0 | Draft | [`channel-spec/v0/README.md`](channel-spec/v0/README.md) | `channel-spec/v0/channel.schema.json` |
 | Engine Kafka connection (every data-plane process's link to the engine cluster) | v0 | Draft, **new in set 1.3** | [`engine-kafka/v0/README.md`](engine-kafka/v0/README.md) | `engine-kafka/v0/engine-kafka.schema.json` |
+| Context extensions (`tributary.context` entry points: signature, loading rules, what a plugin must keep) | v0 | Draft, **new in set 1.5** | [`context-extension/v0/README.md`](context-extension/v0/README.md) | `context-extension/v0/capabilities.json` (capability registry; cross-checked against the channel-spec schema by `validate.py`) |
 
 ### Contract set 1.0 — what "contracts v1" means
 
@@ -26,9 +27,10 @@ directory rename: set 1.0 is the four contracts above, frozen together at the wa
 | 1.2 | Same four directories. **Additive only**: synchronous reply mode (W2-8) — `source.reply` in `channel-spec/v0`; `tb-reply-partition`, `tb-reply-deadline`, `tb-reply-status` and the `REPLY_` codes in `envelope/v0`; reply sizing, the reply consumer and its ACLs in `topics/v0`. `events/v0` unchanged | Published 2026-09-28, **unverified** (expected `validate.py` 134 / 0; nine predicted pairs). Freezes at the wave 2 gate |
 | 1.3 | The four directories plus **`engine-kafka/v0` (new)**. **Additive only**: where every data-plane process gets its engine Kafka connection and credentials (ADR-008), `tls.allowedClientSans` in `channel-spec/v0`, seventeen fixed error codes registered in `envelope/v0`, documentation of values that are schema-valid but refused at startup (`nackOn: spec-invalid`, `auth` `oauth2-client-credentials`/`mtls`), one pointer in `topics/v0` 3.4 | Published 2026-09-29, **unverified** (expected `validate.py` 148 / 0 if set 1.2's 134 held; nine predicted pairs). Freezes at the wave 2 gate with 1.2. **1.3.1 (patch, same day):** README-only. The exact engine-Kafka key allow-list, `ctx.reply` on `ReplyContext`, and the `s3` licence status. No schema or example change |
 | 1.4 | Same five directories. **Additive for every document**: `s3` `expectedBucketOwner` in `channel-spec/v0`; `REPLY_EXPIRED` in `envelope/v0`; one valid `events/v0` example. **Deployment-facing correction in `topics/v0`:** the `security.acls` role table is reconciled with the code (grants added where code needed them, unused `.retry` grants removed, group grants delimited), `super.users` restated, the spec-reader group named (ADR-008 D6-D9). `engine-kafka/v0` README only | Published 2026-09-29, **unverified** (expected `validate.py` 150 / 0; one predicted pair). Freezes at the wave 2 gate with 1.2 and 1.3. **1.4.1 (patch, same day):** `kafka-users-init` is no longer a super user, only ALTER on CLUSTER (ADR-008 D8). Documentation only, one `topic-defaults.json` description string included. No schema or example change, counts unchanged |
+| 1.5 | The five directories plus **`context-extension/v0` (new)**. **Additive for every document**: optional `pipeline.context` in `channel-spec/v0`, the capability registry, and the loading rules and plugin obligations for the `tributary.context` group (ADR-007 D21-D22). **Runtime behaviour changes** for a channel that omits `context`: it no longer receives installed extensions | Published 2026-09-29, **unverified** (expected `validate.py` 153 / 0; three predicted pairs). Freezes at the wave 2 gate with 1.2-1.4 |
 
 A minor set version is additive by definition: every document valid under 1.0 is valid under 1.1,
-1.2, 1.3 and 1.4.
+1.2, 1.3, 1.4 and 1.5.
 A change that would make a 1.0-valid document invalid is breaking, creates a `v1/` directory and needs
 an ADR.
 

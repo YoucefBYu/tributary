@@ -16,6 +16,7 @@ the API can be down throughout (invariant 3).
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import os
 import signal
@@ -51,7 +52,7 @@ from .errors import (
 )
 from .events import EventEmitter, MessageEvent, NullEmitter
 from .executor import ChannelPlan, PipelineAbort, StepFailure, StepStats, run_splitter
-from .extensions import load_context_extensions
+from .extensions import ContextResolver
 from .logs import JsonLogger
 from .producer import KafkaEventEmitter, KafkaProducerLike, RecordProducer
 from .records import RECORD_UNDECODABLE, ConsumedRecord, quarantine_blob
@@ -389,8 +390,9 @@ class PipelineHandler:
     `out` and `dlq` record it queued has been flushed (or, in a transaction, joined it), so "every child
     and destination produced or dead-lettered" holds before the commit.
 
-    `context_extensions` wrap each branch's `WorkerContext` before its first step (`extensions.py`):
-    that is how a mapping step gets `ctx.fhir` without this package importing `tributary-fhir`.
+    The extensions named by the version's `pipeline.context` wrap each branch's `WorkerContext` before
+    its first step (`extensions.py`): that is how a mapping step gets `ctx.fhir` without this package
+    importing `tributary-fhir`. They are resolved in `prepare`, with the steps.
     """
 
     def __init__(
@@ -410,10 +412,13 @@ class PipelineHandler:
         time_budget_s: float | None = None,
         clock: Callable[[], float] = time.monotonic,
         replies: ReplyPublisher | None = None,
-        context_extensions: Sequence[ContextExtension] = (),
+        context_extensions: Sequence[ContextExtension] | None = None,
+        context_resolver: ContextResolver | None = None,
     ) -> None:
         self._env = env
-        self._extensions = tuple(context_extensions)
+        # L7: an explicit tuple replaces discovery (tests only; nothing in `main` sets it).
+        self._context_override = tuple(context_extensions) if context_extensions is not None else None
+        self._context_resolver = context_resolver if context_resolver is not None else ContextResolver(log=log)
         self._replies = replies
         self._transactional = transactional
         self._warned_version: int | None = None
@@ -442,6 +447,10 @@ class PipelineHandler:
         """Build the plan for `spec` now. At startup this is what makes a bad `with` stop the worker
         before it consumes anything, rather than on the first message."""
         plan = build_plan(spec, resolve=self._resolve, pipeline_override=self._steps_override, stats=self.stats)
+        # `pipeline.context` with the steps, all or nothing (context-extension/v0 L1, L2, L6): only
+        # declared entry points are imported, and a refusal here keeps the previous version running.
+        context = self._context_override if self._context_override is not None else self._context_resolver.resolve(spec)
+        plan = dataclasses.replace(plan, context=context)
         if spec.sync_reply and plan.splitter is not None:
             # Channel-spec 3.2.6 refusal 2, at load because a `ref` splitter is known only now: one
             # request would have N outcomes and there is no aggregator to make them one answer.
@@ -508,7 +517,7 @@ class PipelineHandler:
             attempt=message.attempt,
             traceparent=message.traceparent,
             source_type=spec.source_type,
-            extensions=self._extensions,
+            extensions=plan.context,
             subject=message,
         )
         # A StepFailure here propagates: the loop dead-letters the consumed record (stage transformed)
@@ -979,8 +988,8 @@ class PipelineWorker:
     settings: WorkerSettings
     steps_override: tuple[Node, ...] | None = None
     defaults: TopicDefaults | None = None
-    #: `None` discovers the installed `tributary.context` entry points (`extensions.py`); a tuple, even an
-    #: empty one, replaces discovery (tests).
+    #: `None` resolves each version's `pipeline.context` from the installed `tributary.context` entry
+    #: points (`extensions.py`); a tuple, even an empty one, replaces that (L7, tests only).
     context_extensions: tuple[ContextExtension, ...] | None = None
     log: Logger = field(default_factory=lambda: JsonLogger("worker"))
     loop: ConsumerLoop | None = field(default=None, init=False)
@@ -996,13 +1005,6 @@ class PipelineWorker:
         # Before any client is built: a warning emitted after a failed connection is a warning nobody
         # sees on the run where it matters most.
         emit_profile_warning(self.log, defaults, profile=self.settings.profile)
-        # Before any client too: an extension that cannot load, or breaks attrs, tb-usr-* or reply
-        # delegation, refuses the worker here instead of dead-lettering every message (`extensions.py`).
-        extensions = (
-            self.context_extensions
-            if self.context_extensions is not None
-            else tuple(loaded.extend for loaded in load_context_extensions(log=self.log))
-        )
         # Every client below, the `_tb.<env>.channels` reader first, is built from this one link. Its
         # `engine_kafka_link` line was logged once by `load_engine_kafka_or_exit` in `main`.
 
@@ -1078,10 +1080,11 @@ class PipelineWorker:
             # Sized from the same poll interval the consumer is built with (MEDIUM 2, W2-5 review).
             time_budget_s=handle_budget_s(max_poll_interval_ms(spec), self.settings.flush_timeout_s),
             replies=replies,
-            context_extensions=extensions,
+            context_extensions=self.context_extensions,
         )
-        # Resolve and bind every step now: a bad `with`, or a splitter on a per-key channel, stops the
-        # worker before it consumes anything rather than on the first message (README 3.3, 3.3.2).
+        # Resolve and bind every step, and load the declared context extensions, now: a bad `with`, a
+        # splitter on a per-key channel or an unresolvable `pipeline.context` stops the worker before it
+        # consumes anything rather than on the first message (README 3.3, 3.3.2, 3.3.4).
         handler.prepare(spec)
         self.handler = handler
 

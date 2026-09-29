@@ -9,7 +9,7 @@ approves it.
 | [001](ADR-001-kafka-centric-python-integration-engine.md) | Kafka-centric, Python-native open-source integration engine | Proposed | — |
 | [002](ADR-002-topic-topology-and-envelope.md) | Topic topology and envelope specification | Proposed (skeleton, TODOs pending spikes) | `envelope/v0`, `topics/v0` |
 | [003](ADR-003-ordering-retry-and-dlq.md) | Ordering, retry and DLQ policy | Proposed (skeleton, TODOs pending spikes) | `envelope/v0`, `events/v0` |
-| [007](ADR-007-channel-spec-shape-and-refusals.md) | Channel spec shape and what it refuses | Proposed (W1-1, no invariant changes; amended for sets 1.1 and 1.3) | `channel-spec/v0`, `envelope/v0`, `topics/v0` |
+| [007](ADR-007-channel-spec-shape-and-refusals.md) | Channel spec shape and what it refuses | Proposed (W1-1, no invariant changes; amended for sets 1.1, 1.3 and 1.5) | `channel-spec/v0`, `envelope/v0`, `topics/v0`, `context-extension/v0` |
 | [008](ADR-008-engine-kafka-connection-and-lite-transport-security.md) | Engine Kafka connection and the lite stack's transport security | Proposed (2026-09-29, no invariant changes) | `engine-kafka/v0`, `topics/v0` |
 
 Numbers 004 to 006 stay reserved for the planned ADRs below, so the channel-spec decision took 007

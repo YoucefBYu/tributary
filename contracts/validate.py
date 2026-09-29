@@ -40,6 +40,7 @@ CONTRACTS = Path(__file__).resolve().parent
 
 FILE_CONTRACTS = ("envelope", "events", "channel-spec", "engine-kafka")  # engine-kafka: set 1.3, ADR-008
 TOPIC_MANIFEST = CONTRACTS / "topics/v0/examples/topic-names.json"
+CONTEXT_REGISTRY = CONTRACTS / "context-extension/v0/capabilities.json"  # set 1.5, ADR-007 D21
 
 
 class Failure(NamedTuple):
@@ -110,6 +111,26 @@ def check_runnable_metadata(contract: str, manifest: dict[str, Any]) -> None:
             )
 
 
+def check_context_registry() -> None:
+    """The `pipeline.context` item enum and the context-extension registry must name the same capabilities.
+
+    Two files hold the list on purpose: the schema is what a spec author and the control plane see,
+    the registry is what binds each name to the one distribution allowed to supply it
+    (contracts/context-extension/v0 section 4). Drift between them would let a spec validate against
+    a name the worker then refuses, or leave a registered name undeclarable. Capability names are
+    package metadata, not instance data, so printing them is PHI-safe.
+    """
+    schema = load(CONTRACTS / "channel-spec" / "v0" / "channel.schema.json")
+    declared = set(schema["$defs"]["pipeline"]["properties"]["context"]["items"]["enum"])
+    registered = set(load(CONTEXT_REGISTRY)["capabilities"])
+    if declared != registered:
+        raise SystemExit(
+            "channel-spec pipeline.context enum and context-extension/v0/capabilities.json differ: "
+            f"only in the schema {sorted(declared - registered)}, only in the registry "
+            f"{sorted(registered - declared)}. They must list the same names (context-extension README 4)."
+        )
+
+
 def file_cases(contract: str) -> tuple[Path, list[Case]]:
     manifest_path = CONTRACTS / contract / "v0" / "examples" / "manifest.json"
     manifest = load(manifest_path)
@@ -141,6 +162,7 @@ def topic_cases() -> tuple[Path, list[Case]]:
 
 
 def all_suites() -> Iterator[tuple[Path, list[Case]]]:
+    check_context_registry()
     for contract in FILE_CONTRACTS:
         yield file_cases(contract)
     yield topic_cases()

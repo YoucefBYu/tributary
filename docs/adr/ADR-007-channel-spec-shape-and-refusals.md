@@ -4,7 +4,7 @@
 **Date:** 2026-09-22
 **Deciders:** architect, with the lead and human able to overrule before the wave-1 gate
 **Relates to:** ADR-001 sections 6.1, 6.2, 6.4 · ADR-003 D1-D6 · invariants 1, 3, 4, 5, 6, 7 · gate `phase-0-spikes.md` 7.1 requirements 5, 7, 8, 13
-**Contracts:** `contracts/channel-spec/v0` (new), `contracts/envelope/v0` 2.3-2.4, `contracts/topics/v0` 3.7-3.8
+**Contracts:** `contracts/channel-spec/v0` (new), `contracts/envelope/v0` 2.3-2.4, `contracts/topics/v0` 3.7-3.8; `contracts/context-extension/v0` (new in set 1.5, amendment 3)
 **Evidence:** none of these decisions is a measurement — they are design choices, and the options and costs are written out below. The numeric defaults referenced (3 partitions, `session.timeout.ms` 15000, `commit_every`) come from S4 and S5 via ADR-002; the channel spec only points at them. The schema itself is **verified**: `contracts/validate.py` 96 / 0 and `pytest tests/conformance` 99 passed, 2026-09-22 (section 6, follow-up 1).
 
 ---
@@ -143,6 +143,30 @@ The engine-side Kafka credentials ruling from the same review is ADR-008.
 | D19 | **`nackOn: spec-invalid` stays reserved: schema-valid, refused at startup by every receiver** | (a) require support now; (b) remove from the enum; (c) keep refused and document (chosen) | (a) needs receivers to consume `_tb.<env>.channels` and reload live, which is unscheduled and would also have to define the value's meaning. (b) is breaking. **Cost of (c):** a schema-valid spec that no receiver starts with, which the manifest and README 3.2.8 now say |
 | D20 | **`httpAuth` `oauth2-client-credentials` and `mtls` stay reserved; the exit-criterion-1 example uses `bearer`** | (a) define OAuth2 client credentials now (token URL, client id, scope, caching, refresh); (b) reserve and change the example (chosen) | (a) is a token client with its own TLS, redirect and error rules, refresh concurrency, and a `401` path that must not loop PHI; SMART Backend Services needs `private_key_jwt`, which is key management for ADR-004 and a human. Exit criterion 1 does not need it. **Cost of (b):** EHR FHIR APIs that require OAuth cannot be destinations yet, and bearer tokens rotate only by secret replacement and restart |
 
+## 5c. Amendment 3 — contract set 1.5, context extensions (2026-09-29)
+
+**Decided by the architect. No invariant changes. Additive for every document.** Contract text:
+`contracts/context-extension/v0/README.md` (new), `contracts/channel-spec/v0/README.md` 3.3.4,
+`contracts/CHANGELOG.md` 2026-09-29 (set 1.5).
+
+**Context (evidence).** `fb60f3a` (`platform-engineer`) added the `tributary.context` entry-point group
+so that W2-3 steps get `ctx.fhir` without `tributary-runtime` importing `tributary-fhir`. The worker
+loaded **every** installed registrant into every channel (`extensions.py`, `load_context_extensions`,
+read, not run). `security-reviewer` rated this High: any distribution in the image that registers the
+group, including a transitive or typosquatted one, runs per message with the payload and
+`ctx.secrets`. The `tributary.steps` group, by contrast, is loaded only by names that the reviewed spec
+references (`steps.py:78`). The start-up probe checks attrs, `tb-usr-*`, `vars` and `ReplyContext`
+delegation. It cannot see logging, global state or I/O, so it cannot enforce invariants 6 or 7.
+
+| # | Decision | Options considered | What it gives up |
+|---|---|---|---|
+| D21 | **The channel spec declares the context capabilities it loads (`spec.pipeline.context`), and a contract registry pins each name to one distribution.** The worker imports only declared names and refuses the spec if a name is unregistered, registered more than once, or supplied by another distribution | (a) spec declares, channel-level (chosen, with the registry); (a') spec declares per step; (b) worker deployment config (env var or file), as `engine-kafka/v0` does; (c) both (a) and (b); (d) keep load-all and rely on the probe plus image review | (b) is invisible to the spec reviewer, and it makes "what code ran" depend on deployment rather than on `tb-channel-version`. A worker serves one channel, so (b) would restate the spec per deployment. It adds nothing for invariant 3, which (a) already satisfies because specs come from `_tb.<env>.channels`. (c) adds a second list that can drift, for no threat (a) leaves open. It is additive later if operators need to forbid a capability per site. (a') breaks one shared view per branch (one `ctx.fhir` per message, W2-2 fullUrl stability). (d) is the finding. **Without the registry, (a) alone** still loads a typosquat named `fhir` when the real package is absent. **Cost:** a declared capability is visible to every step on the channel, including destination steps. A third-party capability needs a contract change until ADR-005. A spec that forgets to declare `fhir` dead-letters every message on `AttributeError`, loudly but late (follow-up 14) |
+| D22 | **`tributary.context` is a published contract (`context-extension/v0`)**: factory `() -> ContextExtension`; `Callable[[Context, Message], Context]`, `ReplyContext` preserved; loading rules L1-L7; plugin obligations P1-P7. P1 is partly probe-checked (now including a real `reply` call and `log`/`secrets` identity). **P2-P7 are review-enforced, and the registry is the review gate.** Capabilities do no I/O in set 1.x | (a) leave the group as an implementation detail in `extensions.py`; (b) publish it, with a probe as the only enforcement; (c) publish it, with obligations enforced by the probe where possible and by a registry-gated review elsewhere (chosen) | (a) leaves the second code-loading path of the data plane undocumented, where the `uses` path is documented. (b) overstates the probe, which cannot see a logger, a module global or a socket. **Cost of (c):** most obligations rest on review. A registered package that later breaks P2-P6 is caught only by review or by its own tests. The "no I/O" rule means a terminology server needs an ADR, not a capability |
+
+**Found while ruling:** `tributary-fhir`'s `_Attached` already delegates `log`, `secrets`, `kv` and `vars`
+by returning the base's objects, and `_AttachedReply` forwards `reply` (read, not run). So P1 costs that
+package tests, not code.
+
 ## 6. Follow-ups
 
 1. ~~**Measure the expected-failure pairs.**~~ **DONE 2026-09-22.** `contracts/validate.py` 96 / 0
@@ -165,3 +189,14 @@ The engine-side Kafka credentials ruling from the same review is ADR-008.
 9. **Measure set 1.3** (`qa-engineer`): two channel-spec pairs predicted for D18.
 10. **OAuth2 for `http`/`fhir`** (D20): design with ADR-004, candidate for wave 3.
 11. **Receiver live reload** (D19): lifts `spec-invalid` and must define it. Unscheduled.
+12. **Measure set 1.5** (`qa-engineer`): `validate.py` expected 153 / 0, three predicted channel-spec
+    pairs (D21). `uniqueItems` is the least certain.
+13. **Enforce D21 and D22 in the worker** (`platform-engineer`): L1-L7 of `context-extension/v0`,
+    the stronger probe, and the log lines. This closes the security High on `fb60f3a`. Until it lands,
+    the High is open and every installed registrant still runs in every channel.
+14. **Steps declare the capabilities they need** (optional, proposal welcome from `platform-engineer`):
+    for example `@step(context=("fhir",))`, checked at load against `pipeline.context`. That turns the
+    late `AttributeError` in D21's cost into a refused spec. SDK surface, so it goes through a contract change.
+15. **Image-build check** (optional, `devops-engineer`): fail the build if any installed
+    `tributary.context` registrant is not in `capabilities.json`. The runtime only warns (L5), because
+    it imports nothing undeclared.
