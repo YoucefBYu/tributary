@@ -25,7 +25,8 @@ broker.
 - `kafka-tls-init` writes, at `up`, a dev CA (its key is deleted right after signing; the CA has no
   nameConstraints, acceptable only because nothing can use it afterwards), a broker certificate (SANs `kafka`, `localhost`, `127.0.0.1`) and one random
   SCRAM-SHA-512 user per component (`tb-lite-receiver`, `-worker`, `-loader`, `-channel-publish`,
-  `-topic-bootstrap`, `-admin`, plus an ACL-less `-healthcheck`) into the `kafka-secrets` volume. Nothing is committed, baked into an
+  `-topic-bootstrap`, `-admin`) password, plus client certificates for the broker, the healthcheck and
+  `kafka-users-init`, into the `kafka-secrets` volume. Nothing is committed, baked into an
   image or printed. It is idempotent: valid credentials are kept, and regenerated (and the broker's
   storage reformatted to match) when they have under 7 days left or the script changed. Reset
   everything with `docker compose down -v`.
