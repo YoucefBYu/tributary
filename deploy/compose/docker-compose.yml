@@ -293,7 +293,10 @@ services:
       args:
         TB_PACKAGE: tributary-receivers
     container_name: tb-mllp-receiver
-    restart: "no"
+    # unless-stopped, not "no": on a restart-only spec change (port, bind, TLS presence) the receiver
+    # drains and exits 0 and expects its supervisor to start it again. (A config refusal, exit 2, also
+    # restarts, with Docker's back-off: visible in `docker compose ps`, never silent.)
+    restart: unless-stopped
     depends_on:
       kafka:
         condition: service_healthy
@@ -301,7 +304,10 @@ services:
         condition: service_completed_successfully
     command:
       - tributary.receivers.mllp
-      - --channel-spec=/generated/channel.json
+      # The spec comes from _tb.dev.channels (invariant 3), not a file: --channel-spec is retired.
+      # channel-publish still runs first (depends_on below); the receiver also waits, not ready,
+      # until a spec arrives, so the order is a courtesy, not a requirement.
+      - --channel=adt-passthrough
       - --env=dev
     environment:
       TB_ENGINE_KAFKA_FILE: /etc/tributary/engine-kafka.json
@@ -311,7 +317,6 @@ services:
       TB_CONTRACTS_DIR: /contracts
       TB_PROFILE: lite
     volumes:
-      - channel-spec-published:/generated:ro
       - ../../contracts:/contracts:ro
       - ./engine-kafka/receiver.json:/etc/tributary/engine-kafka.json:ro
       - type: volume
