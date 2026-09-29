@@ -3,19 +3,23 @@
 record twice -- the second as a genuine redelivery from an uncommitted offset, not a second call in the
 same process -- and assert what the sink holds."*
 
-One step-built ADT transaction Bundle (the golden output in `tests/fixtures/fhir/`) is published once to
-`out.<dest>` and delivered through the real `python -m tributary.loaders.fhir` entry point to a **real
-HAPI FHIR server** (`hapiproject/hapi`, testcontainers).
+**The fault, and why it is genuine.** One step-built ADT transaction Bundle (the golden output in
+`tests/fixtures/fhir/`) is published once to `out.<dest>`. The real `python -m tributary.loaders.fhir`
+process delivers it to a **real HAPI FHIR server** (`hapiproject/hapi`, testcontainers), through a small
+transparent forwarding proxy that only records what passes (the loader refuses plaintext `http://` to a
+non-loopback host, and the container may not be on loopback). HAPI applies the transaction. The test then
+**SIGKILLs the loader before it commits its Kafka offset** (`commit_every` is 50, so a single record is
+only committed at a graceful stop): the sink applied the write, the source offset did not move, which is
+the at-least-once crash window in its purest form. A second loader process, same static instance id,
+resumes from the uncommitted offset and receives the *same record* again. This replaces an earlier
+version that dropped the first response and relied on the loader's in-process blocking retry, which
+is a second call in the same process and does not meet README 5.1.
 
-**The fault, and why it is genuine and hard.** The loader talks to HAPI through a small forwarding proxy
-in this test. For the first attempt the proxy forwards the request to HAPI, lets HAPI apply the
-transaction, then throws the response away and cuts the connection. HAPI has therefore *committed the
-Patient and the Encounter* while the loader saw only a dropped connection (retryable `CONNECT_FAILED`),
-did not commit its Kafka offset, and enters `ConsumerLoop`'s blocking retry. This is the worst duplicate
-case there is (the sink applied it, the sender never learned). The retry delay is long enough that the
-test observes HAPI holding the resources *before* the redelivery, then the proxy passes the second attempt
-through. The assertion is that HAPI still holds exactly one Patient and one Encounter, and that the source
-offset is committed only after that confirmed delivery.
+The assertions: HAPI held exactly one Patient and one Encounter and the group's committed offset was still
+0 when the first loader died (the fault fired); the replayed delivery reached HAPI as an identical second
+request and the second loader absorbed it as a duplicate (its own `delivery_duplicate` counter, which is
+"the server created nothing", not an inference from the resource counts); HAPI still holds exactly one
+of each; and the offset is committed only after that confirmed delivery.
 
 **Broken-implementation control.** `test_the_same_replay_with_unconditional_posts_would_duplicate`
 replays the same shape with a Bundle whose entries are plain `POST`s (what README 3.4.2 forbids) and shows
@@ -24,9 +28,7 @@ HAPI ends up with two Patients, so "exactly one" above is not something HAPI doe
 
 from __future__ import annotations
 
-import contextlib
 import json
-import socket
 import threading
 import time
 import urllib.error
@@ -48,7 +50,7 @@ from tributary.sdk.testing import make_message
 from tests.support.channel_spec import walking_skeleton_document
 from tests.support.chaos_assertions import assert_fault_fired
 from tests.support.kafka_helpers import await_broker, free_port, publish_messages
-from tests.support.processes import spawn_fhir_loader
+from tests.support.processes import ManagedProcess, spawn_fhir_loader
 
 pytestmark = pytest.mark.integration
 
@@ -58,26 +60,24 @@ DESTINATION = "fhir-server"
 PARTITIONS = 3
 GOLDEN = Path(__file__).resolve().parents[1] / "fixtures" / "fhir" / "adt_a01_admit.bundle.json"
 HAPI_IMAGE = "hapiproject/hapi:v7.4.0"
-RETRY_DELAY_MS = 4000
+INSTANCE = "loader-fhir-replay"  # static membership: the second process resumes the first one's partitions
 RETRY_OVERRIDE = {
     "policy": "blocking",
     "backoff": "fixed",
-    "initialDelayMs": RETRY_DELAY_MS,
-    "maxDelayMs": RETRY_DELAY_MS,
+    "initialDelayMs": 500,
+    "maxDelayMs": 500,
     "maxAttempts": 10,
     "onExhaust": "halt-partition",
 }
 _NO_PROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
-class DroppingProxy:
-    """Forwards to `upstream`; for the first `drop_first_n` requests it forwards, waits for the answer,
-    then cuts the client connection without relaying it (the sink applied the write, the sender never
-    learned). Bounded everywhere: every upstream call has a timeout, and it serves on a daemon thread."""
+class ForwardingProxy:
+    """Forwards every POST to `upstream` and relays the answer unchanged, recording the request bodies.
+    Bounded everywhere: every upstream call has a timeout, and it serves on a daemon thread."""
 
-    def __init__(self, upstream: str, *, drop_first_n: int) -> None:
+    def __init__(self, upstream: str) -> None:
         self.bodies: list[bytes] = []
-        self.dropped = 0
         self.passed = 0
         outer = self
 
@@ -96,25 +96,21 @@ class DroppingProxy:
                         status, payload = resp.status, resp.read()
                 except urllib.error.HTTPError as exc:
                     status, payload = exc.code, exc.read()
-                if outer.dropped < drop_first_n:
-                    outer.dropped += 1
-                    self.close_connection = True
-                    with contextlib.suppress(OSError):
-                        self.request.shutdown(socket.SHUT_RDWR)
-                    self.request.close()
+                try:
+                    self.send_response(status)
+                    self.send_header("Content-Type", "application/fhir+json")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                except OSError:  # the loader was SIGKILLed while HAPI was answering
                     return
                 outer.passed += 1
-                self.send_response(status)
-                self.send_header("Content-Type", "application/fhir+json")
-                self.send_header("Content-Length", str(len(payload)))
-                self.end_headers()
-                self.wfile.write(payload)
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.port = int(self.server.server_address[1])
         self._thread = threading.Thread(target=self.server.serve_forever, daemon=True)
 
-    def __enter__(self) -> DroppingProxy:
+    def __enter__(self) -> ForwardingProxy:
         self._thread.start()
         return self
 
@@ -209,7 +205,10 @@ def _deploy(topics: str, proxy_port: int, *, version: int) -> None:
 
 def _count(base: str, query: str) -> int:
     url = f"{base}/{urllib.parse.quote(query, safe='?=&:/')}&_summary=count"
-    with _NO_PROXY.open(url, timeout=30) as resp:
+    # HAPI reuses a cached search result for 60 s by default, so a poll would keep reading the first (empty)
+    # answer; `no-cache` makes every count a fresh search.
+    request = urllib.request.Request(url, headers={"Cache-Control": "no-cache"})  # noqa: S310
+    with _NO_PROXY.open(request, timeout=30) as resp:
         return int(json.loads(resp.read())["total"])
 
 
@@ -229,14 +228,18 @@ def _committed_total(bootstrap: str) -> int:
         consumer.close()
 
 
-def test_a_dropped_response_after_hapi_applied_the_write_redelivers_and_leaves_exactly_one_of_each(
+def _spawn(topics: str) -> ManagedProcess:
+    return spawn_fhir_loader(channel=CHANNEL, destination=DESTINATION, env=ENV, bootstrap=topics, instance_id=INSTANCE)
+
+
+def test_a_loader_killed_after_hapi_applied_the_bundle_and_before_the_commit_replays_into_one_of_each(
     topics: str, hapi: str
 ) -> None:
     mrn = f"RDL{uuid.uuid4().hex[:10]}"
     patient_q = f"Patient?identifier=urn:id:SYNTH-HOSPITAL|{mrn}"
     encounter_q = f"Encounter?identifier=https://tributary.dev/fhir/identifier/tb-msg-id|synth-{mrn}:encounter"
 
-    with DroppingProxy(hapi, drop_first_n=1) as proxy:
+    with ForwardingProxy(hapi) as proxy:
         _deploy(topics, proxy.port, version=1)
         message = make_message(
             _golden(mrn),
@@ -245,46 +248,51 @@ def test_a_dropped_response_after_hapi_applied_the_write_redelivers_and_leaves_e
             destination=DESTINATION,
             content_type="application/fhir+json",
         )
-        published_ids = publish_messages(topics, out_topic(ENV, CHANNEL, DESTINATION), [message])
-        assert len(published_ids) == 1
+        assert len(publish_messages(topics, out_topic(ENV, CHANNEL, DESTINATION), [message])) == 1
 
-        loader = spawn_fhir_loader(channel=CHANNEL, destination=DESTINATION, env=ENV, bootstrap=topics)
+        first = _spawn(topics)
         try:
-            paused = loader.wait_for_event("partition_paused", timeout_s=60.0)
-            applied_before_redelivery = (_count(hapi, patient_q), _count(hapi, encounter_q))
-            passed_before_redelivery = proxy.passed
-            committed_during_fault = _committed_total(topics)
-            assert_fault_fired(
-                proxy.dropped == 1
-                and paused.get("error_code") == "CONNECT_FAILED"
-                and paused.get("retryable", True) is not False
-                and applied_before_redelivery == (1, 1)
-                and passed_before_redelivery == 0
-                and committed_during_fault == 0,
-                description=(
-                    "expected HAPI to hold the resources while the loader saw only a dropped connection, "
-                    f"got dropped={proxy.dropped} paused={paused!r} applied={applied_before_redelivery}"
-                ),
-            )
-
             deadline = time.monotonic() + 60.0
-            while time.monotonic() < deadline and proxy.passed < 1:
+            while time.monotonic() < deadline and _count(hapi, patient_q) < 1:
                 time.sleep(0.2)
-            assert_fault_fired(proxy.passed == 1, description="the redelivery never reached HAPI")
-
         finally:
-            loader.terminate_and_wait()  # commit_every is 50: the single record is committed on the graceful stop
+            first.kill_and_wait()  # SIGKILL: no graceful commit
+        applied_at_kill = (_count(hapi, patient_q), _count(hapi, encounter_q))
+        committed_after_kill = _committed_total(topics)
+        assert_fault_fired(
+            applied_at_kill == (1, 1) and committed_after_kill == 0 and len(proxy.bodies) >= 1,
+            description=(
+                "expected HAPI to hold the resources and the offset to be uncommitted when the loader died, "
+                f"got applied={applied_at_kill} committed={committed_after_kill}"
+            ),
+        )
+        requests_before_replay = len(proxy.bodies)
+
+        second = _spawn(topics)
+        try:
+            second.wait_for_event("partitions_assigned", timeout_s=60.0)
+            deadline = time.monotonic() + 60.0
+            while time.monotonic() < deadline and len(proxy.bodies) <= requests_before_replay:
+                time.sleep(0.2)
+            while time.monotonic() < deadline and proxy.passed < requests_before_replay + 1:
+                time.sleep(0.2)  # HAPI's answer relayed: the loader now has the confirmation to commit on
+            assert_fault_fired(len(proxy.bodies) > requests_before_replay, description="the replay never reached HAPI")
+        finally:
+            second.terminate_and_wait()  # commit_every is 50: the record is committed on the graceful stop
+        second.collect_pending()
+        exits = [line for line in second.lines if line.get("event") == "loader_exit"]
+        metrics = exits[-1]["delivery_metrics"] if exits else {}
         committed = _committed_total(topics)
 
-    assert len(proxy.bodies) == 2 and proxy.bodies[0] == proxy.bodies[1] == message.payload, (
-        "both attempts must carry the identical original Bundle: a replay of the same offset"
+    assert_fault_fired(
+        metrics.get("delivery_duplicate") == 1,
+        description=f"the replay was not absorbed as a duplicate by the second loader: {metrics!r}",
     )
+    assert proxy.bodies[0] == proxy.bodies[-1] == message.payload, "the replay carries the identical original Bundle"
     patients, encounters = _count(hapi, patient_q), _count(hapi, encounter_q)
     assert (patients, encounters) == (1, 1), "a redelivered Bundle must converge on one Patient and one Encounter"
     assert committed == 1, "the source offset must be committed only after HAPI's confirmed answer"
-    print(
-        f"fhir loader genuine-redelivery: 1 published, {proxy.dropped + proxy.passed} attempts, {patients} Patient(s) held"
-    )
+    print(f"fhir loader genuine-redelivery: 1 published, {len(proxy.bodies)} requests, {patients} Patient(s) held")
 
 
 def test_the_same_replay_with_unconditional_posts_would_duplicate(hapi: str) -> None:
