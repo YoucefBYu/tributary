@@ -131,6 +131,18 @@ evidence from real senders.
 only (ADR-001 2.3). The PostgreSQL loader uses `asyncpg` (Apache-2.0). `psycopg` 3 (LGPL-3.0), which
 CLAUDE.md names for the control plane, is a separate human decision for wave 3.
 
+## 5b. Amendment 2 — contract set 1.3, W2-6/W2-7 rulings (2026-09-29)
+
+**Decided by the architect. No invariant changes; all additive.** Contract text:
+`contracts/channel-spec/v0/README.md` 3.2.7, 3.2.8, 3.4.1, 3.4.2; `contracts/CHANGELOG.md` 2026-09-29.
+The engine-side Kafka credentials ruling from the same review is ADR-008.
+
+| # | Decision | Options considered | What it gives up |
+|---|---|---|---|
+| D18 | **`tls.allowedClientSans`: an optional allow-list of typed client-certificate SANs** (`dns:`, `uri:`; exact; no wildcard; only with `clientAuth: required`; `mllp` and `http`), checked after the handshake and before any application byte | (a) reject: tell operators to use a per-channel CA; (b) `allowedSubjects` as proposed, exact subject or SAN strings; (c) typed SANs only (chosen); (d) make a list required with `clientAuth: required` | (a) is right in principle and rarely done in hospitals, where one enterprise CA issues everything. (b) matches DN strings, which have no canonical form, so the check passes or fails on formatting. (d) is breaking. **Cost of (c):** senders whose certificates carry only a CN (legacy) cannot be listed and must be reissued or kept on a dedicated CA; email and IP SANs are not listable in set 1.3 |
+| D19 | **`nackOn: spec-invalid` stays reserved: schema-valid, refused at startup by every receiver** | (a) require support now; (b) remove from the enum; (c) keep refused and document (chosen) | (a) needs receivers to consume `_tb.<env>.channels` and reload live, which is unscheduled and would also have to define the value's meaning. (b) is breaking. **Cost of (c):** a schema-valid spec that no receiver starts with, which the manifest and README 3.2.8 now say |
+| D20 | **`httpAuth` `oauth2-client-credentials` and `mtls` stay reserved; the exit-criterion-1 example uses `bearer`** | (a) define OAuth2 client credentials now (token URL, client id, scope, caching, refresh); (b) reserve and change the example (chosen) | (a) is a token client with its own TLS, redirect and error rules, refresh concurrency, and a `401` path that must not loop PHI; SMART Backend Services needs `private_key_jwt`, which is key management for ADR-004 and a human. Exit criterion 1 does not need it. **Cost of (b):** EHR FHIR APIs that require OAuth cannot be destinations yet, and bearer tokens rotate only by secret replacement and restart |
+
 ## 6. Follow-ups
 
 1. ~~**Measure the expected-failure pairs.**~~ **DONE 2026-09-22.** `contracts/validate.py` 96 / 0
@@ -150,3 +162,6 @@ CLAUDE.md names for the control plane, is a separate human decision for wave 3.
    matched with 0 mismatches, `pytest tests/conformance` 127 passed.
 8. ~~**SFTP client licence**~~ — `paramiko` human-approved 2026-09-24 (ADR-001 2.3).
    `psycopg` for the wave 3 control plane — still a human decision.
+9. **Measure set 1.3** (`qa-engineer`): two channel-spec pairs predicted for D18.
+10. **OAuth2 for `http`/`fhir`** (D20): design with ADR-004, candidate for wave 3.
+11. **Receiver live reload** (D19): lifts `spec-invalid` and must define it. Unscheduled.

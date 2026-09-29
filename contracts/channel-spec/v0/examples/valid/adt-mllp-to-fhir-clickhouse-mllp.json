@@ -35,7 +35,7 @@
           "fhirVersion": "4.0.1",
           "interaction": "transaction",
           "timeoutMs": 8000,
-          "auth": { "type": "oauth2-client-credentials", "secretRef": "fhir-oauth" },
+          "auth": { "type": "bearer", "secretRef": "fhir-token" },
           "circuitBreaker": { "failureThreshold": 10, "openSeconds": 30 }
         },
         "idempotency": {

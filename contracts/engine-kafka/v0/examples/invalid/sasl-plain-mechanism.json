@@ -1,0 +1,10 @@
+{
+  "apiVersion": "tributary.dev/v1",
+  "kind": "EngineKafkaConnection",
+  "bootstrapServers": ["kafka-0.kafka-brokers.tributary.svc:9093"],
+  "security": {
+    "protocol": "SASL_SSL",
+    "saslMechanism": "PLAIN",
+    "secretRef": "tb-loader-adt-to-fhir-fhir-server"
+  }
+}

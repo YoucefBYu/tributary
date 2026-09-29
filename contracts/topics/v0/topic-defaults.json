@@ -173,7 +173,8 @@
       "sasl.mechanism": "SCRAM-SHA-512 or OAUTHBEARER. Never PLAIN on a listener without TLS.",
       "ssl.endpoint.identification.algorithm": "https",
       "ssl.endpoint.identification.algorithm_note": "Leave hostname verification enabled. Disabling it is the single most common way a TLS Kafka deployment silently accepts a man-in-the-middle.",
-      "credentials": "TODO deployment-specific, resolved from a secretRef or a secrets manager. Never in a channel spec, a Compose file or an image."
+      "credentials": "Set 1.3 (ADR-008): every data-plane process reads one contracts/engine-kafka/v0 document named by TB_ENGINE_KAFKA_FILE (bootstrap servers, protocol, secretRef names), and resolves the secretRefs from local files under TB_SECRETS_DIR at start. The principal names are deployment-specific and ADR-004's. Never in a channel spec, a Compose file or an image; the Compose lite stack generates per-component SCRAM users at `up`.",
+      "plaintext": "Loopback brokers only (127.0.0.0/8, [::1], localhost), enforced by every data-plane role, with no opt-out flag or profile. A container network is not loopback. engine-kafka/v0 section 4."
     },
     "encryption_at_rest": {
       "required": true,

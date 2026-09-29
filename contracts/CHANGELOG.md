@@ -3,6 +3,85 @@
 Newest first. Each entry names the contract, the version, whether the change is additive or
 breaking, and the reason. Breaking changes reference an ADR.
 
+## 2026-09-29 — contract set 1.3: engine Kafka credentials, mTLS client allow-list, W2-6 loader codes
+
+**Additive throughout; no invariant changes.** Every document valid under set 1.2 stays valid. One valid
+channel-spec example changes content without changing validity (`auth` → `bearer`), and two gain
+manifest `requires` entries (below). Sources: the W2-7
+security review HIGH (receivers produced to `raw` over PLAINTEXT, unauthenticated), fixed for
+receivers in `e3ddee1` by `connector-engineer`, whose handoff asked for rulings 1-4; the lead's W2-6
+items 5-7. Decisions and what they give up: **ADR-008** (D1-D5) and **ADR-007 D18-D20**.
+
+| # | Question | Ruling and why |
+|---|---|---|
+| 1 | Where engine-side Kafka credentials come from, for every data-plane role | **New contract `engine-kafka/v0`**: one JSON document per process, named by `TB_ENGINE_KAFKA_FILE`, holding `bootstrapServers` and the channel-spec `kafkaSecurity` shape tightened (SSL must carry a client certificate), with secrets by `secretRef` from local files under `TB_SECRETS_DIR` (invariant 3). Same for receivers, workers, loaders and the archiver. `--bootstrap`, `--engine-security` and `TB_BOOTSTRAP_SERVERS` are retired. **Workers and loaders enforce the same rules as `e3ddee1`**, from one implementation in `tributary-runtime`: PLAINTEXT only to loopback brokers with no opt-out, verified TLS with the AEAD pin, credentials present, and no property passthrough. Rejected: per-role CLI flags (every role parses differently; this is how the gap arose), env vars carrying values (visible in `docker inspect` and `/proc`), fetching from the control plane (invariant 3). ADR-008 D1-D3 |
+| 1a | Found while ruling: `KafkaSettings.security` is merged **after** the contract's producer defaults | **Defect, invariant 1.** `producer_config` builds `{..., **defaults.producer, **settings.security}`, so a security map carrying `acks` or `enable.idempotence` silently overrides them. `engine-kafka/v0` section 4 rule 4: only `security.protocol`, `sasl.*`, `ssl.*` and `enable.ssl.certificate.verification` are accepted, and contract values win. ADR-008 D4 |
+| 2 | Compose lite stack: SASL_SSL, or a dev-only PLAINTEXT opt-out | **SASL_SSL, no opt-out.** A dev CA, broker certificate and per-component SCRAM users generated at `up`; deny-by-default ACLs applied from `topic-defaults.json`. `engine-kafka/v0` section 6. Rejected: an opt-out flag, because no component can tell a Compose network from a production network (both are non-loopback) and lite is also allowed for small sites that carry PHI (`topics/v0` 3.1); a shared network namespace (`network_mode: service:kafka`), which makes "loopback" literally true but leaves TLS, SCRAM and the ACL model unexercised until Helm. ADR-008 D5 |
+| 3 | `tls.allowedSubjects` for the HTTP receiver | **Approved with amendments** as `tls.allowedClientSans`: typed `dns:`/`uri:` SAN entries only, exact match, no wildcard, 1-32 entries, only with `clientAuth: required`, on `mllp` as well as `http`. Checked after the handshake and before any application byte is read; `403` + close on `http`, close on `mllp`; code `TLS_PEER_NOT_ALLOWED`; the log carries the certificate fingerprint, never its names. Rejected: subject DN strings (no canonical form, so the control's result depends on formatting) and CN. Optional, because requiring it would be breaking. README 3.2.7, ADR-007 D18 |
+| 4 | `nackOn: spec-invalid` refused on HTTP and MLLP | **Keep the refusal, on all four source types, documented as reserved.** Nothing detects the condition: receivers do not watch `_tb.<env>.channels`. Stays in the enum (removing it is breaking). Lifts with receiver live reload, which must also define what it means. README 3.2.8, ADR-007 D19 |
+| 5 | `oauth2-client-credentials` in the exit-criterion-1 example | **Not defined in set 1.3.** The example's `fhir` destination now uses `bearer`; `oauth2-client-credentials` and `mtls` are documented as reserved and refused at startup by the `http` and `fhir` loaders. Defining OAuth means a token-endpoint client, caching and refresh rules, and for SMART Backend Services `private_key_jwt`, which is key management (ADR-004 and a human). Exit criterion 1 targets HAPI and does not need it. README 3.4.1, ADR-007 D20 |
+| 6 | Error codes `FHIR_ENTRY_FAILED`, `FHIR_RESPONSE_INVALID`, `S3_KEY_CONFLICT`, `SFTP_NAME_CONFLICT` | **Registered**, all under prefixes already reserved (`FHIR_`, `S3_`, `SFTP_`). **Extended to every fixed name the loaders emit** (rule 2 had not been applied since set 1.1): `HTTP_REDIRECT_REFUSED`, `FHIR_BUNDLE_INVALID`, `CH_UNKNOWN`, `SSH_HOST_KEY_MISMATCH`, `SSH_AUTH_FAILED`, `S3_KEY_VANISHED`, `S3_NO_CREDENTIALS`, `S3_UNKNOWN`, `MLLP_AE`, `MLLP_AR`, `MLLP_TIMEOUT`, `MLLP_NO_ACK`, plus `TLS_PEER_NOT_ALLOWED`: seventeen. New rule: a minted `S3_<CODE>` equal to a fixed name becomes `S3_UNKNOWN`. `HTTP_<status>` confirmed for non-2xx. envelope README 2.3.2 |
+| 7 | README 3.0 status: `fhir`, `sftp`, `s3` loaders | **Moved to Built.** Each has a 5.1 redelivery test in `tests/integration/`; "Implemented" waits for `qa-engineer` to confirm them green in CI. **`s3` carries two open licence questions the lead has taken to the human** (botocore's bundled `cacert.pem`, MPL-2.0 data; MinIO, AGPL-3.0, test-only). Not ruled here. Manifest `connector:destination/{fhir,sftp,s3}` entries removed |
+
+### `tributary.engine-kafka/v0` (new)
+
+`engine-kafka.schema.json`, README, and 11 examples (4 valid, 7 invalid). `contracts/validate.py`
+gains `engine-kafka` in `FILE_CONTRACTS`. **Predicted, unmeasured** pairs:
+
+| Example | Pinned pair |
+|---|---|
+| `plaintext-compose-service-name` | `$.bootstrapServers[0]` / `pattern` |
+| `ssl-without-client-certificate` | `$.security` / `required` |
+| `sasl-plain-mechanism` | `$.security.saslMechanism` / `enum` |
+| `inline-password` | `$.security` / `additionalProperties` |
+| `tls-verification-disabled` | `$.security.tls` / `additionalProperties` |
+| `librdkafka-passthrough` | `$` / `additionalProperties` (first root-level pair; least certain) |
+| `plaintext-with-credentials` | `$.security` / `not` |
+
+### `tributary.channel-spec/v0`
+
+Schema: `$defs/tls.allowedClientSans` with an `allOf` tying it to `clientAuth: required`; new
+`$defs/clientSan`; `kafkaSecurity.secretRef` comment corrected (the client certificate is under
+`security.secretRef`, not `tls.secretRef`, as both implementations already read it; no validation
+change). README: status line, 1 (model snippet now `bearer`), 2, 3.0, 3.2, 3.2.5, new 3.2.7 and 3.2.8,
+3.4 family table, 3.4.1, 3.4.2. Examples: new `valid/http-mtls-allowed-client-sans.json`
+(`runnable: false`); `valid/adt-mllp-to-fhir-clickhouse-mllp.json` `auth` → `bearer`;
+manifest `requires` added to `adt-to-fhir-per-key-mtls` (oauth2) and `two-destinations-fanout`
+(`spec-invalid`). Two invalid examples, **predicted, unmeasured**:
+
+| Example | Pinned pair |
+|---|---|
+| `source-tls-allowed-sans-without-client-auth` | `$.spec.source.tls.clientAuth` / `const` |
+| `source-tls-allowed-san-wildcard` | `$.spec.source.tls.allowedClientSans[0]` / `pattern` |
+
+### `tributary.envelope/v0`
+
+`error-codes.json` set 1.3: seventeen codes, three prefix owner notes. README 2.3.2.
+
+### `tributary.topics/v0`
+
+README 3.4: where engine credentials come from, and what "loopback" means (a container network is
+not). `topic-defaults.json` `security.clients.credentials` (was `TODO`) and a new
+`security.clients.plaintext` note. No value that `must_not_hardcode` lists changed.
+
+### Change requests that follow
+
+- **Must land with this contract commit or immediately after** (`platform-engineer`, owner of
+  `tributary-sdk`): the seventeen codes in `ENGINE_CODES`, or the registry cross-check goes red.
+- The rest are in STATUS.md (2026-09-29) and ADR-008 section 6, per owner.
+
+### Verification owed
+
+Not run by the architect, who has no shell.
+
+- `uv run --no-project --python 3.12 --with jsonschema python contracts/validate.py`: expected
+  **148 / 0** (134 + 14). If set 1.2's 134 was never confirmed, 148 depends on it.
+- `validate.py --emit-expectations`: **needed** for the nine new pairs.
+- `pytest tests/conformance`: `qa-engineer` adds an `engine-kafka` suite; channel-spec gains 3 cases.
+- `uv run pytest packages/tributary-sdk` once `ENGINE_CODES` is updated.
+- The runtime corpus test: `http-mtls-allowed-client-sans.json` must stay unresolved (it names `ref`
+  steps); the three examples whose `connector:` entries were removed still have unresolved entries.
+
 ## 2026-09-28 — contract set 1.2: synchronous reply mode (W2-8)
 
 **Additive throughout.** Every document valid under set 1.1 stays valid, including the set 1.0 reply

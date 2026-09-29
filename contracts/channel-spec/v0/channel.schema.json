@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://tributary.dev/contracts/channel-spec/v0/channel.schema.json",
   "title": "Tributary channel spec, v0",
-  "description": "One deployed channel: source, pipeline steps, destinations, ordering and retry. Authored as YAML in a bundle and published as JSON on the compacted _tb.<env>.channels topic. See README.md. Producers (CLI, control plane) validate strictly; the runtime must ignore unknown fields rather than refusing to start (invariant 3). Contract set 1.1 (2026-09-24) added the wave 2 connector types, and set 1.2 (2026-09-28) the optional source.reply block for synchronous reply mode; every change since set 1.0 is additive and is listed in contracts/CHANGELOG.md.",
+  "description": "One deployed channel: source, pipeline steps, destinations, ordering and retry. Authored as YAML in a bundle and published as JSON on the compacted _tb.<env>.channels topic. See README.md. Producers (CLI, control plane) validate strictly; the runtime must ignore unknown fields rather than refusing to start (invariant 3). Contract set 1.1 (2026-09-24) added the wave 2 connector types, set 1.2 (2026-09-28) the optional source.reply block for synchronous reply mode, and set 1.3 (2026-09-29) the optional tls.allowedClientSans; every change since set 1.0 is additive and is listed in contracts/CHANGELOG.md.",
   "type": "object",
   "required": ["apiVersion", "kind", "metadata", "spec"],
   "additionalProperties": false,
@@ -266,8 +266,29 @@
           "enum": ["none", "required"],
           "$comment": "Required to be stated, with no default. Phase 1 requirement 8 asks for mTLS on receivers; a default would be the setting everyone inherits and nobody reviews. 'required' means the sender presents a client certificate that chains to the trust bundle in secretRef."
         },
-        "minVersion": { "enum": ["1.2", "1.3"] }
-      }
+        "minVersion": { "enum": ["1.2", "1.3"] },
+        "allowedClientSans": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/clientSan" },
+          "$comment": "Set 1.3 (ADR-007 D18). Optional allow-list of client-certificate subjectAltName entries, checked after the handshake and before any application byte is read: the leaf certificate must carry at least one listed entry, compared exactly. Absent means any certificate that chains to the trust bundle in secretRef, which is every certificate that CA ever issued. Subject DN and CN matching are deliberately not offered (README 3.2.7). Only with clientAuth: required."
+        }
+      },
+      "allOf": [
+        {
+          "$comment": "An allow-list of client certificate names means nothing unless the listener demands a certificate.",
+          "if": { "required": ["allowedClientSans"] },
+          "then": { "properties": { "clientAuth": { "const": "required" } } }
+        }
+      ]
+    },
+    "clientSan": {
+      "type": "string",
+      "maxLength": 300,
+      "pattern": "^(dns:[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?|uri:[a-z][a-z0-9+.-]{0,31}:[A-Za-z0-9._~:/@%+-]{1,256})$",
+      "$comment": "Set 1.3. A typed subjectAltName: 'dns:' plus a lower-case DNS name (compared case-insensitively, so the spec must be lower-case), or 'uri:' plus a URI such as a SPIFFE ID (compared byte for byte). No wildcard: '*' cannot be written, so a wildcard certificate never matches. No email or IP types in set 1.3: an email SAN is personal data, and an address is not an identity; either can be added later, additively."
     },
     "clientTls": {
       "type": "object",
@@ -483,7 +504,7 @@
         "saslMechanism": { "enum": ["SCRAM-SHA-512"] },
         "secretRef": {
           "$ref": "#/$defs/secretRef",
-          "$comment": "SASL credentials. The TLS trust bundle and any client certificate are tls.secretRef."
+          "$comment": "The client's identity: keys username and password for SASL_SSL, or tls.crt and tls.key (a client certificate, mTLS) for SSL. tls.secretRef is the trust bundle (ca.crt) only. Corrected in set 1.3 to match both implementations and engine-kafka/v0 section 3; set 1.0-1.2 text put the client certificate under tls.secretRef. No validation change."
         },
         "tls": { "$ref": "#/$defs/clientTls" }
       },

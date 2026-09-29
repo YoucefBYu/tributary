@@ -246,7 +246,7 @@ an ordinary `dlq` record — which is exactly what normalising is for. It is a c
 test per placeholder, in the same category as the rules in 5.2.1 and in the channel-spec contract's
 section 6.
 
-### 2.3.2 Engine error-code registry (set 1.1, 2026-09-25; `REPLY_` added in set 1.2)
+### 2.3.2 Engine error-code registry (set 1.1, 2026-09-25; `REPLY_` added in set 1.2; loader fixed names in set 1.3)
 
 **Machine-readable:** [`error-codes.json`](error-codes.json). This section is its rationale; the file
 is the list.
@@ -306,6 +306,19 @@ They are registered anyway, because integrators and alert rules key on them and 
 must not be able to borrow them. Two are worker codes: `REPLY_BODY_MISSING` on a `failed` reply record
 and its event, and `REPLY_ROUTE_INVALID` on a `replied` event only (2.3.3). A failed reply produce
 reuses `PRODUCE_FAILED` with stage `replied`. Channel-spec README 3.2.6 has the full answer table.
+
+**Set 1.3 (2026-09-29): seventeen fixed names registered, no prefix added.** Rule 2 had not been
+applied to the loaders: `HTTP_REDIRECT_REFUSED`, `FHIR_BUNDLE_INVALID`, the two `SSH_` codes and the
+four `MLLP_` codes were named in channel-spec README 3.4 from set 1.1 and never listed here. Added with
+them are the wave 2 loaders' new fixed names (`FHIR_ENTRY_FAILED`, `FHIR_RESPONSE_INVALID`,
+`CH_UNKNOWN`, `SFTP_NAME_CONFLICT`, and the four fixed `S3_` names) and the receivers'
+`TLS_PEER_NOT_ALLOWED` (log and metrics only, never a header or event; channel-spec README 3.2.7). One
+new rule: **a code minted at run time that equals a registered fixed name is not emitted as that name.**
+Only `S3_` can collide today, because it upper-snake-cases a code the store chooses: a store answering
+`KeyConflict` would otherwise read as the loader's own idempotency conflict. It becomes `S3_UNKNOWN`.
+The numeric families (`HTTP_<status>`, `SFTP_<status>`, `CH_<code>`) and `PG_<class>` cannot collide.
+Behaviour of `Reject` does not change: every new name was already under a reserved prefix. Only the
+cross-check test moves, so `ENGINE_CODES` gains all seventeen in the same commit.
 
 ### 2.3.3 Reply-routing headers: a parse failure disables the reply, not the message (set 1.2)
 

@@ -4,8 +4,9 @@
 **Status:** Frozen at the Phase 1 wave 1 gate as part of contract set 1.0. **Set 1.1 (2026-09-24)
 adds the wave 2 connector types, per-destination steps and the key-expression semantics — all
 additive**: every document valid under 1.0 is still valid. **Set 1.2 (2026-09-28) adds the optional
-`source.reply` block for synchronous reply mode (3.2.6), also additive.** Breaking changes create
-`../v1/`.
+`source.reply` block for synchronous reply mode (3.2.6), also additive.** **Set 1.3 (2026-09-29)
+adds the optional `tls.allowedClientSans` (3.2.7) and writes down which values are schema-valid but
+refused at component startup (3.2.8, 3.4.1), also additive.** Breaking changes create `../v1/`.
 **Owner:** `architect`. Propose changes by message with the exact diff and impact.
 **Source:** ADR-001 sections 6.1 and 6.4, ADR-003 D1/D3/D4/D6, ADR-007 (D1-D9, and D10-D17 for set
 1.1), Phase 0 gate section 7.1.
@@ -52,7 +53,7 @@ spec:
     - name: fhir-server
       type: http
       with: {url: "https://fhir.example.org/fhir", method: POST, timeoutMs: 8000,
-             auth: {type: oauth2-client-credentials, secretRef: fhir-oauth}}
+             auth: {type: bearer, secretRef: fhir-token}}
       idempotency: {technique: idempotency-key-header, header: Idempotency-Key}
       retry: {policy: blocking, backoff: exponential, maxAttempts: 10, onExhaust: halt-partition}
 ```
@@ -107,6 +108,7 @@ schema is expressed there.
 | **Set 1.1:** `fhir` is `interaction: transaction` only | Identifiers stay in the Bundle body, out of the request line |
 | **Set 1.2:** `source.reply` only on `mllp` and `http`; every field bounded; `after` accepts `routed` only | Invariant 1 — sync mode changes what the sender waits for, never when the commit happens (3.2.6) |
 | **Set 1.2:** `source.reply` with `pipeline.transactional: true` is refused | A reply outside the transaction could answer `AA` for aborted work (3.2.6) |
+| **Set 1.3:** `tls.allowedClientSans` only with `clientAuth: required`; entries are typed `dns:`/`uri:` names with no wildcard | One CA's certificates must not open every mTLS channel (3.2.7) |
 
 ---
 
@@ -127,11 +129,11 @@ when a connector lands with its tests.
 | source | `sftp` (poller) | W2-7 | Contracted, not built. `paramiko`, human-approved (section 10.2) |
 | source | `kafka` | W2-7 | Contracted, not built |
 | destination | `http` | W1-6 | **Implemented** |
-| destination | `fhir` | W2-6 | Contracted, not built |
+| destination | `fhir` | W2-6 | **Built** (2026-09-29, `tributary.loaders.fhir`): HAPI FHIR integration test; `auth` `bearer` and `basic` only (3.4.1). A 5.1 redelivery test exists (`tests/integration/test_fhir_loader_duplicate_delivery_uncommitted_redelivery.py`); **Implemented** once `qa-engineer` confirms it green in CI |
 | destination | `postgresql` | W2-6 | **Built** (`eca445a`, `asyncpg`): integration test against a real PostgreSQL, startup uniqueness check. **Genuine-redelivery duplicate test pending** (W2-9 harness, 5.1) |
 | destination | `clickhouse` | W2-6 | Contracted, not built |
-| destination | `sftp` | W2-6 | Contracted, not built. `paramiko`, human-approved (section 10.2) |
-| destination | `s3` | W2-6 | Contracted, not built |
+| destination | `sftp` | W2-6 | **Built** (2026-09-29, `tributary.loaders.sftp`): `paramiko`, human-approved (section 10.2). A 5.1 redelivery test exists (`tests/integration/test_sftp_loader_duplicate_delivery_uncommitted_redelivery.py`); **Implemented** once confirmed green in CI |
+| destination | `s3` | W2-6 | **Built** (2026-09-29, `tributary.loaders.s3`), **with two licence questions open with the human** (raised by the lead 2026-09-29, not ruled here): `botocore`'s bundled `cacert.pem` (MPL-2.0 data) in the runtime closure, and MinIO (AGPL-3.0) as the test-only container its integration and redelivery tests run against. Not "Implemented" until both are answered |
 | destination | `mllp` (client) | W2-6 | Contracted, not built |
 | destination | `kafka` | W2-6 | Contracted, not built |
 
@@ -163,8 +165,8 @@ covers the set 1.1 types.
 | `type` | R | `mllp`, `http`, `sftp` or `kafka`. See 3.0 for which are built. |
 | `bind` | R | IPv4 literal, `localhost`, `::1` or `::`. **No default:** a receiver must say what it listens on. A hostname other than `localhost` is not accepted; resolving a name at bind time is a way to bind something you did not mean to. |
 | `port` | R | 1-65535. |
-| `tls` | C | **Required whenever `bind` is not loopback**, wildcard included. `secretRef` and `clientAuth` are both required inside it; `clientAuth: required` is mTLS. |
-| `ack` | R | `mode` is `after-commit` and nothing else. `nackOn` lists the conditions that NACK instead. A NACK carries a code and `tb-msg-id` only — never the record key, never exception text. |
+| `tls` | C | **Required whenever `bind` is not loopback**, wildcard included. `secretRef` and `clientAuth` are both required inside it; `clientAuth: required` is mTLS. **Set 1.3:** optional `allowedClientSans` limits which client certificates are accepted (3.2.7). |
+| `ack` | R | `mode` is `after-commit` and nothing else. `nackOn` lists the conditions that NACK instead; which values each type accepts is 3.2.8 (`spec-invalid` is refused by every receiver). A NACK carries a code and `tb-msg-id` only — never the record key, never exception text. |
 | `maxMessageBytes` | O | ≤ 1,000,000, the envelope's inline limit. Claim-check for larger payloads is **untested** (gate 7.2 item 18); do not design a channel that depends on it yet. |
 | `queue` | O | When present, `maxBytes` is required; `maxMessages` alone does not conform. When absent the receiver default applies: **64 MiB (67,108,864)**. See 3.2.1. |
 | `reply` | O | **Set 1.2.** Synchronous reply mode, `mllp` and `http` only. Its presence switches sync mode on. See 3.2.6. |
@@ -272,7 +274,8 @@ even when it is the same physical cluster the engine runs on (ADR-007 D11).
 | `contentType` | R | Becomes `tb-content-type` |
 | `kafka.connection.bootstrapServers` | R | 1-16 `host:port` |
 | `kafka.connection.security.protocol` | R | `SSL`, `SASL_SSL` (with `saslMechanism: SCRAM-SHA-512` and `secretRef`), or `PLAINTEXT` — **only when every bootstrap server is loopback** |
-| `kafka.connection.security.tls` | O | Trust bundle and client certificate; verification cannot be disabled |
+| `kafka.connection.security.secretRef` | C | The client's identity: `username` and `password` for `SASL_SSL`; `tls.crt` and `tls.key` (mTLS) for `SSL`. **Corrected in set 1.3**: earlier text put the client certificate under `tls.secretRef`, which neither implementation read. Same layout as `engine-kafka/v0` section 3 |
+| `kafka.connection.security.tls` | O | Trust bundle only (`ca.crt` under `tls.secretRef`; absent means the platform trust store); verification cannot be disabled |
 | `kafka.topic` | R | Not `_tb.*`, and not shaped like a channel topic (`<env>.<channel>.raw` and so on) |
 | `kafka.startFrom` | R | `earliest` or `latest` for a group with no committed offset. No default |
 
@@ -442,6 +445,60 @@ control: every receiver process of a channel shares one principal with READ on t
 **What the browser shows.** The worker's `replied` event records what the worker produced, not what
 the sender received. A sender-side `AE` after a timeout is a receiver metric and a log line keyed by
 `tb-msg-id`, because the receiver has no `_tb.events` ACL (section 9).
+
+#### 3.2.7 `tls.allowedClientSans` — which client certificates an mTLS listener accepts (set 1.3)
+
+Approved 2026-09-29 from `connector-engineer`'s W2-7 proposal (`tls.allowedSubjects`), **with
+amendments**: SAN entries only, typed, no wildcard, and on `mllp` as well as `http` (ADR-007 D18).
+
+**The gap.** `clientAuth: required` proves that the client's certificate chains to the trust bundle in
+`tls.secretRef`. It does not say *which* client. Without a list, every certificate that CA ever
+issued can post to every channel trusting it, which with an enterprise CA means every host in the
+enterprise.
+
+| Rule | |
+|---|---|
+| Where | `source.tls.allowedClientSans`, `mllp` and `http`. Only with `clientAuth: required` (schema) |
+| Entries | 1-32, each `dns:<lower-case DNS name>` or `uri:<URI>` (for example a SPIFFE ID). No `*`. No email or IP entries in set 1.3 |
+| Match | The **leaf** certificate's `subjectAltName` must contain at least one listed entry of the same type. `dns:` compares case-insensitively (the spec value is lower-case by pattern); `uri:` compares byte for byte. A wildcard SAN in the certificate matches nothing, because no entry can contain `*` |
+| When | After the TLS handshake, **before any application byte is read** and before anything is queued or published |
+| Refusal, `http` | A bare `403` with `Connection: close` and no body, sent without reading the request, then close. If the server cannot answer without reading, it closes without answering. Never `401` (that invites a credential retry) and never a `5xx` |
+| Refusal, `mllp` | Close the connection without reading a frame and without an ACK: there is no message to ACK |
+| Observability | Code `TLS_PEER_NOT_ALLOWED` (registered, set 1.3) in the log line and a counter labelled by channel only. The log names the SHA-256 fingerprint of the presented leaf certificate, **never** its subject or SANs: they are attacker-chosen strings, and a subject can name a person |
+| Absent | Unchanged from set 1.2: any certificate that chains is accepted. The control plane (wave 3) warns on a non-loopback `clientAuth: required` listener without a list |
+
+**Rejected:** subject DN matching. A DN has no single canonical string form (RDN order, multi-valued
+RDNs, escaping differ between OpenSSL's one-line form, RFC 4514 and Python's `getpeercert()` tuples),
+so an exact-string DN list is a control whose success depends on formatting: it fails closed for one
+sender and open for another. CN matching was deprecated for identity by RFC 6125. **Rejected:** making
+the list required with `clientAuth: required`: it would invalidate set 1.0-1.2 valid documents, which
+is breaking.
+
+**Until a receiver enforces it, that receiver refuses a spec carrying it at startup**, the same rule as
+every other schema-valid feature a connector has not built (3.0). `http` is first (W2-7); `mllp`
+follows (`connector-engineer`).
+
+#### 3.2.8 `ack.nackOn`: what each source type accepts (set 1.3)
+
+The schema admits three values on every source type. A receiver refuses at startup any value it
+cannot produce, because a declared NACK that can never fire is a false promise to the sender's
+integrator. This is normative:
+
+| Type | `parse-error` | `queue-full` | `spec-invalid` |
+|---|---|---|---|
+| `mllp` | accepted | accepted | **refused at startup** |
+| `http` | accepted | accepted (`503` fires whether declared or not) | **refused at startup** |
+| `sftp` | accepted (move to `rejectDirectory`) | refused: a poller admits nothing until the previous file commits | **refused at startup** |
+| `kafka` | accepted (halts the source partition, 3.2.2) | refused: no NACK exists | **refused at startup** |
+
+**`spec-invalid` is reserved** (ruled 2026-09-29, ADR-007 D19). It would mean "NACK because this
+receiver's channel spec became invalid after it started". No receiver watches its spec after startup:
+receivers do not consume `_tb.<env>.channels` and have no live reload, so nothing can detect the
+condition. It stays in the enum, because removing it would make set 1.0-1.2 documents invalid, and it
+stays refused until receiver live reload is designed. That design must also say what the value means
+(the lenient-consumer rule in 1.1 suggests "keep serving the last good spec", which would not NACK at
+all). Unscheduled. The valid example `two-destinations-fanout.json` lists it, and its manifest entry
+says so.
 
 ### 3.3 `spec.pipeline`
 
@@ -742,11 +799,11 @@ looks like a dead consumer and causes a rebalance loop.
 
 | Type | Error code family |
 |---|---|
-| `http`, `fhir` | `HTTP_<status>`; `HTTP_REDIRECT_REFUSED`; `FHIR_BUNDLE_INVALID` |
+| `http`, `fhir` | `HTTP_<status>`; `HTTP_REDIRECT_REFUSED`; `FHIR_BUNDLE_INVALID`, `FHIR_ENTRY_FAILED`, `FHIR_RESPONSE_INVALID` (3.4.2) |
 | `postgresql` | `PG_<SQLSTATE>` (a class code, never the detail text) |
-| `clickhouse` | `CH_<numeric code>` |
-| `sftp` | `SFTP_<status>`, `SSH_HOST_KEY_MISMATCH`, `SSH_AUTH_FAILED` |
-| `s3` | `S3_<ERROR_CODE>` upper-snake-cased |
+| `clickhouse` | `CH_<numeric code>`; `CH_UNKNOWN` (an error response with no ClickHouse code, e.g. a proxy's page; not retryable) |
+| `sftp` | `SFTP_<status>` (the numeric SFTP status), `SFTP_NAME_CONFLICT` (the name exists with another size: not ours, not retryable), `SSH_HOST_KEY_MISMATCH`, `SSH_AUTH_FAILED` |
+| `s3` | `S3_<ERROR_CODE>` upper-snake-cased; fixed names `S3_KEY_CONFLICT` (the key exists with another size: not retryable), `S3_KEY_VANISHED` (deleted between the `412` and the `HEAD`: retryable), `S3_NO_CREDENTIALS`, `S3_UNKNOWN` (no usable store code). **A store code that would map onto a registered fixed name is emitted as `S3_UNKNOWN`** (set 1.3): a store answering `KeyConflict` must not read as the loader's idempotency conflict |
 | `mllp` | `MLLP_AE`, `MLLP_AR`, `MLLP_TIMEOUT`, `MLLP_NO_ACK` |
 | `kafka` | `KAFKA_<librdkafka error name>` |
 | all | `TIMEOUT`, `CONNECT_FAILED`, `TLS_VERIFY_FAILED`, `PAYLOAD_SHAPE_INVALID` |
@@ -754,8 +811,27 @@ looks like a dead consumer and causes a rebalance loop.
 #### 3.4.1 `http`
 
 Unchanged from set 1.0: `url`, `method`, `timeoutMs` required; optional `headers`, `auth`,
-`circuitBreaker`. `auth.type` values `oauth2-client-credentials` and `mtls` are in the schema but the
-wave 1 loader refuses them at startup; see `tributary.loaders.http.config`.
+`circuitBreaker`.
+
+**`auth.type` `oauth2-client-credentials` and `mtls` are reserved: schema-valid, refused at startup
+by the `http` and `fhir` loaders** (ruled 2026-09-29, ADR-007 D20). `basic` and `bearer` are the
+implemented types. The shape `{type, secretRef}` cannot say where the token endpoint, client id and
+scope come from, and defining them is a design of its own, not a field list:
+
+- a second outbound connection per destination (the token endpoint), with the same TLS, redirect,
+  timeout and error-code rules as the destination;
+- token caching, expiry with clock skew, refresh under concurrency, and a `401` that must not turn
+  into a re-send loop carrying PHI;
+- the client authentication method. SMART Backend Services, which most EHR FHIR APIs require, uses
+  `private_key_jwt`: a JWT signed with the client's private key. That is key management, which
+  ADR-004 and a human own. A shared-secret-only design would likely be redone for it.
+
+It is **not needed for wave 2 exit criterion 1**, whose end-to-end test targets a HAPI FHIR server,
+so the exit-criterion example now uses `bearer`. **Give up:** until it is designed, EHR FHIR APIs that
+require OAuth cannot be `fhir` destinations, and a `bearer` token is long-lived and rotated only by
+replacing the secret and restarting the loader (credentials are resolved at startup, rule 4 above).
+Unscheduled; a candidate for wave 3, together with ADR-004. `mtls` needs client-certificate plumbing
+in the shared HTTP client and is additive when built.
 
 #### 3.4.2 `fhir`
 
@@ -764,12 +840,24 @@ wave 1 loader refuses them at startup; see `tributary.loaders.http.config`.
 | `url` | R | The FHIR base URL. HTTPS unless loopback, no query, no fragment |
 | `fhirVersion` | R | `4.0.1`, `4.3.0` or `5.0.0` |
 | `interaction` | R | `transaction` only |
-| `timeoutMs`, `headers`, `auth`, `circuitBreaker` | | As `http` |
+| `timeoutMs`, `headers`, `auth`, `circuitBreaker` | | As `http`, including the reserved `auth` types (3.4.1) |
 
 The payload is a FHIR Bundle with `type: transaction`, built by a step. The loader POSTs it to `url`
-exactly and checks `Bundle.type` first; any other payload is `FHIR_BUNDLE_INVALID`, non-retryable.
-A `2xx` transaction-response is success. `3xx` is refused, `408`/`429`/`5xx` are retryable, and any
-other `4xx` is non-retryable.
+exactly and checks `Bundle.type` first; any other payload, or an entry that is not idempotent by
+construction, is `FHIR_BUNDLE_INVALID`, non-retryable. `3xx` is `HTTP_REDIRECT_REFUSED`,
+`408`/`429`/`5xx` are retryable, `409` is retryable (the retry re-runs the conditions and converges),
+`412` and any other `4xx` are non-retryable.
+
+**A `2xx` alone is not success** (set 1.3, rule 1 of 3.4). Success is a `2xx` whose body is a
+`transaction-response` Bundle with the request's entry count and every entry status `2xx`.
+
+| `2xx`, but | Code | Retryable |
+|---|---|---|
+| an entry status is `>= 400` | `FHIR_ENTRY_FAILED` | only if a failed entry is `408`, `409`, `429` or `5xx` |
+| no parseable `transaction-response` of the right size (a gateway's `200` page, a truncated body, a response over the size cap) | `FHIR_RESPONSE_INVALID` | yes: every entry is idempotent, so a resend converges; bounded by `maxAttempts` |
+
+The server's `OperationOutcome` is never copied into a code, header or log line; it routinely quotes
+the payload.
 
 **Why transaction only (ADR-007 D12).** Conditional create and update put a business identifier in the
 request — `?identifier=system|MRN` on the URL, or an `If-None-Exist` header — and the request line is

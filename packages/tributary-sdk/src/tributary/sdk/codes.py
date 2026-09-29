@@ -105,6 +105,25 @@ ENGINE_CODES: Final = frozenset(
         REPLY_UNAVAILABLE,
         REPLY_BODY_MISSING,
         REPLY_ROUTE_INVALID,
+        # set 1.3: fixed names the wave 2 loaders emit under reserved prefixes (envelope README
+        # 2.3.2 rule 2), plus the receivers' mTLS client allow-list refusal (channel-spec 3.2.7)
+        "HTTP_REDIRECT_REFUSED",
+        "FHIR_BUNDLE_INVALID",
+        "FHIR_ENTRY_FAILED",
+        "FHIR_RESPONSE_INVALID",
+        "CH_UNKNOWN",
+        "SFTP_NAME_CONFLICT",
+        "SSH_HOST_KEY_MISMATCH",
+        "SSH_AUTH_FAILED",
+        "S3_KEY_CONFLICT",
+        "S3_KEY_VANISHED",
+        "S3_NO_CREDENTIALS",
+        "S3_UNKNOWN",
+        "MLLP_AE",
+        "MLLP_AR",
+        "MLLP_TIMEOUT",
+        "MLLP_NO_ACK",
+        "TLS_PEER_NOT_ALLOWED",  # log line and metrics only; never a header or event
         # built-in steps (channel-spec README 3.3.2)
         FILTER_UNRESOLVED,
         VALIDATE_NOT_HL7,

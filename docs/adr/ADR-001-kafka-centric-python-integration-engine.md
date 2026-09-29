@@ -614,7 +614,7 @@ Rows marked **measured** were exercised in Phase 0; the rest remain design inten
 
 ## 8. Security and Compliance
 
-- **Transport:** TLS for all listeners (MLLP over TLS), mTLS or SASL/SCRAM plus ACLs on Kafka, per-channel topic ACLs.
+- **Transport:** TLS for all listeners (MLLP over TLS), mTLS or SASL/SCRAM plus ACLs on Kafka, per-channel topic ACLs. Every data-plane process reads its engine Kafka connection and credentials from one `engine-kafka/v0` document and refuses PLAINTEXT to any non-loopback broker, the lite Compose stack included (ADR-008, 2026-09-29). An mTLS listener can restrict which client certificates it accepts by SAN (ADR-007 D18).
 - **AuthN/Z:** OIDC (Keycloak or similar); roles `admin`, `developer`, `operator`, `auditor`, `viewer`; channel-level scopes; API tokens with scopes and expiry.
 - **Secrets:** Vault or Kubernetes external secrets; never in specs; only `secretRef`.
 - **PHI protection:** field-level or payload envelope encryption in the archive; keyed-hash search index; log scrubbing; configurable masking in the message browser.

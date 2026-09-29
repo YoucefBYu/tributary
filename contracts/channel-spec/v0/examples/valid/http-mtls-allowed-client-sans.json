@@ -1,0 +1,52 @@
+{
+  "apiVersion": "tributary.dev/v1",
+  "kind": "Channel",
+  "metadata": {
+    "name": "lab-results-ingest",
+    "labels": { "domain": "oru", "owner": "integration-team" },
+    "description": "Set 1.3: an mTLS HTTP ingest that accepts only two named senders, by DNS and SPIFFE subjectAltName. Synthetic only."
+  },
+  "spec": {
+    "ordering": "per-key",
+    "partitionKey": "json:/subject/reference",
+    "source": {
+      "type": "http",
+      "bind": "0.0.0.0",
+      "port": 8443,
+      "path": "/lab/results",
+      "accept": ["application/fhir+json"],
+      "auth": { "type": "mtls" },
+      "tls": {
+        "secretRef": "lab-ingest-tls",
+        "clientAuth": "required",
+        "minVersion": "1.3",
+        "allowedClientSans": ["dns:lis-sender.lab.example.org", "uri:spiffe://tributary-synth.example/ns/lab/sa/results-sender"]
+      },
+      "ack": { "mode": "after-commit", "nackOn": ["parse-error", "queue-full"], "timeoutMs": 10000 },
+      "maxMessageBytes": 1000000,
+      "queue": { "maxBytes": 67108864 }
+    },
+    "pipeline": {
+      "bundle": "ghcr.io/tributary-synth/fhir-integration@sha256:a1b2c3d4e5f60718293a4b5c6d7e8f900a1b2c3d4e5f60718293a4b5c6d7e8f9",
+      "steps": [{ "name": "validate", "ref": "fhir_flow.checks.validate_observation" }]
+    },
+    "destinations": [
+      {
+        "name": "results-db",
+        "type": "postgresql",
+        "steps": [{ "name": "to-row", "ref": "fhir_flow.mapping.to_observation_row" }],
+        "with": {
+          "host": "db.example.org",
+          "port": 5432,
+          "database": "clinical",
+          "table": "staging.observations",
+          "auth": { "type": "password", "secretRef": "results-db" },
+          "tls": { "mode": "verify-full", "secretRef": "results-db-ca" },
+          "timeoutMs": 5000
+        },
+        "idempotency": { "technique": "sink-native", "note": "INSERT ... ON CONFLICT (tb_msg_id) DO NOTHING" },
+        "retry": { "policy": "blocking", "maxAttempts": 20, "onExhaust": "halt-partition" }
+      }
+    ]
+  }
+}

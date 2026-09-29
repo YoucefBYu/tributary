@@ -288,6 +288,18 @@ cluster-wide `WRITE`, `DELETE` or `ALTER`; and no worker or loader gets `WRITE` 
 `_tb.<env>.channels`, because that topic is what invariant 3 makes workers trust completely — write
 access to it is remote code execution across the whole data plane.
 
+**Where a data-plane process gets its engine credentials (set 1.3, ADR-008).** From one
+[`engine-kafka/v0`](../../engine-kafka/v0/README.md) document per process, named by
+`TB_ENGINE_KAFKA_FILE`, holding the bootstrap servers, the protocol and `secretRef` names resolved from
+local files. It is the same for receivers, workers, loaders and the archiver, and every one of them
+enforces its section 4: **PLAINTEXT only to loopback brokers, with no opt-out**, verified TLS with the
+AEAD cipher pin, credentials present, and no property that can override the client settings in 3.2 and
+3.3. "Loopback" means the client connects to `127.0.0.0/8`, `[::1]` or `localhost`. A Docker Compose
+network, a Kubernetes pod network and a host-only bridge are **not** loopback, so the "loopback-bound
+lite listener" in the table above means a listener bound to `127.0.0.1` that only same-host (or
+same-container) processes reach. The Compose lite stack runs `SASL_SSL` (ADR-008 D5, `engine-kafka/v0`
+section 6); the lite profile lowers durability only (3.8), never transport security.
+
 **Escalated, not decided here:** the complete role model, credential rotation and key management are
 ADR-004 plus a human decision. This section fixes the minimum shape the configuration contract must
 state; it does not design the authorization model or any cryptography.

@@ -38,7 +38,7 @@ except ImportError:  # pragma: no cover - the message is the point
 
 CONTRACTS = Path(__file__).resolve().parent
 
-FILE_CONTRACTS = ("envelope", "events", "channel-spec")
+FILE_CONTRACTS = ("envelope", "events", "channel-spec", "engine-kafka")  # engine-kafka: set 1.3, ADR-008
 TOPIC_MANIFEST = CONTRACTS / "topics/v0/examples/topic-names.json"
 
 
