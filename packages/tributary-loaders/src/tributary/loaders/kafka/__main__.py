@@ -1,5 +1,4 @@
-"""`python -m tributary.loaders.kafka --channel <name> --destination <name> --env <env>
---bootstrap <hosts>`."""
+"""`python -m tributary.loaders.kafka --channel <name> --destination <name> --env <env>`."""
 
 from .main import main
 

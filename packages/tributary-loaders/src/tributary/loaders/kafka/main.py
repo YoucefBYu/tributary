@@ -1,13 +1,12 @@
-"""`python -m tributary.loaders.kafka --channel <name> --destination <name> --env <env>
---bootstrap <hosts>`.
+"""`python -m tributary.loaders.kafka --channel <name> --destination <name> --env <env>`.
 
 Wires `KafkaRecordHandler` into `tributary.runtime`'s `ConsumerLoop`, mirroring `postgresql/main.py`
 and `http/main.py`: the same `clients.consumer_config`/`producer_config`, the same `topics.
 consumer_group`/`out_topic`/`dlq_topic`/`events_topic`, the same `KafkaDlqWriter` and
 `KafkaEventEmitter`, the same live `_tb.<env>.channels` spec source, for the **engine's own** cluster
-(`--bootstrap`). This file only differs from those two in which loader/handler pair it builds, and in
+(`TB_ENGINE_KAFKA_FILE`). This file only differs from those two in which loader/handler pair it builds, and in
 that the destination's own `confluent_kafka.Producer` (`client.producer_settings_from_config`) is a
-second, unrelated Kafka client, deliberately never sharing `--bootstrap`/credentials with the ones
+second, unrelated Kafka client, deliberately never sharing the engine link's settings/credentials with the ones
 above (ADR-007 D11, `config.py`'s module docstring) — a `kafka` destination pointed at the very same
 physical cluster the engine runs on still gets its own `Producer` with its own principal.
 """
@@ -18,9 +17,11 @@ import argparse
 import json
 import os
 import signal
+import sys
 import time
 from typing import cast
 
+from tributary.runtime import load_engine_kafka_or_exit
 from tributary.runtime.channels import open_spec_source
 from tributary.runtime.clients import (
     KafkaSettings,
@@ -57,10 +58,9 @@ def emit_lite_profile_warning(log: Logger, *, profile: str) -> None:
     )
 
 
-def build_loop(a: argparse.Namespace) -> tuple[ConsumerLoop, KafkaRecordHandler]:
+def build_loop(a: argparse.Namespace, kafka_settings: KafkaSettings) -> tuple[ConsumerLoop, KafkaRecordHandler]:
     from confluent_kafka import Consumer, Producer
 
-    kafka_settings = KafkaSettings(bootstrap_servers=a.bootstrap)
     defaults: TopicDefaults = load_topic_defaults(a.contracts_dir)
     instance = a.instance_id or f"loader-{a.destination}-{os.getpid()}"
     log = JsonLogger(f"loader-{a.destination}", base={"channel": a.channel, "destination": a.destination})
@@ -144,7 +144,6 @@ def main() -> None:
     p.add_argument("--channel", required=True, help="the deployed channel name (spec.metadata.name)")
     p.add_argument("--destination", required=True, help="the spec.destinations[].name to load")
     p.add_argument("--env", required=True, help="the topic-name env segment, e.g. 'dev' or 'prod'")
-    p.add_argument("--bootstrap", required=True, help="the ENGINE's Kafka bootstrap.servers, not the destination's")
     p.add_argument("--instance-id", help="defaults to loader-<destination>-<pid>")
     p.add_argument("--secrets-dir", help="overrides TB_SECRETS_DIR / the default secrets mount")
     p.add_argument("--contracts-dir", help="overrides TB_CONTRACTS_DIR / the default contracts/ search")
@@ -155,7 +154,8 @@ def main() -> None:
         help="topic-defaults.json profile in use; 'lite' emits the mandatory RF=1 startup warning",
     )
     a = p.parse_args()
-    loop, handler = build_loop(a)
+    kafka_settings = load_engine_kafka_or_exit(argv=sys.argv[1:], log=JsonLogger(f"loader-{a.destination}"))
+    loop, handler = build_loop(a, kafka_settings)
 
     def _shutdown(signum: int, _frame: object) -> None:
         loop.stop()

@@ -1,5 +1,4 @@
-"""`python -m tributary.loaders.postgresql --channel <name> --destination <name> --env <env>
---bootstrap <hosts>`.
+"""`python -m tributary.loaders.postgresql --channel <name> --destination <name> --env <env>`.
 
 Wires `PostgresqlRecordHandler` into `tributary.runtime`'s `ConsumerLoop`, mirroring
 `http/main.py`: the same `clients.consumer_config`/`producer_config`, the same
@@ -27,9 +26,11 @@ import asyncio
 import json
 import os
 import signal
+import sys
 import time
 from typing import cast
 
+from tributary.runtime import load_engine_kafka_or_exit
 from tributary.runtime.channels import open_spec_source
 from tributary.runtime.clients import (
     KafkaSettings,
@@ -65,10 +66,9 @@ def emit_lite_profile_warning(log: Logger, *, profile: str) -> None:
     )
 
 
-def build_loop(a: argparse.Namespace) -> tuple[ConsumerLoop, PostgresqlRecordHandler]:
+def build_loop(a: argparse.Namespace, kafka_settings: KafkaSettings) -> tuple[ConsumerLoop, PostgresqlRecordHandler]:
     from confluent_kafka import Consumer, Producer
 
-    kafka_settings = KafkaSettings(bootstrap_servers=a.bootstrap)
     defaults: TopicDefaults = load_topic_defaults(a.contracts_dir)
     instance = a.instance_id or f"loader-{a.destination}-{os.getpid()}"
     log = JsonLogger(f"loader-{a.destination}", base={"channel": a.channel, "destination": a.destination})
@@ -170,7 +170,6 @@ def main() -> None:
     p.add_argument("--channel", required=True, help="the deployed channel name (spec.metadata.name)")
     p.add_argument("--destination", required=True, help="the spec.destinations[].name to load")
     p.add_argument("--env", required=True, help="the topic-name env segment, e.g. 'dev' or 'prod'")
-    p.add_argument("--bootstrap", required=True, help="Kafka bootstrap.servers")
     p.add_argument("--instance-id", help="defaults to loader-<destination>-<pid>")
     p.add_argument("--secrets-dir", help="overrides TB_SECRETS_DIR / the default secrets mount")
     p.add_argument("--contracts-dir", help="overrides TB_CONTRACTS_DIR / the default contracts/ search")
@@ -181,7 +180,8 @@ def main() -> None:
         help="topic-defaults.json profile in use; 'lite' emits the mandatory RF=1 startup warning",
     )
     a = p.parse_args()
-    loop, handler = build_loop(a)
+    kafka_settings = load_engine_kafka_or_exit(argv=sys.argv[1:], log=JsonLogger(f"loader-{a.destination}"))
+    loop, handler = build_loop(a, kafka_settings)
 
     def _shutdown(signum: int, _frame: object) -> None:
         loop.stop()
