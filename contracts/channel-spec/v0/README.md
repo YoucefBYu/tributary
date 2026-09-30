@@ -8,7 +8,10 @@ additive**: every document valid under 1.0 is still valid. **Set 1.2 (2026-09-28
 adds the optional `tls.allowedClientSans` (3.2.7) and writes down which values are schema-valid but
 refused at component startup (3.2.8, 3.4.1), also additive.** **Set 1.5 (2026-09-29) adds the
 optional `pipeline.context` (3.3.4), which declares the context extensions a channel loads, also
-additive.** Breaking changes create `../v1/`.
+additive.** **Set 1.6 (2026-09-30) pins each `uses` step to one distribution: a registry for the
+engine's `tributary.*` namespaces ([`step-namespaces.json`](step-namespaces.json)) and the optional
+`pipeline.stepNamespaces` for every other namespace (3.3.5), also additive for documents.**
+Breaking changes create `../v1/`.
 **Owner:** `architect`. Propose changes by message with the exact diff and impact.
 **Source:** ADR-001 sections 6.1 and 6.4, ADR-003 D1/D3/D4/D6, ADR-007 (D1-D9, and D10-D17 for set
 1.1), Phase 0 gate section 7.1.
@@ -112,6 +115,7 @@ schema is expressed there.
 | **Set 1.2:** `source.reply` with `pipeline.transactional: true` is refused | A reply outside the transaction could answer `AA` for aborted work (3.2.6) |
 | **Set 1.3:** `tls.allowedClientSans` only with `clientAuth: required`; entries are typed `dns:`/`uri:` names with no wildcard | One CA's certificates must not open every mTLS channel (3.2.7) |
 | **Set 1.5:** `pipeline.context` lists registered capability names only, at least one, no duplicates | Only reviewed, declared plugin code runs beside the steps (3.3.4; `context-extension/v0`) |
+| **Set 1.6:** `pipeline.stepNamespaces` cannot name a `tributary.*` namespace; values are PEP 503 normalised distribution names; at least one entry | A spec cannot rebind an engine step to a look-alike package (3.3.5). The rest of 3.3.5 (N1-N4) is a runtime refusal, because a cross-field prefix match is not expressible in JSON Schema |
 
 ---
 
@@ -538,6 +542,7 @@ says so.
 | `stepRetries` | O | In-place retries before the DLQ (ADR-003 D4). Default 3 — a **judgement, unmeasured**: S5 exercised the DLQ path, not the retry count. |
 | `transactional` | O | Kafka transactions on the `raw` → `out.<dest>` hop (ADR-003 D6). Opt-in, default false. |
 | `context` | O | **Set 1.5.** Registered context capabilities the channel's steps need, e.g. `[fhir]`. Only these extensions load (3.3.4). |
+| `stepNamespaces` | O | **Set 1.6.** `{namespace: distribution}` for every non-engine namespace a `uses` name in this channel needs, e.g. `{"acme.lab": "acme-lab-steps"}`. Engine (`tributary.*`) namespaces come from `step-namespaces.json` and cannot appear here (3.3.5). |
 
 `with` takes scalars and flat arrays of scalars. No nested objects: a nested structure is where
 configuration turns into a program the runtime has to interpret. Property names that denote a
@@ -574,7 +579,7 @@ The two step forms resolve by different mechanisms, and only one of them is impl
 
 | Form | Resolves by | Wave 1 |
 |---|---|---|
-| `uses` | A Python entry point in the `tributary.steps` group, already present in the running image (ADR-001 6.2) | **Works.** |
+| `uses` | A Python entry point in the `tributary.steps` group, already present in the running image (ADR-001 6.2), **supplied by the one distribution its namespace is bound to (set 1.6, 3.3.5)** | **Works.** |
 | `ref` | A dotted path inside the OCI bundle named by `pipeline.bundle`, which something has to fetch and put on the worker's import path | **Not implemented.** No bundle-fetch exists; the runtime calls `importlib.import_module` and assumes the code is already importable. |
 
 So **a spec that must run today uses `uses` only.** A `ref` step raises at first execution — not at
@@ -817,12 +822,94 @@ pipeline:
   distribution, and refuses the spec otherwise (context-extension README section 2, L1-L2). A
   refused spec keeps the previous version running, as for an unresolvable `uses` step.
 - **Why in the spec** (ADR-007 D21): it is how `uses` already works (`steps.py` loads only names the
-  spec references). A reviewer sees in the spec diff what code runs beside the steps, and "what code
+  spec references; since set 1.6, each from one pinned distribution, 3.3.5). A reviewer sees in the spec diff what code runs beside the steps, and "what code
   ran" stays answerable from `tb-channel-version` alone.
 - **Failure mode to know:** a step that uses `ctx.fhir` on a channel that did not declare `fhir`
   raises `AttributeError` on every message and dead-letters it (`STEP_ERROR`), loudly but late. Until
   steps declare their own capability needs (ADR-007 follow-up 14), declaring `context` correctly is
   the spec author's job. The runtime cannot infer it.
+
+#### 3.3.5 Which distribution may supply a `uses` step (set 1.6)
+
+**Source:** `security-reviewer` Medium (re-review, 2026-09-30), pre-existing: `steps.py` loaded a
+`uses` name from the **first** installed `tributary.steps` entry point carrying it, with no duplicate
+check and no distribution pin. A typosquat, or a transitive dependency that registers
+`tributary.core.passthrough`, could win. This is the class set 1.5 closed for context extensions.
+Proposed by `platform-engineer` as rule S1, amended here (ADR-007 D23). The `bundle` digest does not
+close it: the digest pins the whole image, not which distribution in it answers a name.
+
+```yaml
+pipeline:
+  bundle: ghcr.io/example/lab-integration@sha256:<64 hex>
+  stepNamespaces: {acme.lab: acme-lab-steps}   # only for non-engine namespaces
+  steps:
+    - {name: parse,     uses: tributary.hl7v2.parse}       # bound by step-namespaces.json
+    - {name: normalise, uses: acme.lab.normalise_units}    # bound by stepNamespaces above
+```
+
+Normative for `tributary-runtime`. Rules N1-N6.
+
+1. **N1. Namespace.** A `uses` name's namespace is its first two dot-separated segments. A name needs
+   at least three segments (`<org>.<package>.<step>`). A two-segment name has no namespace and is
+   refused. The schema still admits two segments, because tightening the pattern would be breaking; the
+   CLI and control plane refuse it as well.
+2. **N2. Engine namespaces are reserved.** Every namespace whose first segment is `tributary` is bound
+   only by [`step-namespaces.json`](step-namespaces.json). A `tributary.*` name whose namespace is not
+   in that file is refused. A spec cannot declare a `tributary.*` namespace (schema).
+3. **N3. Other namespaces are bound by the spec.** `spec.pipeline.stepNamespaces` maps each non-engine
+   namespace the channel uses to one distribution, in PEP 503 normalised form. A `uses` name whose
+   namespace is in neither place is refused. An entry that no `uses` references loads nothing (the CLI
+   should warn).
+4. **N4. Resolution.** A `uses` name resolves only if **exactly one** installed `tributary.steps`
+   entry point carries the name, and that entry point's distribution name, PEP 503 normalised, equals
+   the namespace's bound distribution. An entry point with no distribution metadata never matches.
+   Otherwise the spec is refused with a `ChannelSpecError`. **`EntryPoint.load()` is called only on
+   that one verified entry point**, and discovery before that reads metadata only, so no other
+   registrant is imported. At startup the worker refuses to start. On a hot reload the previous version
+   keeps running, as for every other step refusal. "Exactly one" is counted after `importlib.metadata`'s
+   own de-duplication by normalised distribution name (CPython 3.12 `entry_points()`; **unverified
+   by the architect**, and `platform-engineer` pins it with a test), so one distribution visible twice
+   on `sys.path` is not a duplicate. Two different distributions carrying the name always are.
+5. **N5. Log lines** (structured, no payload, no header values, invariant 6). Names are package
+   metadata:
+   - `step_entry_point_loaded` (info): `step` (the `uses` name), `distribution`, `version` (from the
+     distribution's metadata), `channel`, `channel_version`. One per distinct `uses` name per applied
+     version.
+   - `step_entry_point_skipped` (warning): the same metadata fields plus `reason`. Emitted for each
+     installed entry point that carries a name the spec references and is not loaded (`duplicate`,
+     `distribution-mismatch`, `unregistered-namespace`), and for each installed entry point in a
+     reserved `tributary.*` namespace that fails `step-namespaces.json` (`unregistered-namespace` or
+     `distribution-mismatch`) even if no spec names it. That last case is the image-wide signal for a
+     look-alike package, and it does not stop the worker, because nothing was imported. There is no
+     `not-referenced` line: an unused step in the image is not news.
+6. **N6. Test seam.** Entry-point discovery and the namespace registry may be replaced by explicit
+   arguments for unit tests only. No CLI flag or environment variable reaches them.
+
+**Why the spec, and not an operator file, binds third-party namespaces.** Same reasons as
+`pipeline.context` (3.3.4, ADR-007 D21): the reviewer sees the binding in the spec diff, and "what code
+ran" stays answerable from `tb-channel-version` plus the `bundle` digest. A per-site file would vary
+per deployment. A core-registry-only rule would force every hospital's in-house package through an
+upstream contract change and publish its package names, which ADR-001 2.2 ("Extensibility:
+third-party connectors and steps as Python packages via entry points") and 6.2 rule out.
+
+**What this does and does not stop.**
+
+| Threat | Outcome |
+|---|---|
+| A look-alike registers `tributary.core.passthrough` beside `tributary-runtime` | Duplicate, so a spec naming it is refused (N4); `step_entry_point_skipped`, warning |
+| A look-alike registers a `tributary.*` name and the real package is absent | Distribution mismatch, refused (N4) |
+| A spec binds `tributary.core` to another distribution | Refused by the schema (N2) |
+| A look-alike registers `acme.lab.normalise_units` beside `acme-lab-steps` | Duplicate, refused (N4) |
+| A package that **replaces** a bound distribution under the same name | **Not detected at runtime.** The controls are the locked, hash-pinned dependency set, the digest-pinned image, `licence_check.py` and the SBOM, as for context extensions |
+| A spec author binds a namespace to a distribution that is in the image for another reason | Loads only entry points that distribution itself registers under that exact name. The spec is trusted input (`_tb.<env>.channels` is written only by the control plane, `topics/v0` 3.4) |
+
+**Give up.** Every `uses` name now carries a three-segment shape, and a channel using a customer step
+restates its binding in every spec that uses it. A second distribution cannot contribute steps to an
+engine namespace: a contributed step for `tributary.hl7v2` must ship in `tributary-hl7v2` or take its own
+namespace. **Adding an engine namespace** is additive: the owner proposes the namespace and
+distribution, the architect approves, and `security-reviewer` reviews the package. `contracts/validate.py`
+checks that the `tributary.steps` entry points in `packages/*/pyproject.toml` and the registry agree
+both ways, so an unregistered engine namespace fails the contract run.
 
 ### 3.4 `spec.destinations`
 

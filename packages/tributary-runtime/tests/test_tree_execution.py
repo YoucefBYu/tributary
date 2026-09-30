@@ -544,18 +544,40 @@ def test_a_ref_module_that_fails_at_import_is_a_channel_spec_error(
     assert PHI_MARKER not in str(caught.value), "only the exception's type name is kept"
 
 
-def test_an_entry_point_that_fails_at_import_is_a_channel_spec_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    from tributary.runtime import steps as steps_module
+class _Dist:
+    """What `EntryPoint.dist` offers the resolver: a name and a version, read without importing."""
 
-    class Broken:
-        name = "t.broken"
+    name = "tributary-runtime"
+    version = "0.0.0"
+
+
+def _raising_point(name: str, raised: BaseException) -> object:
+    """An entry point from the registered distribution of `tributary.core`, which raises on `load()`.
+
+    Through the resolver's test seam (README 3.3.5 N6), with a registered three-segment name, so the
+    tests below reach the import-failure path rather than the namespace refusal in front of it.
+    """
+
+    class Raising:
+        value = "synth_steps.module:step"
+        dist = _Dist()
+
+        def __init__(self) -> None:
+            self.name = name
 
         def load(self) -> object:
-            raise RuntimeError("import-time failure")
+            raise raised
 
-    monkeypatch.setattr(steps_module, "entry_points", lambda group: [Broken()])
-    with pytest.raises(ChannelSpecError, match="RuntimeError"):
-        steps_module.load_step(StepRef(name="s", uses="t.broken"))
+    return Raising()
+
+
+def test_an_entry_point_that_fails_at_import_is_a_channel_spec_error() -> None:
+    from tributary.runtime.steps import StepResolver
+
+    broken = _raising_point("tributary.core.broken", RuntimeError("import-time failure"))
+    resolver = StepResolver(points=lambda: [broken])  # type: ignore[list-item]
+    with pytest.raises(ChannelSpecError, match=r"cannot load step .*: RuntimeError"):
+        resolver.load(StepRef(name="s", uses="tributary.core.broken"))
 
 
 @pytest.mark.parametrize(
@@ -581,18 +603,14 @@ def test_sys_exit_at_import_refuses_the_spec(tmp_path: Path, monkeypatch: pytest
 
 
 @pytest.mark.parametrize(("raised", "refused"), [(SystemExit(3), True), (KeyboardInterrupt(), False)])
-def test_an_entry_point_exiting_is_refused_but_an_interrupt_propagates(
-    monkeypatch: pytest.MonkeyPatch, raised: BaseException, refused: bool
-) -> None:
-    from tributary.runtime import steps as steps_module
+def test_an_entry_point_exiting_is_refused_but_an_interrupt_propagates(raised: BaseException, refused: bool) -> None:
+    from tributary.runtime.steps import StepResolver
 
-    class Exiting:
-        name = "t.exiting"
-
-        def load(self) -> object:
-            raise raised
-
-    monkeypatch.setattr(steps_module, "entry_points", lambda group: [Exiting()])
-    expected: type[BaseException] = ChannelSpecError if refused else KeyboardInterrupt
-    with pytest.raises(expected):
-        steps_module.load_step(StepRef(name="s", uses="t.exiting"))
+    exiting = _raising_point("tributary.core.exiting", raised)
+    resolver = StepResolver(points=lambda: [exiting])  # type: ignore[list-item]
+    if refused:
+        with pytest.raises(ChannelSpecError, match=r"cannot load step .*: SystemExit"):
+            resolver.load(StepRef(name="s", uses="tributary.core.exiting"))
+    else:
+        with pytest.raises(KeyboardInterrupt):
+            resolver.load(StepRef(name="s", uses="tributary.core.exiting"))

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://tributary.dev/contracts/channel-spec/v0/channel.schema.json",
   "title": "Tributary channel spec, v0",
-  "description": "One deployed channel: source, pipeline steps, destinations, ordering and retry. Authored as YAML in a bundle and published as JSON on the compacted _tb.<env>.channels topic. See README.md. Producers (CLI, control plane) validate strictly; the runtime must ignore unknown fields rather than refusing to start (invariant 3). Contract set 1.1 (2026-09-24) added the wave 2 connector types, set 1.2 (2026-09-28) the optional source.reply block for synchronous reply mode, set 1.3 (2026-09-29) the optional tls.allowedClientSans, and set 1.5 (2026-09-29) the optional pipeline.context; every change since set 1.0 is additive and is listed in contracts/CHANGELOG.md.",
+  "description": "One deployed channel: source, pipeline steps, destinations, ordering and retry. Authored as YAML in a bundle and published as JSON on the compacted _tb.<env>.channels topic. See README.md. Producers (CLI, control plane) validate strictly; the runtime must ignore unknown fields rather than refusing to start (invariant 3). Contract set 1.1 (2026-09-24) added the wave 2 connector types, set 1.2 (2026-09-28) the optional source.reply block for synchronous reply mode, set 1.3 (2026-09-29) the optional tls.allowedClientSans, set 1.5 (2026-09-29) the optional pipeline.context, and set 1.6 (2026-09-30) the optional pipeline.stepNamespaces; every change since set 1.0 is additive and is listed in contracts/CHANGELOG.md.",
   "type": "object",
   "required": ["apiVersion", "kind", "metadata", "spec"],
   "additionalProperties": false,
@@ -609,6 +609,23 @@
           "uniqueItems": true,
           "items": { "enum": ["fhir"] },
           "$comment": "Set 1.5 (ADR-007 D21). The context capabilities this channel's steps need, for example 'fhir' for ctx.fhir and ctx.terminology. It applies to every step the worker runs for the channel, pipeline and destination steps alike. The worker loads ONLY these tributary.context entry points and refuses the spec if one cannot be resolved from its registered distribution (contracts/context-extension/v0 L1-L2). Absent means none: there is one spelling for 'no capabilities', so an empty list is refused. The enum is exactly the registry in contracts/context-extension/v0/capabilities.json, and contracts/validate.py checks that. A set, not a sequence: order carries no meaning."
+        },
+        "stepNamespaces": {
+          "type": "object",
+          "minProperties": 1,
+          "maxProperties": 8,
+          "propertyNames": {
+            "allOf": [
+              { "maxLength": 64, "pattern": "^[a-z][a-z0-9_]*\\.[a-z][a-z0-9_]*$" },
+              { "not": { "pattern": "^tributary\\." } }
+            ]
+          },
+          "additionalProperties": {
+            "type": "string",
+            "maxLength": 100,
+            "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$"
+          },
+          "$comment": "Set 1.6 (ADR-007 D23). Binds each non-engine step namespace this channel's uses names need to the ONE distribution allowed to supply it, e.g. {\"acme.lab\": \"acme-lab-steps\"}. A namespace is the first two segments of a uses name. Namespaces whose first segment is 'tributary' are reserved to the engine registry (step-namespaces.json) and cannot be declared here, so a spec can never rebind an engine step. The value is the distribution name in PEP 503 normalised form: one spelling. The worker loads a uses step only if exactly one installed tributary.steps entry point carries the name and its distribution equals the binding; otherwise the spec is refused and nothing is imported (README 3.3.5). Absent means the channel may use engine namespaces only; an empty object is refused (one spelling for 'none')."
         }
       }
     },
@@ -616,7 +633,7 @@
       "type": "object",
       "required": ["name"],
       "additionalProperties": false,
-      "$comment": "Exactly one of 'uses' (a step registered through the tributary.steps entry point) or 'ref' (a dotted path inside the bundle). There is deliberately NO field carrying inline code: invariant 7 requires every step to be a unit-testable function of (message, ctx), and inline source in a spec cannot be imported by pytest, reviewed in a diff, or type-checked. That is the one Mirth affordance this contract refuses on purpose.",
+      "$comment": "Exactly one of 'uses' (a step registered through the tributary.steps entry point) or 'ref' (a dotted path inside the bundle). Set 1.6: a uses name resolves only from the distribution its namespace (first two segments) is bound to, by step-namespaces.json for tributary.* or by pipeline.stepNamespaces otherwise, and needs at least three segments; the runtime refuses the spec otherwise (README 3.3.5). The pattern still admits two segments because tightening it would be breaking. There is deliberately NO field carrying inline code: invariant 7 requires every step to be a unit-testable function of (message, ctx), and inline source in a spec cannot be imported by pytest, reviewed in a diff, or type-checked. That is the one Mirth affordance this contract refuses on purpose.",
       "properties": {
         "name": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,63}$" },
         "uses": {

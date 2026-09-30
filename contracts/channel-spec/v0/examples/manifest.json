@@ -93,6 +93,15 @@
         "tls.allowedClientSans enforcement in the http receiver (connector-engineer, set 1.3; until it lands the receiver refuses the field at startup)"
       ],
       "note": "Set 1.3. mTLS HTTP ingest limited to two senders by typed subjectAltName, one dns: and one uri: (SPIFFE) entry (README 3.2.7), to a PostgreSQL table"
+    },
+    {
+      "file": "valid/third-party-step-namespace.json",
+      "runnable": false,
+      "requires": [
+        "acme-lab-steps: a FICTIONAL customer distribution providing acme.lab.normalise_units. Illustrative by design, like the adt_flow bundle modules; nothing in this repo will ever install it (README 3.3.5)",
+        "pipeline.stepNamespaces binding in the worker's step loader (platform-engineer, set 1.6; until it lands a set 1.5 runtime ignores the field and loads uses unpinned)"
+      ],
+      "note": "Set 1.6. An engine step (tributary.hl7v2.parse, bound by step-namespaces.json) and a customer step whose namespace acme.lab is bound to one distribution by the spec itself, so a third-party step package needs no core contract change (ADR-007 D23)"
     }
   ],
   "invalid": [
@@ -400,6 +409,20 @@
       "expected_json_path": "$.spec.pipeline.context",
       "expected_validator": "minItems",
       "expectation_note": "PREDICTED by the architect (set 1.5), UNMEASURED"
+    },
+    {
+      "file": "invalid/step-namespace-reserved-prefix.json",
+      "violates": "pipeline.stepNamespaces may not declare a namespace whose first segment is 'tributary'; engine namespaces are bound only by step-namespaces.json, so a spec cannot rebind tributary.core to a look-alike distribution such as tributary-core (the typosquat class of ADR-007 D23)",
+      "expected_json_path": "$.spec.pipeline.stepNamespaces",
+      "expected_validator": "not",
+      "expectation_note": "PREDICTED by the architect (set 1.6), UNMEASURED. Same mechanism as step-with-inline-secret.json (measured): propertyNames reports at the containing object with the inner keyword of the allOf member that failed"
+    },
+    {
+      "file": "invalid/step-namespaces-empty.json",
+      "violates": "an empty pipeline.stepNamespaces is refused: 'engine namespaces only' has one spelling, omitting the field",
+      "expected_json_path": "$.spec.pipeline.stepNamespaces",
+      "expected_validator": "minProperties",
+      "expectation_note": "PREDICTED by the architect (set 1.6), UNMEASURED. First use of minProperties in the channel-spec examples"
     }
   ]
 }

@@ -120,7 +120,7 @@ def resolvable(spec: ChannelSpec) -> tuple[bool, list[str]]:
     references = [*spec.pipeline.steps, *(ref for destination in spec.destinations for ref in destination.steps)]
     for reference in references:
         try:
-            load_step(reference)
+            load_step(reference, namespaces=spec.pipeline.step_namespaces)  # N3: the spec's own bindings
         except ChannelSpecError:
             unresolved.append(reference.uses or reference.ref or reference.name)
     return not unresolved, unresolved

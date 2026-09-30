@@ -19,10 +19,18 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Literal
 
 from .capabilities import CAPABILITIES, NAME_PATTERN
 from .errors import ChannelSpecError, safe_token
+from .step_namespaces import (
+    DISTRIBUTION_MAX_LENGTH,
+    DISTRIBUTION_PATTERN,
+    NAMESPACE_MAX_LENGTH,
+    NAMESPACE_PATTERN,
+    is_reserved,
+)
 from .topics import CHANNEL, DESTINATION
 
 Ordering = Literal["per-key", "none"]
@@ -91,6 +99,9 @@ class Pipeline:
     #: `pipeline.context` (set 1.5, README 3.3.4): registered capability names, sorted, no duplicates.
     #: Empty when absent. Only these `tributary.context` extensions are loaded (`extensions.py`).
     context: tuple[str, ...] = ()
+    #: `pipeline.stepNamespaces` (set 1.6, README 3.3.5 N3): non-engine namespace -> the one distribution
+    #: (PEP 503 normalised) that may supply its `uses` steps. Empty when absent: engine namespaces only.
+    step_namespaces: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,6 +237,7 @@ def _pipeline(channel: str, block: Mapping[str, Any]) -> Pipeline:
         else DEFAULT_STEP_RETRIES,
         transactional=bool(block.get("transactional", False)),
         context=_context(channel, block),
+        step_namespaces=_step_namespaces(channel, block),
     )
 
 
@@ -248,6 +260,40 @@ def _context(channel: str, block: Mapping[str, Any]) -> tuple[str, ...]:
             raise ChannelSpecError(f"{where} names {safe_token(item)} twice")
         names.append(item)
     return tuple(sorted(names))  # L4: a set; wrapping order is by name
+
+
+def _step_namespaces(channel: str, block: Mapping[str, Any]) -> Mapping[str, str]:
+    """`pipeline.stepNamespaces`. Not lenient, like `context`: dropping a malformed binding would refuse
+    every customer step later with a less useful error, and a `tributary.*` key is a spec trying to
+    rebind an engine step (README 3.3.5 N2), which is refused however the CLI was bypassed."""
+    if "stepNamespaces" not in block:
+        return MappingProxyType({})
+    value = block["stepNamespaces"]
+    where = f"channel {safe_token(channel)}: spec.pipeline.stepNamespaces"
+    if not isinstance(value, dict) or not value:
+        raise ChannelSpecError(f"{where} must be a non-empty object (omit it for engine namespaces only)")
+    bindings: dict[str, str] = {}
+    for namespace, distribution in value.items():
+        if (
+            not isinstance(namespace, str)
+            or len(namespace) > NAMESPACE_MAX_LENGTH
+            or not NAMESPACE_PATTERN.fullmatch(namespace)
+        ):
+            raise ChannelSpecError(f"{where} keys must be two-segment namespaces such as acme.lab")
+        if is_reserved(namespace):
+            raise ChannelSpecError(
+                f"{where} binds {safe_token(namespace)}: tributary.* namespaces are bound only by the engine registry"
+            )
+        if (
+            not isinstance(distribution, str)
+            or len(distribution) > DISTRIBUTION_MAX_LENGTH
+            or not DISTRIBUTION_PATTERN.fullmatch(distribution)
+        ):
+            raise ChannelSpecError(
+                f"{where} binds {safe_token(namespace)} to a value that is not a PEP 503 normalised distribution name"
+            )
+        bindings[namespace] = distribution
+    return MappingProxyType(bindings)
 
 
 def _step(channel: str, block: Mapping[str, Any]) -> StepRef:

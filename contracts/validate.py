@@ -22,7 +22,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
+import tomllib
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -41,6 +43,11 @@ CONTRACTS = Path(__file__).resolve().parent
 FILE_CONTRACTS = ("envelope", "events", "channel-spec", "engine-kafka")  # engine-kafka: set 1.3, ADR-008
 TOPIC_MANIFEST = CONTRACTS / "topics/v0/examples/topic-names.json"
 CONTEXT_REGISTRY = CONTRACTS / "context-extension/v0/capabilities.json"  # set 1.5, ADR-007 D21
+STEP_NAMESPACES = CONTRACTS / "channel-spec/v0/step-namespaces.json"  # set 1.6, ADR-007 D23
+CHANNEL_SPEC_MANIFEST = CONTRACTS / "channel-spec/v0/examples/manifest.json"
+PACKAGES = CONTRACTS.parent / "packages"
+STEP_GROUP = "tributary.steps"
+RESERVED_FIRST_SEGMENT = "tributary"
 
 
 class Failure(NamedTuple):
@@ -131,6 +138,121 @@ def check_context_registry() -> None:
         )
 
 
+def normalise_distribution(name: str) -> str:
+    """PEP 503: lowercase, and every run of '-', '_' and '.' becomes one '-'."""
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def namespace_of(uses: str) -> str | None:
+    """The first two segments of a `uses` name, or None when it has fewer than three (README 3.3.5 N1)."""
+    parts = uses.split(".")
+    return ".".join(parts[:2]) if len(parts) >= 3 else None
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def example_uses(document: Any) -> list[str]:
+    """Every `uses` in a channel-spec document, pipeline and destination steps alike.
+
+    Tolerant of shape on purpose: invalid examples are malformed somewhere else, and this check must
+    not crash on them before the schema run reports why they fail.
+    """
+    spec = _as_dict(_as_dict(document).get("spec"))
+    step_lists: list[Any] = [_as_dict(spec.get("pipeline")).get("steps")]
+    destinations = spec.get("destinations")
+    if isinstance(destinations, list):
+        step_lists += [_as_dict(destination).get("steps") for destination in destinations]
+    names: list[str] = []
+    for steps in step_lists:
+        if isinstance(steps, list):
+            names += [s["uses"] for s in steps if isinstance(s, dict) and isinstance(s.get("uses"), str)]
+    return names
+
+
+def spec_declared_namespaces(document: Any) -> set[str]:
+    """`pipeline.stepNamespaces` keys, minus reserved ones: a spec can never bind a `tributary.*` namespace."""
+    pipeline = _as_dict(_as_dict(_as_dict(document).get("spec")).get("pipeline"))
+    declared = _as_dict(pipeline.get("stepNamespaces"))
+    return {name for name in declared if name.split(".", 1)[0] != RESERVED_FIRST_SEGMENT}
+
+
+def check_step_namespaces() -> None:
+    """The engine step-namespace registry, the channel-spec examples and the repo's packages must agree.
+
+    Three checks (channel-spec README 3.3.5, ADR-007 D23):
+
+    1. every registry namespace is a two-segment `tributary.*` namespace bound to a PEP 503 normalised
+       distribution name;
+    2. every `uses` in every channel-spec example (valid and invalid) has at least three segments, and
+       its namespace is in the registry or in that example's own `pipeline.stepNamespaces`;
+    3. the `tributary.steps` entry points declared in `packages/*/pyproject.toml` and the registry match
+       both ways: each entry point is in a registered namespace bound to its own project name, and each
+       registered namespace has at least one entry point. That is the review gate: a new engine
+       namespace fails here until the architect registers it.
+
+    Check 3 reads source `pyproject.toml` files with `tomllib`, not installed metadata, so it still runs
+    on a clean clone. It answers "does the registry agree with what the packages declare", not "does
+    the name resolve", which remains the runtime corpus test's question (contracts/README.md). Names
+    printed here are package metadata, never instance data, so the output is PHI-safe. Adds no count.
+    """
+    registry = load(STEP_NAMESPACES)
+    engine = {name: str(entry["distribution"]) for name, entry in registry["namespaces"].items()}
+    problems: list[str] = []
+
+    for name, distribution in sorted(engine.items()):
+        parts = name.split(".")
+        if len(parts) != 2 or parts[0] != RESERVED_FIRST_SEGMENT:
+            problems.append(f"registry namespace {name} is not a two-segment {RESERVED_FIRST_SEGMENT}.* namespace")
+        if normalise_distribution(distribution) != distribution:
+            problems.append(f"registry namespace {name}: distribution {distribution} is not PEP 503 normalised")
+
+    manifest = load(CHANNEL_SPEC_MANIFEST)
+    for entry in [*manifest["valid"], *manifest["invalid"]]:
+        document = load(CHANNEL_SPEC_MANIFEST.parent / entry["file"])
+        allowed = set(engine) | spec_declared_namespaces(document)
+        for uses in example_uses(document):
+            namespace = namespace_of(uses)
+            if namespace is None:
+                problems.append(f"channel-spec {entry['file']}: uses {uses} has fewer than three segments (N1)")
+            elif namespace not in allowed:
+                problems.append(
+                    f"channel-spec {entry['file']}: uses {uses} is in namespace {namespace}, which is neither in "
+                    "step-namespaces.json nor declared in the example's pipeline.stepNamespaces (N2, N3)"
+                )
+
+    pyprojects = sorted(PACKAGES.glob("*/pyproject.toml"))
+    if not pyprojects:
+        problems.append(f"no packages/*/pyproject.toml under {PACKAGES}: cannot cross-check {STEP_GROUP}")
+    seen: set[str] = set()
+    for path in pyprojects:
+        project = _as_dict(tomllib.loads(path.read_text(encoding="utf-8")).get("project"))
+        distribution = normalise_distribution(str(project.get("name", "")))
+        for point in _as_dict(_as_dict(project.get("entry-points")).get(STEP_GROUP)):
+            namespace = namespace_of(point)
+            if namespace is None or namespace not in engine:
+                problems.append(
+                    f"{path.parent.name}: {STEP_GROUP} entry point {point} is not in a namespace registered in "
+                    "step-namespaces.json. Propose the namespace to the architect (README 3.3.5)"
+                )
+            elif engine[namespace] != distribution:
+                problems.append(
+                    f"{path.parent.name}: {STEP_GROUP} entry point {point} is declared by {distribution}, but "
+                    f"step-namespaces.json binds {namespace} to {engine[namespace]}"
+                )
+            else:
+                seen.add(namespace)
+    for namespace in sorted(set(engine) - seen):
+        problems.append(
+            f"step-namespaces.json registers {namespace}, but no packages/*/pyproject.toml declares a "
+            f"{STEP_GROUP} entry point in it"
+        )
+
+    if problems:
+        raise SystemExit("step namespaces (channel-spec README 3.3.5):\n  " + "\n  ".join(problems))
+
+
 def file_cases(contract: str) -> tuple[Path, list[Case]]:
     manifest_path = CONTRACTS / contract / "v0" / "examples" / "manifest.json"
     manifest = load(manifest_path)
@@ -163,6 +285,7 @@ def topic_cases() -> tuple[Path, list[Case]]:
 
 def all_suites() -> Iterator[tuple[Path, list[Case]]]:
     check_context_registry()
+    check_step_namespaces()
     for contract in FILE_CONTRACTS:
         yield file_cases(contract)
     yield topic_cases()

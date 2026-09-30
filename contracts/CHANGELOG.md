@@ -3,7 +3,94 @@
 Newest first. Each entry names the contract, the version, whether the change is additive or
 breaking, and the reason. Breaking changes reference an ADR.
 
-## 2026-09-29 (latest) — contract set 1.5: context extensions load only when the spec declares them
+## 2026-09-30 (latest) — contract set 1.6: each `uses` step loads from one pinned distribution
+
+**Additive for every document.** Every channel spec valid under set 1.5 stays valid:
+`pipeline.stepNamespaces` is optional, and the `uses` pattern is unchanged. **No invariant changes.**
+**Runtime behaviour changes** once `platform-engineer` lands N1-N6: a `uses` name is refused if its
+namespace is unbound, if two installed entry points carry it, or if its entry point comes from another
+distribution. Nothing in the repo relies on the old behaviour. Every `uses` in `contracts/`,
+`packages/`, `tests/` and `deploy/` is in `tributary.core`, `tributary.hl7v2` or
+`tributary.content_hl7_fhir`, except the runtime's own unit tests that inject fake entry points
+(`t.broken`, `t.exiting`; checked by grep, not by a run).
+
+Source: `security-reviewer` Medium on re-review, pre-existing. `steps.py:78-82` loaded the **first**
+installed `tributary.steps` entry point carrying a name: no duplicate check, no distribution pin. It is
+the typosquat class set 1.5 closed for context extensions. `platform-engineer` proposed rule S1
+(engine registry, exactly-one, distribution match, a skip log line, a `validate.py` check). Decision
+and what it gives up: **ADR-007 D23**.
+
+| # | Question | Ruling and why |
+|---|---|---|
+| 1 | S1 as proposed | **Approved, amended.** Registry, exactly-one, PEP 503 distribution match, refusal with `ChannelSpecError`, never loading another entry point: all kept. Confirmed against the repo: three namespaces register `tributary.steps` entry points (`tributary.core` by `tributary-runtime`, five names; `tributary.hl7v2` by `tributary-hl7v2`, one; `tributary.content_hl7_fhir` by `tributary-content-hl7-fhir`, two). The prefix cannot yield the distribution (`tributary.core` is not `tributary-core`), so a registry is needed |
+| 2 | Third-party and customer steps (the amendment) | **The engine registry covers only the reserved `tributary.*` namespaces. Every other namespace is bound per channel by the new optional `pipeline.stepNamespaces` (`{namespace: distribution}`).** S1 as written refused every non-registered namespace, so each hospital's in-house step package would need an upstream contract change, contrary to ADR-001 2.2 ("third-party steps as Python packages via entry points"). **Rejected:** an operator-supplied namespace file or env var (the reviewer cannot see it, and "what code ran" would depend on the site rather than on `tb-channel-version`; the same reasons as D21); exactly-one without a distribution pin for non-engine names (still loads a look-alike when the real package is absent) |
+| 3 | Namespace shape | **The first two segments; a `uses` name needs at least three.** Enforced at runtime, not by tightening the schema pattern, which would be breaking. All 34 `uses` values in the set 1.5 examples already have three segments |
+| 4 | Log lines | **`step_entry_point_loaded`** (info: `step`, `distribution`, `version`, `channel`, `channel_version`) and **`step_entry_point_skipped`** (warning, `reason`: `duplicate`, `distribution-mismatch`, `unregistered-namespace`), including for any installed `tributary.*` entry point that fails the registry even if no spec names it. No `not-referenced` line |
+
+### `tributary.channel-spec/v0`
+
+- **New `step-namespaces.json`**: the engine registry, three namespaces.
+- **Schema:** `$defs/pipeline.properties.stepNamespaces` (object, 1-8 entries; keys are two segments,
+  64 characters at most, and never `tributary.*`; values are PEP 503 normalised names). Top-level
+  description and the `step` `$comment` updated. The `uses` pattern is unchanged.
+- **README:** status line, section 2 row, 3.3 table row, the 3.3.1 `uses` row, **new 3.3.5** (rules
+  N1-N6, threat table, give-ups).
+- **Examples** (predicted, unmeasured):
+
+| Example | Kind | Pinned pair |
+|---|---|---|
+| `valid/third-party-step-namespace.json` | valid, `runnable: false` (fictional `acme-lab-steps`) | none |
+| `invalid/step-namespace-reserved-prefix.json` | invalid | `$.spec.pipeline.stepNamespaces` / `not` (same mechanism as the measured `step-with-inline-secret`) |
+| `invalid/step-namespaces-empty.json` | invalid | `$.spec.pipeline.stepNamespaces` / `minProperties` (first use; least certain) |
+
+### `contracts/validate.py`
+
+New `check_step_namespaces()`, run before the suites like `check_context_registry()`, adds no count.
+It exits non-zero if a registry namespace is not a two-segment `tributary.*` name with a normalised
+distribution, if any channel-spec example (valid or invalid) has a `uses` with fewer than three
+segments or in a namespace neither registered nor declared in its own `stepNamespaces`, or if the
+`tributary.steps` entry points in `packages/*/pyproject.toml` (read with `tomllib`, stdlib) and the
+registry disagree in either direction.
+
+### Change requests that follow
+
+- **`platform-engineer`** (owner of `steps.py`, `spec.py`):
+  - parse `pipeline.stepNamespaces` strictly (like `context`: a malformed value or a `tributary.*` key
+    refuses the spec rather than being ignored, because dropping it would refuse every customer step
+    later with a less useful error);
+  - a runtime copy of the registry with a two-way test against `step-namespaces.json`; reuse
+    `capabilities.normalise_distribution`;
+  - the step resolver needs the spec's bindings (N3). Suggested, not required: an optional keyword on
+    `load_step` defaulting to "engine namespaces only", so existing callers (`resolve_custom` in
+    `test_envelope_limits_and_budget.py`, the corpus test) keep working, and `build_plan` passes the
+    spec's map;
+  - N4: select by name from metadata, refuse on zero, more than one or a mismatch, and call `load()`
+    only on the verified entry point; N5 log lines; N6 seam (`points`, `registry`), as `ContextResolver`
+    already has;
+  - tests: a look-alike duplicate is refused and **never imported** (a `load()` that raises must not be
+    reached); a distribution mismatch is refused; a missing-distribution entry point is refused; a
+    two-segment name is refused; a customer namespace resolves only with its binding; a `tributary.*`
+    binding in the spec is refused; `importlib.metadata` de-duplication of one distribution seen twice
+    (the N4 claim the architect did not verify). Update `t.broken` and `t.exiting` in
+    `test_tree_execution.py` to a registered three-segment name and a fake distribution through the
+    seam, so they keep testing the import-failure path rather than the new namespace refusal.
+- **`qa-engineer`:** measure the counts below.
+- Optional, **`devops-engineer`:** fail the image build if any installed `tributary.steps` entry point
+  in a `tributary.*` namespace is not from its registered distribution (ADR-007 follow-up 18).
+
+### Verification owed
+
+Not run by the architect, who has no shell.
+
+- `validate.py`: expected **156 / 0** (set 1.5's predicted 153, itself unverified, + 1 valid + 2
+  invalid channel-spec). If set 1.5 measured N, expect N + 3.
+- `validate.py --emit-expectations`: the two pairs above.
+- `pytest tests/conformance`: +3 cases over the set 1.5 measurement.
+- `tributary-runtime` corpus and parse tests: +1 parametrised case each (`test_spec.py` globs
+  `valid/*.json`; `test_core_steps.py` reads the manifest). The new example parses under today's
+  lenient runtime, which ignores `stepNamespaces`, and stays `runnable: false`.
+
+## 2026-09-29 — contract set 1.5: context extensions load only when the spec declares them
 
 **Additive for every document.** Every channel spec valid under set 1.4 stays valid, because
 `pipeline.context` is optional. One valid example gains the field and stays valid. **No invariant

@@ -4,7 +4,7 @@
 **Date:** 2026-09-22
 **Deciders:** architect, with the lead and human able to overrule before the wave-1 gate
 **Relates to:** ADR-001 sections 6.1, 6.2, 6.4 · ADR-003 D1-D6 · invariants 1, 3, 4, 5, 6, 7 · gate `phase-0-spikes.md` 7.1 requirements 5, 7, 8, 13
-**Contracts:** `contracts/channel-spec/v0` (new), `contracts/envelope/v0` 2.3-2.4, `contracts/topics/v0` 3.7-3.8; `contracts/context-extension/v0` (new in set 1.5, amendment 3)
+**Contracts:** `contracts/channel-spec/v0` (new), `contracts/envelope/v0` 2.3-2.4, `contracts/topics/v0` 3.7-3.8; `contracts/context-extension/v0` (new in set 1.5, amendment 3); `contracts/channel-spec/v0/step-namespaces.json` (set 1.6, amendment 4)
 **Evidence:** none of these decisions is a measurement — they are design choices, and the options and costs are written out below. The numeric defaults referenced (3 partitions, `session.timeout.ms` 15000, `commit_every`) come from S4 and S5 via ADR-002; the channel spec only points at them. The schema itself is **verified**: `contracts/validate.py` 96 / 0 and `pytest tests/conformance` 99 passed, 2026-09-22 (section 6, follow-up 1).
 
 ---
@@ -167,6 +167,31 @@ delegation. It cannot see logging, global state or I/O, so it cannot enforce inv
 by returning the base's objects, and `_AttachedReply` forwards `reply` (read, not run). So P1 costs that
 package tests, not code.
 
+## 5d. Amendment 4 — contract set 1.6, `uses` steps pinned to one distribution (2026-09-30)
+
+**Decided by the architect. No invariant changes. Additive for every document.** Contract text:
+`contracts/channel-spec/v0/README.md` 3.3.5, `contracts/channel-spec/v0/step-namespaces.json` (new),
+`contracts/CHANGELOG.md` 2026-09-30 (set 1.6).
+
+**Context (evidence).** `security-reviewer` re-review, Medium, pre-existing: `steps.py:78-82` loads a
+`uses` name from the **first** installed `tributary.steps` entry point carrying it, with no duplicate
+check and no distribution pin. D21's evidence line called the `uses` path the safe one because it
+loads only names the spec references. That was half true: the *name* is reviewed, the *supplier* was
+not. `platform-engineer` proposed rule S1 (an engine registry mapping the first two segments to one
+distribution, exactly-one, PEP 503 match, refusal, a skip log line, a `validate.py` check). Checked
+against the repo by grep: `tributary.core` (5 entry points) is registered by `tributary-runtime`,
+`tributary.hl7v2` (1) by `tributary-hl7v2`, `tributary.content_hl7_fhir` (2) by
+`tributary-content-hl7-fhir`. No other distribution registers the group. Every `uses` in the examples
+is in one of the three.
+
+| # | Decision | Options considered | What it gives up |
+|---|---|---|---|
+| D23 | **A `uses` name resolves only from the one distribution its namespace (first two segments) is bound to, and only if exactly one installed entry point carries it; otherwise the spec is refused and nothing is imported. `tributary.*` namespaces are bound by a contract registry; every other namespace is bound by the spec's optional `pipeline.stepNamespaces`** | (a) S1 as proposed: engine registry only, every other namespace refused; (b) S1 plus an operator-supplied namespace file or env var; (c) S1 for `tributary.*` plus spec-declared bindings for the rest (chosen); (d) exactly-one only, no distribution pin; (e) derive the distribution from the prefix | (a) blocks every in-house step package behind an upstream contract change and publishes its name, against ADR-001 2.2. (b) is D21's rejected option again: invisible in the spec diff, varies per site, so "what code ran" leaves `tb-channel-version`. (d) still loads a look-alike when the real package is absent. (e) is false today (`tributary.core` is `tributary-runtime`). **Cost of (c):** `uses` names need three segments (runtime-enforced; the schema pattern is not tightened because that would be breaking); a channel restates its customer binding in every spec; a second distribution cannot add steps to an engine namespace; a same-named replacement of a bound distribution is not detected at runtime (lockfile, image digest and SBOM remain the control, as in D21) |
+
+**Relation to D21.** Same shape, different default. Context capabilities have no third-party path
+until ADR-005, because none is needed yet. Steps must have one now: `ref` is unimplemented (README
+3.3.1), so `uses` is the only way a customer's code runs at all.
+
 ## 6. Follow-ups
 
 1. ~~**Measure the expected-failure pairs.**~~ **DONE 2026-09-22.** `contracts/validate.py` 96 / 0
@@ -200,3 +225,12 @@ package tests, not code.
 15. **Image-build check** (optional, `devops-engineer`): fail the build if any installed
     `tributary.context` registrant is not in `capabilities.json`. The runtime only warns (L5), because
     it imports nothing undeclared.
+16. **Enforce D23 in the worker** (`platform-engineer`): N1-N6 of channel-spec README 3.3.5, strict
+    parse of `stepNamespaces`, a runtime copy of `step-namespaces.json` with a two-way test, and the
+    two log lines. Closes the re-review Medium on `steps.py:78-82`. Until it lands, the first installed
+    registrant of a name still wins.
+17. **Measure set 1.6** (`qa-engineer`): `validate.py` expected 156 / 0, two predicted pairs.
+    `minProperties` is the less certain.
+18. **Image-build check** (optional, `devops-engineer`): fail the build if an installed
+    `tributary.steps` entry point in a `tributary.*` namespace is not from its registered distribution.
+    Can share the follow-up 15 script.

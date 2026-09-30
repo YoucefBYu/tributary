@@ -21,6 +21,17 @@ to check it against. Two namespaces are refused now because they are certainly n
 Python standard library (`ref: os.system` would import and then be refused only by the signature
 check, and an import alone can have side effects) and `tributary.*`, whose steps are named with `uses`.
 Restricting `ref` to the bundle's own top-level package is proposed to the architect for bundle-fetch.
+
+**Which distribution may answer a `uses` name (set 1.6, README 3.3.5, rules N1-N6).** A `uses` name has
+at least three segments, and its first two are its namespace (N1). A `tributary.*` namespace is bound by
+the engine registry (`step_namespaces.STEP_NAMESPACES`, N2), any other by the spec's
+`pipeline.stepNamespaces` (N3). The name resolves only if exactly one installed `tributary.steps` entry
+point carries it and that entry point's distribution, PEP 503 normalised, is the bound one (N4).
+Everything before that reads entry-point metadata only: `EntryPoint.load()` is called on the one
+verified entry point and on nothing else, so a look-alike package in the image is never imported, and a
+refusal is a `ChannelSpecError` like every other step refusal. `StepResolver.bind` logs
+`step_entry_point_loaded` and `step_entry_point_skipped` (N5); `points` and `registry` are the unit-test
+seam (N6), and nothing outside tests sets them.
 """
 
 from __future__ import annotations
@@ -28,31 +39,222 @@ from __future__ import annotations
 import copy
 import importlib
 import sys
-from collections.abc import Callable
-from importlib.metadata import entry_points
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
+from importlib.metadata import EntryPoint, entry_points
+from types import MappingProxyType
 
 from tributary.sdk import Splitter, Step
+from tributary.sdk.context import Logger
 from tributary.sdk.errors import StepDefinitionError, safe_token
 
+from .capabilities import normalise_distribution
 from .errors import ChannelSpecError
 from .executor import ChannelPlan, PipelineExecutor, StepStats
 from .spec import ChannelSpec, Pipeline, StepRef
+from .step_namespaces import ENTRY_POINT_GROUP, RESERVED_FIRST_SEGMENT, STEP_NAMESPACES, is_reserved, namespace_of
 
-ENTRY_POINT_GROUP = "tributary.steps"
+__all__ = [
+    "DISTRIBUTION_MISMATCH",
+    "DUPLICATE",
+    "ENTRY_POINT_GROUP",
+    "UNREGISTERED_NAMESPACE",
+    "Node",
+    "Resolver",
+    "StepResolver",
+    "build_plan",
+    "load_step",
+    "load_steps",
+]
 
 Node = Step | Splitter
 Resolver = Callable[[StepRef], Node]
 
+#: `step_entry_point_skipped` reasons (N5), all at warning level: each points at a look-alike or a
+#: transitive package in the image. None stops the worker by itself, because nothing was imported.
+DUPLICATE = "duplicate"
+DISTRIBUTION_MISMATCH = "distribution-mismatch"
+UNREGISTERED_NAMESPACE = "unregistered-namespace"
 
-def load_step(reference: StepRef) -> Node:
+_NO_BINDINGS: Mapping[str, str] = MappingProxyType({})
+
+
+def load_step(reference: StepRef, *, namespaces: Mapping[str, str] | None = None) -> Node:
     """Resolve one step and bind its `with`. Raises `ChannelSpecError`, which stops the channel, not the worker.
 
-    Binding happens here, once per channel version (README 3.3): an unknown key, a key that is not a
-    Python identifier, a wrongly typed value or a missing required key refuses the spec loudly, and the
-    worker keeps running the previous one.
+    `namespaces` is the spec's `pipeline.stepNamespaces`; absent means engine namespaces only. This is
+    the unlogged form for callers without a channel version (the corpus tests, harness resolvers); the
+    worker goes through `StepResolver.bind`, which logs N5. Binding happens here, once per channel
+    version (README 3.3): an unknown key, a key that is not a Python identifier, a wrongly typed value or
+    a missing required key refuses the spec loudly, and the worker keeps running the previous one.
     """
-    loaded = _from_entry_point(reference.uses) if reference.uses else _from_dotted_path(reference.ref)
+    return StepResolver().load(reference, namespaces=namespaces)
 
+
+@dataclass(frozen=True, slots=True)
+class _Scope:
+    """What one resolution logs against: the channel version, and which lines it has already written."""
+
+    channel: str | None
+    channel_version: int | None
+    logged: set[tuple[str, ...]]
+
+
+class StepResolver:
+    """Resolves `uses` and `ref` steps under rules N1-N6. One per worker process; holds no mutable state.
+
+    `points` replaces entry-point discovery and `registry` the engine registry, for tests only (N6).
+    """
+
+    def __init__(
+        self,
+        *,
+        log: Logger | None = None,
+        points: Callable[[], Iterable[EntryPoint]] | None = None,
+        registry: Mapping[str, str] = STEP_NAMESPACES,
+    ) -> None:
+        self._log: Logger = log if log is not None else _Quiet()
+        self._points = points if points is not None else lambda: entry_points(group=ENTRY_POINT_GROUP)
+        self._registry = registry
+
+    def bind(self, spec: ChannelSpec) -> Resolver:
+        """A resolver for one channel version: the spec's bindings, one metadata scan, N5 logging.
+
+        The image-wide check runs here, once per version: every installed entry point in a reserved
+        `tributary.*` namespace that the registry would not load is logged, named by a spec or not.
+        """
+        installed = list(self._points())
+        scope = _Scope(channel=spec.name, channel_version=spec.version, logged=set())
+        for point in installed:
+            reason = self._reserved_failure(point)
+            if reason is not None:
+                self._skipped(point, reason, scope)
+        namespaces = spec.pipeline.step_namespaces
+
+        def resolve(reference: StepRef) -> Node:
+            return self._node(reference, namespaces, installed, scope)
+
+        return resolve
+
+    def load(self, reference: StepRef, *, namespaces: Mapping[str, str] | None = None) -> Node:
+        """One step, outside any channel version. Discovery runs only for a `uses` step."""
+        installed = list(self._points()) if reference.uses else []
+        scope = _Scope(channel=None, channel_version=None, logged=set())
+        return self._node(reference, namespaces if namespaces is not None else _NO_BINDINGS, installed, scope)
+
+    # -- one step ------------------------------------------------------------------------------------
+
+    def _node(
+        self, reference: StepRef, namespaces: Mapping[str, str], installed: list[EntryPoint], scope: _Scope
+    ) -> Node:
+        loaded = (
+            self._from_entry_point(reference.uses, namespaces, installed, scope)
+            if reference.uses
+            else _from_dotted_path(reference.ref)
+        )
+        return _as_node(reference, loaded)
+
+    def _from_entry_point(
+        self, name: str | None, namespaces: Mapping[str, str], installed: list[EntryPoint], scope: _Scope
+    ) -> object:
+        if not name:
+            raise ChannelSpecError("step has no `uses` value")
+        namespace = namespace_of(name)
+        if namespace is None:  # N1
+            raise ChannelSpecError(
+                f"uses {safe_token(name)} has no namespace: a uses name needs at least three segments "
+                "(channel-spec README 3.3.5 N1)"
+            )
+        carriers = [point for point in installed if point.name == name]
+        expected = self._registry.get(namespace) if is_reserved(namespace) else namespaces.get(namespace)
+        if expected is None:  # N2, N3
+            for point in carriers:
+                self._skipped(point, UNREGISTERED_NAMESPACE, scope)
+            where = "the engine registry" if is_reserved(namespace) else "spec.pipeline.stepNamespaces"
+            raise ChannelSpecError(
+                f"uses {safe_token(name)}: namespace {safe_token(namespace)} is not bound by {where} "
+                "(channel-spec README 3.3.5)"
+            )
+        if not carriers:
+            raise ChannelSpecError(f"no step registered as {safe_token(name)} in {ENTRY_POINT_GROUP}")
+        if len(carriers) > 1:  # N4: two distributions, since importlib.metadata de-duplicates one
+            for point in carriers:
+                self._skipped(point, DUPLICATE, scope)
+            raise ChannelSpecError(
+                f"uses {safe_token(name)} is registered by more than one entry point; none is loaded"
+            )
+        point = carriers[0]
+        distribution = _metadata(point)[0]
+        if point.dist is None or normalise_distribution(distribution) != expected:
+            self._skipped(point, DISTRIBUTION_MISMATCH, scope)
+            raise ChannelSpecError(
+                f"uses {safe_token(name)} comes from distribution {safe_token(distribution)}, "
+                f"bound to {safe_token(expected)}"
+            )
+        try:
+            target = point.load()  # the one verified entry point, and the only import (N4)
+        except (Exception, SystemExit) as exc:  # import-time code can raise anything, even sys.exit()
+            raise ChannelSpecError(f"cannot load step {safe_token(name)}: {type(exc).__name__}") from None
+        self._emit("step_entry_point_loaded", point, scope, reason=None, level="info")
+        return target
+
+    # -- N5 ------------------------------------------------------------------------------------------
+
+    def _reserved_failure(self, point: EntryPoint) -> str | None:
+        """Why the registry would refuse an installed entry point in a reserved namespace, if it would."""
+        if point.name.split(".", 1)[0] != RESERVED_FIRST_SEGMENT:
+            return None
+        namespace = namespace_of(point.name)
+        expected = self._registry.get(namespace) if namespace is not None else None
+        if expected is None:
+            return UNREGISTERED_NAMESPACE
+        if point.dist is None or normalise_distribution(_metadata(point)[0]) != expected:
+            return DISTRIBUTION_MISMATCH
+        return None
+
+    def _skipped(self, point: EntryPoint, reason: str, scope: _Scope) -> None:
+        self._emit("step_entry_point_skipped", point, scope, reason=reason, level="warning")
+
+    def _emit(self, event: str, point: EntryPoint, scope: _Scope, *, reason: str | None, level: str) -> None:
+        distribution, version = _metadata(point)
+        key = (event, point.name, distribution, point.value, reason or "")
+        if key in scope.logged:
+            return  # one line per distinct name per applied version, however often the spec names it
+        scope.logged.add(key)
+        fields: dict[str, object] = {"step": point.name, "distribution": distribution, "version": version}
+        if scope.channel is not None:
+            fields.update(channel=scope.channel, channel_version=scope.channel_version)
+        if reason is not None:
+            fields["reason"] = reason
+        (self._log.warning if level == "warning" else self._log.info)(event, **fields)
+
+
+def _metadata(point: EntryPoint) -> tuple[str, str]:
+    """`(distribution name, distribution version)` from the entry point's metadata. No import."""
+    dist = point.dist
+    if dist is None:
+        return "unknown", "unknown"
+    return str(dist.name), str(dist.version)
+
+
+class _Quiet:
+    """The logger of an unlogged `StepResolver` (`load_step`)."""
+
+    def debug(self, event: str, /, **fields: object) -> None:
+        return None
+
+    def info(self, event: str, /, **fields: object) -> None:
+        return None
+
+    def warning(self, event: str, /, **fields: object) -> None:
+        return None
+
+    def error(self, event: str, /, **fields: object) -> None:
+        return None
+
+
+def _as_node(reference: StepRef, loaded: object) -> Node:
+    """Wrap a loaded callable as a step if it is not one yet, and bind the spec's `with`."""
     node: Node
     if isinstance(loaded, Step | Splitter):
         node = loaded
@@ -70,18 +272,6 @@ def load_step(reference: StepRef) -> Node:
     except StepDefinitionError as exc:
         # The binder's messages carry key names only, never values (they may have been pasted from data).
         raise ChannelSpecError(f"step {safe_token(reference.name)}: {exc}") from None
-
-
-def _from_entry_point(name: str | None) -> object:
-    if not name:
-        raise ChannelSpecError("step has no `uses` value")
-    matches = [point for point in entry_points(group=ENTRY_POINT_GROUP) if point.name == name]
-    if not matches:
-        raise ChannelSpecError(f"no step registered as {safe_token(name)} in {ENTRY_POINT_GROUP}")
-    try:
-        return matches[0].load()
-    except (Exception, SystemExit) as exc:  # import-time code can raise anything, even sys.exit()
-        raise ChannelSpecError(f"cannot load step {safe_token(name)}: {type(exc).__name__}") from None
 
 
 def _from_dotted_path(path: str | None) -> object:
@@ -106,13 +296,13 @@ def _from_dotted_path(path: str | None) -> object:
 
 def load_steps(pipeline: Pipeline) -> tuple[Node, ...]:
     """Resolve every step in order. All-or-nothing: a channel with one unloadable step does not run."""
-    return tuple(load_step(reference) for reference in pipeline.steps)
+    return tuple(load_step(reference, namespaces=pipeline.step_namespaces) for reference in pipeline.steps)
 
 
 def build_plan(
     spec: ChannelSpec,
     *,
-    resolve: Resolver = load_step,
+    resolve: Resolver | None = None,
     pipeline_override: tuple[Node, ...] | None = None,
     stats: StepStats | None = None,
 ) -> ChannelPlan:
@@ -127,6 +317,8 @@ def build_plan(
     * a splitter in `destinations[].steps`: a destination's copy is one record to one `out.<dest>`.
     """
     stats = stats if stats is not None else StepStats()
+    # N3: the default resolver carries this version's `stepNamespaces`; a harness resolver replaces it.
+    resolve = resolve if resolve is not None else StepResolver().bind(spec)
     nodes = (
         pipeline_override
         if pipeline_override is not None

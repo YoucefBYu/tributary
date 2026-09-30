@@ -179,6 +179,18 @@ wave's exit criteria here.
   - `qa-engineer`: exit-criterion-1 spec asserts `context: [fhir]` (inherited from the example), plus a
     control without it; `validate.py` **153 / 0** with three predicted pairs;
   - optional `devops-engineer`: an image-build check against `capabilities.json`.
+- **OPEN, wave 2: security Medium (re-review, pre-existing), `uses` steps load from the first
+  registrant** (`steps.py:78-82`). Ruled 2026-09-30 as **contract set 1.6** (additive, unverified;
+  ADR-007 D23; `platform-engineer`'s S1, amended). Engine namespaces are pinned by the new
+  `contracts/channel-spec/v0/step-namespaces.json` (`tributary.core` → `tributary-runtime`,
+  `tributary.hl7v2` → `tributary-hl7v2`, `tributary.content_hl7_fhir` → `tributary-content-hl7-fhir`).
+  Third-party namespaces are bound per channel by the optional `pipeline.stepNamespaces`, so no
+  customer package needs a core contract change. A duplicate, mismatched or unbound name refuses the
+  spec, and nothing else is imported. Follow-ups:
+  - `platform-engineer`: N1-N6 (README 3.3.5), strict `stepNamespaces` parse, runtime registry copy
+    with a two-way test, the two log lines, and the `t.broken`/`t.exiting` tests moved onto the seam;
+  - `qa-engineer`: `validate.py` **156 / 0**, two predicted pairs, conformance +3;
+  - optional `devops-engineer`: an image-build check for `tributary.*` step entry points.
 - **OPEN, wave 2: invariant 3 is broken on every receiver. Owner: `connector-engineer`, started
   2026-09-29 with `mllp`.** `mllp`, `http`, `sftp` and `kafka_source` all take a required
   `--channel-spec <file>` (confirmed by grep; none calls `open_spec_source`). So each needs a file that
@@ -417,6 +429,7 @@ All six filed and synthesised. Full threshold table with evidence ratings quoted
 | 2026-09-29 | **Set 1.4.1: `kafka-users-init` is not a super user** (amends the super-users row above). It holds only ALTER on CLUSTER, granted by `start-broker.sh` with the broker certificate (`5495498`). Super users: broker (`CN=kafka`), `topic-bootstrap`, `admin`. Recorded, not hidden: ALTER on CLUSTER also authorises `CreateAcls`/`DeleteAcls`, so escalation needs one explicit, listable ACL write. Rejected: keeping the set 1.4 super-user text, which is looser than the code. **Give up:** nothing functional. The key stays super-user-grade, and revoking the grant after provisioning is optional | ADR-008 D8 and follow-up 9, `engine-kafka/v0` 6 rule 3, `topics/v0` 3.4 |
 | 2026-09-29 | **Context extensions load only when the channel spec declares them (set 1.5, additive).** `spec.pipeline.context` lists registered capabilities (`fhir`). A registry in the new `contracts/context-extension/v0` pins each name to one distribution. The worker never imports an undeclared registrant, and refuses a spec whose name is unregistered, duplicated or from another distribution. The group is now a contract: factory `() -> ContextExtension`, `ReplyContext` preserved, rules L1-L7, plugin obligations P1-P7 (no own logger, no global mutable state, no I/O or side effects outside `ctx`, identity delegation of `log`/`secrets`/`vars`/`kv`). `context_extension_loaded` carries distribution and version. Rejected: deployment config as the allow-list (the reviewer cannot see it, and it varies per site), both lists (drift, no extra threat covered), per-step declaration (breaks one `ctx.fhir` per branch), and load-all plus probe (the finding). **Give up:** a declared capability reaches every step on the channel; third-party capabilities need a contract change until ADR-005; an undeclared `ctx.fhir` use dead-letters late | ADR-007 D21-D22, `contracts/context-extension/v0`, channel-spec README 3.3.4 |
 | 2026-09-29 | **Receivers' `--channel-spec` files are an invariant-3 defect, not a stand-in to keep.** They are to be migrated to `_tb.<env>.channels` in wave 2, starting with `mllp` (`connector-engineer`). No contract change: set 1.4 grants already cover it. Live reload stays out of scope (ADR-007 D19) | ADR-008 D6, invariant 3 |
+| 2026-09-30 | **`uses` steps load only from one pinned distribution (set 1.6, additive; `platform-engineer`'s S1 approved with an amendment).** The namespace is the first two segments of a `uses` name, and a name needs three. `tributary.*` namespaces are reserved and bound by `step-namespaces.json`. Every other namespace is bound by the spec's `pipeline.stepNamespaces`. Exactly one installed entry point must carry the name, from the bound distribution (PEP 503), or the spec is refused with nothing imported. `step_entry_point_loaded` and `step_entry_point_skipped` log lines. `validate.py` cross-checks the registry against the examples and `packages/*/pyproject.toml`. Rejected: engine registry only (blocks in-house step packages, against ADR-001 2.2), an operator namespace file (invisible to the reviewer, varies per site, as in D21), exactly-one without a pin, deriving the distribution from the prefix (`tributary.core` is `tributary-runtime`). **Give up:** three-segment names, bindings restated per spec, no second distribution in an engine namespace, a same-named replacement package undetected at runtime | ADR-007 D23, channel-spec README 3.3.5, `step-namespaces.json` |
 
 ## Open questions for the human
 

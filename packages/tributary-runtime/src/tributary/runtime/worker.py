@@ -68,7 +68,7 @@ from .reply import (
     destination_rank,
 )
 from .spec import ChannelSpec, RetryPolicy
-from .steps import Node, Resolver, build_plan, load_step
+from .steps import Node, Resolver, StepResolver, build_plan
 from .topics import (
     channels_topic,
     consumer_group,
@@ -405,7 +405,7 @@ class PipelineHandler:
         log: Logger,
         instance: str,
         steps_override: tuple[Node, ...] | None = None,
-        resolve: Resolver = load_step,
+        resolve: Resolver | None = None,
         flush_timeout_s: float = 30.0,
         transactional: bool = False,
         stats_interval_s: float = 60.0,
@@ -414,6 +414,7 @@ class PipelineHandler:
         replies: ReplyPublisher | None = None,
         context_extensions: Sequence[ContextExtension] | None = None,
         context_resolver: ContextResolver | None = None,
+        step_resolver: StepResolver | None = None,
     ) -> None:
         self._env = env
         # L7: an explicit tuple replaces discovery (tests only; nothing in `main` sets it).
@@ -428,7 +429,10 @@ class PipelineHandler:
         self._log = log
         self._instance = instance
         self._steps_override = steps_override
+        # `resolve` is a harness seam; the worker's own path is the step resolver, bound per version so a
+        # `uses` step loads from its pinned distribution only (channel-spec README 3.3.5, N1-N6).
         self._resolve = resolve
+        self._step_resolver = step_resolver if step_resolver is not None else StepResolver(log=log)
         self._flush_timeout_s = flush_timeout_s
         self._time_budget_s = time_budget_s
         self._clock = clock
@@ -446,7 +450,8 @@ class PipelineHandler:
     def prepare(self, spec: ChannelSpec) -> ChannelPlan:
         """Build the plan for `spec` now. At startup this is what makes a bad `with` stop the worker
         before it consumes anything, rather than on the first message."""
-        plan = build_plan(spec, resolve=self._resolve, pipeline_override=self._steps_override, stats=self.stats)
+        resolve = self._resolve if self._resolve is not None else self._step_resolver.bind(spec)
+        plan = build_plan(spec, resolve=resolve, pipeline_override=self._steps_override, stats=self.stats)
         # `pipeline.context` with the steps, all or nothing (context-extension/v0 L1, L2, L6): only
         # declared entry points are imported, and a refusal here keeps the previous version running.
         context = self._context_override if self._context_override is not None else self._context_resolver.resolve(spec)
