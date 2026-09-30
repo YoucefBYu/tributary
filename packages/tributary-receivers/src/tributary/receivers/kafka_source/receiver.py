@@ -30,13 +30,18 @@ log line and metric carry topic, partition and offset and a reason code, never t
 payload. The halt lasts until the process restarts or the partition is reassigned, and an operator
 must act (skip the offset on the source cluster, or fix the producer).
 
+**Live spec (invariant 3).** `apply_settings` replaces the settings; each record reads them once when it is
+handled, so one record is never checked under one spec and stamped with another. `pause` (a tombstone) stops
+after the record in flight: nothing fetched afterwards is published, `run` then commits **only the offsets
+that were acked** and closes the consumer. A record fetched but not published is not committed and is re-read
+after a redeploy. `kafka_source/reload.py` is the live-versus-restart table.
+
 **Inbound headers are never trusted or copied**: the envelope is minted fresh; the inbound key is used
 only by a `record:key` partitionKey; inbound headers are read only by a `header:` partitionKey.
 """
 
 from __future__ import annotations
 
-import argparse
 import asyncio
 import json
 import logging
@@ -59,10 +64,10 @@ from ..metrics import Metrics
 from ..mllp.kafka_publisher import RawPublisher, topic_name
 from ..payload import well_formed
 from ..secrets import DirSecretResolver, SecretResolver
-from .config import KafkaSourceSettings, kafka_source_settings_from_channel_spec
+from .config import KafkaSourceSettings
 from .security import security_properties
 
-__all__ = ["KafkaSourceReceiver", "build_consumer", "serve_from_channel_spec"]
+__all__ = ["KafkaSourceReceiver", "build_consumer"]
 
 _log = logging.getLogger("tributary.receivers.kafka_source")
 _PARTITION_EOF = -191  # confluent_kafka.KafkaError._PARTITION_EOF
@@ -117,6 +122,21 @@ class KafkaSourceReceiver:
         self._resume_at: float | None = None
         self._backoff_s = cfg.unavailable_backoff_initial_s
         self._source = f"kafka:{cfg.instance}@{cfg.source_bootstrap[0]}"
+        self._paused = False
+
+    def apply_settings(self, new: KafkaSourceSettings) -> None:
+        """Replace the settings (a live spec update; `kafka_source/reload.py`). One assignment: a record that
+        already took its snapshot finishes under the old one. The caller has refused restart-only changes."""
+        self.cfg = new
+
+    def pause(self) -> None:
+        """Stop after the record in flight (a tombstone): nothing more is published, `run` commits what was
+        acked and closes. Idempotent; a redeploy builds a new receiver."""
+        self._paused = True
+
+    @property
+    def paused(self) -> bool:
+        return self._paused
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -141,7 +161,7 @@ class KafkaSourceReceiver:
     async def run(self, stop: asyncio.Event) -> None:
         self.start()
         try:
-            while not stop.is_set():
+            while not stop.is_set() and not self._paused:
                 await self.step()
         finally:
             await asyncio.to_thread(self.close)
@@ -170,20 +190,23 @@ class KafkaSourceReceiver:
 
     # ------------------------------------------------------------------ one record
 
-    def _refusal(self, value: bytes | None, key: bytes | None, headers: Any) -> tuple[str | None, bytes | None]:
+    @staticmethod
+    def _refusal(
+        cfg: KafkaSourceSettings, value: bytes | None, key: bytes | None, headers: Any
+    ) -> tuple[str | None, bytes | None]:
         """`(reason, None)` if the record must be refused, else `(None, partition key)`."""
         if value is None:
             return "tombstone", None
-        if len(value) > self.cfg.max_message_bytes:
+        if len(value) > cfg.max_message_bytes:
             return "oversize", None
         if not value:
             return "empty", None
-        if "parse-error" in self.cfg.nack_on and not well_formed(self.cfg.content_type, value):
+        if "parse-error" in cfg.nack_on and not well_formed(cfg.content_type, value):
             return "parse-error", None
         outcome = resolve_key(
-            self.cfg.key_expression,
+            cfg.key_expression,
             payload=value,
-            content_type=self.cfg.content_type,
+            content_type=cfg.content_type,
             headers=[(name, val) for name, val in (headers or [])],
             record_key=key,
             header_source="kafka",
@@ -193,27 +216,30 @@ class KafkaSourceReceiver:
         return None, outcome.key
 
     async def _handle(self, msg: Any) -> None:
+        cfg = self.cfg  # one snapshot for this whole record
         partition: int = msg.partition()
         offset: int = msg.offset()
         if partition in self.halted:
             return  # in-flight leftover from a halted partition: never processed, never committed past
+        if self._paused:
+            return  # tombstoned after this record was fetched: not published, not committed, re-read on redeploy
         self.metrics.messages_received += 1
         value: bytes | None = msg.value()
-        reason, key = self._refusal(value, msg.key(), msg.headers())
+        reason, key = self._refusal(cfg, value, msg.key(), msg.headers())
         if reason is not None or value is None:
             self._halt(partition, offset, reason or "tombstone")
             return
         message = build_raw_envelope(
-            channel=self.cfg.channel,
-            channel_version=self.cfg.channel_version,
+            channel=cfg.channel,
+            channel_version=cfg.channel_version,
             source=self._source,
             payload=value,
             key=key,
-            content_type=self.cfg.content_type,
+            content_type=cfg.content_type,
         )
         t0 = time.monotonic()
         try:
-            ok = await self.publisher.publish(message, timeout_s=self.cfg.ack_timeout_s)
+            ok = await self.publisher.publish(message, timeout_s=cfg.ack_timeout_s)
         except PermanentPublishError:
             self.metrics.rejected_envelope += 1
             self._halt(partition, offset, "envelope-invalid")  # D16: retrying cannot help
@@ -322,74 +348,76 @@ def build_consumer(cfg: KafkaSourceSettings, resolver: SecretResolver) -> Any:
     return Consumer(config)
 
 
-async def serve_from_channel_spec(
-    spec: dict[str, Any],
-    *,
-    env: str,
-    kafka: KafkaSettings,
-    instance: str = "kafka-0",
-    secret_resolver: SecretResolver | None = None,
-    metrics_file: str | None = None,
-) -> None:
-    cfg = kafka_source_settings_from_channel_spec(spec, env=env, instance=instance)
-    resolver = secret_resolver or DirSecretResolver()
-    consumer = build_consumer(cfg, resolver)
-    topic = topic_name(cfg.env, cfg.channel)
-    publisher = RawPublisher(
-        kafka,
-        topic,
-        ordering="per-key" if cfg.key_expression is not None else "none",
-        client_id_prefix="kafka-source-receiver",
-    )
-    publisher.start(asyncio.get_running_loop())
-    metrics = Metrics()
-    receiver = KafkaSourceReceiver(cfg, publisher, consumer, metrics=metrics)
-    stop = asyncio.Event()
-    print(
-        json.dumps({"event": "listening", "channel": cfg.channel, "topic": topic, "port": 0, "tls": False}), flush=True
-    )
-    try:
-        task = asyncio.create_task(receiver.run(stop))
-        while not task.done():
-            await asyncio.wait({task}, timeout=1.0)
-            if metrics_file:
-                with open(metrics_file, "w") as f:
-                    json.dump({**metrics.snapshot(), "halted_partitions": sorted(receiver.halted)}, f)
-        await task
-    finally:
-        stop.set()
-        publisher.close()
-
-
 def main() -> None:
+    """`python -m tributary.receivers.kafka_source --channel <name> --env <env>`.
+
+    The channel spec is read from the compacted `_tb.<env>.channels` topic over the engine Kafka link
+    (invariant 3); there is no file input. Consumption starts only after a valid spec for `--channel` has been
+    read. Exit codes: 0 after SIGTERM/SIGINT or after a spec change that needs a restart (the supervisor
+    restarts on 0), 2 for a refused startup configuration."""
+    from tributary.runtime.errors import RuntimeConfigurationError
+
+    from ..cli import QuietArgumentParser, run_until_stopped, spec_feed_opener
+    from ..startup import refuse, refuse_retired_channel_spec_flag, spec_reader_group_or_exit
+    from .runner import KafkaSourceRunner, RunnerOptions
+    from .service import KafkaSourceService
+
+    argv = sys.argv[1:]
+    log = JsonLogger("receiver-kafka-source")
     # Before parse_args: argparse echoes an unknown flag's value to stderr, so a retired
-    # --bootstrap / --engine-security must reach the ENGINE_KAFKA_RETIRED_INPUT refusal first.
-    kafka = load_engine_kafka_or_exit(argv=sys.argv[1:], log=JsonLogger("receiver-kafka-source"))
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--channel-spec", required=True)
-    p.add_argument("--env", required=True)
-    p.add_argument("--instance", default="kafka-0")
-    p.add_argument("--secrets-dir")
+    # --bootstrap / --engine-security / --channel-spec must reach its refusal first.
+    kafka = load_engine_kafka_or_exit(argv=argv, log=log)
+    refuse_retired_channel_spec_flag(argv, log)
+    p = QuietArgumentParser(log, description=__doc__)
+    p.add_argument("--channel", required=True, help="the deployed channel name (spec.metadata.name)")
+    p.add_argument("--env", required=True, help="the topic-name env segment, e.g. 'dev' or 'prod'")
+    p.add_argument("--instance", default="kafka-0", help="this process's identity: static group member and tb-source")
+    p.add_argument("--secrets-dir", help="overrides TB_SECRETS_DIR / the default secrets mount")
+    p.add_argument("--contracts-dir", help="overrides TB_CONTRACTS_DIR / the default contracts/ search")
     p.add_argument("--metrics-file")
-    a = p.parse_args()
+    a = p.parse_args(argv)
     logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(message)s")
-    with open(a.channel_spec, encoding="utf-8") as f:
-        spec = json.load(f)
-    resolver = DirSecretResolver(a.secrets_dir) if a.secrets_dir else None
-    coro = serve_from_channel_spec(
-        spec,
-        env=a.env,
-        kafka=kafka,
-        instance=a.instance,
-        secret_resolver=resolver,
+    # Operator input is validated (and refused without being echoed) before it becomes a log field.
+    spec_group = spec_reader_group_or_exit(a.env, a.channel, a.instance, log)
+    log = JsonLogger("receiver-kafka-source", base={"channel": a.channel, "instance": a.instance})
+    try:
+        defaults = load_topic_defaults(a.contracts_dir)
+    except RuntimeConfigurationError as exc:
+        refuse(log, error=type(exc).__name__, code=exc.code)
+    try:
+        topic = topic_name(a.env, a.channel)
+    except ValueError:
+        refuse(log, error="UsageError", code="ARGUMENTS_INVALID", reason="invalid --env or --channel")
+    resolver = DirSecretResolver(a.secrets_dir) if a.secrets_dir else DirSecretResolver()
+
+    def make_publisher(cfg: KafkaSourceSettings) -> RawPublisher:
+        publisher = RawPublisher(
+            kafka,
+            topic,
+            topic_defaults=defaults,
+            ordering="per-key" if cfg.key_expression is not None else "none",
+            client_id_prefix="kafka-source-receiver",
+        )
+        publisher.start(asyncio.get_running_loop())
+        return publisher
+
+    def make_service(cfg: KafkaSourceSettings, publisher: RawPublisher, metrics: Metrics) -> KafkaSourceService:
+        # The topic, the foreign connection and its credentials are restart-only, so the startup settings
+        # build the consumer for the life of the process.
+        return KafkaSourceService(cfg, publisher, build_consumer(cfg, resolver), metrics=metrics)
+
+    runner = KafkaSourceRunner(
+        open_feed=spec_feed_opener(
+            kafka=kafka, defaults=defaults, env=a.env, channel=a.channel, group=spec_group, log=log
+        ),
+        make_publisher=make_publisher,
+        make_service=make_service,
+        options=RunnerOptions(env=a.env, instance=a.instance, topic=topic),
+        commit_every=defaults.consumer.commit_every,
+        log=log,
         metrics_file=a.metrics_file,
     )
-    try:
-        import uvloop  # type: ignore[import-not-found]
-    except ImportError:
-        asyncio.run(coro)
-    else:
-        uvloop.run(coro)
+    run_until_stopped(runner)
 
 
 if __name__ == "__main__":

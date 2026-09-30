@@ -11,6 +11,10 @@ minimum version, so accepting `1.3` would be a promise nothing keeps; the same r
 `tributary.loaders.kafka` makes), a `PLAINTEXT` connection to a non-loopback broker, a topic that is
 `_tb.*` or channel-shaped, and any `ack.nackOn` value other than `parse-error` (a Kafka source has no
 NACK: a refused record halts its partition, D16, so `queue-full` and `spec-invalid` cannot fire).
+
+The spec arrives as a parsed `tributary.runtime.spec.ChannelSpec` from the live `_tb.<env>.channels` reader
+(`kafka_source_settings_from_spec`), and `kafka_source/reload.py` says which settings apply live: every value
+applied live is checked here, so a bad update is a `ConfigError` before anything is applied.
 """
 
 from __future__ import annotations
@@ -20,6 +24,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from tributary.runtime.spec import ChannelSpec
 from tributary.sdk.keys import KeyExpression
 
 from ..errors import ConfigError
@@ -71,6 +76,9 @@ class KafkaSourceSettings:
     commit_flush_interval_s: float = 1.0
     unavailable_backoff_initial_s: float = 1.0
     unavailable_backoff_max_s: float = 30.0
+    #: `spec.ordering` and the `spec.partitionKey` text. Fixed for the life of the process (`kafka_source/reload.py`).
+    ordering: str = "none"
+    partition_key: str | None = None
 
     @property
     def group_id(self) -> str:
@@ -78,6 +86,18 @@ class KafkaSourceSettings:
         return f"tb.{self.env}.{self.channel}.receiver"
 
     def __post_init__(self) -> None:
+        if (self.ordering == "per-key") != (self.key_expression is not None):
+            raise ConfigError(f"channel {self.channel!r}: ordering per-key needs a key expression, none forbids one")
+        if isinstance(self.max_message_bytes, bool) or not isinstance(self.max_message_bytes, int):
+            raise ConfigError(f"channel {self.channel!r}: maxMessageBytes must be a positive integer")
+        if self.max_message_bytes < 1:
+            raise ConfigError(f"channel {self.channel!r}: maxMessageBytes must be a positive integer")
+        if not isinstance(self.ack_timeout_s, int | float) or isinstance(self.ack_timeout_s, bool):
+            raise ConfigError(f"channel {self.channel!r}: source.ack.timeoutMs must be a positive number")
+        if not 0 < self.ack_timeout_s < float("inf"):
+            raise ConfigError(f"channel {self.channel!r}: source.ack.timeoutMs must be a positive number")
+        if self.start_from not in ("earliest", "latest"):
+            raise ConfigError(f"channel {self.channel!r}: kafka.startFrom must be 'earliest' or 'latest'")
         if not _INSTANCE.match(self.instance):
             raise ConfigError(f"instance {self.instance!r} must match {_INSTANCE.pattern}")
         if self.max_message_bytes > DEFAULT_MAX_MESSAGE_BYTES:
@@ -149,9 +169,48 @@ def kafka_source_settings_from_channel_spec(
     """Build settings from a parsed channel spec. `commit_every` defaults to the topics contract's
     consumer value (`load_topic_defaults`), which is also this source's replay window."""
     metadata = _require(spec, "metadata", "channel spec")
-    channel = _require(metadata, "name", "metadata")
     body = _require(spec, "spec", "channel spec")
-    source = _require(body, "source", "spec")
+    return _settings(
+        _require(metadata, "name", "metadata"),
+        int(metadata.get("version", 0)),
+        _require(body, "ordering", "spec"),
+        _require(body, "source", "spec"),
+        partition_key=body.get("partitionKey"),
+        env=env,
+        instance=instance,
+        commit_every=commit_every,
+    )
+
+
+def kafka_source_settings_from_spec(
+    spec: ChannelSpec, *, env: str, instance: str = "kafka-0", commit_every: int | None = None
+) -> KafkaSourceSettings:
+    """Build settings from the runtime's parsed spec (the `_tb.<env>.channels` record)."""
+    if not spec.source:
+        raise ConfigError(f"channel {spec.name!r}: spec.source is absent")
+    return _settings(
+        spec.name,
+        spec.version,
+        spec.ordering,
+        spec.source,
+        partition_key=spec.partition_key,
+        env=env,
+        instance=instance,
+        commit_every=commit_every,
+    )
+
+
+def _settings(
+    channel: str,
+    channel_version: int,
+    ordering: str,
+    source: Mapping[str, Any],
+    *,
+    partition_key: str | None,
+    env: str,
+    instance: str,
+    commit_every: int | None,
+) -> KafkaSourceSettings:
     if source.get("type") != "kafka":
         raise ConfigError(f"channel {channel!r}: source.type is {source.get('type')!r}, not 'kafka'")
     ack = _require(source, "ack", "source")
@@ -168,7 +227,10 @@ def kafka_source_settings_from_channel_spec(
     kafka = _require(source, "kafka", "source")
     connection = _require(kafka, "connection", "source.kafka")
     key_expression = key_expression_from_spec(
-        body, channel=channel, source_type="kafka", content_types=frozenset({content_type})
+        {"ordering": ordering, "partitionKey": partition_key},
+        channel=channel,
+        source_type="kafka",
+        content_types=frozenset({content_type}),
     )
     if commit_every is None:
         from tributary.runtime.config import load_topic_defaults
@@ -176,7 +238,7 @@ def kafka_source_settings_from_channel_spec(
         commit_every = load_topic_defaults().consumer.commit_every
     return KafkaSourceSettings(
         channel=channel,
-        channel_version=int(metadata.get("version", 0)),
+        channel_version=channel_version,
         content_type=content_type,
         source_bootstrap=tuple(_require(connection, "bootstrapServers", "source.kafka.connection")),
         security=parse_security(_require(connection, "security", "source.kafka.connection"), channel),
@@ -184,9 +246,11 @@ def kafka_source_settings_from_channel_spec(
         start_from=_require(kafka, "startFrom", "source.kafka"),
         nack_on=nack_on,
         key_expression=key_expression,
-        max_message_bytes=int(source.get("maxMessageBytes", DEFAULT_MAX_MESSAGE_BYTES)),
+        max_message_bytes=source.get("maxMessageBytes", DEFAULT_MAX_MESSAGE_BYTES),
         ack_timeout_s=ack.get("timeoutMs", DEFAULT_ACK_TIMEOUT_MS) / 1000,
         env=env,
         instance=instance,
         commit_every=commit_every,
+        ordering=ordering,
+        partition_key=partition_key,
     )

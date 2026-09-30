@@ -42,6 +42,7 @@ def cfg_for(source: str, engine: str, channel: str, topic: str, **kw: object) ->
         start_from="earliest",
         nack_on=frozenset(),
         key_expression=parse_key_expression("record:key"),
+        ordering="per-key",
         max_message_bytes=1_000,
         ack_timeout_s=kw.pop("ack_timeout_s", 15.0),  # type: ignore[arg-type]
         env=ENV,

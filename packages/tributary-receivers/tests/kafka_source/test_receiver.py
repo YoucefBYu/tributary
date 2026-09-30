@@ -145,6 +145,8 @@ def settings(**kw: object) -> KafkaSourceSettings:
         commit_every=3,
         commit_flush_interval_s=10.0,
     )
+    if kw.get("key_expression") is not None:
+        kw.setdefault("ordering", "per-key")
     return replace(base, **kw)  # type: ignore[arg-type]
 
 
