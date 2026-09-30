@@ -51,6 +51,8 @@ def settings(**overrides: object) -> HttpSettings:
         idle_timeout_s=2.0,
         request_timeout_s=3.0,
     )
+    if overrides.get("key_expression") is not None:
+        overrides.setdefault("ordering", "per-key")
     return replace(base, **overrides)  # type: ignore[arg-type]
 
 

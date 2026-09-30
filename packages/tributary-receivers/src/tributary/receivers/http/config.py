@@ -1,10 +1,11 @@
 """Turning a `contracts/channel-spec/v0` document (`spec.source.type: http`) into `HttpSettings`.
 
-Same wave-1-stand-in note as `tributary.receivers.mllp.config`: there is no `tributary-runtime`
-channel-cache consumer for this receiver yet, so a caller loads the spec document itself (a file, in
-`__main__.py`) and hands it to `http_settings_from_channel_spec`. Everything else mirrors that
-module's split: the schema is trusted for shapes it already constrains; this module refuses, at
-startup, the handful of legal shapes this wave's receiver cannot yet honour.
+The spec arrives as a parsed `tributary.runtime.spec.ChannelSpec` from the live `_tb.<env>.channels`
+reader (`http_settings_from_spec`), not from a file: invariant 3 and `http/reload.py` (which settings apply
+live and which need a restart). `http_settings_from_channel_spec` keeps the published-document shape for
+tests and tools; both share `_settings`. The schema is trusted for shapes it already constrains; this module
+refuses the legal shapes this receiver cannot honour, and every numeric or structural value it will apply, so
+a bad live update is a `ConfigError` before anything is applied.
 
 README 3.2.3: "It is an ingest endpoint, not a FHIR server" -- one fixed `POST` path. A FHIR-ingest
 channel is an `http` source whose `accept` includes `application/fhir+json`; there is no separate
@@ -16,10 +17,9 @@ Known gaps, stated rather than hidden:
 * `auth: mtls` authenticates that the client certificate chains to the trust bundle in `tls.secretRef`.
   Without `tls.allowedClientSans` (set 1.3, README 3.2.7) every certificate that chains is accepted; with
   it, the leaf must carry a listed SAN, enforced after the handshake and before any byte is read.
-* `ack.nackOn: spec-invalid` is schema-valid but refused at startup, as `mllp` does: it means "NACK
-  because the channel spec became invalid", and nothing in this wave watches the spec after start-up
-  (no `_tb.<env>.channels` consumption in a receiver), so accepting it would promise a NACK that can
-  never fire. Refusing it is intended until that watcher exists; the architect may overrule.
+* `ack.nackOn: spec-invalid` is schema-valid but refused, as `mllp` does: it means "NACK because the
+  channel spec became invalid", and nothing detects that, so accepting it would promise a NACK that can
+  never fire. The architect may overrule.
 * Publish timeouts can duplicate: a 503 after `ack.timeoutMs` does not cancel the produce already handed
   to librdkafka, which may still be delivered when the broker returns (`delivery.timeout.ms` is longer
   than the ACK timeout). The sender's retry then lands a second record under a new `tb-msg-id`.
@@ -33,6 +33,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from tributary.runtime.spec import ChannelSpec
 from tributary.sdk.keys import KeyExpression
 
 from ..backpressure import DEFAULT_MAX_BYTES
@@ -92,8 +93,30 @@ class HttpSettings:
     max_header_bytes: int = 16_384
     max_inflight: int = 5000
     linger_ms: int = 5
+    #: `spec.ordering` and, for `per-key`, the parsed `spec.partitionKey`. Fixed for the life of the process
+    #: (`http/reload.py`): the raw producer's key rule is set at construction (invariant 5).
+    ordering: str = "none"
+    partition_key: str | None = None
 
     def __post_init__(self) -> None:
+        # Every value that is applied live is checked here, once, so a bad update is refused as a
+        # `ConfigError` before anything is applied (the MLLP zero-`queue.maxBytes` lesson).
+        if (self.ordering == "per-key") != (self.key_expression is not None):
+            raise ConfigError(f"channel {self.channel!r}: ordering per-key needs a key expression, none forbids one")
+        for name in ("queue_max_bytes", "max_message_bytes"):
+            _positive_int(getattr(self, name), name, self.channel)
+        if self.queue_max_messages is not None:
+            _positive_int(self.queue_max_messages, "queue_max_messages", self.channel)
+        if isinstance(self.port, bool) or not isinstance(self.port, int) or not 0 <= self.port <= 65535:
+            raise ConfigError(f"channel {self.channel!r}: source.port must be an integer in 0..65535")
+        if not isinstance(self.bind, str) or not self.bind:
+            raise ConfigError(f"channel {self.channel!r}: source.bind must be a non-empty string")
+        if not isinstance(self.ack_timeout_s, int | float) or self.ack_timeout_s <= 0:
+            raise ConfigError(f"channel {self.channel!r}: source.ack.timeoutMs must be a positive number")
+        if not isinstance(self.path, str):
+            raise ConfigError(f"channel {self.channel!r}: source.path must be a string")
+        if not self.accept or not all(isinstance(t, str) and t for t in self.accept):
+            raise ConfigError(f"channel {self.channel!r}: source.accept must list at least one content type")
         if self.max_message_bytes > self.queue_max_bytes:
             raise ConfigError(
                 f"channel {self.channel!r}: maxMessageBytes ({self.max_message_bytes}) exceeds "
@@ -113,6 +136,11 @@ class HttpSettings:
             raise ConfigError(f"channel {self.channel!r}: auth.mode 'mtls' requires tls.clientAuth: required")
 
 
+def _positive_int(value: object, field: str, channel: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ConfigError(f"channel {channel!r}: {field} must be a positive integer")
+
+
 def _require(mapping: Mapping[str, Any], key: str, where: str) -> Any:
     try:
         return mapping[key]
@@ -124,11 +152,43 @@ def http_settings_from_channel_spec(spec: Mapping[str, Any], *, env: str, instan
     """Build `HttpSettings` from a parsed channel-spec document. Raises `ConfigError` for anything
     this receiver cannot honour; never silently ignores a field the schema allows."""
     metadata = _require(spec, "metadata", "channel spec")
-    channel = _require(metadata, "name", "metadata")
-    channel_version = metadata.get("version", 0)
-
     body = _require(spec, "spec", "channel spec")
-    source = _require(body, "source", "spec")
+    return _settings(
+        _require(metadata, "name", "metadata"),
+        int(metadata.get("version", 0)),
+        _require(body, "ordering", "spec"),
+        _require(body, "source", "spec"),
+        partition_key=body.get("partitionKey"),
+        env=env,
+        instance=instance,
+    )
+
+
+def http_settings_from_spec(spec: ChannelSpec, *, env: str, instance: str = "http-0") -> HttpSettings:
+    """Build `HttpSettings` from the runtime's parsed spec (the `_tb.<env>.channels` record)."""
+    if not spec.source:
+        raise ConfigError(f"channel {spec.name!r}: spec.source is absent")
+    return _settings(
+        spec.name,
+        spec.version,
+        spec.ordering,
+        spec.source,
+        partition_key=spec.partition_key,
+        env=env,
+        instance=instance,
+    )
+
+
+def _settings(
+    channel: str,
+    channel_version: int,
+    ordering: str,
+    source: Mapping[str, Any],
+    *,
+    partition_key: str | None,
+    env: str,
+    instance: str,
+) -> HttpSettings:
     if source.get("type") != "http":
         raise ConfigError(f"channel {channel!r}: source.type is {source.get('type')!r}, not 'http'")
 
@@ -162,14 +222,19 @@ def http_settings_from_channel_spec(spec: Mapping[str, Any], *, env: str, instan
     if not accept:
         raise ConfigError(f"channel {channel!r}: source.accept must list at least one content type")
 
-    key_expression = key_expression_from_spec(body, channel=channel, source_type="http", content_types=accept)
+    key_expression = key_expression_from_spec(
+        {"ordering": ordering, "partitionKey": partition_key},
+        channel=channel,
+        source_type="http",
+        content_types=accept,
+    )
 
     queue = source.get("queue") or {}
     queue_max_bytes = queue.get("maxBytes", DEFAULT_MAX_BYTES)
 
     return HttpSettings(
         channel=channel,
-        channel_version=int(channel_version),
+        channel_version=channel_version,
         bind=_require(source, "bind", "source"),
         port=_require(source, "port", "source"),
         tls=tls,
@@ -184,4 +249,6 @@ def http_settings_from_channel_spec(spec: Mapping[str, Any], *, env: str, instan
         queue_max_messages=queue.get("maxMessages"),
         env=env,
         instance=instance,
+        ordering=ordering,
+        partition_key=partition_key,
     )

@@ -39,6 +39,7 @@ def cfg(channel: str, **kw: object) -> HttpSettings:
         queue_max_bytes=64 * 1024 * 1024,
         queue_max_messages=None,
         env=ENV,
+        ordering="per-key",
     )
     return base
 

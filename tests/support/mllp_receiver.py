@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import sys
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -52,25 +52,37 @@ def receiver_args(*, channel: str, env: str, instance: str) -> list[str]:
     ]
 
 
+def start_receiver(
+    module: str,
+    *,
+    channel: str,
+    env: str,
+    bootstrap: str,
+    instance: str,
+    secrets_dir: Path | str | None = None,
+    extra_args: Sequence[str] = (),
+) -> ManagedProcess:
+    """Spawn `python -m <module>` (a receiver) without waiting for it: it stays not ready until its channel's
+    spec is on `_tb.<env>.channels`. Every receiver takes the same `--channel/--env/--instance` flags."""
+    args = [sys.executable, "-m", module, "--channel", channel, "--env", env, "--instance", instance]
+    if secrets_dir is not None:
+        args += ["--secrets-dir", str(secrets_dir)]
+    return ManagedProcess([*args, *extra_args], env=engine_kafka_env(bootstrap))
+
+
 def start_mllp_receiver(
     *, channel: str, env: str, bootstrap: str, instance: str = "mllp-e2e", secrets_dir: Path | str | None = None
 ) -> ManagedProcess:
     """Spawn the receiver without waiting for it: it stays not-ready until a spec is on the topic.
     (`tests.support.processes.spawn_mllp_receiver_from_topic` is the same command plus the `listening` wait.)"""
-    args = [
-        sys.executable,
-        "-m",
+    return start_receiver(
         "tributary.receivers.mllp",
-        "--channel",
-        channel,
-        "--env",
-        env,
-        "--instance",
-        instance,
-    ]
-    if secrets_dir is not None:
-        args += ["--secrets-dir", str(secrets_dir)]
-    return ManagedProcess(args, env=engine_kafka_env(bootstrap))
+        channel=channel,
+        env=env,
+        bootstrap=bootstrap,
+        instance=instance,
+        secrets_dir=secrets_dir,
+    )
 
 
 def spawn_mllp_receiver_with_spec_file(
