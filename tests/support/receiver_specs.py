@@ -52,22 +52,37 @@ def sftp_document(
     channel: str,
     *,
     version: int = 1,
-    host: str = "127.0.0.1",
+    host: str = "sftp.synthetic.example",
     port: int = 22,
-    directory: str = "/drop",
-    **source: Any,
+    directory: str = "/in",
+    pattern: str = "*.hl7",
+    poll_interval_s: float = 0.05,
+    secret_ref: str = "sftp-cred",  # noqa: S107
+    host_key: str = "SHA256:" + "A" * 43,
+    **sftp: Any,
 ) -> dict[str, Any]:
-    body: dict[str, Any] = {
-        "type": "sftp",
+    """An sftp source. `sftp` overrides or adds fields of `source.sftp`."""
+    inner: dict[str, Any] = {
         "host": host,
         "port": port,
-        "path": directory,
-        "auth": {"type": "password", "secretRef": "sftp-cred"},
-        "hostKey": {"fingerprint": "SHA256:" + "A" * 43},
-        "pollIntervalMs": 1000,
-        "pattern": "*.hl7",
+        "hostKeys": [host_key],
+        "auth": {"type": "password", "secretRef": secret_ref},
+        "directory": directory,
+        "filePattern": pattern,
+        "pollIntervalSeconds": poll_interval_s,
+        "minFileAgeSeconds": 0,
+        "maxFilesPerPoll": 100,
+        "afterCommit": "delete",
+        "rejectDirectory": f"{directory}/rejected",
     }
-    body.update(source)
+    inner.update(sftp)
+    body: dict[str, Any] = {
+        "type": "sftp",
+        "contentType": "application/hl7-v2+er7",
+        "ack": {"mode": "after-commit", "nackOn": ["parse-error"]},
+        "maxMessageBytes": 1_000_000,
+        "sftp": inner,
+    }
     return _with_source(channel, version, body)
 
 
@@ -77,14 +92,25 @@ def kafka_source_document(
     version: int = 1,
     bootstrap: str = "127.0.0.1:19092",
     topic: str = "upstream.events",
-    group: str = "tb-src-1",
+    security: dict[str, Any] | None = None,
+    start_from: str = "earliest",
+    nack_on: tuple[str, ...] = ("parse-error",),
     **source: Any,
 ) -> dict[str, Any]:
+    """A kafka source on a foreign cluster; `source` overrides or adds fields of `spec.source`."""
     body: dict[str, Any] = {
         "type": "kafka",
-        "bootstrapServers": bootstrap,
-        "topic": topic,
-        "groupId": group,
+        "contentType": "application/json",
+        "ack": {"mode": "after-commit", "nackOn": list(nack_on)},
+        "maxMessageBytes": 1_000_000,
+        "kafka": {
+            "connection": {
+                "bootstrapServers": [bootstrap],
+                "security": security if security is not None else {"protocol": "PLAINTEXT"},
+            },
+            "topic": topic,
+            "startFrom": start_from,
+        },
     }
     body.update(source)
     return _with_source(channel, version, body)

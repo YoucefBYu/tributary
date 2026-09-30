@@ -157,6 +157,8 @@ def settings(**kw: object) -> SftpSettings:
         ack_timeout_s=5.0,
         env="dev",
     )
+    if kw.get("key_expression") is not None:
+        kw.setdefault("ordering", "per-key")
     return replace(base, **kw)  # type: ignore[arg-type]
 
 

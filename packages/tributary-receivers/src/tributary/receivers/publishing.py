@@ -1,15 +1,18 @@
-"""The lifecycle of a receiver that owns a listening socket and a `RawPublisher` (MLLP, HTTP).
+"""The lifecycle of a receiver that publishes to `<env>.<channel>.raw` through one `RawPublisher`.
 
-On top of `ReceiverLifecycle`: one raw publisher shared by every server the process builds over its life,
-the servers a tombstone leaves draining (`_retired`), and the rule that a producer is never closed under a
-frame whose commit is still in flight.
+MLLP and HTTP run a listening server; the SFTP poller and the Kafka source run a loop. All four are a
+"component" to this module: something that starts on settings, applies live changes, stops taking new work,
+and drains what it already took. On top of `ReceiverLifecycle` this adds one raw publisher shared by every
+component the process builds over its life, the components a tombstone leaves draining (`_retired`), and the
+rule that a producer is never closed under work whose commit is still in flight.
 
-* **tombstone**: the running server stops accepting (its listener closes, a request or frame that arrives
-  later on an open connection is refused with a fixed text) and moves to `_retired`; whatever it had already
-  handed to the publisher still gets its answer. A later spec starts a fresh server on the same publisher.
+* **tombstone**: the running component stops taking new work (a listener closes and later requests are
+  refused with a fixed text; a poller or consumer stops fetching) and moves to `_retired`; whatever it had
+  already handed to the publisher still gets its answer. A later spec starts a fresh component on the same
+  publisher, after the retired one has drained.
 * **a redeploy that changes the publisher's ordering rule** rebuilds the producer, because the key rule is
-  fixed at construction. The retired servers drain first, then the old producer flushes and closes.
-* **stop**: every server stops accepting, drains bounded, closes its connections; the publisher closes last.
+  fixed at construction. The retired components drain first, then the old producer flushes and closes.
+* **stop**: every component stops taking work, drains bounded, closes what it holds; the publisher closes last.
 """
 
 from __future__ import annotations
@@ -22,16 +25,20 @@ from .lifecycle import ReceiverLifecycle
 from .mllp.kafka_publisher import RawPublisher
 
 
-class ListenerServer[S](Protocol):
-    """What a listener lifecycle needs from `MllpServer` / `HttpServer`."""
+class PublishingComponent[S](Protocol):
+    """What the lifecycle needs from `MllpServer`, `HttpServer`, and the SFTP and Kafka-source services."""
 
     @property
     def cfg(self) -> S: ...
 
     @property
-    def open_connections(self) -> int: ...
+    def open_connections(self) -> int:
+        """Work still open: connections for a listener, 1 while a poll cycle or a fetch loop runs, else 0."""
+        ...
 
-    async def start(self) -> asyncio.base_events.Server: ...
+    async def start(self) -> Any:
+        """Start. The result is handed to `started_event` (a listener returns its `asyncio` server)."""
+        ...
 
     async def apply_settings(self, new: S) -> None: ...
 
@@ -40,12 +47,16 @@ class ListenerServer[S](Protocol):
     async def drain(self, timeout_s: float) -> bool: ...
 
 
-class ListenerLifecycle[S](ReceiverLifecycle[S]):
+class PublishingLifecycle[S](ReceiverLifecycle[S]):
     #: The tombstone reason a later request on an open connection is refused with (a fixed string).
     UNDEPLOYED_REASON = "channel-undeployed"
+    #: A poller or consumer must not start while its retired predecessor still runs (two pollers of one
+    #: instance would both recover the same claim; two consumers of one group would fight over offsets). A
+    #: listener may: the old one only answers what it already took, on sockets nothing new reaches.
+    DRAIN_RETIRED_BEFORE_START = False
 
-    _server: ListenerServer[S] | None
-    _retired: list[ListenerServer[S]]
+    _server: PublishingComponent[S] | None
+    _retired: list[PublishingComponent[S]]
     _publisher: RawPublisher | None
     _publisher_ordering: str
 
@@ -67,10 +78,10 @@ class ListenerLifecycle[S](ReceiverLifecycle[S]):
     def build_publisher(self, cfg: S) -> RawPublisher: ...
 
     @abstractmethod
-    def build_server(self, cfg: S, publisher: RawPublisher) -> ListenerServer[S]: ...
+    def build_server(self, cfg: S, publisher: RawPublisher) -> PublishingComponent[S]: ...
 
     @abstractmethod
-    def started_event(self, cfg: S, server: ListenerServer[S], listener: asyncio.base_events.Server) -> dict[str, Any]:
+    def started_event(self, cfg: S, server: PublishingComponent[S], started: Any) -> dict[str, Any]:
         """The event emitted once the listener is up (names, versions, the bound port; nothing else)."""
 
     # -- ReceiverLifecycle ------------------------------------------------------------------------
@@ -96,6 +107,8 @@ class ListenerLifecycle[S](ReceiverLifecycle[S]):
 
     async def start_component(self, cfg: S) -> dict[str, Any] | None:
         ordering = self.ordering_of(cfg)
+        if self.DRAIN_RETIRED_BEFORE_START:
+            await self._drain_retired()
         if self._publisher is not None and self._publisher_ordering != ordering:
             await self._drain_retired()
             old, self._publisher = self._publisher, None
@@ -104,9 +117,9 @@ class ListenerLifecycle[S](ReceiverLifecycle[S]):
             self._publisher = self.build_publisher(cfg)
             self._publisher_ordering = ordering
         server = self.build_server(cfg, self._publisher)
-        listener = await server.start()
+        started = await server.start()
         self._server = server
-        return self.started_event(cfg, server, listener)
+        return self.started_event(cfg, server, started)
 
     async def _drain_retired(self) -> None:
         retired, self._retired = self._retired, []

@@ -2,7 +2,7 @@
 
 The generic part (spec feed, not-ready gating, the live-versus-restart decision, tombstone and redeploy, the
 last good spec kept through a channels-topic outage) is `tributary.receivers.lifecycle`; the listener and
-publisher handling shared with the HTTP receiver is `tributary.receivers.listener`. This module adds what is
+publisher handling shared with the HTTP receiver is `tributary.receivers.publishing`. This module adds what is
 MLLP's: how a spec becomes `MllpSettings`, `reload.py`'s table, and the `listening` event.
 
 * **undeployed** (tombstone): `stop_accepting` closes the listener; frames already committed still get
@@ -14,7 +14,6 @@ MLLP's: how a spec becomes `MllpSettings`, `reload.py`'s table, and the `listeni
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Callable
 from typing import Any
 
@@ -28,8 +27,8 @@ from ..lifecycle import (
     SpecFeed,
     print_event,
 )
-from ..listener import ListenerLifecycle, ListenerServer
 from ..metrics import Metrics
+from ..publishing import PublishingComponent, PublishingLifecycle
 from .config import MllpSettings, mllp_settings_from_spec
 from .kafka_publisher import RawPublisher
 from .reload import live_fields_changed, restart_required_fields
@@ -38,7 +37,7 @@ from .server import MllpServer
 __all__ = ["POLLS_PER_TICK", "LiveSpecFeed", "MllpRunner", "RunnerOptions", "SpecFeed"]
 
 
-class MllpRunner(ListenerLifecycle[MllpSettings]):
+class MllpRunner(PublishingLifecycle[MllpSettings]):
     EVENT_START_RETRY = "listener_bind_failed"
     EVENT_START_REFUSED = "listener_refused"
 
@@ -87,17 +86,17 @@ class MllpRunner(ListenerLifecycle[MllpSettings]):
     def build_publisher(self, cfg: MllpSettings) -> RawPublisher:
         return self._make_publisher(cfg)
 
-    def build_server(self, cfg: MllpSettings, publisher: RawPublisher) -> ListenerServer[MllpSettings]:
+    def build_server(self, cfg: MllpSettings, publisher: RawPublisher) -> PublishingComponent[MllpSettings]:
         return self._make_server(cfg, publisher, self.metrics)
 
     def started_event(
-        self, cfg: MllpSettings, server: ListenerServer[MllpSettings], listener: asyncio.base_events.Server
+        self, cfg: MllpSettings, server: PublishingComponent[MllpSettings], started: Any
     ) -> dict[str, Any]:
         return {
             "event": "listening",
             "channel": cfg.channel,
             "channel_version": cfg.channel_version,
             "topic": self._opts.topic,
-            "port": listener.sockets[0].getsockname()[1],
+            "port": started.sockets[0].getsockname()[1],
             "tls": cfg.tls is not None,
         }
