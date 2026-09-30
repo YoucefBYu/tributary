@@ -24,11 +24,9 @@ backpressures the reader independently of `ByteBudget`.
 
 from __future__ import annotations
 
-import argparse
 import asyncio
 import json
 import os
-import signal
 import ssl
 import sys
 import time
@@ -356,25 +354,6 @@ def emit_lite_profile_warning(*, profile: str) -> None:
     )
 
 
-class _QuietArgumentParser(argparse.ArgumentParser):
-    """argparse echoes an unknown flag, a bad `choices` value or a missing argument's name to stderr.
-    Operator input is never echoed: one `startup_refused` line, exit 2."""
-
-    def __init__(self, log: Any, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
-        self._tb_log = log
-
-    def error(self, message: str) -> Any:
-        from ..startup import refuse
-
-        refuse(
-            self._tb_log,
-            error="UsageError",
-            code="ARGUMENTS_INVALID",
-            reason="invalid command-line arguments; run with --help for the accepted flags",
-        )
-
-
 def main() -> None:
     """`python -m tributary.receivers.mllp --channel <name> --env <env>`.
 
@@ -382,15 +361,12 @@ def main() -> None:
     (invariant 3); there is no file input. The listener opens only after a valid spec for `--channel` has
     been read. Exit codes: 0 after SIGTERM/SIGINT or after a spec change that needs a restart (the
     supervisor restarts on 0), 2 for a refused startup configuration."""
-    from confluent_kafka import Consumer
-    from tributary.runtime.channels import open_spec_source
-    from tributary.runtime.clients import consumer_config
     from tributary.runtime.config import load_topic_defaults
     from tributary.runtime.errors import RuntimeConfigurationError
-    from tributary.runtime.topics import channels_topic
 
+    from ..cli import QuietArgumentParser, run_until_stopped, spec_feed_opener
     from ..startup import refuse, refuse_retired_channel_spec_flag, spec_reader_group_or_exit
-    from .runner import LiveSpecFeed, MllpRunner, RunnerOptions, SpecFeed
+    from .runner import MllpRunner, RunnerOptions
 
     argv = sys.argv[1:]
     log = JsonLogger("receiver-mllp")
@@ -398,7 +374,7 @@ def main() -> None:
     # --bootstrap / --engine-security must reach the ENGINE_KAFKA_RETIRED_INPUT refusal first.
     kafka = load_engine_kafka_or_exit(argv=argv, log=log)
     refuse_retired_channel_spec_flag(argv, log)
-    p = _QuietArgumentParser(log, description=__doc__)
+    p = QuietArgumentParser(log, description=__doc__)
     p.add_argument("--channel", required=True, help="the deployed channel name (spec.metadata.name)")
     p.add_argument("--env", required=True, help="the topic-name env segment, e.g. 'dev' or 'prod'")
     p.add_argument("--instance", default="mllp-0", help="this process's identity, for tb-source")
@@ -423,14 +399,9 @@ def main() -> None:
     resolver = DirSecretResolver(a.secrets_dir) if a.secrets_dir else None
     topic = raw_topic_name(a.env, a.channel)
 
-    def open_feed() -> SpecFeed:
-        consumer = Consumer(consumer_config(kafka, defaults, group_id=spec_group, enable_partition_eof=True))
-        try:
-            source = open_spec_source(channel=a.channel, consumer=consumer, topic=channels_topic(a.env), log=log)
-        except BaseException:
-            consumer.close()
-            raise
-        return LiveSpecFeed(source, a.channel)
+    open_feed = spec_feed_opener(
+        kafka=kafka, defaults=defaults, env=a.env, channel=a.channel, group=spec_group, log=log
+    )
 
     def make_publisher(cfg: MllpSettings) -> RawPublisher:
         publisher = RawPublisher(
@@ -456,19 +427,7 @@ def main() -> None:
         metrics_file=a.metrics_file,
     )
 
-    async def run() -> int:
-        loop = asyncio.get_running_loop()
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            loop.add_signal_handler(sig, runner.request_stop)
-        return await runner.run()
-
-    try:
-        import uvloop  # type: ignore[import-not-found]  # no Windows wheel; optional on this platform
-    except ImportError:
-        code = asyncio.run(run())
-    else:
-        code = uvloop.run(run())
-    raise SystemExit(code)
+    run_until_stopped(runner)
 
 
 if __name__ == "__main__":
