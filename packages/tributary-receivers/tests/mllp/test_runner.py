@@ -692,3 +692,47 @@ def test_changing_the_partition_key_is_restart_only() -> None:
 
     h = run(scenario, FakeFeed(parse(keyed_spec(1))))
     assert h.log.of("spec_restart_required")[0]["fields"] == "partition_key"
+
+
+def test_rebuilding_the_publisher_waits_for_the_retired_server_to_drain_first() -> None:
+    """A tombstone leaves a retired server with a frame in flight on the old producer. A redeploy with a
+    different ordering rebuilds the producer: it must not be closed before that frame's ACK is written."""
+
+    class Tracked(Publisher):
+        pass
+
+    made: list[Tracked] = []
+
+    def make_publisher(_cfg: MllpSettings) -> Any:
+        made.append(Tracked())
+        return made[-1]
+
+    async def go() -> None:
+        h = Harness(FakeFeed(parse(spec_doc(1))))
+        h.runner._make_publisher = make_publisher
+        task = asyncio.create_task(h.runner.run())
+        try:
+            port = await h.listening_port()
+            first = made[0]
+            first.gate = asyncio.Event()
+            r, w = await asyncio.open_connection("127.0.0.1", port)
+            w.write(frame(adt("C1")))
+            await w.drain()
+            await asyncio.wait_for(first.entered.wait(), 5)
+
+            h.feed.spec = None
+            await h.until(lambda: h.runner.server is None)
+            h.feed.spec = parse(keyed_spec(2))  # per-key: the producer's ordering rule differs, so it is rebuilt
+            await asyncio.sleep(0.3)
+            assert first.closed is False and len(made) == 1  # waiting for the in-flight frame, not closed under it
+
+            first.gate.set()
+            assert await read_ack(r) == "AA"
+            await h.until(lambda: len(made) == 2)
+            assert first.closed is True  # closed only after its frame was ACKed
+            w.close()
+        finally:
+            h.runner.request_stop()
+            assert await asyncio.wait_for(task, 20) == 0
+
+    asyncio.run(go())

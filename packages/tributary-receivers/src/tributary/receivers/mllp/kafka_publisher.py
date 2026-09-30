@@ -133,6 +133,7 @@ class RawPublisher:
         self._producer = Producer(config)
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stop = threading.Event()
+        self._closed = False
         self._poller = threading.Thread(target=self._poll, daemon=True, name="raw-publisher-poll")
 
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
@@ -144,8 +145,11 @@ class RawPublisher:
             self._producer.poll(0.005)
 
     def close(self, timeout_s: float = 5.0) -> None:
-        self._stop.set()
+        """Flush what is in flight, then refuse every later `publish` (it returns `False`: not committed, so
+        the caller NACKs). Set before the flush, so nothing new can slip in behind it. Idempotent."""
+        self._closed = True
         self._producer.flush(timeout_s)
+        self._stop.set()  # the poller keeps running through the flush: it delivers the reports
 
     async def publish(self, message: Message, *, timeout_s: float) -> bool:
         """Raises `PermanentPublishError` for a record that breaks the envelope contract (retrying cannot
@@ -155,6 +159,8 @@ class RawPublisher:
         loop = self._loop
         if loop is None:
             raise RuntimeError("RawPublisher.start() must run before publish() is awaited")
+        if self._closed:
+            return False  # a closed producer commits nothing: never ACK
         try:
             # `ordering` is the channel's, fixed at construction: `none` (the MLLP receiver's only mode)
             # takes a null key, `per-key` refuses a record whose key did not resolve (invariant 5).

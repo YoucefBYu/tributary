@@ -239,6 +239,8 @@ class MllpServer:
         writer_task = asyncio.create_task(self._ack_writer(q, w, conn))
         try:
             while not parser.fatal:
+                if conn.revoked and conn.pending == 0:
+                    break  # revoked between two reads (a revocation only closes a connection parked in read)
                 conn.reading = True
                 try:
                     chunk = await asyncio.wait_for(r.read(READ_CHUNK), self.cfg.idle_timeout_s)
