@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 from collections.abc import Callable, Mapping, MutableMapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -429,6 +430,7 @@ def test_the_factory_runs_once_per_process_and_loaded_is_logged_per_version() ->
         (_raise(SystemExit(3)), "cannot load .* SystemExit"),
         (lambda: "not callable", "not a callable factory"),
         (lambda: _raise(RuntimeError("SYNTHPATIENT^ALPHA")), "failed to start: RuntimeError"),
+        (lambda: _raise(SystemExit("SYNTHPATIENT^ALPHA")), "failed to start: SystemExit"),
         (lambda: lambda: 42, "did not return a callable"),
     ],
 )
@@ -458,6 +460,52 @@ def test_a_refused_context_on_hot_reload_keeps_the_previous_version_running() ->
     subject._context_resolver = resolver(stream=stream)  # the capability vanished from the image
     subject.handle(adt_record())  # still version 4, still with ctx.fhir
     assert [line["event"] for line in lines(stream)].count("channel_spec_refused") == 1
+
+
+def _exits(base: Context, message: Message) -> Context:
+    raise SystemExit("SYNTHPATIENT^ALPHA")
+
+
+def reloading_handler(
+    specs: list[ChannelSpec],
+    *installed: FakePoint,
+    producer: FakeProducer,
+    emitter: RecordingEmitter,
+    stream: io.StringIO,
+) -> PipelineHandler:
+    return PipelineHandler(
+        env="dev",
+        spec_provider=lambda: specs[-1],
+        producer=RecordProducer(producer, log=JsonLogger("test", stream=stream)),
+        emitter=emitter,
+        log=JsonLogger("worker", stream=stream),
+        instance="worker:test@localhost",
+        context_resolver=resolver(*installed, stream=stream),
+    )
+
+
+@pytest.mark.parametrize(
+    ("target", "match"),
+    [
+        (lambda: _raise(SystemExit("SYNTHPATIENT^ALPHA")), "failed to start: SystemExit"),
+        (factory_of(_exits), "failed its probe: SystemExit"),
+    ],
+)
+def test_a_factory_or_probe_raising_systemexit_on_hot_reload_keeps_the_previous_version(
+    target: Callable[[], Any], match: str
+) -> None:
+    """Security re-review Low: `sys.exit()` in plugin code is a refused version, not a stopped worker."""
+    specs = [channel(pipeline=[{"name": "passthrough", "uses": "tributary.core.passthrough"}], version=4)]
+    producer, emitter, stream = FakeProducer(), RecordingEmitter(), io.StringIO()
+    subject = reloading_handler(specs, fhir_point(target), producer=producer, emitter=emitter, stream=stream)
+    subject.prepare(specs[0])
+    specs.append(declaring_fhir(5))
+    subject.handle(adt_record())  # must not raise SystemExit
+    assert {event.channel_version for event in emitter.events if hasattr(event, "channel_version")} == {4}
+    refused = [line for line in lines(stream) if line["event"] == "channel_spec_refused"]
+    assert [(line["channel_version"], line["running_version"]) for line in refused] == [(5, 4)]
+    assert re.search(match, refused[0]["reason"])
+    assert "SYNTHPATIENT" not in stream.getvalue()
 
 
 def test_the_worker_refuses_to_start_on_an_unresolvable_context() -> None:
@@ -605,6 +653,7 @@ def _probe_raises(base: Context, message: Message) -> Context:
         (lambda base, message: _SwallowsAttrs(base), "set_attr"),
         (lambda base, message: _SwallowsUsr(base), "set_usr"),
         (_probe_raises, "failed its probe: KeyError"),
+        (_exits, "failed its probe: SystemExit"),
     ],
 )
 def test_the_probe_refuses_a_wrapper_that_breaks_what_the_worker_reads(wrapper: Any, match: str) -> None:

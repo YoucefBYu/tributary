@@ -26,7 +26,8 @@ destination context: attrs, `tb-usr-*` and `vars` must reach the base (the worke
 real `view.reply(...)` must land in the base's reply cell on the pipeline context and must raise on the
 destination context, and `view.log`, `view.secrets` and `view.vars` must be the base's own objects. It
 checks delegation only; obligations P2-P7 (no own logger, no global state, no I/O, determinism) are
-enforced by review and the registry gate, not here.
+enforced by review and the registry gate, not here. A factory or a probe that raises, `SystemExit`
+included, refuses the spec; it never stops the worker.
 
 Nothing here logs a payload or a header value (invariant 6): entry-point, distribution and channel
 names, versions and fixed reason codes only. Exception text from plugin code is never repeated.
@@ -195,7 +196,7 @@ def _build(point: EntryPoint) -> ContextExtension:
         raise ContextExtensionError(f"context extension {name} is not a callable factory")
     try:
         extend = factory()
-    except Exception as exc:
+    except (Exception, SystemExit) as exc:  # plugin code can call sys.exit(); refuse, never stop the worker
         raise ContextExtensionError(f"context extension {name} failed to start: {type(exc).__name__}") from None
     if not callable(extend):
         raise ContextExtensionError(f"context extension {name}'s factory did not return a callable")
@@ -218,7 +219,7 @@ def verify_extension(extension: LoadedExtension) -> None:
             _check(view, base)
         except ContextExtensionError as exc:
             raise ContextExtensionError(f"context extension {safe_token(extension.name)}: {exc}") from None
-        except Exception as exc:
+        except (Exception, SystemExit) as exc:  # as for the factory: a refused spec, not a stopped worker
             raise ContextExtensionError(
                 f"context extension {safe_token(extension.name)} failed its probe: {type(exc).__name__}"
             ) from None
