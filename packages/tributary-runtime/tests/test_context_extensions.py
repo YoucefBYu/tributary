@@ -626,6 +626,25 @@ class _OwnVars(_Delegating):
         return self._own
 
 
+class _ForwardingKv:
+    """Forwards every call to the base's store, yet is not it: rule P1 asks for identity."""
+
+    def __init__(self, inner: KeyValueStore) -> None:
+        self._inner = inner
+
+    def get(self, key: str) -> tuple[str, int] | None:
+        return self._inner.get(key)
+
+    def put(self, key: str, value: str, *, expected_version: int | None = None) -> int:
+        return self._inner.put(key, value, expected_version=expected_version)
+
+
+class _OwnKv(_Delegating):
+    @property
+    def kv(self) -> KeyValueStore:
+        return _ForwardingKv(self._base.kv)
+
+
 class _SwallowsAttrs(_Delegating):
     def set_attr(self, name: str, value: str) -> None:
         return None
@@ -650,6 +669,7 @@ def _probe_raises(base: Context, message: Message) -> Context:
         (lambda base, message: _OwnLog(base), "own `log`"),
         (lambda base, message: _OwnSecrets(base), "own `secrets`"),
         (lambda base, message: _OwnVars(base), "own `vars`"),
+        (lambda base, message: _OwnKv(base), "own `kv`"),
         (lambda base, message: _SwallowsAttrs(base), "set_attr"),
         (lambda base, message: _SwallowsUsr(base), "set_usr"),
         (_probe_raises, "failed its probe: KeyError"),

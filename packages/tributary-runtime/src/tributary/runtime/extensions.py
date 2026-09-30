@@ -24,10 +24,10 @@ callable then runs once per `WorkerContext` that runs a step (`WorkerContext.ste
 **The probe (L3)** runs on each extension before its first use, against a pipeline context and a
 destination context: attrs, `tb-usr-*` and `vars` must reach the base (the worker reads them there), a
 real `view.reply(...)` must land in the base's reply cell on the pipeline context and must raise on the
-destination context, and `view.log`, `view.secrets` and `view.vars` must be the base's own objects. It
-checks delegation only; obligations P2-P7 (no own logger, no global state, no I/O, determinism) are
-enforced by review and the registry gate, not here. A factory or a probe that raises, `SystemExit`
-included, refuses the spec; it never stops the worker.
+destination context, and `view.log`, `view.secrets`, `view.vars` and `view.kv` must be the base's own
+objects (P1). It checks delegation only; obligations P2-P7 (no own logger, no global state, no I/O,
+determinism) are enforced by review and the registry gate, not here. A factory or a probe that raises,
+`SystemExit` included, refuses the spec; it never stops the worker.
 
 Nothing here logs a payload or a header value (invariant 6): entry-point, distribution and channel
 names, versions and fixed reason codes only. Exception text from plugin code is never repeated.
@@ -238,6 +238,8 @@ def _check(view: object, base: WorkerContext) -> None:
         raise ContextExtensionError("does not return its base's own `secrets`")
     if view.vars is not base.vars:
         raise ContextExtensionError("does not return its base's own `vars`")
+    if view.kv is not base.kv:
+        raise ContextExtensionError("does not return its base's own `kv`")
     view.set_attr(*_PROBE_ATTR)
     view.set_usr(*_PROBE_USR)
     view.vars[_PROBE_VAR] = True
