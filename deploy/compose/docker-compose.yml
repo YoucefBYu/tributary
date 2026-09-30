@@ -334,6 +334,13 @@ services:
     read_only: true
     tmpfs:
       - /tmp
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     # No port is published. The walking-skeleton channel spec binds the MLLP listener to 127.0.0.1
     # (contracts/channel-spec/v0 `source.bind`), which `require_safe_bind` (tributary-receivers)
     # accepts without TLS -- but a container's own loopback is not reachable through Docker's port
