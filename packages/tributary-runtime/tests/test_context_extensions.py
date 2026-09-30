@@ -508,6 +508,39 @@ def test_a_factory_or_probe_raising_systemexit_on_hot_reload_keeps_the_previous_
     assert "SYNTHPATIENT" not in stream.getvalue()
 
 
+def test_hot_reload_from_no_context_to_fhir_loads_only_the_declared_extension() -> None:
+    """Security re-review test gap: version 4 declares no `context`, version 5 declares `fhir`, and an
+    undeclared registrant stays installed throughout. It is never imported, before or after the reload,
+    and version 5 runs with `ctx.fhir`."""
+    rogue = FakePoint("telemetry", _raise(RuntimeError("would run at import")), FakeDist("some-transitive-dep"))
+    fhir = fhir_point()
+    specs = [channel(pipeline=[{"name": "passthrough", "uses": "tributary.core.passthrough"}], version=4)]
+    producer, emitter, stream = FakeProducer(), RecordingEmitter(), io.StringIO()
+    subject = reloading_handler(specs, rogue, fhir, producer=producer, emitter=emitter, stream=stream)
+    subject.prepare(specs[0])
+    subject.handle(adt_record())
+    assert fhir.loads == 0 and rogue.loads == 0
+
+    specs.append(declaring_fhir(5))
+    subject.handle(adt_record())
+
+    assert fhir.loads == 1 and rogue.loads == 0
+    bundle = orjson.loads(cast(bytes, producer.produced[-1][2]))
+    assert bundle["resourceType"] == "Bundle"
+    logged = lines(stream)
+    assert "channel_spec_refused" not in [line["event"] for line in logged]
+    assert [
+        (line["extension"], line["channel_version"]) for line in logged if line["event"] == "context_extension_loaded"
+    ] == [("fhir", 5)]
+    rogue_skips = [
+        line for line in logged if line["event"] == "context_extension_skipped" and line["extension"] == "telemetry"
+    ]
+    assert [(line["channel_version"], line["reason"]) for line in rogue_skips] == [
+        (4, "unregistered"),
+        (5, "unregistered"),
+    ]
+
+
 def test_the_worker_refuses_to_start_on_an_unresolvable_context() -> None:
     """At startup there is no previous version: `prepare` raises and the worker does not consume."""
     subject = PipelineHandler(
