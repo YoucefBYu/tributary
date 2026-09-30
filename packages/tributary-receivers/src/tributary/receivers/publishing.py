@@ -19,7 +19,8 @@ from __future__ import annotations
 
 import asyncio
 from abc import abstractmethod
-from typing import Any, Protocol
+from collections.abc import Callable
+from typing import Any, Protocol, runtime_checkable
 
 from .lifecycle import ReceiverLifecycle
 from .mllp.kafka_publisher import RawPublisher
@@ -45,6 +46,13 @@ class PublishingComponent[S](Protocol):
     def stop_accepting(self, reason: str) -> None: ...
 
     async def drain(self, timeout_s: float) -> bool: ...
+
+
+@runtime_checkable
+class FailureReporting(Protocol):
+    """A component that runs a task of its own (poller, consumer loop) and can say it died."""
+
+    def set_failure_handler(self, handler: Callable[[BaseException], None]) -> None: ...
 
 
 class PublishingLifecycle[S](ReceiverLifecycle[S]):
@@ -117,6 +125,8 @@ class PublishingLifecycle[S](ReceiverLifecycle[S]):
             self._publisher = self.build_publisher(cfg)
             self._publisher_ordering = ordering
         server = self.build_server(cfg, self._publisher)
+        if isinstance(server, FailureReporting):
+            server.set_failure_handler(self.report_failure)
         started = await server.start()
         self._server = server
         return self.started_event(cfg, server, started)

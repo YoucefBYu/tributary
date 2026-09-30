@@ -24,6 +24,8 @@ import os
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
+from .errors import SecretUnresolvedError
+
 DEFAULT_SECRETS_DIR = "/var/run/secrets/tributary"
 ENV_SECRETS_DIR = "TB_SECRETS_DIR"
 
@@ -38,7 +40,7 @@ class SecretResolver(Protocol):
 
 
 class DirSecretResolver:
-    """`<base_dir>/<ref>/<key>`. Raises `FileNotFoundError` for a missing ref or key: fail closed,
+    """`<base_dir>/<ref>/<key>`. Raises `SecretUnresolvedError` (a `FileNotFoundError`) for a missing ref or key: fail closed,
     the same way a missing required header does, rather than start a listener with no certificate."""
 
     def __init__(self, base_dir: str | Path | None = None) -> None:
@@ -48,9 +50,9 @@ class DirSecretResolver:
         path = (self._base / ref / key).resolve()
         if self._base.resolve() not in path.parents:
             # A ref or key containing ".." must not escape the secrets directory.
-            raise FileNotFoundError(f"secretRef {ref!r} resolves outside the secrets directory")
+            raise SecretUnresolvedError(f"secretRef {ref!r} resolves outside the secrets directory")
         if not path.is_file():
-            raise FileNotFoundError(f"no {key!r} under secretRef {ref!r} in {self._base}")
+            raise SecretUnresolvedError(f"no {key!r} under secretRef {ref!r} in {self._base}")
         return path
 
     def resolve_file(self, ref: str, key: str) -> Path:

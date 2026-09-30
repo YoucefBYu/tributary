@@ -27,6 +27,18 @@ class SftpService:
         self._poller = SftpPoller(cfg, publisher, session_factory, metrics=metrics)
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
+        self._on_failure: Callable[[BaseException], None] | None = None
+
+    def set_failure_handler(self, handler: Callable[[BaseException], None]) -> None:
+        self._on_failure = handler
+
+    def _task_done(self, task: asyncio.Task[None]) -> None:
+        """A loop that ends with an error (anything but a cancel) is reported, never swallowed."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None and self._on_failure is not None:
+            self._on_failure(exc)
 
     @property
     def cfg(self) -> SftpSettings:
@@ -43,6 +55,7 @@ class SftpService:
 
     async def start(self) -> Any:
         self._task = asyncio.create_task(self._poller.run(self._stop))
+        self._task.add_done_callback(self._task_done)
         return None
 
     async def apply_settings(self, new: SftpSettings) -> None:

@@ -397,6 +397,11 @@ class HttpServer:
             ctx["msg_id"] = msg_id
             # Tombstoned or revoked while this request waited for the queue or for its body: not published.
             self._check_open(conn)
+            current = self._live
+            if current.cfg.auth != cfg.auth or current.bearer_tokens != live.bearer_tokens:
+                # The auth settings changed after this request passed them (a token was removed, or the mode
+                # changed): its credentials are checked again under the current ones, nothing published on 401.
+                self._check_auth(current, headers)
             conn.publishing = True  # from here its answer is owed: revocation and drain wait for it
             # The ACK budget starts now, once the body is in: a slow upload must not eat it and turn a
             # healthy Kafka into a 503 (whose retry would duplicate the message).

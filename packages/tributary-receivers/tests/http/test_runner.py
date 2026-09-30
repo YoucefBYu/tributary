@@ -304,6 +304,76 @@ def test_control_plane_down_the_cached_spec_keeps_serving() -> None:
     run(scenario, FakeFeed(parse(http_document("fhir-in"))))
 
 
+def test_a_request_that_passed_auth_is_checked_again_when_its_token_is_removed_before_it_publishes(
+    tmp_path: Path,
+) -> None:
+    for name, token in (("tok-a", TOKEN_A), ("tok-b", TOKEN_B)):
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "token").write_text(token, encoding="utf-8")
+    bearer = lambda ref: {"type": "bearer", "secretRef": ref}  # noqa: E731
+
+    async def scenario(h: Harness) -> None:
+        port = await h.listening_port()
+        server = h.runner.server
+        assert server is not None
+        entered, release = asyncio.Event(), asyncio.Event()
+        original = server.budget.reserve
+
+        async def slow_reserve(n: int, timeout: float) -> bool:
+            entered.set()
+            await release.wait()
+            return await original(n, timeout)
+
+        server.budget.reserve = slow_reserve  # type: ignore[method-assign]
+        r, w = await asyncio.open_connection("127.0.0.1", port)
+        w.write(http_request(token=TOKEN_A))
+        await w.drain()
+        await asyncio.wait_for(entered.wait(), 5)  # auth passed under token A; waiting for the queue
+
+        h.feed.spec = parse(http_document("fhir-in", version=2, auth=bearer("tok-b")))  # token A is gone
+        await h.until(lambda: "spec_applied" in h.log.names())
+        release.set()
+        assert await read_status(r) == 401
+        w.close()
+        assert h.publisher.calls == []
+
+    run(
+        scenario,
+        FakeFeed(parse(http_document("fhir-in", auth=bearer("tok-a")))),
+        resolver=DirSecretResolver(tmp_path),
+    )
+
+
+def test_a_tombstone_that_lands_while_a_request_waits_for_the_queue_refuses_it() -> None:
+    async def scenario(h: Harness) -> None:
+        port = await h.listening_port()
+        server = h.runner.server
+        assert server is not None
+        entered, release = asyncio.Event(), asyncio.Event()
+        original = server.budget.reserve
+
+        async def slow_reserve(n: int, timeout: float) -> bool:
+            entered.set()
+            await release.wait()
+            return await original(n, timeout)
+
+        server.budget.reserve = slow_reserve  # type: ignore[method-assign]
+        r, w = await asyncio.open_connection("127.0.0.1", port)
+        w.write(http_request())
+        await w.drain()
+        await asyncio.wait_for(entered.wait(), 5)
+
+        h.feed.spec = None
+        await h.until(lambda: "channel_undeployed" in h.log.names())
+        release.set()
+        assert await read_status(r) == 503  # told to retry, nothing published
+        w.close()
+        assert h.publisher.calls == []
+        assert server.budget.used_messages == 0
+
+    run(scenario, FakeFeed(parse(http_document("fhir-in"))))
+
+
 # -- restart-only changes ---------------------------------------------------------------------------
 
 
@@ -516,6 +586,22 @@ def test_a_request_whose_body_is_buffered_when_the_san_is_revoked_is_refused_not
         FakeFeed(parse(tls_doc(1, ["dns:sender.example.org"]))),
         resolver=DirSecretResolver(tmp_path),
     )
+
+
+def test_a_bearer_secret_that_is_not_mounted_refuses_to_start_with_its_own_code_and_exit_2(tmp_path: Path) -> None:
+    async def go() -> None:
+        h = Harness(
+            FakeFeed(parse(http_document("fhir-in", auth={"type": "bearer", "secretRef": "tok-missing"}))),
+            resolver=DirSecretResolver(tmp_path),
+        )
+        code = await asyncio.wait_for(h.runner.run(), 15)
+        assert code == 2 and h.emitted == []
+        [refused] = h.log.of("startup_refused")
+        assert refused["code"] == "SECRET_UNRESOLVED"
+        assert "listener_bind_failed" not in h.log.names()  # not retried as if a bind had failed
+        assert "tok-missing" not in repr(h.log.events)
+
+    asyncio.run(go())
 
 
 # -- entry point ------------------------------------------------------------------------------------

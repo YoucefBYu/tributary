@@ -27,3 +27,11 @@ class PermanentPublishError(ReceiverError):
 class BindError(ReceiverError):
     """Refused to bind: the bind rule (no wildcard default, no plaintext on a non-loopback
     address) rejected the requested address, or the address is otherwise not ours to use."""
+
+
+class SecretUnresolvedError(ReceiverError, FileNotFoundError):
+    """A `secretRef` does not resolve to a file (not mounted yet, or a wrong key). A `FileNotFoundError` so callers
+    that already treat a missing file as one keep working; distinct so a lifecycle can refuse to start (exit 2,
+    `SECRET_UNRESOLVED`) instead of retrying it as if a bind had failed. The message names a ref and a key only."""
+
+    code = "SECRET_UNRESOLVED"

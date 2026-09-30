@@ -444,6 +444,70 @@ def test_a_file_read_when_the_tombstone_lands_is_handed_back_not_published() -> 
     run(scenario, FakeFeed(parse(sftp_document("lab-drop"))))
 
 
+def test_a_poll_loop_that_dies_with_an_unexpected_error_is_reported_and_the_process_exits_1() -> None:
+    async def go() -> None:
+        h = Harness(FakeFeed(parse(sftp_document("lab-drop"))))
+
+        def boom(directory: str, limit: int) -> list[RemoteEntry]:
+            raise RuntimeError("SYNTH-BOOM-TEXT-42")
+
+        h.remote.list_dir = boom  # type: ignore[method-assign]
+        code = await asyncio.wait_for(h.runner.run(), 15)
+        assert code == 1
+        [failed] = h.log.of("component_failed")
+        assert failed["error"] == "RuntimeError"
+        assert "SYNTH-BOOM-TEXT-42" not in repr(h.log.events)  # the class name only, never the message
+
+    asyncio.run(go())
+
+
+def test_each_file_of_a_cycle_uses_the_cycles_directory_even_when_the_directory_changes_mid_cycle() -> None:
+    from dataclasses import replace
+
+    async def go() -> None:
+        remote = Remote()
+        remote.put("a.hl7")
+        remote.put("b.hl7")
+        cfg = sftp_settings_from_spec(parse(sftp_document("lab-drop")), env="dev")
+        moved = replace(cfg, directory="/elsewhere", reject_directory="/elsewhere/rejected", channel_version=2)
+        service = SftpService(cfg, None, lambda: remote, metrics=Metrics())  # type: ignore[arg-type]
+
+        class Applying(Publisher):
+            async def publish(self, message: Message, *, timeout_s: float) -> bool:
+                ok = await super().publish(message, timeout_s=timeout_s)
+                service.poller.apply_settings(moved)  # the directory changes while the first file is committed
+                return ok
+
+        publisher = Applying()
+        service.poller.publisher = publisher
+        assert await service.poller.poll_once() == 2  # b.hl7 is still claimed, read and removed under /in
+        assert len(publisher.calls) == 2 and remote.names() == [] and remote.names("/elsewhere") == []
+
+    asyncio.run(go())
+
+
+def test_a_drain_timeout_that_cancels_a_file_in_flight_leaves_its_claim_in_place() -> None:
+    async def go() -> None:
+        remote = Remote()
+        remote.put("a.hl7")
+        cfg = sftp_settings_from_spec(parse(sftp_document("lab-drop")), env="dev")
+        publisher = Publisher()
+        publisher.gate = asyncio.Event()  # never released: the commit does not complete
+        service = SftpService(cfg, publisher, lambda: remote, metrics=Metrics())  # type: ignore[arg-type]
+        await service.start()
+        await asyncio.wait_for(publisher.entered.wait(), 5)
+        assert await service.drain(0.05) is False  # timed out and cancelled
+        # Not committed, so not removed and not archived: it stays under this instance's claim, which the next
+        # poller of the instance recovers (a duplicate at worst, never a loss).
+        assert remote.names() == [f"{CLAIM_PREFIX}sftp-0.a.hl7"] and remote.names("/in/rejected") == []
+
+        publisher.gate = None
+        replacement = SftpService(cfg, publisher, lambda: remote, metrics=Metrics())  # type: ignore[arg-type]
+        assert await replacement.poller.poll_once() == 1 and remote.names() == []
+
+    asyncio.run(go())
+
+
 # -- entry point ------------------------------------------------------------------------------------
 
 

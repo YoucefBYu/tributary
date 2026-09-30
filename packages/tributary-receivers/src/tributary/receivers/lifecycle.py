@@ -44,7 +44,7 @@ from tributary.runtime.errors import ChannelSpecError, ChannelsUnavailableError,
 from tributary.runtime.spec import ChannelSpec
 from tributary.sdk.context import Logger
 
-from .errors import ConfigError
+from .errors import ConfigError, SecretUnresolvedError
 from .metrics import Metrics
 
 #: Non-blocking polls of the channels consumer per tick. Each is a librdkafka `poll(0)`; the count only
@@ -139,6 +139,7 @@ class ReceiverLifecycle[S](ABC):
         self._poll_failing = False
         self._metrics_failing = False
         self.restart_requested = False
+        self.exit_code = 0
 
     # -- what a concrete receiver supplies ------------------------------------------------------
 
@@ -190,6 +191,14 @@ class ReceiverLifecycle[S](ABC):
     def request_stop(self) -> None:
         self._stop.set()
 
+    def report_failure(self, exc: BaseException) -> None:
+        """A component's task died with an error nothing handles (a poller or consumer loop). Logged by class name
+        only, then the process drains and exits 1 so the supervisor restarts it: a receiver that keeps running
+        with its loop dead would look healthy and take nothing in."""
+        self._log.error("component_failed", ready=False, error=safe_token(type(exc).__name__))
+        self.exit_code = 1
+        self._stop.set()
+
     async def run(self) -> int:
         """Run until stopped. Returns the process exit code: 0 for a signal or a restart-only change."""
         feed: SpecFeed | None = None
@@ -202,8 +211,8 @@ class ReceiverLifecycle[S](ABC):
             if feed is not None:
                 feed.close()
             await self.close_resources()
-            self._log.info("receiver_stopped", restart_requested=self.restart_requested)
-        return 0
+            self._log.info("receiver_stopped", restart_requested=self.restart_requested, exit_code=self.exit_code)
+        return self.exit_code
 
     # -- waiting for the first spec -------------------------------------------------------------
 
@@ -338,6 +347,13 @@ class ReceiverLifecycle[S](ABC):
                 return
         try:
             event = await self.start_component(cfg)
+        except SecretUnresolvedError as exc:
+            # Not a bind failure: a secret the spec names is not mounted. Retrying in place would hide it;
+            # exit 2 (a refused configuration) lets the supervisor restart with its own back-off, visibly.
+            self._log.error("startup_refused", ready=False, error=type(exc).__name__, code=exc.code)
+            self.exit_code = 2
+            self._stop.set()
+            return
         except OSError as exc:
             self._start_failure = (cfg, now + self._opts.bind_retry_s)
             self._log.error(self.EVENT_START_RETRY, ready=False, errno=exc.errno or 0)
