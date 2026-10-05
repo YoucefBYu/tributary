@@ -20,6 +20,17 @@ up behind the one write that is blocked in `w.drain()`, an unbounded-item-count 
 byte-count budget (code review, W1-5 second round). `conn_pipeline` bounds `q` itself for the same
 reason, defense in depth: even if a future change reordered the release again, a full `q` still
 backpressures the reader independently of `ByteBudget`.
+
+**Synchronous reply** (`source.reply`, channel-spec README 3.2.6, ADR-003 D10; `tributary.receivers.reply`).
+The same per-connection queue carries the request, but its answer waits for the worker: the frame is published
+with `tb-correlation-id`, `tb-reply-partition` (a partition this process holds) and `tb-reply-deadline`, the raw
+delivery callback starts the reply clock, and the one answer comes from the runtime's `SyncRequest` state
+machine through `reply/pending.py`. `AR` means the commit was not confirmed (a resend is safe; also: no reply
+partition held, or `maxPending` reached, in which case nothing was published); `AE` means committed (a resend
+duplicates); `AA` needs the commit and an `accepted` reply, and a `body: step` body replaces the built ACK.
+`MSA-2` is the sender's own control id, `MSA-3` is `<CODE> <tb-msg-id>`; the control id lives only in the pending
+map and the writer queue, never in a header or a log line. A connection with a request in flight is not idle,
+a reset peer ends its entries at once, and a half-closed one is still answered.
 """
 
 from __future__ import annotations
