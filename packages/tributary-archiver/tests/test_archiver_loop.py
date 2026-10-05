@@ -275,3 +275,48 @@ def test_each_batch_is_committed_before_the_next_consume_so_a_revoke_never_stran
     archiver.run_once()
     archiver.run_once()
     assert consumer.calls == ["consume", "commit", "consume", "commit"]
+
+
+class _LeakyClient:
+    """A driver client whose exception text quotes a row value, as ClickHouse server errors can."""
+
+    def __init__(self, marker: str, *, fail: int) -> None:
+        self.marker, self.fail = marker, fail
+
+    def insert(self, *_a: Any, **_k: Any) -> None:
+        if self.fail > 0:
+            self.fail -= 1
+            raise RuntimeError(f"Code: 53. Cannot parse value '{self.marker}' for column mrn")
+
+    def close(self) -> None:
+        pass
+
+
+def test_driver_exception_text_never_reaches_the_log_and_every_line_matches_the_log_schema() -> None:
+    from pathlib import Path
+
+    import jsonschema
+    from tributary.archiver.sink import ClickhouseSink
+
+    schema = json.loads(
+        (Path(__file__).resolve().parents[3] / "contracts/observability/v0/log-line.schema.json").read_text()
+    )
+    marker = "SYNTH-PHI-MARKER-4471"
+    stream = io.StringIO()
+    # Code 53 TYPE_MISMATCH is classified permanent, so this run exercises insert_halted too.
+    consumer = FakeConsumer([[event(0), FakeMessage(1, b"junk")]])
+    archiver = Archiver(
+        consumer,
+        ClickhouseSink(_LeakyClient(marker, fail=2)),
+        log=JsonLogger("archiver", stream=stream),
+        settings=ArchiverSettings(backoff_initial_s=0.01, backoff_max_s=0.02, stats_interval_s=0.0),
+        sleep=lambda _s: None,
+    )
+    archiver.run_once()
+    out = stream.getvalue()
+    assert marker not in out and "Cannot parse" not in out
+    lines = [json.loads(x) for x in out.splitlines()]
+    events = {x["event"] for x in lines}
+    assert {"insert_halted", "event_rejected", "archiver_stats"} <= events
+    for line in lines:
+        jsonschema.validate(line, schema)

@@ -167,9 +167,17 @@ class Archiver:
                         if not halted:
                             halted = True
                             self.metrics.batches_halted += 1
-                            self._log.error("insert_halted", error=str(exc), rows=len(rows))
+                            self._log.error(
+                                "insert_halted", error=type(exc).__name__, error_code=exc.code, rows=len(rows)
+                            )
                     else:
-                        self._log.warning("insert_failed", error=str(exc), retry_in_s=delay, rows=len(rows))
+                        self._log.warning(
+                            "insert_failed",
+                            error=type(exc).__name__,
+                            error_code=exc.code,
+                            retry_in_s=delay,
+                            rows=len(rows),
+                        )
                     self._pause(paused)
                     if not self._backoff(delay, paused):
                         return False
