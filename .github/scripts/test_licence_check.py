@@ -166,8 +166,16 @@ def test_runtime_closure_excludes_the_dev_group() -> None:
     trusts, so a mistake here would silently defeat it rather than fail loudly."""
     names = lc.runtime_closure_names()
     assert "orjson" in names  # tributary-runtime's own dependency: must ship
-    for dev_only in ("hypothesis", "pathspec", "certifi", "pytest", "ruff", "mypy", "testcontainers"):
+    for dev_only in ("hypothesis", "pathspec", "pytest", "ruff", "mypy", "testcontainers"):
         assert dev_only not in names
+    # certifi is dev-only via testcontainers -> docker -> requests, but tributary-archiver (clickhouse-connect)
+    # now puts it in the runtime closure (human-approved 2026-09-28, W3-15). That is the only allowed path:
+    # the closure must contain it exactly when the archiver is a member, and no other member imports it.
+    if "tributary-archiver" in lc.workspace_members():
+        assert "certifi" in names
+        assert lc.importers_of("certifi") == {"tributary-archiver"}
+    else:
+        assert "certifi" not in names
 
 
 def test_workspace_members_lists_known_packages() -> None:

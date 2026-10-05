@@ -1,0 +1,24 @@
+[project]
+name = "tributary-archiver"
+version = "0.0.0"
+description = "Archive: consumes _tb.<env>.events into ClickHouse (message browser, off the critical path)."
+license = "Apache-2.0"
+requires-python = ">=3.12"
+dependencies = [
+    "tributary-sdk",
+    "tributary-runtime",          # engine-kafka loader, KafkaSettings, topic names, JsonLogger
+    "confluent-kafka>=2.6.0",     # Apache-2.0
+    "orjson>=3.10",               # MPL-2.0 OR Apache-2.0 (dual), human-approved 2026-09-22, same as tributary-runtime
+    "clickhouse-connect>=1.9,<1.10",    # Apache-2.0; human-approved. Pulls certifi (MPL-2.0, human-approved 2026-09-28, archiver only)
+]
+
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tributary"]
+
+[tool.uv.sources]
+tributary-sdk = { workspace = true }
+tributary-runtime = { workspace = true }
