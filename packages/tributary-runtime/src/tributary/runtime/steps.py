@@ -41,7 +41,7 @@ import importlib
 import sys
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from importlib.metadata import EntryPoint, distributions
+from importlib.metadata import EntryPoint
 from types import MappingProxyType
 
 from tributary.sdk import Splitter, Step
@@ -50,7 +50,7 @@ from tributary.sdk.errors import StepDefinitionError, safe_token
 
 from .errors import ChannelSpecError
 from .executor import ChannelPlan, PipelineExecutor, StepStats
-from .provenance import canonical_distribution, install_folder_name, provenance_problem
+from .provenance import InstalledEntryPoints, provenance_problem, scan_entry_points
 from .spec import ChannelSpec, Pipeline, StepRef
 from .step_namespaces import ENTRY_POINT_GROUP, RESERVED_FIRST_SEGMENT, STEP_NAMESPACES, is_reserved, namespace_of
 
@@ -92,44 +92,11 @@ def load_step(reference: StepRef, *, namespaces: Mapping[str, str] | None = None
 
 
 def _all_entry_points() -> list[EntryPoint]:
-    """Every `tributary.steps` entry point of every installed distribution, **without** de-duplication.
-
-    `importlib.metadata.entry_points()` keeps only the first distribution per name on `sys.path`, so a
-    same-named package earlier on the path would hide the real one without a trace (security review of
-    a1219af, Low 2). Reading every distribution lets the resolver see the hidden one and say so (N5).
-    """
-    return [point for dist in distributions() for point in dist.entry_points.select(group=ENTRY_POINT_GROUP)]
+    """Every `tributary.steps` entry point of every installed distribution, without de-duplication."""
+    return scan_entry_points(ENTRY_POINT_GROUP)
 
 
-@dataclass(frozen=True, slots=True)
-class _Installed:
-    """What one metadata scan found: the entry points `importlib.metadata` would show, and the hidden rest.
-
-    `visible` keeps the first installation per distribution name in `sys.path` order, which is what
-    `entry_points()` returns and what N4 counts. `shadowed` are entry points of a later installation
-    with the same name: never loaded, and logged as `duplicate` when they matter (N5).
-    """
-
-    visible: tuple[EntryPoint, ...]
-    shadowed: tuple[EntryPoint, ...]
-
-    @classmethod
-    def split(cls, points: Iterable[EntryPoint]) -> _Installed:
-        first: dict[str, object] = {}
-        visible: list[EntryPoint] = []
-        shadowed: list[EntryPoint] = []
-        for point in points:
-            dist = point.dist
-            if dist is None:
-                visible.append(point)
-                continue
-            name = install_folder_name(dist) or canonical_distribution(str(dist.name)) or str(dist.name)
-            install = getattr(dist, "_path", None) or id(dist)
-            if first.setdefault(name, install) == install:
-                visible.append(point)
-            else:
-                shadowed.append(point)
-        return cls(visible=tuple(visible), shadowed=tuple(shadowed))
+_Installed = InstalledEntryPoints
 
 
 _NOTHING = _Installed(visible=(), shadowed=())

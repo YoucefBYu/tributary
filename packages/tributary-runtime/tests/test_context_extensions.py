@@ -593,6 +593,70 @@ def test_the_real_tributary_fhir_registrant_resolves_and_passes_the_probe() -> N
     assert hasattr(view, "fhir") and hasattr(view, "terminology")
 
 
+# -- shadowing (set 1.7, L5 `duplicate`, ADR-007 D24) ------------------------------------------------
+
+
+def test_a_hidden_same_named_installation_is_logged_duplicate_and_never_loaded() -> None:
+    """The first installation per distribution name is the one `importlib.metadata` shows and `import`
+    loads; a later one of the same name is a `duplicate` warning, neither loaded nor a refusal."""
+    stream = io.StringIO()
+    shown = fhir_point()
+    hidden = FakePoint("fhir", _raise(AssertionError("must not be imported")), FakeDist("tributary-fhir", "0.9.0"))
+    assert resolver(shown, hidden, stream=stream).resolve(declaring_fhir()) == (fhir_extension,)
+    assert shown.loads == 1 and hidden.loads == 0
+    skipped = [line for line in lines(stream) if line["event"] == "context_extension_skipped"]
+    assert [(line["version"], line["reason"], line["level"]) for line in skipped] == [("0.9.0", "duplicate", "warning")]
+
+
+def test_a_duplicate_does_not_refuse_a_channel_that_declares_nothing() -> None:
+    stream = io.StringIO()
+    hidden = FakePoint("fhir", _raise(AssertionError("must not be imported")), FakeDist("tributary-fhir", "0.9.0"))
+    assert resolver(fhir_point(), hidden, stream=stream).resolve(channel(pipeline=[PARSE])) == ()
+    assert sorted((line["version"], line["reason"]) for line in lines(stream)) == [
+        ("0.9.0", "duplicate"),
+        ("1.2.3", "not-declared"),
+    ]
+
+
+def test_a_real_same_named_install_earlier_on_sys_path_hides_the_real_one_and_is_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Real metadata: a `tributary-fhir` earlier on `sys.path` hides the workspace's. `entry_points()`
+    alone shows only the impostor; the resolver's scan reads every distribution and logs the hidden real
+    installation `duplicate`. Nothing is imported (the channel declares no capability)."""
+    import importlib
+    import sys
+
+    root = tmp_path / "shadow"
+    root.mkdir()
+    info = root / "tributary_fhir-9.9.dist-info"
+    info.mkdir()
+    (info / "METADATA").write_text("Metadata-Version: 2.1\nName: tributary-fhir\nVersion: 9.9\n", encoding="utf-8")
+    (info / "entry_points.txt").write_text(
+        f"[{ENTRY_POINT_GROUP}]\nfhir = synth_fhir_shadow:factory\n", encoding="utf-8"
+    )
+    (root / "synth_fhir_shadow.py").write_text("raise RuntimeError('must not be imported')\n", encoding="utf-8")
+    (info / "RECORD").write_text(
+        f"synth_fhir_shadow.py,,\n{info.name}/METADATA,,\n{info.name}/entry_points.txt,,\n{info.name}/RECORD,,\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(root))
+    monkeypatch.delitem(sys.modules, "synth_fhir_shadow", raising=False)
+    importlib.invalidate_caches()
+
+    shown = [point for point in entry_points(group=ENTRY_POINT_GROUP) if point.name == "fhir"]
+    assert [point.dist.version for point in shown if point.dist] == ["9.9"], "importlib shows the impostor only"
+
+    stream = io.StringIO()
+    ContextResolver(log=JsonLogger("worker", stream=stream)).resolve(channel(pipeline=[PARSE]))
+    by_reason = {(line["distribution"], line["version"], line["reason"]) for line in lines(stream)}
+    assert ("tributary-fhir", "9.9", "not-declared") in by_reason
+    duplicates = [line for line in lines(stream) if line["reason"] == "duplicate"]
+    assert duplicates and all(line["distribution"] == "tributary-fhir" for line in duplicates)
+    assert all(line["version"] != "9.9" and line["level"] == "warning" for line in duplicates)
+    assert "synth_fhir_shadow" not in sys.modules
+
+
 # -- the probe (L3) ---------------------------------------------------------------------------------
 
 

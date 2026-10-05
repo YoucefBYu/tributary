@@ -19,6 +19,12 @@ own installed files (`provenance.py`). Anything else refuses the spec with
 previous version keeps running, exactly as for an unresolvable `uses` step. An installed registrant that
 is not loaded is never imported, and is logged as `context_extension_skipped` with its reason (L5).
 
+**Shadowing (set 1.7, L5 `duplicate`, ADR-007 D24).** Discovery reads every installed distribution,
+not `entry_points()`, which keeps only the first installation per distribution name on `sys.path`.
+Resolution counts the installation `importlib.metadata` shows (the one `import` loads); each hidden
+same-named installation is logged `duplicate` (warning) and is never loaded or refused, the same rule
+`steps.py` applies to `uses` steps (`provenance.InstalledEntryPoints`).
+
 **The factory runs at most once per capability per process** and its result is cached; the per-message
 callable then runs once per `WorkerContext` that runs a step (`WorkerContext.step_view`).
 
@@ -39,7 +45,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from importlib.metadata import EntryPoint, entry_points
+from importlib.metadata import EntryPoint
 
 from tributary.sdk import Message
 from tributary.sdk import headers as h
@@ -49,10 +55,11 @@ from tributary.sdk.ids import new_traceparent, uuid7
 from .capabilities import CAPABILITIES, ENTRY_POINT_GROUP, normalise_distribution
 from .context import ContextExtension, WorkerContext
 from .errors import ChannelSpecError, safe_token
-from .provenance import provenance_problem
+from .provenance import InstalledEntryPoints, provenance_problem, scan_entry_points
 from .spec import ChannelSpec
 
 __all__ = [
+    "DUPLICATE",
     "ENTRY_POINT_GROUP",
     "ContextExtensionError",
     "ContextResolver",
@@ -64,11 +71,14 @@ __all__ = [
 #: What an entry point in `ENTRY_POINT_GROUP` loads: called once, returns the per-message hook.
 ExtensionFactory = Callable[[], ContextExtension]
 
-#: `context_extension_skipped` reasons (L5). The first is routine; the other two point at a transitive
-#: or typosquatted package in the image, so they are warnings. None stops the worker: nothing was imported.
+#: `context_extension_skipped` reasons (L5). The first is routine; the others point at a transitive,
+#: typosquatted or shadowed package in the image, so they are warnings. None stops the worker: nothing
+#: was imported.
 NOT_DECLARED = "not-declared"
 UNREGISTERED = "unregistered"
 DISTRIBUTION_MISMATCH = "distribution-mismatch"
+#: Set 1.7: a later installation of a distribution name `importlib.metadata` already shows. Never loaded.
+DUPLICATE = "duplicate"
 
 _PROBE_CHANNEL = "tb-extension-probe"
 _PROBE_ATTR = ("tb_probe", "1")
@@ -109,16 +119,18 @@ class ContextResolver:
         registry: Mapping[str, str] = CAPABILITIES,
     ) -> None:
         self._log = log
-        self._points = points if points is not None else lambda: entry_points(group=ENTRY_POINT_GROUP)
+        self._points = points if points is not None else lambda: scan_entry_points(ENTRY_POINT_GROUP)
         self._registry = registry
         self._loaded: dict[tuple[str, str, str], LoadedExtension] = {}
 
     def resolve(self, spec: ChannelSpec) -> tuple[ContextExtension, ...]:
         """The extensions for `spec`, wrapping order by name (L4). Raises `ContextExtensionError`."""
         declared = spec.pipeline.context
-        installed = list(self._points())
-        for point in installed:
-            reason = self._skip_reason(point, declared)
+        scan = InstalledEntryPoints.split(self._points())
+        installed = list(scan.visible)
+        skipped = [(point, self._skip_reason(point, declared)) for point in installed]
+        skipped.extend((point, DUPLICATE) for point in scan.shadowed)  # hidden: never loaded or refused
+        for point, reason in skipped:
             if reason is not None:
                 fields = _metadata(point)
                 (self._log.info if reason == NOT_DECLARED else self._log.warning)(

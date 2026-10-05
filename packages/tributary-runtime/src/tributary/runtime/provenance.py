@@ -17,6 +17,13 @@ three ways around it (security review of a1219af, Lows 1 and 3):
   For an editable install (the uv workspace) the `RECORD` lists a `.pth` file instead, and the module
   must then lie under a directory that `.pth` names (`ships_module`).
 
+**Shadowing** (set 1.7, ADR-007 D24, channel-spec README 3.3.5 N4, context-extension L5).
+`importlib.metadata.entry_points()` keeps only the first installation per distribution name on
+`sys.path`, so a same-named package earlier on the path hides the real one without a trace.
+`scan_entry_points` reads every distribution instead, and `InstalledEntryPoints.split` separates what
+`importlib.metadata` would show (`visible`, which is what resolution counts and what `import` loads) from
+the hidden rest (`shadowed`, never loaded, logged as `duplicate` by each loader).
+
 None of this detects a package that **replaces** a bound distribution's files under the same name; the
 controls for that are the locked, hash-pinned dependency set and the digest-pinned image.
 """
@@ -25,13 +32,22 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable
+from dataclasses import dataclass
 from importlib.machinery import EXTENSION_SUFFIXES
+from importlib.metadata import EntryPoint, distributions
 from pathlib import Path
 from typing import Any
 
 from .capabilities import normalise_distribution
 
-__all__ = ["canonical_distribution", "install_folder_name", "provenance_problem", "ships_module"]
+__all__ = [
+    "InstalledEntryPoints",
+    "canonical_distribution",
+    "install_folder_name",
+    "provenance_problem",
+    "scan_entry_points",
+    "ships_module",
+]
 
 #: PEP 508 distribution name, ASCII only (`re.ASCII` keeps `\w`-style shortcuts out of it altogether).
 _NAME = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?", re.ASCII)
@@ -105,3 +121,44 @@ def provenance_problem(dist: Any, value: str, expected: str) -> str | None:
     if not ships_module(dist, module):
         return "targets a module its distribution does not ship"
     return None
+
+
+def scan_entry_points(group: str) -> list[EntryPoint]:
+    """Every `group` entry point of every installed distribution, **without** de-duplication.
+
+    `importlib.metadata.entry_points()` keeps only the first distribution per name on `sys.path`, so a
+    same-named package earlier on the path would hide the real one without a trace (security review of
+    a1219af, Low 2). Reading every distribution lets a loader see the hidden one and say so.
+    """
+    return [point for dist in distributions() for point in dist.entry_points.select(group=group)]
+
+
+@dataclass(frozen=True, slots=True)
+class InstalledEntryPoints:
+    """What one metadata scan found: the entry points `importlib.metadata` would show, and the hidden rest.
+
+    `visible` keeps the first installation per distribution name in `sys.path` order, which is what
+    `entry_points()` returns and what N4 and L2 count. `shadowed` are entry points of a later
+    installation with the same name: never loaded, and logged as `duplicate` (N5, L5).
+    """
+
+    visible: tuple[EntryPoint, ...]
+    shadowed: tuple[EntryPoint, ...]
+
+    @classmethod
+    def split(cls, points: Iterable[EntryPoint]) -> InstalledEntryPoints:
+        first: dict[str, object] = {}
+        visible: list[EntryPoint] = []
+        shadowed: list[EntryPoint] = []
+        for point in points:
+            dist = point.dist
+            if dist is None:
+                visible.append(point)
+                continue
+            name = install_folder_name(dist) or canonical_distribution(str(dist.name)) or str(dist.name)
+            install = getattr(dist, "_path", None) or id(dist)
+            if first.setdefault(name, install) == install:
+                visible.append(point)
+            else:
+                shadowed.append(point)
+        return cls(visible=tuple(visible), shadowed=tuple(shadowed))
