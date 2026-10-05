@@ -140,6 +140,7 @@ class PendingMap:
         self._request_factory = request_factory
         self._by_id: dict[str, Pending] = {}
         self._per_connection: dict[int, int] = {}
+        self._background: set[asyncio.Task[None]] = set()
         self._retired = False
 
     def __len__(self) -> int:
@@ -215,6 +216,8 @@ class PendingMap:
         entry = self._by_id.get(record.correlation_id)
         if entry is None or entry.msg_id is None or entry.msg_id != record.msg_id:
             return False, None  # the feed counts it once, after every sink has declined
+        if entry.outcome.done():
+            return True, self._settle(entry, entry.request.disconnected())  # its waiter was cancelled: end it
         if entry.reply_seen:
             return True, None  # the first reply counts (SyncRequest ignores a later one; no second charge)
         entry.reply_seen = True
@@ -282,6 +285,11 @@ class PendingMap:
         entry.body, entry.body_charged = b"", 0
         if not entry.outcome.done():
             entry.outcome.set_result(outcome)
+        elif outcome.body_charged:
+            # Nobody will take this outcome (its waiter was cancelled): the bytes must not stay charged.
+            release = self._loop.create_task(self._budget.release_bytes(outcome.take_charge()))
+            self._background.add(release)
+            release.add_done_callback(self._background.discard)
         return resolution
 
 

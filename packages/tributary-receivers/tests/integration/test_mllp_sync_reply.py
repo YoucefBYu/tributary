@@ -261,3 +261,54 @@ def test_sync_reply_aa_round_trip_latency_is_reported(kafka: str, procs: list[Ma
         f"p99_ms={raw['ack_latency_ms_p99']:.1f}"
     )
     assert len(ordered) == 300
+
+
+def test_sync_reply_a_duplicate_group_instance_id_fences_the_first_member_into_a_fatal_stop(kafka: str) -> None:
+    """Two replicas with the same `<instance>-p<pid>` (every container's pid 1 under the default instance) fence each
+    other. The fenced consumer's `poll` returns `_FATAL` with no revoke: the feed must stop advertising, answer its
+    entries and call the failure handler (the runner exits 1 so a supervisor restarts it)."""
+    import asyncio
+
+    from tributary.receivers.metrics import Metrics
+    from tributary.receivers.reply.feed import open_reply_feed
+    from tributary.runtime.clients import KafkaSettings
+    from tributary.runtime.config import load_topic_defaults
+
+    from ..reply.support import RecordingLog
+
+    channel = "sr-fence"
+    deploy(kafka, channel, reply={"timeoutMs": 20000})
+
+    async def go() -> None:
+        loop = asyncio.get_running_loop()
+        feeds = []
+        failures: list[BaseException] = []
+        for name in ("first", "second"):
+            feed = open_reply_feed(
+                KafkaSettings(bootstrap_servers=kafka),
+                load_topic_defaults(),
+                env=ENV,
+                channel=channel,
+                instance="dup",
+                pid=1,
+                log=RecordingLog(),
+                metrics=Metrics(),
+            )
+            if name == "first":
+                feed.fatal_handler = failures.append
+            feed.start(loop)
+            feeds.append(feed)
+            if name == "first":
+                async with asyncio.timeout(60):
+                    while not feeds[0].ready:
+                        await asyncio.sleep(0.1)
+        try:
+            async with asyncio.timeout(90):
+                while not failures:
+                    await asyncio.sleep(0.2)
+            assert not feeds[0].ready and feeds[0].choose_partition() is None
+        finally:
+            for feed in feeds:
+                await asyncio.to_thread(feed.close)
+
+    asyncio.run(go())

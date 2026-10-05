@@ -608,3 +608,44 @@ def test_a_writer_cancelled_while_waiting_on_an_outcome_returns_its_reservation(
         server.stop_accepting("test")
 
     asyncio.run(go())
+
+
+def test_a_body_reply_arriving_after_the_writer_was_cancelled_does_not_stay_charged() -> None:
+    """Regression (re-review): cancelling the writer at `await outcome` cancels the entry's future too. A step body
+    that then arrives, before the handler abandons the connection, was charged and dropped with the outcome."""
+
+    async def go() -> None:
+        server = MllpServer(sync_settings(reply=ReplySettings(timeout_s=5.0, body="step")), Recorder())  # type: ignore[arg-type]
+        server.use_reply_feed(FakePartitions(0))  # type: ignore[arg-type]
+        await server.start()
+        assert server.pending is not None
+        conn = object()
+        entry = server.pending.open(sender_control_id="C1", connection=conn)
+        assert not isinstance(entry, str) and await server.budget.reserve(100, 1.0)
+        publisher = server.publisher
+        task = asyncio.ensure_future(
+            server._publish_sync(adt("C1"), "r", asyncio.get_running_loop().time() + 1, server.cfg, None, entry)
+        )  # type: ignore[arg-type]
+        q: asyncio.Queue = asyncio.Queue()  # type: ignore[type-arg]
+
+        class Sink:
+            def write(self, data: bytes) -> None: ...
+
+            async def drain(self) -> None: ...
+
+            def close(self) -> None: ...
+
+        await q.put(("C1", task, 100))
+        writer = asyncio.create_task(server._ack_writer(q, Sink()))  # type: ignore[arg-type]
+        await asyncio.sleep(0.1)
+        writer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await writer
+        assert entry.outcome.cancelled()
+        server.pending.deliver_reply(reply_for(publisher.calls[0], body=RESPONSE))  # type: ignore[attr-defined]
+        server.pending.abandon(conn)
+        await asyncio.sleep(0.05)
+        assert server.budget.used_bytes == 0 and server.budget.used_messages == 0 and len(server.pending) == 0
+        server.stop_accepting("test")
+
+    asyncio.run(go())
