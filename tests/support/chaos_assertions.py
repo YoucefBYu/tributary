@@ -44,6 +44,33 @@ def assert_per_key_order_preserved(first_delivery_by_key: dict[bytes, list[int]]
         assert sequences == sorted(sequences), f"per-key order broken for key {key!r}: {sequences}"
 
 
+def assert_each_key_on_one_partition(partitions_by_key: dict[bytes, set[int]]) -> None:
+    """Invariant 5: a key's records all sit on one partition. A key seen on two partitions means ordering
+    for it cannot hold (Kafka orders within a partition only), whatever the sequence numbers say."""
+    split = {key: sorted(parts) for key, parts in partitions_by_key.items() if len(parts) != 1}
+    assert not split, f"keys not confined to one partition: {split}"
+
+
+def keys_hit_by_fault(
+    partitions_by_key: dict[bytes, set[int]],
+    partitions_led_by_killed: frozenset[int],
+    acked_indexes_by_key: dict[bytes, list[int]],
+    *,
+    kill_index: int,
+) -> set[bytes]:
+    """Keys that make a keyed chaos run mean something: the key lives on a partition the killed broker led,
+    and it has an ACKed send on each side of the kill (`index < kill_index` and `index >= kill_index`). A
+    key on an unaffected partition, or one with no traffic after the kill, says nothing about order across
+    a leader change."""
+    return {
+        key
+        for key, partitions in partitions_by_key.items()
+        if partitions & partitions_led_by_killed
+        and any(i < kill_index for i in acked_indexes_by_key.get(key, []))
+        and any(i >= kill_index for i in acked_indexes_by_key.get(key, []))
+    }
+
+
 def assert_fault_fired(condition: bool, *, description: str) -> None:
     """A named assertion for the "did the fault actually happen" half of every chaos scenario
     (PHASE-0-DECISION section 4). Kept as its own function -- rather than a bare `assert` at the call

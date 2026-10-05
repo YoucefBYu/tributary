@@ -82,3 +82,31 @@ def test_count_order_violations_sees_a_reorder_and_is_zero_for_a_clean_run() -> 
 
     assert count_order_violations({b"k": [0, 1, 2, 3]}) == 0
     assert count_order_violations({b"k": [0, 2, 1, 3], b"j": [0, 1]}) == 1
+
+
+# ---- W3-22: the keyed broker-kill helpers -------------------------------------------------------------
+
+
+def test_one_partition_check_passes_for_confined_keys_and_catches_a_split_key() -> None:
+    from tests.support.chaos_assertions import assert_each_key_on_one_partition
+
+    assert_each_key_on_one_partition({b"a": {0}, b"b": {2}})
+    with pytest.raises(AssertionError, match="not confined to one partition"):
+        assert_each_key_on_one_partition({b"a": {0}, b"b": {1, 2}})  # mutation: a key that moved partitions
+
+
+def test_keys_hit_by_fault_needs_a_led_partition_and_traffic_on_both_sides() -> None:
+    from tests.support.chaos_assertions import keys_hit_by_fault
+
+    partitions = {b"a": {0}, b"b": {1}, b"c": {0}, b"d": {0}}
+    acked = {b"a": [1, 70], b"b": [2, 80], b"c": [3, 4], b"d": [90, 91]}
+    hit = keys_hit_by_fault(partitions, frozenset({0}), acked, kill_index=60)
+    assert hit == {b"a"}  # b: partition 1 not led by the killed broker; c: nothing after; d: nothing before
+
+
+def test_keys_hit_by_fault_is_empty_when_the_killed_broker_led_nothing_the_keys_use() -> None:
+    """Mutation control for the "fault fired" half: a kill that leaves every key's partition untouched must
+    not count, or a bystander kill would certify per-key order."""
+    from tests.support.chaos_assertions import keys_hit_by_fault
+
+    assert keys_hit_by_fault({b"a": {0}}, frozenset({2}), {b"a": [1, 70]}, kill_index=60) == set()
