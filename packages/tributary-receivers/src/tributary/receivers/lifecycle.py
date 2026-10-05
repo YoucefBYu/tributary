@@ -44,8 +44,10 @@ from tributary.runtime.errors import ChannelSpecError, ChannelsUnavailableError,
 from tributary.runtime.spec import ChannelSpec
 from tributary.sdk.context import Logger
 
-from .errors import ConfigError, SecretUnresolvedError
+from . import readiness as rd
+from .errors import CHANNEL_SPEC_UNAVAILABLE, ConfigError, SecretUnresolvedError
 from .metrics import Metrics
+from .ops import OpsServer, OpsSettings
 
 #: Non-blocking polls of the channels consumer per tick. Each is a librdkafka `poll(0)`; the count only
 #: bounds how long one tick can spend catching up on a backlog of spec records.
@@ -100,10 +102,26 @@ class RunnerOptions:
     open_retry_max_s: float = 10.0
     bind_retry_s: float = 5.0
     metrics_every_s: float = 5.0
+    #: `None`: no ops listener (an embedded caller or a unit test). Every `main()` supplies one (O4).
+    ops: OpsSettings | None = None
+    lite_profile: bool = False
+
+    @property
+    def channel(self) -> str:
+        """The channel name, from the raw topic `<env>.<channel>.raw` (the name is not in the spec yet when
+        `/readyz` first answers; observability/v0 W2)."""
+        return self.topic[len(self.env) + 1 : -len(".raw")]
 
 
-def print_event(record: dict[str, Any]) -> None:
-    print(json.dumps(record), flush=True)
+def json_emitter(log: Logger) -> Callable[[dict[str, Any]], None]:
+    """`emit` that writes the started event as a structured line (`event` becomes the event name; every other
+    key stays a field), so it carries `ts`, `level` and `component` like every other line."""
+
+    def emit(record: dict[str, Any]) -> None:
+        fields = dict(record)
+        log.info(str(fields.pop("event")), **fields)
+
+    return emit
 
 
 class ReceiverLifecycle[S](ABC):
@@ -116,6 +134,8 @@ class ReceiverLifecycle[S](ABC):
     #: Log event names a receiver may rename (MLLP says "listener"; a poller has no listener).
     EVENT_START_RETRY = "start_failed"
     EVENT_START_REFUSED = "start_refused"
+    #: `mllp`, `http`, `sftp` or `kafka` (`readiness.schema.json` `receiver_type`).
+    RECEIVER_TYPE = "mllp"
 
     def __init__(
         self,
@@ -125,14 +145,14 @@ class ReceiverLifecycle[S](ABC):
         open_feed: Callable[[], SpecFeed],
         metrics: Metrics | None = None,
         metrics_file: str | None = None,
-        emit: Callable[[dict[str, Any]], None] = print_event,
+        emit: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self._open_feed = open_feed
         self._opts = options
         self._log = log
         self.metrics = metrics if metrics is not None else Metrics()
         self._metrics_file = metrics_file
-        self._emit = emit
+        self._emit = emit if emit is not None else json_emitter(log)
         self._stop = asyncio.Event()
         self._rejected_version: int | None = None
         self._start_failure: tuple[S, float | None] | None = None
@@ -140,6 +160,13 @@ class ReceiverLifecycle[S](ABC):
         self._metrics_failing = False
         self.restart_requested = False
         self.exit_code = 0
+        self._ops: OpsServer | None = None
+        self.ops_port: int | None = None
+        self._stopping = False
+        self._component_failed = False
+        self._spec_status = rd.NO_SPEC
+        self._seen_spec = False
+        self._applied: S | None = None
 
     # -- what a concrete receiver supplies ------------------------------------------------------
 
@@ -186,10 +213,37 @@ class ReceiverLifecycle[S](ABC):
     def on_tick(self) -> None:  # noqa: B027 - optional hook
         """Called once per serving tick, after reconcile. Default: nothing."""
 
+    async def prepare_component(self, cfg: S) -> bool:
+        """Called before every start attempt, inside its error handling. `False` means "not yet, try on the next
+        tick" (the producer warm-up, `publishing.py`); it must not block the tick. Default: ready."""
+        return True
+
+    def raw_producer_reason(self) -> str | None:
+        """The `raw_producer` check: `None` when ok, else a closed reason. Default: no producer, always ok."""
+        return None
+
+    def reply_consumer_reason(self, cfg: S) -> str | None:
+        """The `reply_consumer` check, asked only when `sync_reply_required(cfg)`. Default: ok."""
+        return None
+
+    def sync_reply_required(self, cfg: S) -> bool:
+        return False
+
     # -- public ---------------------------------------------------------------------------------
 
-    def request_stop(self) -> None:
+    def _begin_stop(self) -> None:
+        """`component` goes `stopping` before the drain starts (R6), then the loop ends."""
+        self._stopping = True
         self._stop.set()
+
+    def request_stop(self) -> None:
+        self._begin_stop()
+
+    def report_fatal(self) -> None:
+        """The raw producer or the reply consumer is `_FATAL` (R2): reported by that check, then exit 1."""
+        self._log.error("kafka_client_fatal", ready=False)
+        self.exit_code = 1
+        self._begin_stop()
 
     def report_failure(self, exc: BaseException) -> None:
         """A component's task died with an error nothing handles (a poller or consumer loop). Logged by class name
@@ -197,10 +251,71 @@ class ReceiverLifecycle[S](ABC):
         with its loop dead would look healthy and take nothing in."""
         self._log.error("component_failed", ready=False, error=safe_token(type(exc).__name__))
         self.exit_code = 1
-        self._stop.set()
+        self._component_failed = True
+        self._begin_stop()
+
+    # -- readiness (contracts/observability/v0 2.3): a snapshot of state, never a Kafka call ---------------
+
+    def readiness_report(self) -> rd.Report:
+        applied = self._applied
+        running = self.running_settings()
+        if self._component_failed:
+            component: str | None = rd.COMPONENT_FAILED
+        elif self._stopping:
+            component = rd.STOPPING
+        elif running is not None:
+            component = None
+        elif self._start_failure is not None and self._start_failure[1] is not None:
+            component = rd.BIND_FAILED
+        elif self._start_failure is not None:
+            component = rd.COMPONENT_FAILED
+        else:
+            component = rd.STARTING
+        spec_reason = None if self._spec_status == "ok" else self._spec_status
+        checks = [
+            rd.Check("spec", spec_reason),
+            rd.Check("component", component),
+            rd.Check("raw_producer", self.raw_producer_reason()),
+        ]
+        sync = applied is not None and self.sync_reply_required(applied)
+        if sync and applied is not None:
+            checks.append(rd.Check("reply_consumer", self.reply_consumer_reason(applied)))
+        degraded = []
+        if self._poll_failing:
+            degraded.append(rd.SPEC_SOURCE_UNPROVEN)
+        if self._opts.lite_profile:
+            degraded.append(rd.LITE_PROFILE)
+        return rd.Report(
+            channel=self._opts.channel,
+            receiver_type=self.RECEIVER_TYPE,
+            channel_version=self.version_of(applied) if applied is not None else None,
+            sync_reply=sync,
+            checks=tuple(checks),
+            degraded=tuple(degraded),
+        )
+
+    async def _start_ops(self) -> bool:
+        """O4: a listener that cannot bind refuses the start (exit 2)."""
+        settings = self._opts.ops
+        if settings is None:
+            return True
+        ops = OpsServer(settings, self.readiness_report)
+        try:
+            self.ops_port = await ops.start()
+        except OSError as exc:
+            self._log.error("startup_refused", error="OSError", code="OPS_LISTENER_BIND_FAILED", errno=exc.errno or 0)
+            self.exit_code = 2
+            return False
+        self._ops = ops
+        if settings.explicit_non_loopback:
+            self._log.warning("ops_listener_non_loopback", ops_port=self.ops_port)
+        self._log.info("ops_listening", ops_port=self.ops_port)
+        return True
 
     async def run(self) -> int:
         """Run until stopped. Returns the process exit code: 0 for a signal or a restart-only change."""
+        if not await self._start_ops():
+            return self.exit_code
         feed: SpecFeed | None = None
         try:
             feed = await self._wait_for_feed()
@@ -211,6 +326,8 @@ class ReceiverLifecycle[S](ABC):
             if feed is not None:
                 feed.close()
             await self.close_resources()
+            if self._ops is not None:
+                await self._ops.close()
             self._log.info("receiver_stopped", restart_requested=self.restart_requested, exit_code=self.exit_code)
         return self.exit_code
 
@@ -221,9 +338,11 @@ class ReceiverLifecycle[S](ABC):
         while not self._stop.is_set():
             try:
                 return await asyncio.to_thread(self._open_feed)
-            except ChannelSpecError:
-                # Not deployed yet, or the channels topic cannot be read: stay not ready, act on nothing.
-                self._log.warning("spec_unavailable", ready=False, retry_in_s=delay)
+            except ChannelSpecError as exc:
+                # Not deployed yet, or the channels topic cannot be read: stay not ready, act on nothing. The
+                # code says which (an authorization failure is not "not deployed").
+                code = safe_token(str(getattr(exc, "error_code", CHANNEL_SPEC_UNAVAILABLE)))
+                self._log.warning("spec_unavailable", ready=False, retry_in_s=delay, error_code=code)
             except Exception as exc:  # a client-construction failure must not take the process down either
                 self._log.error("spec_source_failed", ready=False, error=safe_token(type(exc).__name__))
             await self._sleep(delay)
@@ -280,13 +399,20 @@ class ReceiverLifecycle[S](ABC):
     async def _reconcile(self, spec: ChannelSpec | None) -> None:
         running = self.running_settings()
         if spec is None:
+            if self._seen_spec:
+                self._spec_status = rd.UNDEPLOYED
             if running is not None:
                 self.pause_component()  # act first: the log line means it is done
                 self._log.warning("channel_undeployed", ready=False)
             return
+        self._seen_spec = True
         cfg = self._settings_for(spec, serving=running is not None)
         if cfg is None:
+            # Serving: the last good spec keeps serving. Not serving: the only spec seen is refused.
+            self._spec_status = "ok" if running is not None else rd.SPEC_REFUSED
             return
+        self._spec_status = "ok"
+        self._applied = cfg
         if running is None:
             await self._start(cfg)
         elif cfg != running:
@@ -322,7 +448,7 @@ class ReceiverLifecycle[S](ABC):
                 action="exit_0_for_supervisor_restart",
             )
             self.restart_requested = True
-            self._stop.set()
+            self._begin_stop()
             return
         try:
             await self.apply_component(cfg)
@@ -346,13 +472,15 @@ class ReceiverLifecycle[S](ABC):
             if failed_cfg == cfg and (retry_at is None or now < retry_at):
                 return
         try:
+            if not await self.prepare_component(cfg):
+                return
             event = await self.start_component(cfg)
         except SecretUnresolvedError as exc:
             # Not a bind failure: a secret the spec names is not mounted. Retrying in place would hide it;
             # exit 2 (a refused configuration) lets the supervisor restart with its own back-off, visibly.
             self._log.error("startup_refused", ready=False, error=type(exc).__name__, code=exc.code)
             self.exit_code = 2
-            self._stop.set()
+            self._begin_stop()
             return
         except OSError as exc:
             self._start_failure = (cfg, now + self._opts.bind_retry_s)
@@ -364,4 +492,4 @@ class ReceiverLifecycle[S](ABC):
             return
         self._start_failure = None
         if event is not None:
-            self._emit(event)
+            self._emit({**event, "ops_port": self.ops_port} if self.ops_port is not None else event)

@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import shutil
 import ssl
 import subprocess
@@ -111,7 +110,7 @@ class Recorder:
 
 
 @pytest.mark.parametrize("case", list(CASES))
-def test_http_allowed_client_sans(tmp_path: Path, case: str, caplog: pytest.LogCaptureFixture) -> None:
+def test_http_allowed_client_sans(tmp_path: Path, case: str, capsys: pytest.CaptureFixture[str]) -> None:
     san, allowed, accepted = CASES[case]
     pki = Pki(tmp_path)
     client_ctx = pki.client_context("client", san)
@@ -142,9 +141,8 @@ def test_http_allowed_client_sans(tmp_path: Path, case: str, caplog: pytest.LogC
             server.close()
             await server.wait_closed()
 
-    with caplog.at_level(logging.WARNING, logger="tributary.receivers.tls"):
-        asyncio.run(go())
-    lines = [json.loads(r.getMessage()) for r in caplog.records if r.name == "tributary.receivers.tls"]
+    asyncio.run(go())
+    lines = [json.loads(x) for x in capsys.readouterr().err.splitlines() if "tls_peer_refused" in x]
     if accepted:
         assert lines == []
     else:
@@ -301,7 +299,7 @@ def _revoked(srv: MllpServer) -> MllpSettings:
 
 
 def test_revoking_a_san_closes_an_idle_open_connection_at_once(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     pub = Recorder()
 
@@ -318,9 +316,8 @@ def test_revoking_a_san_closes_an_idle_open_connection_at_once(
             w.close()
             server.close()
 
-    with caplog.at_level(logging.WARNING, logger="tributary.receivers.tls"):
-        asyncio.run(go())
-    [line] = [json.loads(x.getMessage()) for x in caplog.records if x.name == "tributary.receivers.tls"]
+    asyncio.run(go())
+    [line] = [json.loads(x) for x in capsys.readouterr().err.splitlines() if "tls_peer_refused" in x]
     assert line["code"] == "TLS_PEER_NOT_ALLOWED" and len(line["cert_sha256"]) == 64
     assert "example.org" not in json.dumps(line)
 

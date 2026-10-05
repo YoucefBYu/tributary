@@ -59,6 +59,24 @@ _DOWN = frozenset({"_ALL_BROKERS_DOWN", "_TRANSPORT", "_RESOLVE"})
 #: librdkafka's name for a consumer that can never continue (measured: a second member with the same
 #: `group.instance.id` makes the first one's `poll` return `_FATAL`, with no revoke or lost callback).
 _FATAL_NAME = "_FATAL"
+#: Kafka error names for "this principal may not do that": a missing ACL, or credentials the broker refuses.
+#: Not a fatal error and not an outage, so they used to fall through `on_kafka_error` unseen.
+_AUTH = frozenset(
+    {
+        "GROUP_AUTHORIZATION_FAILED",
+        "TOPIC_AUTHORIZATION_FAILED",
+        "CLUSTER_AUTHORIZATION_FAILED",
+        "SASL_AUTHENTICATION_FAILED",
+        "_AUTHENTICATION",
+    }
+)
+#: Log-only code for the first authorization failure of a streak (observability/v0 L6; unregistered).
+UNAUTHORIZED_CODE = "REPLY_CONSUMER_UNAUTHORIZED"
+#: librdkafka retries and re-raises an authorization error and sends no "fixed" signal, so no repeat for this long
+#: is taken to mean it was fixed. 30 s is deliberately conservative: a restored ACL keeps the replier out of
+#: rotation for up to this long (and until a record arrives), in exchange for never advertising a partition while
+#: the refusal may still stand. A shorter window would flap on a refusal that recurs less often than it.
+_AUTH_DECAY_S = 30.0
 _MAX_ENUM_CHARS = 64
 _LOG_FIRST = 5
 _LOG_EVERY = 1000
@@ -169,6 +187,7 @@ class ReplyFeed:
         self._held: list[int] = []
         self._connected = True
         self._fatal = False
+        self._auth_until = 0.0  # monotonic; unauthorized while `now < _auth_until`
         #: Called on the event loop thread when the consumer is fatally broken (fenced by a duplicate
         #: `group.instance.id`, say). The runner makes the process exit so a supervisor restarts it.
         self.fatal_handler: Callable[[BaseException], None] | None = None
@@ -183,8 +202,25 @@ class ReplyFeed:
     # -- event loop side --------------------------------------------------------------------------
 
     @property
+    def unauthorized(self) -> bool:
+        return time.monotonic() < self._auth_until
+
+    @property
     def ready(self) -> bool:
-        return self._connected and bool(self._held)
+        return self._connected and bool(self._held) and not self.unauthorized
+
+    def readiness_reason(self) -> str | None:
+        """`None` when ready, else a closed reason of `readiness.schema.json` (`reply_consumer`), the first that
+        holds of: fatal, disconnected, unauthorized, not_established, no_partition (observability/v0 2.3)."""
+        if self._fatal:
+            return "fatal"
+        if not self._connected:
+            return "disconnected"
+        if self.unauthorized:
+            return "unauthorized"
+        if self._held:
+            return None
+        return "not_established" if self._unpositioned else "no_partition"
 
     @property
     def held(self) -> tuple[int, ...]:
@@ -192,7 +228,7 @@ class ReplyFeed:
 
     def choose_partition(self) -> int | None:
         """A held, positioned partition (round-robin across them), or `None`: not ready."""
-        if not self._connected or not self._held:
+        if not self.ready:
             return None
         partition = self._held[self._rr % len(self._held)]
         self._rr += 1
@@ -269,6 +305,23 @@ class ReplyFeed:
         self._set_ready_gauge()
         if self.fatal_handler is not None:
             self.fatal_handler(RuntimeError("reply consumer fatal"))
+
+    def _on_unauthorized(self, name: str) -> None:
+        """Stop advertising (a sync request is refused `AR`/`REPLY_UNAVAILABLE` at once instead of timing out)
+        and say why, once per streak. Recovery: the error stops repeating, or a record arrives."""
+        new_streak = not self.unauthorized
+        self._auth_until = time.monotonic() + _AUTH_DECAY_S
+        self._set_ready_gauge()
+        if new_streak:
+            self._log.error(
+                "reply_consumer_unauthorized", ready=False, error_code=UNAUTHORIZED_CODE, kafka_error=name.lstrip("_")
+            )
+
+    def _on_authorized(self) -> None:
+        if self._auth_until:
+            self._auth_until = 0.0
+            self._set_ready_gauge()
+            self._log.info("reply_consumer_authorized")
 
     def _on_connection(self, up: bool) -> None:
         if self._fatal:
@@ -371,6 +424,8 @@ class ReplyFeed:
             if error is not None:
                 self.on_kafka_error(error)
                 return
+            if self._auth_until:
+                self._post(self._on_authorized)  # a fetched record: the principal can read again
             record = parse_reply_record(msg)
             if record is None:
                 self._drop_unreadable(msg)
@@ -389,6 +444,8 @@ class ReplyFeed:
         if fatal or name == _FATAL_NAME:
             self._down_probe_at = 0.0
             self._post(self._on_fatal)
+        elif name in _AUTH:
+            self._post(self._on_unauthorized, name)
         elif name in _DOWN:
             self._down_probe_at = time.monotonic() + _RETRY_S
             self._post(self._on_connection, False)

@@ -56,7 +56,7 @@ def build_loop(a: argparse.Namespace, kafka_settings: KafkaSettings) -> tuple[Co
 
     defaults: TopicDefaults = load_topic_defaults(a.contracts_dir)
     instance = a.instance_id or f"loader-{a.destination}-{os.getpid()}"
-    log = JsonLogger(f"loader-{a.destination}", base={"channel": a.channel, "destination": a.destination})
+    log = JsonLogger("loader-fhir", base={"channel": a.channel, "destination": a.destination})
     emit_lite_profile_warning(log, profile=a.profile)
 
     spec_group = spec_reader_group_or_exit(a.env, a.channel, instance, log)

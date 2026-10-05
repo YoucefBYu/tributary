@@ -366,3 +366,57 @@ def test_the_replier_effective_config_equals_the_topics_contract(monkeypatch: py
         assert seen[key.removeprefix("clients.reply_consumer.")] == profile[key.removeprefix("clients.reply_consumer.")]
     assert seen["group.id"] == "tb.dev.lab.replier" and seen["group.instance.id"] == "rx-1-p7"
     assert seen["isolation.level"] == "read_uncommitted"
+
+
+# -- readiness reasons (contracts/observability/v0 2.3, `reply_consumer`) and authorization failures ------
+
+
+def test_readiness_reason_walks_the_closed_list() -> None:
+    consumer = FakeConsumer(watermarks={0: 5})
+    consumer.watermark_failures = {1}
+    feed, _, _ = new_feed(consumer)
+    assert feed.readiness_reason() == "no_partition"  # nothing assigned yet
+    consumer.rebalance_assign(1)  # assigned, but the watermark cannot be read: no fetch position
+    assert feed.readiness_reason() == "not_established"
+    consumer.rebalance_assign(0)
+    assert feed.readiness_reason() is None
+    consumer.messages.append(FakeMessage(error=FakeKafkaError("_ALL_BROKERS_DOWN")))
+    feed.tick()
+    assert feed.readiness_reason() == "disconnected"
+    consumer.messages.append(FakeMessage(error=FakeKafkaError("_FATAL")))
+    feed.tick()
+    assert feed.readiness_reason() == "fatal"
+
+
+@pytest.mark.parametrize("name", ["TOPIC_AUTHORIZATION_FAILED", "GROUP_AUTHORIZATION_FAILED", "_AUTHENTICATION"])
+def test_an_authorization_error_makes_the_feed_not_ready_and_logs_a_code_once(name: str) -> None:
+    consumer = FakeConsumer()
+    feed, metrics, log = new_feed(consumer)
+    consumer.rebalance_assign(0)
+    assert feed.ready
+    for _ in range(3):
+        consumer.messages.append(FakeMessage(error=FakeKafkaError(name)))
+        feed.tick()
+    assert not feed.ready and feed.choose_partition() is None and metrics.reply_ready == 0
+    assert feed.readiness_reason() == "unauthorized"
+    [(level, _event, fields)] = [line for line in log.lines if line[1] == "reply_consumer_unauthorized"]
+    assert level == "error" and fields["error_code"] == "REPLY_CONSUMER_UNAUTHORIZED"
+    assert fields["kafka_error"] == name.lstrip("_") and "error_code" in fields
+
+
+def test_authorization_recovers_when_a_record_arrives_or_the_error_stops_repeating() -> None:
+    consumer = FakeConsumer()
+    feed, _, log = new_feed(consumer)
+    consumer.rebalance_assign(0)
+    consumer.messages.append(FakeMessage(error=FakeKafkaError("TOPIC_AUTHORIZATION_FAILED")))
+    feed.tick()
+    assert not feed.ready
+    consumer.messages.append(reply_message(new_correlation_id(), str(uuid7())))
+    feed.tick()
+    assert feed.ready and "reply_consumer_authorized" in log.events()
+    consumer.messages.append(FakeMessage(error=FakeKafkaError("TOPIC_AUTHORIZATION_FAILED")))
+    feed.tick()
+    assert not feed.ready
+    feed._auth_until = 0.001  # the decay window has passed with no repeat
+    assert feed.ready
+    assert [e for e in log.events() if e == "reply_consumer_unauthorized"] == ["reply_consumer_unauthorized"] * 2

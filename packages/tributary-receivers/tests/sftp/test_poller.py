@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import posixpath
 import threading
 from collections.abc import Callable
@@ -399,17 +398,17 @@ def test_run_loop_polls_until_stopped() -> None:
     assert len(pub.calls) == 2
 
 
-def test_file_names_and_payload_never_reach_logs_metrics_or_reprs(caplog: pytest.LogCaptureFixture) -> None:
+def test_file_names_and_payload_never_reach_logs_metrics_or_reprs(capsys: pytest.CaptureFixture[str]) -> None:
     s = FakeSession()
     s.put(PHI_NAME, HL7)
     s.put("SMITH_REJECT.hl7", b"")
     pub = Recorder()
     p = poller(settings(), pub, s)
-    with caplog.at_level(logging.DEBUG):
-        asyncio.run(p.poll_once())
-    events = [json.loads(r.getMessage()) for r in caplog.records if r.name == "tributary.receivers.sftp"]
+    asyncio.run(p.poll_once())
+    err = capsys.readouterr().err
+    events = [json.loads(line) for line in err.splitlines() if line.startswith("{")]
     assert {e["event"] for e in events} >= {"sftp_committed", "sftp_rejected"}
-    blob = caplog.text + json.dumps(p.metrics.snapshot()) + repr(p.metrics)
+    blob = err + json.dumps(p.metrics.snapshot()) + repr(p.metrics)
     for forbidden in ("SMITH", "ACC12345", "SYNTH0001", "TRIBUTARY-SYNTH"):
         assert forbidden not in blob
     assert "SMITH" not in repr(RemoteEntry(PHI_NAME, 1, 0.0, True))

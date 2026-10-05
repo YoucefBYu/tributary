@@ -307,6 +307,7 @@ def test_sync_reply_a_duplicate_group_instance_id_fences_the_first_member_into_a
                 while not failures:
                     await asyncio.sleep(0.2)
             assert not feeds[0].ready and feeds[0].choose_partition() is None
+            assert feeds[0].readiness_reason() == "fatal"
         finally:
             for feed in feeds:
                 await asyncio.to_thread(feed.close)

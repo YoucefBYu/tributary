@@ -41,8 +41,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import fnmatch
-import json
 import logging
+import os
 import posixpath
 import sys
 import time
@@ -57,6 +57,7 @@ from tributary.sdk import headers as h
 
 from ..envelope import build_raw_envelope
 from ..errors import ConfigError, PermanentPublishError
+from ..events import event_logger
 from ..keys import resolve_key
 from ..metrics import Metrics
 from ..mllp.kafka_publisher import RawPublisher, topic_name
@@ -77,7 +78,6 @@ __all__ = ["SftpPoller"]
 
 CLAIM_PREFIX = ".tb-claim."
 _MAX_NAME = 200  # leaves room for the claim prefix inside a 255-byte file name limit
-_log = logging.getLogger("tributary.receivers.sftp")
 
 
 class _Publisher(Protocol):  # the slice of RawPublisher this module uses
@@ -90,7 +90,7 @@ def _safe_name(name: str) -> bool:
 
 
 def _event(event: str, **fields: object) -> None:
-    _log.info(json.dumps({"event": event, **fields}))
+    event_logger("receiver-sftp").info(event, **fields)
 
 
 class SftpPoller:
@@ -333,7 +333,7 @@ def main() -> None:
     from tributary.runtime.config import load_topic_defaults
     from tributary.runtime.errors import RuntimeConfigurationError
 
-    from ..cli import QuietArgumentParser, run_until_stopped, spec_feed_opener
+    from ..cli import QuietArgumentParser, add_ops_arguments, ops_settings_or_exit, run_until_stopped, spec_feed_opener
     from ..startup import refuse, refuse_retired_channel_spec_flag, spec_reader_group_or_exit
     from .runner import RunnerOptions, SftpRunner
     from .service import SftpService
@@ -351,6 +351,7 @@ def main() -> None:
     p.add_argument("--secrets-dir", help="overrides TB_SECRETS_DIR / the default secrets mount")
     p.add_argument("--contracts-dir", help="overrides TB_CONTRACTS_DIR / the default contracts/ search")
     p.add_argument("--metrics-file")
+    add_ops_arguments(p)
     a = p.parse_args(argv)
     logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(message)s")
     # Operator input is validated (and refused without being echoed) before it becomes a log field.
@@ -387,7 +388,13 @@ def main() -> None:
         ),
         make_publisher=make_publisher,
         make_service=make_service,
-        options=RunnerOptions(env=a.env, instance=a.instance, topic=topic),
+        options=RunnerOptions(
+            env=a.env,
+            instance=a.instance,
+            topic=topic,
+            ops=ops_settings_or_exit(a, log),
+            lite_profile=os.environ.get("TB_PROFILE", "lite") == "lite",
+        ),
         log=log,
         metrics_file=a.metrics_file,
     )

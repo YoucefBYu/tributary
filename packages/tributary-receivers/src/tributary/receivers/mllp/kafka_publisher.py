@@ -24,9 +24,11 @@ because this package is now runtime-driven (see `mllp/__init__.py`: there is sti
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import re
 import threading
-from collections.abc import Mapping
+import time
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from functools import lru_cache
 
@@ -44,6 +46,15 @@ _ENV = re.compile(r"^[a-z][a-z0-9-]{0,15}$")
 _CHANNEL = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
 
 CONTENT_TYPE = "application/hl7-v2+er7"
+
+#: Readiness (`contracts/observability/v0` 2.3, R1): while the producer reports every broker down, one
+#: metadata probe at most this often, each bounded by `PROBE_TIMEOUT_S`, tells it that it has recovered.
+PROBE_INTERVAL_S = 5.0
+PROBE_TIMEOUT_S = 2.0
+#: The warm-up round trip (2.4 W1): long enough for the first connection, short enough to retry.
+WARM_TIMEOUT_S = 5.0
+_ALL_DOWN = "_ALL_BROKERS_DOWN"
+_FATAL = "_FATAL"
 
 
 def topic_name(env: str, channel: str) -> str:
@@ -142,7 +153,21 @@ class RawPublisher:
             config["linger.ms"] = linger_ms  # not in the contract's must_not_hardcode list
         config["queue.buffering.max.messages"] = queue_max_messages
         config["socket.keepalive.enable"] = True
+        config["error_cb"] = self._on_error
         self._producer = Producer(config)
+        self._warmed = False
+        self._all_brokers_down = False
+        self._fatal = False
+        self._probe_lock = threading.Lock()
+        self._probe_in_flight = False
+        self._probe_thread: threading.Thread | None = None
+        self._next_probe_at = 0.0
+        #: Bumped on every `_ALL_BROKERS_DOWN`. A probe or warm-up that began before the latest one proves nothing
+        #: about it, so it may not clear the flag.
+        self._down_generation = 0
+        #: Called once, on the producer's poll thread, when librdkafka reports a fatal error. The runner hops
+        #: to its event loop and exits non-zero (observability/v0 R2).
+        self.fatal_handler: Callable[[], None] | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stop = threading.Event()
         self._closed = False
@@ -155,6 +180,89 @@ class RawPublisher:
     def _poll(self) -> None:
         while not self._stop.is_set():
             self._producer.poll(0.005)
+            if self._all_brokers_down:
+                self._maybe_probe()
+
+    # -- readiness (state only; nothing here is called on a request path that waits for Kafka) ------
+
+    @property
+    def warmed(self) -> bool:
+        return self._warmed
+
+    def readiness_reason(self) -> str | None:
+        """`None` when ready, else a closed reason from `readiness.schema.json` (`raw_producer` check)."""
+        if self._fatal:
+            return "fatal"
+        if not self._warmed:
+            return "not_warmed"
+        if self._all_brokers_down:
+            return "all_brokers_down"
+        return None
+
+    def _on_error(self, error: object) -> None:
+        """librdkafka `error_cb`, on the poll thread. Only the symbolic name is read, never the text."""
+        name = ""
+        fatal = False
+        with contextlib.suppress(Exception):
+            name = str(error.name())  # type: ignore[attr-defined]
+            fatal = bool(error.fatal())  # type: ignore[attr-defined]
+        if fatal or name == _FATAL:
+            if not self._fatal:
+                self._fatal = True
+                handler = self.fatal_handler
+                if handler is not None:
+                    with contextlib.suppress(Exception):
+                        handler()
+        elif name == _ALL_DOWN:
+            self._down_generation += 1
+            self._all_brokers_down = True
+
+    def _metadata_names_every_leader(self, timeout_s: float) -> bool:
+        """One metadata round trip for this topic: it exists and every partition has a leader."""
+        try:
+            metadata = self._producer.list_topics(self.topic, timeout=timeout_s)
+        except Exception:
+            return False
+        topic = metadata.topics.get(self.topic)
+        if topic is None or topic.error is not None or not topic.partitions:
+            return False
+        for detail in topic.partitions.values():
+            if getattr(detail, "error", None) is not None or getattr(detail, "leader", -1) < 0:
+                return False
+        return True
+
+    def warm_up(self, timeout_s: float = WARM_TIMEOUT_S) -> bool:
+        """Blocking (run it off the event loop): the warm-up of observability/v0 2.4. True once the reply names
+        a leader for every partition of `<env>.<channel>.raw`; `warmed` stays False otherwise."""
+        generation = self._down_generation
+        if self._metadata_names_every_leader(timeout_s):
+            self._warmed = True
+            if generation == self._down_generation:
+                self._all_brokers_down = False
+            return True
+        return False
+
+    def _maybe_probe(self) -> None:
+        now = time.monotonic()
+        with self._probe_lock:
+            if self._probe_in_flight or now < self._next_probe_at:
+                return
+            self._probe_in_flight = True
+            self._next_probe_at = now + PROBE_INTERVAL_S
+        thread = threading.Thread(target=self._probe, name="raw-publisher-probe", daemon=True)
+        thread.start()
+        self._probe_thread = thread  # after start: `close` joins it only once it is running
+
+    def _probe(self) -> None:
+        generation = self._down_generation
+        try:
+            if self._closed:
+                return  # the producer is closing: no metadata call on it
+            if self._metadata_names_every_leader(PROBE_TIMEOUT_S) and generation == self._down_generation:
+                self._all_brokers_down = False
+        finally:
+            with self._probe_lock:
+                self._probe_in_flight = False
 
     def close(self, timeout_s: float = 5.0) -> None:
         """Flush what is in flight, then refuse every later `publish` (it returns `False`: not committed, so
@@ -162,6 +270,9 @@ class RawPublisher:
         self._closed = True
         self._producer.flush(timeout_s)
         self._stop.set()  # the poller keeps running through the flush: it delivers the reports
+        probe = self._probe_thread
+        if probe is not None:
+            probe.join(PROBE_TIMEOUT_S + 0.5)  # bounded: `list_topics` honours its timeout
 
     async def publish(self, message: Message, *, timeout_s: float) -> bool:
         """Raises `PermanentPublishError` for a record that breaks the envelope contract (retrying cannot
@@ -183,6 +294,9 @@ class RawPublisher:
         future: asyncio.Future[bool] = loop.create_future()
 
         def on_delivery(err: object, _msg: object) -> None:
+            if err is None:
+                self._all_brokers_down = False  # a delivery report proves the brokers answer (R1)
+
             def set_result() -> None:
                 if not future.done():
                     future.set_result(err is None)

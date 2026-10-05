@@ -35,3 +35,19 @@ class SecretUnresolvedError(ReceiverError, FileNotFoundError):
     `SECRET_UNRESOLVED`) instead of retrying it as if a bind had failed. The message names a ref and a key only."""
 
     code = "SECRET_UNRESOLVED"
+
+
+#: Log-only codes for why a channel spec could not be read (not `tb-error-code` values; observability/v0 L6).
+CHANNELS_UNAUTHORIZED = "CHANNELS_UNAUTHORIZED"  # the principal may not describe or read `_tb.<env>.channels`
+CHANNELS_TOPIC_MISSING = "CHANNELS_TOPIC_MISSING"  # the topic does not exist (yet)
+CHANNEL_NOT_DEPLOYED = "CHANNEL_NOT_DEPLOYED"  # the topic is readable and holds no spec for this channel
+CHANNEL_SPEC_UNAVAILABLE = "CHANNEL_SPEC_UNAVAILABLE"  # anything else (a catch-up timeout, say)
+
+
+def spec_unavailable_error(code: str) -> Exception:
+    """A `ChannelSpecError` carrying `error_code`, so `lifecycle` can log why without reading message text."""
+    from tributary.runtime.errors import ChannelSpecError
+
+    exc = ChannelSpecError("channel spec unavailable")
+    exc.error_code = code  # type: ignore[attr-defined]
+    return exc

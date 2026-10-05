@@ -27,7 +27,6 @@ from ..lifecycle import (
     LiveSpecFeed,
     RunnerOptions,
     SpecFeed,
-    print_event,
 )
 from ..metrics import Metrics
 from ..publishing import PublishingComponent, PublishingLifecycle
@@ -41,6 +40,7 @@ __all__ = ["POLLS_PER_TICK", "LiveSpecFeed", "MllpRunner", "RunnerOptions", "Spe
 
 
 class MllpRunner(PublishingLifecycle[MllpSettings]):
+    RECEIVER_TYPE = "mllp"
     EVENT_START_RETRY = "listener_bind_failed"
     EVENT_START_REFUSED = "listener_refused"
 
@@ -55,7 +55,7 @@ class MllpRunner(PublishingLifecycle[MllpSettings]):
         log: Logger,
         metrics: Metrics | None = None,
         metrics_file: str | None = None,
-        emit: Callable[[dict[str, Any]], None] = print_event,
+        emit: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         super().__init__(
             options=options, log=log, open_feed=open_feed, metrics=metrics, metrics_file=metrics_file, emit=emit
@@ -106,10 +106,17 @@ class MllpRunner(PublishingLifecycle[MllpSettings]):
             if self._make_reply_feed is None:
                 raise ConfigError("source.reply is set but this process has no reply consumer")
             feed = self._make_reply_feed(self.metrics)
-            feed.fatal_handler = self.report_failure
+            feed.fatal_handler = lambda _exc: self.report_fatal()
             feed.start(asyncio.get_running_loop())
             self._reply_feed = feed
         return self._reply_feed
+
+    def sync_reply_required(self, cfg: MllpSettings) -> bool:
+        return cfg.reply is not None
+
+    def reply_consumer_reason(self, cfg: MllpSettings) -> str | None:
+        feed = self._reply_feed
+        return "no_partition" if feed is None else feed.readiness_reason()
 
     async def close_resources(self) -> None:
         if self._reply_feed is not None:

@@ -1,7 +1,7 @@
 {
   "marker": "integration",
   "command": "uv run pytest -m integration",
-  "count": 167,
+  "count": 180,
   "modules": {
     "packages/tributary-api/tests/db/test_migrations_integration.py": 3,
     "packages/tributary-api/tests/db/test_repository_integration.py": 14,
@@ -20,6 +20,8 @@
     "packages/tributary-receivers/tests/integration/test_kafka_source_spec_lifecycle.py": 1,
     "packages/tributary-receivers/tests/integration/test_mllp_spec_lifecycle.py": 5,
     "packages/tributary-receivers/tests/integration/test_mllp_sync_reply.py": 7,
+    "packages/tributary-receivers/tests/integration/test_readiness_integration.py": 10,
+    "packages/tributary-receivers/tests/integration/test_readiness_sync_reply.py": 3,
     "packages/tributary-receivers/tests/integration/test_sftp_integration.py": 2,
     "packages/tributary-receivers/tests/integration/test_sftp_spec_lifecycle.py": 1,
     "packages/tributary-runtime/tests/test_integration_channels_outage.py": 1,

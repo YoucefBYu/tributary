@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import shutil
 import ssl
 import subprocess
@@ -639,7 +638,7 @@ def test_budget_is_reserved_before_the_body_is_read() -> None:
     asyncio.run(run(settings(max_message_bytes=5000, queue_max_bytes=6000), pub, client))
 
 
-def test_logs_carry_msg_id_and_never_payload_headers_or_path(caplog: pytest.LogCaptureFixture) -> None:
+def test_logs_carry_msg_id_and_never_payload_headers_or_path(capsys: pytest.CaptureFixture[str]) -> None:
     pub = FakePublisher()
 
     async def client(port: int, srv: HttpServer) -> None:
@@ -647,16 +646,17 @@ def test_logs_carry_msg_id_and_never_payload_headers_or_path(caplog: pytest.LogC
         await post(port, request(path="/secret-path-SYNTH"))
         await post(port, request(content_type="text/plain"))
 
-    with caplog.at_level(logging.DEBUG):
-        asyncio.run(run(settings(), pub, client))
-    text = caplog.text
+    asyncio.run(run(settings(), pub, client))
+    text = capsys.readouterr().err
     for forbidden in (MARKER.decode(), "SYNTHQUERY", "SYNTHHEADER", "secret-path-SYNTH", "boom"):
         assert forbidden not in text
-    events = [json.loads(rec.getMessage()) for rec in caplog.records if rec.name.endswith("http.access")]
+    events = [json.loads(line) for line in text.splitlines() if '"http_access"' in line]
+    for event in events:
+        assert {"ts", "level", "component"} <= set(event)
     assert [e["status"] for e in events] == [202, 404, 415]
     assert events[0]["tb_msg_id"] == pub.calls[0].headers["tb-msg-id"]
     assert events[0]["bytes"] == len(BODY)
-    assert set(events[0]) == {"event", "channel", "method", "status", "bytes", "tb_msg_id"}
+    assert set(events[0]) == {"ts", "level", "component", "event", "channel", "method", "status", "bytes", "tb_msg_id"}
 
 
 def test_metrics_snapshot_has_no_payload_text() -> None:

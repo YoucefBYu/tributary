@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 from collections.abc import Callable
 from dataclasses import replace
 from typing import Any
@@ -227,20 +226,23 @@ def test_publisher_exception_is_a_refusal_never_a_commit() -> None:
     ],
 )
 def test_a_refused_record_halts_its_partition_and_nothing_past_it_is_committed(
-    msg_kwargs: dict[str, Any], cfg_kwargs: dict[str, Any], reason: str, caplog: pytest.LogCaptureFixture
+    msg_kwargs: dict[str, Any], cfg_kwargs: dict[str, Any], reason: str, capsys: pytest.CaptureFixture[str]
 ) -> None:
     c = FakeConsumer()
     pub = Publisher()
     c.queue = [FakeMsg(0, 7), FakeMsg(0, 8, **msg_kwargs), FakeMsg(0, 9), FakeMsg(1, 3)]
     rx = make(c, pub, commit_every=100, **cfg_kwargs)
-    with caplog.at_level(logging.DEBUG):
-        drive(rx, 4)
+    drive(rx, 4)
     # offset 7 was acked and is committed when the halt happens; 8 and 9 never are.
     assert c.commits[0] == {0: 8}
     assert all(commit.get(0, 0) <= 8 for commit in c.commits)
     assert c.paused == [[0]] and rx.halted == {0: 8}
     assert len(pub.calls) == 2  # record 7 and partition 1's record; 8 and the leftover 9 were not published
-    halted = [json.loads(r.getMessage()) for r in caplog.records if "halted" in r.getMessage()]
+    halted = [
+        {k: v for k, v in json.loads(line).items() if k not in {"ts", "level", "component"}}
+        for line in capsys.readouterr().err.splitlines()
+        if "halted" in line
+    ]
     assert halted == [
         {
             "event": "kafka_source_partition_halted",
@@ -405,13 +407,14 @@ def test_run_closes_after_committing_pending_offsets() -> None:
     assert c.commits == [{0: 2}] and c.closed
 
 
-def test_payload_key_and_headers_never_reach_logs_or_metrics(caplog: pytest.LogCaptureFixture) -> None:
+def test_payload_key_and_headers_never_reach_logs_or_metrics(capsys: pytest.CaptureFixture[str]) -> None:
     c = FakeConsumer()
     c.queue = [FakeMsg(0, 1, key=b"KEYSYNTH", headers=[("h", b"HDRSYNTH")]), FakeMsg(0, 2, value=b"")]
     rx = make(c, Publisher(), commit_every=100)
-    with caplog.at_level(logging.DEBUG):
-        drive(rx, 2)
-    blob = caplog.text + json.dumps(rx.metrics.snapshot())
+    drive(rx, 2)
+    logged = capsys.readouterr().err
+    assert logged  # the run did log; an empty capture would make the check vacuous
+    blob = logged + json.dumps(rx.metrics.snapshot())
     for forbidden in ("KEYSYNTH", "HDRSYNTH", "SYNTH-1", "TRIBUTARY-SYNTH"):
         assert forbidden not in blob
 

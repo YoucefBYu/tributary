@@ -12,10 +12,11 @@ from tributary.receivers.mllp.server import emit_lite_profile_warning
 
 def test_lite_profile_emits_the_warning(capsys: pytest.CaptureFixture[str]) -> None:
     emit_lite_profile_warning(profile="lite")
-    out = json.loads(capsys.readouterr().out.strip())
-    assert out["event"] == "lite_profile_active"
+    out = json.loads(capsys.readouterr().err.strip())
+    assert out["event"] == "lite_profile_active" and out["level"] == "warning" and out["component"] == "receiver-mllp"
 
 
 def test_production_profile_emits_nothing(capsys: pytest.CaptureFixture[str]) -> None:
     emit_lite_profile_warning(profile="production")
-    assert capsys.readouterr().out == ""
+    captured = capsys.readouterr()
+    assert captured.out == "" and captured.err == ""

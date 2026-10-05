@@ -43,8 +43,8 @@ only by a `record:key` partitionKey; inbound headers are read only by a `header:
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
+import os
 import sys
 import time
 from collections.abc import Callable
@@ -59,6 +59,7 @@ from tributary.sdk import Message
 
 from ..envelope import build_raw_envelope
 from ..errors import PermanentPublishError, ReceiverError
+from ..events import event_logger
 from ..keys import resolve_key
 from ..metrics import Metrics
 from ..mllp.kafka_publisher import RawPublisher, topic_name
@@ -69,7 +70,6 @@ from .security import security_properties
 
 __all__ = ["KafkaSourceReceiver", "build_consumer"]
 
-_log = logging.getLogger("tributary.receivers.kafka_source")
 _PARTITION_EOF = -191  # confluent_kafka.KafkaError._PARTITION_EOF
 
 
@@ -97,7 +97,7 @@ class SourceConsumer(Protocol):
 
 
 def _event(event: str, **fields: object) -> None:
-    _log.info(json.dumps({"event": event, **fields}))
+    event_logger("receiver-kafka").info(event, **fields)
 
 
 class KafkaSourceReceiver:
@@ -357,7 +357,7 @@ def main() -> None:
     restarts on 0), 2 for a refused startup configuration."""
     from tributary.runtime.errors import RuntimeConfigurationError
 
-    from ..cli import QuietArgumentParser, run_until_stopped, spec_feed_opener
+    from ..cli import QuietArgumentParser, add_ops_arguments, ops_settings_or_exit, run_until_stopped, spec_feed_opener
     from ..startup import refuse, refuse_retired_channel_spec_flag, spec_reader_group_or_exit
     from .runner import KafkaSourceRunner, RunnerOptions
     from .service import KafkaSourceService
@@ -375,6 +375,7 @@ def main() -> None:
     p.add_argument("--secrets-dir", help="overrides TB_SECRETS_DIR / the default secrets mount")
     p.add_argument("--contracts-dir", help="overrides TB_CONTRACTS_DIR / the default contracts/ search")
     p.add_argument("--metrics-file")
+    add_ops_arguments(p)
     a = p.parse_args(argv)
     logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(message)s")
     # Operator input is validated (and refused without being echoed) before it becomes a log field.
@@ -414,7 +415,13 @@ def main() -> None:
         ),
         make_publisher=make_publisher,
         make_service=make_service,
-        options=RunnerOptions(env=a.env, instance=a.instance, topic=topic),
+        options=RunnerOptions(
+            env=a.env,
+            instance=a.instance,
+            topic=topic,
+            ops=ops_settings_or_exit(a, log),
+            lite_profile=os.environ.get("TB_PROFILE", "lite") == "lite",
+        ),
         commit_every=defaults.consumer.commit_every,
         log=log,
         metrics_file=a.metrics_file,

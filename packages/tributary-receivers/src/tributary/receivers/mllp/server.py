@@ -36,7 +36,6 @@ a reset peer ends its entries at once, and a half-closed one is still answered.
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import ssl
 import sys
@@ -52,6 +51,7 @@ from tributary.sdk.keys import HL7_CONTENT_TYPE
 
 from ..backpressure import BudgetExceeded, ByteBudget
 from ..errors import ConfigError
+from ..events import event_logger
 from ..keys import resolve_key
 from ..metrics import Metrics
 from ..net import require_safe_bind
@@ -526,15 +526,10 @@ def emit_lite_profile_warning(*, profile: str) -> None:
     job; this is the receiver's (`tributary-loaders.http.main` carries the loader's)."""
     if profile != "lite":
         return
-    print(
-        json.dumps(
-            {
-                "event": "lite_profile_active",
-                "detail": "RF=1, min.insync.replicas=1: no RPO=0 guarantee for an acknowledged message "
-                "(contracts/topics/v0/topic-defaults.json profiles.lite)",
-            }
-        ),
-        flush=True,
+    event_logger("receiver-mllp").warning(
+        "lite_profile_active",
+        detail="RF=1, min.insync.replicas=1: no RPO=0 guarantee for an acknowledged message "
+        "(contracts/topics/v0/topic-defaults.json profiles.lite)",
     )
 
 
@@ -548,7 +543,7 @@ def main() -> None:
     from tributary.runtime.config import load_topic_defaults
     from tributary.runtime.errors import RuntimeConfigurationError
 
-    from ..cli import QuietArgumentParser, run_until_stopped, spec_feed_opener
+    from ..cli import QuietArgumentParser, add_ops_arguments, ops_settings_or_exit, run_until_stopped, spec_feed_opener
     from ..startup import refuse, refuse_retired_channel_spec_flag, spec_reader_group_or_exit
     from .runner import MllpRunner, RunnerOptions
 
@@ -570,6 +565,7 @@ def main() -> None:
     p.add_argument("--secrets-dir", help="overrides TB_SECRETS_DIR / the default secrets mount")
     p.add_argument("--contracts-dir", help="overrides TB_CONTRACTS_DIR / the default contracts/ search")
     p.add_argument("--metrics-file")
+    add_ops_arguments(p)
     p.add_argument(
         "--profile",
         default=os.environ.get("TB_PROFILE", "lite"),
@@ -627,7 +623,13 @@ def main() -> None:
         make_publisher=make_publisher,
         make_server=make_server,
         make_reply_feed=make_reply_feed,
-        options=RunnerOptions(env=a.env, instance=a.instance, topic=topic),
+        options=RunnerOptions(
+            env=a.env,
+            instance=a.instance,
+            topic=topic,
+            ops=ops_settings_or_exit(a, log),
+            lite_profile=a.profile == "lite",
+        ),
         log=log,
         metrics_file=a.metrics_file,
     )

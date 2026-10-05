@@ -18,12 +18,43 @@ rule that a producer is never closed under work whose commit is still in flight.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import threading
 from abc import abstractmethod
 from collections.abc import Callable
 from typing import Any, Protocol, runtime_checkable
 
+from . import readiness as rd
 from .lifecycle import ReceiverLifecycle
-from .mllp.kafka_publisher import RawPublisher
+from .mllp.kafka_publisher import WARM_TIMEOUT_S, RawPublisher
+
+STOPPING_WARM_TIMEOUT_S = 2.0
+
+
+async def _in_daemon_thread[T](fn: Callable[..., T], *args: Any) -> T:
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[T] = loop.create_future()
+
+    def deliver(result: T | None, error: BaseException | None) -> None:
+        if future.done():
+            return
+        if error is not None:
+            future.set_exception(error)
+        else:
+            future.set_result(result)  # type: ignore[arg-type]
+
+    def run() -> None:
+        try:
+            result = fn(*args)
+        except BaseException as exc:
+            with contextlib.suppress(RuntimeError):
+                loop.call_soon_threadsafe(deliver, None, exc)
+        else:
+            with contextlib.suppress(RuntimeError):
+                loop.call_soon_threadsafe(deliver, result, None)
+
+    threading.Thread(target=run, name="raw-publisher-warm", daemon=True).start()
+    return await future
 
 
 class PublishingComponent[S](Protocol):
@@ -49,6 +80,18 @@ class PublishingComponent[S](Protocol):
 
 
 @runtime_checkable
+class Warmable(Protocol):
+    """What `RawPublisher` offers readiness. A publisher without it (a test double) counts as warm."""
+
+    @property
+    def warmed(self) -> bool: ...
+
+    def warm_up(self, timeout_s: float = ...) -> bool: ...
+
+    def readiness_reason(self) -> str | None: ...
+
+
+@runtime_checkable
 class FailureReporting(Protocol):
     """A component that runs a task of its own (poller, consumer loop) and can say it died."""
 
@@ -67,8 +110,10 @@ class PublishingLifecycle[S](ReceiverLifecycle[S]):
     _retired: list[PublishingComponent[S]]
     _publisher: RawPublisher | None
     _publisher_ordering: str
+    _warm_task: asyncio.Task[None] | None
 
     def _init_listener_state(self) -> None:
+        self._warm_task = None
         self._server = None
         self._retired = []
         self._publisher = None
@@ -113,7 +158,10 @@ class PublishingLifecycle[S](ReceiverLifecycle[S]):
             self._retired.append(server)
             self._server = None
 
-    async def start_component(self, cfg: S) -> dict[str, Any] | None:
+    async def prepare_component(self, cfg: S) -> bool:
+        """The publisher for `cfg`'s ordering rule, warmed (observability/v0 2.4 W1) before anything binds or
+        polls. The warm-up runs as a task with the open backoff, so the tick loop keeps handling spec changes
+        and a stop while Kafka is unreachable; `False` until it succeeds."""
         ordering = self.ordering_of(cfg)
         if self.DRAIN_RETIRED_BEFORE_START:
             await self._drain_retired()
@@ -124,7 +172,54 @@ class PublishingLifecycle[S](ReceiverLifecycle[S]):
         if self._publisher is None:
             self._publisher = self.build_publisher(cfg)
             self._publisher_ordering = ordering
-        server = self.build_server(cfg, self._publisher)
+            self._hook_fatal(self._publisher)
+        return self._warm(self._publisher)
+
+    def _hook_fatal(self, publisher: RawPublisher) -> None:
+        if not hasattr(publisher, "fatal_handler"):
+            return
+        loop = asyncio.get_running_loop()
+
+        def on_fatal() -> None:  # the producer's poll thread
+            with contextlib.suppress(RuntimeError):  # the loop is closed: the process is already stopping
+                loop.call_soon_threadsafe(self.report_fatal)
+
+        publisher.fatal_handler = on_fatal
+
+    def _warm(self, publisher: RawPublisher) -> bool:
+        if not isinstance(publisher, Warmable) or publisher.warmed:
+            return True
+        task = self._warm_task
+        if task is None or task.done():
+            self._warm_task = asyncio.create_task(self._warm_loop(publisher))
+        return False
+
+    async def _warm_loop(self, publisher: RawPublisher) -> None:
+        delay = self._opts.open_retry_initial_s
+        while not self._stop.is_set():
+            # A daemon thread, not `to_thread`: the default executor is joined at loop shutdown, which would hold a
+            # stop for the rest of an in-flight round trip. Once stopping, the round trip is capped at 2 s.
+            timeout = min(WARM_TIMEOUT_S, STOPPING_WARM_TIMEOUT_S) if self._stop.is_set() else WARM_TIMEOUT_S
+            if await _in_daemon_thread(publisher.warm_up, timeout):
+                self._log.info("producer_warmed")
+                return
+            self._log.warning("producer_warm_failed", ready=False, retry_in_s=delay)
+            await self._sleep(delay)
+            delay = min(delay * 2, self._opts.open_retry_max_s)
+
+    def raw_producer_reason(self) -> str | None:
+        publisher = self._publisher
+        if publisher is None:
+            return rd.NOT_WARMED
+        if isinstance(publisher, Warmable):
+            return publisher.readiness_reason()
+        return None
+
+    async def start_component(self, cfg: S) -> dict[str, Any] | None:
+        publisher = self._publisher
+        if publisher is None:  # `prepare_component` ran first
+            raise RuntimeError("no publisher")
+        server = self.build_server(cfg, publisher)
         if isinstance(server, FailureReporting):
             server.set_failure_handler(self.report_failure)
         started = await server.start()
@@ -146,5 +241,9 @@ class PublishingLifecycle[S](ReceiverLifecycle[S]):
         self._retired = []
 
     async def close_resources(self) -> None:
+        task = self._warm_task
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
         if self._publisher is not None:
             await asyncio.to_thread(self._publisher.close)

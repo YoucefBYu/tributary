@@ -11,13 +11,13 @@ inherited default nobody reviewed.
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import re
 import ssl
 from dataclasses import dataclass
 from typing import Any
 
+from .events import event_logger
 from .secrets import SecretResolver
 
 #: The AEAD-only TLS 1.2 list every Tributary TLS client already pins (`ECDHE` key exchange, GCM or ChaCha20).
@@ -30,6 +30,7 @@ _CLIENT_SAN = re.compile(
 MAX_ALLOWED_CLIENT_SANS = 32
 #: Registered in `contracts/envelope/v0/error-codes.json` (set 1.3); appears in a log line and a counter only.
 TLS_PEER_NOT_ALLOWED = "TLS_PEER_NOT_ALLOWED"
+
 _log = logging.getLogger("tributary.receivers.tls")
 
 
@@ -118,8 +119,6 @@ def log_peer_refused(channel: str, ssl_object: ssl.SSLObject | ssl.SSLSocket | N
             der = None
         if der:
             fingerprint = hashlib.sha256(der).hexdigest()
-    _log.warning(
-        json.dumps(
-            {"event": "tls_peer_refused", "code": TLS_PEER_NOT_ALLOWED, "channel": channel, "cert_sha256": fingerprint}
-        )
+    event_logger("receiver-tls").warning(
+        "tls_peer_refused", code=TLS_PEER_NOT_ALLOWED, channel=channel, cert_sha256=fingerprint
     )

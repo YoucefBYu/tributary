@@ -17,7 +17,7 @@ from typing import Any
 from tributary.runtime.spec import ChannelSpec
 from tributary.sdk.context import Logger
 
-from ..lifecycle import LiveSpecFeed, RunnerOptions, SpecFeed, print_event
+from ..lifecycle import LiveSpecFeed, RunnerOptions, SpecFeed
 from ..metrics import Metrics
 from ..mllp.kafka_publisher import RawPublisher
 from ..publishing import PublishingComponent, PublishingLifecycle
@@ -29,6 +29,7 @@ __all__ = ["LiveSpecFeed", "RunnerOptions", "SftpRunner", "SpecFeed"]
 
 
 class SftpRunner(PublishingLifecycle[SftpSettings]):
+    RECEIVER_TYPE = "sftp"
     EVENT_START_RETRY = "poller_start_failed"
     EVENT_START_REFUSED = "poller_refused"
     DRAIN_RETIRED_BEFORE_START = True
@@ -43,7 +44,7 @@ class SftpRunner(PublishingLifecycle[SftpSettings]):
         log: Logger,
         metrics: Metrics | None = None,
         metrics_file: str | None = None,
-        emit: Callable[[dict[str, Any]], None] = print_event,
+        emit: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         super().__init__(
             options=options, log=log, open_feed=open_feed, metrics=metrics, metrics_file=metrics_file, emit=emit

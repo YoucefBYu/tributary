@@ -28,38 +28,29 @@ from collections.abc import Callable
 
 import pytest
 from hypothesis import find, given, settings
-from hypothesis import strategies as st
 from tributary.receivers.backpressure import ByteBudget
 from tributary.receivers.metrics import Metrics
 from tributary.receivers.reply.feed import ReplyRecord
 from tributary.receivers.reply.pending import Pending, PendingMap
 from tributary.receivers.reply.settings import ReplySettings
 from tributary.runtime.sync_answer import Resolution, SyncRequest, answer_for_reply
-from tributary.sdk.codes import REPLY_ROUTE_LOST, REPLY_TIMEOUT, TRANSFORM_ERROR
 from tributary.sdk.ids import uuid7
+
+from tests.support.sync_reply_oracle import (
+    BROKEN_REQUESTS as SHARED_BROKEN_REQUESTS,
+)
+from tests.support.sync_reply_oracle import (
+    LastReplyWins,
+    drive,
+    revoke_gaps,
+    traces,
+    violations,
+)
 
 from .support import FakeClock, FakePartitions
 
 LOOP = asyncio.new_event_loop()  # never run: futures and `call_later` handles are created, nothing is awaited
 atexit.register(LOOP.close)
-
-REPLIES = {
-    "reply_accepted": ("accepted", None),
-    "reply_rejected": ("rejected", "LAB_QUERY_UNSUPPORTED"),
-    "reply_failed": ("failed", TRANSFORM_ERROR),
-    "reply_absent": (None, None),
-    "reply_unknown": ("partially-accepted", None),
-}
-NOISE = [*REPLIES, "timeout", "revoke", "disconnect"]
-
-
-@st.composite
-def traces(draw: st.DrawFn) -> list[str]:
-    noise = draw(st.lists(st.sampled_from(NOISE), max_size=8))
-    commit = draw(st.sampled_from(["commit_ok", "commit_failed"]))
-    position = draw(st.integers(min_value=0, max_value=len(noise)))
-    return [*noise[:position], commit, *noise[position:], "timeout"]
-
 
 # -- the adapter ---------------------------------------------------------------------------------------
 
@@ -132,75 +123,6 @@ class MapEntry:
         return self._settled(was_done)
 
 
-# -- the mirror of the runtime's oracle ----------------------------------------------------------------
-
-
-def drive(request: MapEntry | SyncRequest, event: str) -> Resolution | None:
-    if event == "commit_ok":
-        return request.commit_succeeded()
-    if event == "commit_failed":
-        return request.commit_failed()
-    if event in REPLIES:
-        status, code = REPLIES[event]
-        return request.reply_received(status, code)
-    if event == "timeout":
-        return request.reply_timed_out()
-    if event == "revoke":
-        return request.partition_revoked()
-    if event == "disconnect":
-        return request.disconnected()
-    raise AssertionError(event)
-
-
-def oracle(cause: str, first_reply: str | None, revoked: bool) -> Resolution | None:
-    if cause == "disconnect":
-        return Resolution(answer=None)
-    if cause == "commit_failed":
-        return Resolution("AR")
-    if cause == "timeout":
-        return Resolution("AE", REPLY_TIMEOUT)
-    if cause == "revoke":
-        return Resolution("AE", REPLY_ROUTE_LOST)
-    if first_reply is not None:
-        status, code = REPLIES[first_reply]
-        return Resolution("AA") if status == "accepted" else Resolution("AE", code)
-    if cause == "commit_ok" and revoked:
-        return Resolution("AE", REPLY_ROUTE_LOST)
-    return None
-
-
-def violations(trace: list[str], factory: Callable[[], MapEntry | SyncRequest]) -> list[str]:
-    request = factory()
-    found: list[str] = []
-    resolutions: list[Resolution] = []
-    committed = disconnected = revoked = False
-    first_reply: str | None = None
-    for event in trace:
-        committed = committed or event == "commit_ok"
-        if first_reply is None and event in REPLIES and not resolutions:
-            first_reply = event
-        revoked = revoked or (event == "revoke" and not resolutions)
-        resolution = drive(request, event)
-        disconnected = disconnected or event == "disconnect"
-        if resolution is None:
-            continue
-        resolutions.append(resolution)
-        if resolution.answer in ("AA", "AE") and not committed:
-            found.append(f"{resolution.answer} before the raw callback succeeded (invariant 1)")
-        if resolution.answer == "AR" and committed:
-            found.append("AR after a confirmed commit")
-        if resolution.answer == "AA" and first_reply != "reply_accepted":
-            found.append("AA without the first reply being accepted")
-        if resolution.answer is not None and disconnected:
-            found.append("an answer written to a sender that had gone")
-        expected = oracle(event, first_reply, revoked)
-        if len(resolutions) == 1 and resolution != expected:
-            found.append(f"{resolution} where the rules give {expected} (cause {event})")
-    if len(resolutions) != 1:
-        found.append(f"{len(resolutions)} resolutions, expected exactly one")
-    return found
-
-
 # -- the property --------------------------------------------------------------------------------------
 
 
@@ -226,72 +148,7 @@ def test_a_settled_entry_leaves_the_map_and_its_timer_is_cancelled(trace: list[s
     assert rig.clock.live() == [], "no timer outlives its entry"
 
 
-# -- controls: the broken SyncRequests (copied from the runtime test), caught through the map -----------
-
-
-class AnswersOnReplyAlone(SyncRequest):
-    def reply_received(self, status: str | None, code: str | None) -> Resolution | None:
-        if self.resolved:
-            return None
-        self.resolution = answer_for_reply(status, code)
-        return self.resolution
-
-
-class AnswersRevokeEagerly(SyncRequest):
-    def partition_revoked(self) -> Resolution | None:
-        if self.resolved:
-            return None
-        self.resolution = Resolution("AE", REPLY_ROUTE_LOST)
-        return self.resolution
-
-
-class TrustsAbsentStatus(SyncRequest):
-    def reply_received(self, status: str | None, code: str | None) -> Resolution | None:
-        return super().reply_received("accepted" if status is None else status, code)
-
-
-class LastReplyWins(SyncRequest):
-    def reply_received(self, status: str | None, code: str | None) -> Resolution | None:
-        if self.resolved or self._committed:
-            return super().reply_received(status, code)
-        self._reply = None
-        return super().reply_received(status, code)
-
-
-class SwapsAeCodes(SyncRequest):
-    def reply_timed_out(self) -> Resolution | None:
-        resolved = super().reply_timed_out()
-        return None if resolved is None else self._resolve(Resolution("AE", REPLY_ROUTE_LOST))
-
-    def partition_revoked(self) -> Resolution | None:
-        resolved = super().partition_revoked()
-        return None if resolved is None else self._resolve(Resolution("AE", REPLY_TIMEOUT))
-
-
-class TrustsUnrecognisedStatus(SyncRequest):
-    def reply_received(self, status: str | None, code: str | None) -> Resolution | None:
-        trusted = "accepted" if status not in (None, "rejected", "failed") else status
-        return super().reply_received(trusted, code)
-
-
-class AnswersHeldReplyOnFailedCommit(SyncRequest):
-    def commit_failed(self) -> Resolution | None:
-        if not self.resolved and self._committed is None and self._reply is not None:
-            self._committed = False
-            return self._resolve(answer_for_reply(self._reply.status, self._reply.code))
-        return super().commit_failed()
-
-
-#: `LastReplyWins` is not here: the map forwards only a request's first reply (`reply_seen`), so that bug of the
-#: model is invisible through it. The guard is what holds the rule; `ForwardsEveryReply` below is its control.
-BROKEN_REQUESTS = [
-    AnswersOnReplyAlone,
-    AnswersRevokeEagerly,
-    TrustsAbsentStatus,
-    SwapsAeCodes,
-    TrustsUnrecognisedStatus,
-    AnswersHeldReplyOnFailedCommit,
-]
+BROKEN_REQUESTS = [b for b in SHARED_BROKEN_REQUESTS if b is not LastReplyWins]
 
 
 @pytest.mark.parametrize("broken", BROKEN_REQUESTS)
@@ -352,21 +209,6 @@ def test_each_broken_map_is_caught(broken_map: type[PendingMap]) -> None:
         traces(), lambda trace: bool(violations(trace, factory)), settings=settings(max_examples=5000)
     )
     assert violations(counterexample, factory)
-
-
-def revoke_gaps(trace: list[str], factory: Callable[[], MapEntry]) -> list[str]:
-    """After the callback, a revoke of the advertised partition answers `AE` / `REPLY_ROUTE_LOST` **at once**
-    (the oracle only judges answers that were given, so a revoke that is ignored needs its own check)."""
-    request, committed, settled = factory(), False, False
-    found: list[str] = []
-    for event in trace:
-        resolution = drive(request, event)
-        if resolution is not None:
-            settled = True
-        elif event == "revoke" and committed and not settled:
-            found.append("a revoke after the callback did not answer")
-        committed = committed or event == "commit_ok"
-    return found
 
 
 @given(traces())

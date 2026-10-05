@@ -23,6 +23,7 @@ import contextlib
 import hmac
 import json
 import logging
+import os
 import re
 import ssl
 import sys
@@ -39,6 +40,7 @@ from tributary.sdk import headers as h
 from ..backpressure import BudgetExceeded, ByteBudget
 from ..envelope import build_raw_envelope
 from ..errors import ConfigError, PermanentPublishError
+from ..events import event_logger
 from ..keys import resolve_key
 from ..metrics import Metrics
 from ..mllp.kafka_publisher import RawPublisher, topic_name
@@ -63,8 +65,6 @@ _KNOWN_METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OP
 #: destroy the response before the sender reads it. Bounded, so it is not a way to make us buffer.
 _LINGER_BYTES = 65536
 _LINGER_S = 0.5
-
-_access_log = logging.getLogger("tributary.receivers.http.access")
 
 
 class _HttpError(Exception):
@@ -437,18 +437,15 @@ class HttpServer:
 
     def _log_access(self, ctx: dict[str, Any], status: int) -> None:
         # Method (allow-listed), status, byte count and tb-msg-id: never the request line, a header or a body.
-        _access_log.info(
-            json.dumps(
-                {
-                    "event": "http_access",
-                    "channel": self.cfg.channel,
-                    "method": ctx.get("method", "OTHER"),
-                    "status": status,
-                    "bytes": ctx.get("bytes", 0),
-                    "tb_msg_id": ctx.get("msg_id"),
-                }
-            )
-        )
+        fields: dict[str, object] = {
+            "channel": self.cfg.channel,
+            "method": ctx.get("method", "OTHER"),
+            "status": status,
+            "bytes": ctx.get("bytes", 0),
+        }
+        if ctx.get("msg_id") is not None:
+            fields["tb_msg_id"] = ctx["msg_id"]  # absent, not null: the schema types it as a uuid
+        event_logger("receiver-http").info("http_access", **fields)
 
     async def handle(self, r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         peer = w.get_extra_info("peername")
@@ -535,7 +532,7 @@ def main() -> None:
     from tributary.runtime.config import load_topic_defaults
     from tributary.runtime.errors import RuntimeConfigurationError
 
-    from ..cli import QuietArgumentParser, run_until_stopped, spec_feed_opener
+    from ..cli import QuietArgumentParser, add_ops_arguments, ops_settings_or_exit, run_until_stopped, spec_feed_opener
     from ..startup import refuse, refuse_retired_channel_spec_flag, spec_reader_group_or_exit
     from .runner import HttpRunner, RunnerOptions
 
@@ -552,6 +549,7 @@ def main() -> None:
     p.add_argument("--secrets-dir", help="overrides TB_SECRETS_DIR / the default secrets mount")
     p.add_argument("--contracts-dir", help="overrides TB_CONTRACTS_DIR / the default contracts/ search")
     p.add_argument("--metrics-file")
+    add_ops_arguments(p)
     a = p.parse_args(argv)
     logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(message)s")
     # Operator input is validated (and refused without being echoed) before it becomes a log field.
@@ -589,7 +587,13 @@ def main() -> None:
         ),
         make_publisher=make_publisher,
         make_server=make_server,
-        options=RunnerOptions(env=a.env, instance=a.instance, topic=topic),
+        options=RunnerOptions(
+            env=a.env,
+            instance=a.instance,
+            topic=topic,
+            ops=ops_settings_or_exit(a, log),
+            lite_profile=os.environ.get("TB_PROFILE", "lite") == "lite",
+        ),
         log=log,
         metrics_file=a.metrics_file,
     )
