@@ -43,6 +43,17 @@ class Metrics:
     commit_failures: int = 0
     offset_commits: int = 0
     publish_failures: int = 0
+    # Synchronous reply mode (channel-spec README 3.2.6). Counts only; no id, key or header value.
+    nacked_reply_busy: int = 0  # AR REPLY_BUSY, nothing published
+    nacked_reply_unavailable: int = 0  # AR REPLY_UNAVAILABLE, no reply partition held, nothing published
+    reply_aa: int = 0
+    reply_ae: int = 0
+    reply_timeouts: int = 0  # AE REPLY_TIMEOUT
+    reply_route_lost: int = 0  # AE REPLY_ROUTE_LOST
+    replies_unmatched: int = 0  # unknown correlation id or tb-msg-id mismatch: late, foreign or forged
+    replies_unreadable: int = 0  # a reply record the consumer could not parse, dropped
+    reply_pending: int = 0  # gauge: entries in the pending map now
+    reply_ready: int = 0  # gauge: 1 while this process holds a reply partition and its consumer is connected
     _ack_latency_ms: list[float] = field(default_factory=list, repr=False)
 
     def record_ack_latency_ms(self, value: float) -> None:
@@ -73,6 +84,16 @@ class Metrics:
             "commit_failures": self.commit_failures,
             "offset_commits": self.offset_commits,
             "publish_failures": self.publish_failures,
+            "nacked_reply_busy": self.nacked_reply_busy,
+            "nacked_reply_unavailable": self.nacked_reply_unavailable,
+            "reply_aa": self.reply_aa,
+            "reply_ae": self.reply_ae,
+            "reply_timeouts": self.reply_timeouts,
+            "reply_route_lost": self.reply_route_lost,
+            "replies_unmatched": self.replies_unmatched,
+            "replies_unreadable": self.replies_unreadable,
+            "reply_pending": self.reply_pending,
+            "reply_ready": self.reply_ready,
             "ack_latency_ms_count": len(samples),
         }
         if samples:

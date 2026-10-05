@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import re
 import threading
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from functools import lru_cache
 
@@ -56,12 +57,23 @@ def topic_name(env: str, channel: str) -> str:
 
 
 def build_raw_envelope(
-    *, channel: str, channel_version: int, source: str, payload: bytes, key: bytes | None
+    *,
+    channel: str,
+    channel_version: int,
+    source: str,
+    payload: bytes,
+    key: bytes | None,
+    reply_headers: Mapping[str, str] | None = None,
 ) -> Message:
     """The `class: raw` envelope for one received message: a fresh `tb-msg-id`, no `tb-attempt`
-    beyond `0` (this is the first hop), a fresh `traceparent` (this receiver starts the trace)."""
+    beyond `0` (this is the first hop), a fresh `traceparent` (this receiver starts the trace).
+
+    `reply_headers` is synchronous reply mode's `tb-correlation-id`, `tb-reply-partition` and
+    `tb-reply-deadline` (`reply/pending.py`): engine-minted ids, an integer and a timestamp. The sender's own
+    control id is never a header."""
     return Message(
         headers={
+            **(reply_headers or {}),
             h.TB_MSG_ID: ids.uuid7(),
             h.TB_CHANNEL: channel,
             h.TB_CHANNEL_VERSION: str(channel_version),

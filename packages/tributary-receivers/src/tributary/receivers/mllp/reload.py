@@ -14,6 +14,7 @@ and must never be half-applied for the ones that cannot.
 | Queue limits | `source.queue.maxBytes`, `maxMessages` | immediately (waiting reservations re-check) |
 | TLS client allow-list | `source.tls.allowedClientSans` | the next handshake, i.e. the next connection |
 | Stamped channel version | `metadata.version` | the next record published |
+| Reply timeout, pending cap, reply body mode | `source.reply.timeoutMs`, `maxPending`, `body` | the next request opened (entries already waiting keep the timeout they were opened with) |
 
 `source.ack.mode` has one legal value (`after-commit`, invariant 1), so "changing ack mode" is only a
 change that the receiver refuses: a spec carrying any other value is rejected and the last good spec
@@ -25,6 +26,7 @@ keeps serving.
 |---|---|
 | `source.bind`, `source.port` | the listening socket is bound to them; rebinding would drop the listener |
 | `spec.ordering`, `spec.partitionKey` | the raw producer's ordering rule is fixed at construction, and a key that changes under a running channel would move one patient between partitions and reorder them silently (invariant 5) |
+| `source.reply` present or absent | whether this process joins the `replier` group (a consumer, a group member, partitions held) is decided at start |
 | `source.tls` presence, `secretRef`, `clientAuth`, `minVersion` | the `SSLContext` (certificate, key, minimum version, client-auth mode) is built once; certificate paths come from the secrets mount |
 
 The supervisor must restart the process on exit 0 (`restart: always` / `unless-stopped`, a Kubernetes
@@ -53,6 +55,7 @@ LIVE_FIELDS = (
     "queue_max_bytes",
     "queue_max_messages",
     "tls.allowed_client_sans",
+    "reply",
 )
 
 
@@ -61,12 +64,16 @@ def restart_required_fields(old: MllpSettings, new: MllpSettings) -> list[str]:
     changed = [name for name in ("bind", "port", "partition_key") if getattr(old, name) != getattr(new, name)]
     if _tls_without_allow_list(old) != _tls_without_allow_list(new):
         changed.append("tls")
+    if (old.reply is None) != (new.reply is None):
+        changed.append("reply")
     return changed
 
 
 def live_fields_changed(old: MllpSettings, new: MllpSettings) -> list[str]:
     """The live fields that differ, by name."""
     changed = [name for name in LIVE_FIELDS if not name.startswith("tls.") and getattr(old, name) != getattr(new, name)]
+    if (old.reply is None) != (new.reply is None):
+        changed.remove("reply")  # presence is restart-only; only a change inside the block is live
     if _allow_list(old) != _allow_list(new):
         changed.append("tls.allowed_client_sans")
     return changed

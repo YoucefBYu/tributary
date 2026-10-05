@@ -28,6 +28,7 @@ from tributary.sdk.keys import KeyExpression
 from ..backpressure import DEFAULT_MAX_BYTES
 from ..errors import ConfigError
 from ..keys import key_expression_from_spec
+from ..reply.settings import ReplySettings, reply_settings
 from ..tls import TlsSpec
 
 #: `ack.nackOn` conditions this v0 receiver can actually produce. `spec-invalid` is in the contract's
@@ -70,6 +71,9 @@ class MllpSettings:
     partition_key: str | None = None
     key_expression: KeyExpression | None = None
     linger_ms: int = 5  # matches contracts/topics/v0 clients.receiver_producer.linger.ms
+    #: `source.reply` (README 3.2.6): present means synchronous reply mode. `None` is the async after-commit path.
+    #: Its presence needs a restart (`reload.py`); `timeoutMs`, `maxPending` and `body` apply to the next request.
+    reply: ReplySettings | None = None
     # No delivery_timeout_ms field: that value is `acks`/`enable.idempotence`'s sibling in the
     # topics contract's must_not_hardcode list, and RawPublisher reads it from the contract
     # unconditionally (kafka_publisher.py) rather than accepting it as a parameter here.
@@ -120,6 +124,7 @@ def mllp_settings_from_channel_spec(spec: Mapping[str, Any], *, env: str, instan
     metadata = _require(spec, "metadata", "channel spec")
     channel = _require(metadata, "name", "metadata")
     body = _require(spec, "spec", "channel spec")
+    pipeline = body.get("pipeline") or {}
     return _settings(
         channel,
         int(metadata.get("version", 0)),
@@ -128,6 +133,14 @@ def mllp_settings_from_channel_spec(spec: Mapping[str, Any], *, env: str, instan
         partition_key=body.get("partitionKey"),
         env=env,
         instance=instance,
+        transactional=bool(pipeline.get("transactional", False)),
+        step_uses=tuple(
+            step.get("uses")
+            for steps in (
+                [pipeline.get("steps") or []] + [d.get("steps") or [] for d in body.get("destinations") or []]
+            )
+            for step in steps
+        ),
     )
 
 
@@ -143,6 +156,10 @@ def mllp_settings_from_spec(spec: ChannelSpec, *, env: str, instance: str = "mll
         partition_key=spec.partition_key,
         env=env,
         instance=instance,
+        transactional=spec.pipeline.transactional,
+        step_uses=tuple(
+            step.uses for steps in [spec.pipeline.steps, *(d.steps for d in spec.destinations)] for step in steps
+        ),
     )
 
 
@@ -155,6 +172,8 @@ def _settings(
     partition_key: str | None,
     env: str,
     instance: str,
+    transactional: bool,
+    step_uses: tuple[str | None, ...],
 ) -> MllpSettings:
     # `per-key` (invariant 5): the key expression is parsed and source-checked here, so a malformed or
     # inapplicable locator is a `ConfigError`, never a per-message surprise (`receivers/keys.py`).
@@ -197,6 +216,8 @@ def _settings(
         else None
     )
 
+    reply = reply_settings(source, channel=channel, transactional=transactional, step_uses=step_uses)
+
     queue = source.get("queue") or {}
     queue_max_bytes = queue.get("maxBytes", DEFAULT_MAX_BYTES)
 
@@ -216,4 +237,5 @@ def _settings(
         ordering=ordering,
         partition_key=partition_key,
         key_expression=key_expression,
+        reply=reply,
     )

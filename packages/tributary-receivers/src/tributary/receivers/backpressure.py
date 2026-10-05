@@ -98,6 +98,27 @@ class ByteBudget:
         except TimeoutError:
             return False
 
+    def try_charge(self, n_bytes: int) -> bool:
+        """Charge `n_bytes` at once, without waiting and without taking a message slot, or charge nothing and
+        return `False`. For bytes that are *added* to a frame already admitted (a synchronous reply body held
+        until its answer is written): they count against `maxBytes` like the frame itself, but a full budget
+        refuses them rather than queueing, since the frame's own slot is what the sender is waiting on. Release
+        with `release_bytes`. Synchronous so a reply handler on the event loop never yields while charging."""
+        if n_bytes < 0:
+            raise ValueError("n_bytes must not be negative")
+        if self._used_bytes + n_bytes > self._max_bytes:
+            return False
+        self._used_bytes += n_bytes
+        return True
+
+    async def release_bytes(self, n_bytes: int) -> None:
+        """Return bytes charged by `try_charge` (no message slot is released)."""
+        if n_bytes <= 0:
+            return
+        async with self._cond:
+            self._used_bytes = max(0, self._used_bytes - n_bytes)
+            self._cond.notify_all()
+
     async def release(self, n_bytes: int) -> None:
         async with self._cond:
             self._used_bytes = max(0, self._used_bytes - n_bytes)

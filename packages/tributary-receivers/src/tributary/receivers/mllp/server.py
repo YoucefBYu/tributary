@@ -35,17 +35,22 @@ from typing import Any
 
 from tributary.runtime import load_engine_kafka_or_exit
 from tributary.runtime.logs import JsonLogger
+from tributary.sdk import headers as h
+from tributary.sdk.codes import REPLY_ROUTE_LOST, REPLY_TIMEOUT
 from tributary.sdk.keys import HL7_CONTENT_TYPE
 
 from ..backpressure import BudgetExceeded, ByteBudget
+from ..errors import ConfigError
 from ..keys import resolve_key
 from ..metrics import Metrics
 from ..net import require_safe_bind
+from ..reply.feed import ReplyFeed, open_reply_feed
+from ..reply.pending import Outcome, Pending, PendingMap
 from ..secrets import DirSecretResolver, SecretResolver
 from ..tls import AEAD_CIPHER_PIN, build_ssl_context, log_peer_refused, peer_san_allowed
 from .ack import build_ack
 from .config import MllpSettings
-from .framing import Fatal, FrameParser, Oversize, control_id, looks_like_hl7
+from .framing import CR, EB, SB, Fatal, FrameParser, Oversize, control_id, looks_like_hl7
 from .kafka_publisher import RawPublisher, build_raw_envelope
 from .kafka_publisher import topic_name as raw_topic_name
 from .reload import restart_required_fields
@@ -54,9 +59,10 @@ __all__ = ["MllpServer", "MllpSettings"]
 
 READ_CHUNK = 65536
 
-#: (control id, outcome, reserved byte count or None). Outcome is a completed `asyncio.Task[bool]`
-#: for a message that reached the publisher, or a `str` NACK reason decided before publishing.
-_QueueItem = tuple[str, "asyncio.Task[bool] | str", int | None]
+#: (control id, outcome, reserved byte count or None). Outcome is a completed `asyncio.Task[bool]` for a
+#: message that reached the publisher, an `asyncio.Task[Outcome]` for a synchronous-reply request (it
+#: resolves once the answer is known), or a `str` NACK reason decided before publishing.
+_QueueItem = tuple[str, "asyncio.Task[bool] | asyncio.Task[Outcome] | str", int | None]
 
 
 @dataclass(slots=True)
@@ -90,10 +96,23 @@ class MllpServer:
         self._listener: asyncio.base_events.Server | None = None
         self._conns: dict[asyncio.StreamWriter, _Conn] = {}
         self._refusal: str | None = None  # set by `stop_accepting`: the fixed NACK text for later frames
+        self._reply_feed: ReplyFeed | None = None
+        self._pending: PendingMap | None = None
+        self._background: set[asyncio.Future[None]] = set()
         if cfg.tls is not None:
             self._ssl_context = build_ssl_context(
                 cfg.tls, secret_resolver or DirSecretResolver(), cipher_pin=AEAD_CIPHER_PIN
             )
+
+    def use_reply_feed(self, feed: ReplyFeed) -> None:
+        """The process's reply consumer, for a spec with `source.reply`. Before `start`; the feed outlives the
+        server (the runner owns it: a redeploy must not build a second consumer on the same
+        `group.instance.id`, which would fence the first)."""
+        self._reply_feed = feed
+
+    @property
+    def pending(self) -> PendingMap | None:
+        return self._pending
 
     @property
     def open_connections(self) -> int:
@@ -112,6 +131,8 @@ class MllpServer:
         if restart_required_fields(self.cfg, new):
             raise ValueError("settings changed a field that needs a restart")
         self.budget.set_limits(new.queue_max_bytes, new.queue_max_messages)
+        if self._pending is not None and new.reply is not None:
+            self._pending.configure(new.reply)
         self.cfg = new
         self._revoke_disallowed_peers(new)
         await self.budget.wake()
@@ -144,6 +165,8 @@ class MllpServer:
         is still written (invariant 1). Idempotent; the first reason wins."""
         if self._refusal is None:
             self._refusal = reason
+        if self._pending is not None:
+            self._pending.retire()
         if self._listener is not None:
             self._listener.close()
 
@@ -155,6 +178,8 @@ class MllpServer:
             await asyncio.sleep(0.01)
         for w in list(self._conns):
             w.close()
+        if self._pending is not None:
+            self._pending.abandon_all()  # whatever outlived the budget: nothing is left to answer
         return self.budget.used_messages == 0
 
     async def _publish(self, frame: bytes, remote: str, deadline: float, cfg: MllpSettings, key: bytes | None) -> bool:
@@ -175,6 +200,93 @@ class MllpServer:
         except Exception:
             return False
 
+    async def _publish_sync(
+        self, frame: bytes, remote: str, deadline: float, cfg: MllpSettings, key: bytes | None, entry: Pending
+    ) -> Outcome:
+        """A synchronous-reply request: publish to `raw` with the reply route, report the raw callback to the
+        pending map (which starts the reply clock on success), then wait for the one answer. The answer is
+        `SyncRequest`'s: nothing here decides it (`reply/pending.py`)."""
+        pending = self._pending
+        if pending is None:
+            raise RuntimeError("synchronous reply without a pending map")
+        ok = False
+        try:
+            try:
+                async with self._inflight:
+                    timeout = max(deadline - time.monotonic(), 0.001)
+                    message = build_raw_envelope(
+                        channel=cfg.channel,
+                        channel_version=cfg.channel_version,
+                        source=f"mllp:{cfg.instance}@{remote}",
+                        payload=frame,
+                        key=key,
+                        reply_headers=entry.routing_headers(ack_timeout_s=cfg.ack_timeout_s),
+                    )
+                    entry.bind(message.require(h.TB_MSG_ID))  # before the produce: no reply can name it earlier
+                    t0 = time.monotonic()
+                    ok = await self.publisher.publish(message, timeout_s=timeout)
+                    self.metrics.record_ack_latency_ms((time.monotonic() - t0) * 1000)
+            except Exception:
+                ok = False
+        except asyncio.CancelledError:
+            pending.commit(entry, ok=False)  # never leave an entry no one will settle
+            raise
+        pending.commit(entry, ok=ok)
+        return await entry.outcome
+
+    def _sync_ack(self, result: Outcome) -> bytes | None:
+        """The frame to write for a settled synchronous request, or `None` when the sender is gone.
+
+        `MSA-2` is the sender's own control id; `MSA-3` is `<CODE> <tb-msg-id>` and never payload or
+        exception text. `AR` is the commit that was not confirmed, so a resend is safe; `AE` is a commit, so
+        a resend duplicates; `AA` is a commit and an `accepted` reply (a step body replaces the built ACK)."""
+        resolution = result.resolution
+        cid, msg_id = result.sender_control_id, result.msg_id or ""
+        if resolution.answer is None:
+            return None
+        if resolution.answer == "AA":
+            self.metrics.acked += 1
+            self.metrics.reply_aa += 1
+            if result.body:
+                return SB + result.body + EB + CR
+            return build_ack("AA", cid, msg_id)
+        if resolution.answer == "AE":
+            self.metrics.reply_ae += 1
+            if resolution.code == REPLY_TIMEOUT:
+                self.metrics.reply_timeouts += 1
+            elif resolution.code == REPLY_ROUTE_LOST:
+                self.metrics.reply_route_lost += 1
+            return build_ack("AE", cid, f"{resolution.code or ''} {msg_id}".strip())
+        self.metrics.publish_failures += 1
+        self.metrics.nacked_unavailable += 1
+        return build_ack("AR", cid, "unavailable")
+
+    def _release_body_when_done(self, task: asyncio.Task[Any]) -> None:
+        """A queued answer that will never be written (its writer was cancelled): hand back its body bytes."""
+        if task.cancelled() or task.exception() is not None:
+            return
+        result = task.result()
+        if isinstance(result, Outcome) and (charged := result.take_charge()):
+            release = asyncio.ensure_future(self.budget.release_bytes(charged))
+            self._background.add(release)
+            release.add_done_callback(self._background.discard)
+
+    async def _discard_queue(self, q: asyncio.Queue[_QueueItem | None], conn: _Conn) -> None:
+        """After a writer was cancelled: give back what its unanswered items still hold."""
+        while True:
+            try:
+                item = q.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            if item is None:
+                continue
+            _cid, outcome, reserved = item
+            if reserved is not None:
+                await self.budget.release(reserved)
+                conn.pending -= 1
+            if isinstance(outcome, asyncio.Task):
+                outcome.add_done_callback(self._release_body_when_done)
+
     async def _ack_writer(
         self, q: asyncio.Queue[_QueueItem | None], w: asyncio.StreamWriter, conn: _Conn | None = None
     ) -> None:
@@ -182,11 +294,16 @@ class MllpServer:
         dead = False
         while (item := await q.get()) is not None:
             cid, outcome, reserved = item
+            charged = 0
+            out: bytes | None
             if isinstance(outcome, str):
                 out = build_ack("AR", cid, outcome)
             else:
                 result = await outcome
-                if result:
+                if isinstance(result, Outcome):
+                    charged = result.take_charge()
+                    out = self._sync_ack(result)
+                elif result:
                     out = build_ack("AA", cid)
                     self.metrics.acked += 1
                 else:
@@ -194,12 +311,16 @@ class MllpServer:
                     self.metrics.publish_failures += 1
                     self.metrics.nacked_unavailable += 1
             try:
-                if not dead:  # keep draining so the reader never blocks on a dead peer
+                if not dead and out is not None:  # keep draining so the reader never blocks on a dead peer
                     w.write(out)
                     await asyncio.wait_for(w.drain(), self.cfg.write_timeout_s)
             except (ConnectionError, OSError, TimeoutError):
                 dead = True
+                if self._pending is not None:
+                    self._pending.abandon(conn)  # nothing more can be written to this sender
             finally:
+                if charged:
+                    await self.budget.release_bytes(charged)
                 # Released only now, once the write attempt (or the decision to skip it for a
                 # dead peer) is over: while a stalled peer's drain() is pending, this frame's
                 # bytes stay charged, so the budget cannot be bypassed by piling up written-but-
@@ -242,6 +363,10 @@ class MllpServer:
                 conn.reading = True
                 try:
                     chunk = await asyncio.wait_for(r.read(READ_CHUNK), self.cfg.idle_timeout_s)
+                except TimeoutError:
+                    if conn.pending:
+                        continue  # not idle: the sender is waiting for an answer (a reply can take up to timeoutMs)
+                    raise
                 finally:
                     conn.reading = False
                 if not chunk:
@@ -301,19 +426,40 @@ class MllpServer:
                         await q.put((cid, refusal, None))
                         refused = True
                         break
+                    waiting: Pending | None = None
+                    if cfg.reply is not None and self._pending is not None:
+                        # Refused before anything is published: no reply partition held, or maxPending reached.
+                        opened = self._pending.open(sender_control_id=cid, connection=conn)
+                        if isinstance(opened, str):
+                            await self.budget.release(len(frame))
+                            await q.put((cid, opened, None))  # AR, MSA-3 = the REPLY_ code
+                            continue
+                        waiting = opened
                     conn.pending += 1
-                    task = asyncio.ensure_future(self._publish(frame, remote, deadline, cfg, outcome.key))
+                    task: asyncio.Task[Any]
+                    if waiting is None:
+                        task = asyncio.ensure_future(self._publish(frame, remote, deadline, cfg, outcome.key))
+                    else:
+                        task = asyncio.ensure_future(
+                            self._publish_sync(frame, remote, deadline, cfg, outcome.key, waiting)
+                        )
                     await q.put((cid, task, len(frame)))
                 if refused:
                     break
-        except (TimeoutError, ConnectionError, OSError, ssl.SSLError):
-            pass  # idle timeout, reset, half-open detected by the idle timer, or a TLS failure
+        except (TimeoutError, ConnectionError, OSError, ssl.SSLError) as exc:
+            # idle timeout, reset, half-open detected by the idle timer, or a TLS failure
+            if self._pending is not None and not isinstance(exc, TimeoutError):
+                self._pending.abandon(conn)  # a reset or failed peer cannot be written to: end its waiting entries now
         finally:
+            reply_wait = self.cfg.reply.timeout_s if self.cfg.reply is not None else 0.0
             try:
                 await asyncio.wait_for(q.put(None), self.cfg.write_timeout_s)
-                await asyncio.wait_for(writer_task, self.cfg.ack_timeout_s + self.cfg.write_timeout_s)
+                await asyncio.wait_for(writer_task, self.cfg.ack_timeout_s + reply_wait + self.cfg.write_timeout_s)
             except (TimeoutError, asyncio.CancelledError):
                 writer_task.cancel()
+                await self._discard_queue(q, conn)
+            if self._pending is not None:
+                self._pending.abandon(conn)  # the sender is gone: its waiting entries end, none outlive the handler
             self.metrics.connections_open -= 1
             self._conns.pop(w, None)
             w.close()
@@ -323,14 +469,29 @@ class MllpServer:
         (asyncio calls the handler after the handshake), so it does not count against `max_conns`. Half-open
         handshakes are bounded by `tls_handshake_timeout_s` and the listen backlog; a plaintext-to-TLS flood
         is the operator's edge-firewall concern. Counting them needs a custom protocol factory, not done."""
-        self._listener = await asyncio.start_server(
-            self.handle,
-            self.cfg.bind,
-            self.cfg.port,
-            ssl=self._ssl_context,
-            backlog=1024,
-            ssl_handshake_timeout=self.cfg.tls_handshake_timeout_s if self._ssl_context else None,
-        )
+        if self.cfg.reply is not None:
+            if self._reply_feed is None:
+                raise ConfigError(
+                    f"channel {self.cfg.channel!r}: source.reply needs a reply consumer, none was provided"
+                )
+            loop = asyncio.get_running_loop()
+            self._pending = PendingMap(
+                self.cfg.reply, feed=self._reply_feed, loop=loop, budget=self.budget, metrics=self.metrics
+            )
+            self._reply_feed.attach(self._pending)
+        try:
+            self._listener = await asyncio.start_server(
+                self.handle,
+                self.cfg.bind,
+                self.cfg.port,
+                ssl=self._ssl_context,
+                backlog=1024,
+                ssl_handshake_timeout=self.cfg.tls_handshake_timeout_s if self._ssl_context else None,
+            )
+        except BaseException:
+            if self._pending is not None:
+                self._pending.retire()  # a failed bind leaves no sink behind on the shared feed
+            raise
         return self._listener
 
 
@@ -418,10 +579,23 @@ def main() -> None:
     def make_server(cfg: MllpSettings, publisher: RawPublisher, metrics: Metrics) -> MllpServer:
         return MllpServer(cfg, publisher, metrics=metrics, secret_resolver=resolver)
 
+    def make_reply_feed(metrics: Metrics) -> ReplyFeed:
+        return open_reply_feed(
+            kafka,
+            defaults,
+            env=a.env,
+            channel=a.channel,
+            instance=a.instance,
+            pid=os.getpid(),
+            log=log,
+            metrics=metrics,
+        )
+
     runner = MllpRunner(
         open_feed=open_feed,
         make_publisher=make_publisher,
         make_server=make_server,
+        make_reply_feed=make_reply_feed,
         options=RunnerOptions(env=a.env, instance=a.instance, topic=topic),
         log=log,
         metrics_file=a.metrics_file,
