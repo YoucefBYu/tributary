@@ -48,7 +48,9 @@ from tests.support.chaos_assertions import (
     assert_fault_fired,
     assert_no_acknowledged_loss,
     assert_per_key_order_preserved,
+    count_order_violations,
     duplicate_rate,
+    record_chaos_row,
 )
 from tests.support.kafka_helpers import (
     await_broker,
@@ -211,5 +213,13 @@ def test_joiner_against_a_stable_assignment_moves_partitions_without_loss_or_dup
     )
 
     order = first_delivery_order(delivered, sequence_header=SEQ_HEADER)
+    record_chaos_row(
+        scenario="cooperative-rebalance-stable-join",
+        sent=len(published),
+        delivered_total=len(delivered_ids),
+        delivered_distinct=len(set(delivered_ids)),
+        order_violations=count_order_violations(order),
+        fault_fired=trio["joiner"] > 0,
+    )
     assert set(order) == set(KEYS), "every key must appear in what was delivered"
     assert_per_key_order_preserved(order)

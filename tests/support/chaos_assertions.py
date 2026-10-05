@@ -11,6 +11,8 @@ test-owned verification logic, not a replacement for the runtime under test.
 
 from __future__ import annotations
 
+from itertools import pairwise
+
 
 def assert_no_acknowledged_loss(published_ids: set[str], delivered_ids: set[str]) -> None:
     """Invariant 1/4: every id this scenario put on `raw` (or had ACKed by a receiver) must show up
@@ -47,3 +49,47 @@ def assert_fault_fired(condition: bool, *, description: str) -> None:
     (PHASE-0-DECISION section 4). Kept as its own function -- rather than a bare `assert` at the call
     site -- so every scenario's fault-confirmation reads the same way and is easy to grep for."""
     assert condition, f"fault did not fire: {description} -- this run proves nothing about the invariant"
+
+
+def count_order_violations(first_delivery_by_key: dict[bytes, list[int]]) -> int:
+    """Per-key adjacent inversions among FIRST deliveries (0 when `assert_per_key_order_preserved`
+    would pass). Counted rather than asserted so the report row can carry the number."""
+    return sum(
+        1 for sequences in first_delivery_by_key.values() for earlier, later in pairwise(sequences) if later < earlier
+    )
+
+
+def record_chaos_row(
+    *,
+    scenario: str,
+    sent: int,
+    delivered_total: int,
+    delivered_distinct: int,
+    order_violations: int | None,
+    fault_fired: bool,
+) -> dict[str, object]:
+    """Print one machine-readable report row and, when `TB_CHAOS_ROWS_FILE` is set, append it as JSON
+    Lines. Used by W2-9's duplicate-rate report (docs/spikes/wave-2-duplicate-rate.md). Ids only, no
+    payload content (invariant 6). `order_violations=None` means the scenario has no per-key order
+    assertion (the receiver-originated broker-kill scenario)."""
+    import json
+    import os
+
+    duplicates = delivered_total - delivered_distinct
+    row: dict[str, object] = {
+        "scenario": scenario,
+        "sent": sent,
+        "delivered_total": delivered_total,
+        "delivered_distinct": delivered_distinct,
+        "duplicates": duplicates,
+        "duplicate_rate": duplicate_rate(published_count=sent, delivered_count=delivered_total),
+        "order_violations": order_violations,
+        "fault_fired": fault_fired,
+    }
+    line = json.dumps(row, sort_keys=True)
+    print(f"CHAOS_ROW {line}")
+    path = os.environ.get("TB_CHAOS_ROWS_FILE")
+    if path:
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+    return row

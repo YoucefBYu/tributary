@@ -52,7 +52,9 @@ from tests.support.chaos_assertions import (
     assert_fault_fired,
     assert_no_acknowledged_loss,
     assert_per_key_order_preserved,
+    count_order_violations,
     duplicate_rate,
+    record_chaos_row,
 )
 from tests.support.http_stub import CapturedRequest, StubHttpServer
 from tests.support.kafka_helpers import await_broker, free_port, publish_messages
@@ -283,4 +285,12 @@ def test_destination_outage_under_blocking_retry_loses_nothing_and_recovers(
         seen = order.setdefault(key, [])
         if seq not in seen:
             seen.append(seq)
+    record_chaos_row(
+        scenario="destination-outage-blocking-retry",
+        sent=len(published),
+        delivered_total=len(delivered_identities),
+        delivered_distinct=len(set(delivered_identities)),
+        order_violations=count_order_violations(order),
+        fault_fired=len(delivered_before) == len(batch_a),
+    )
     assert_per_key_order_preserved(order)

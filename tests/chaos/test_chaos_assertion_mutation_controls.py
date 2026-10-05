@@ -75,3 +75,10 @@ def test_fault_fired_check_catches_a_fault_that_never_happened() -> None:
 
 def test_fault_fired_check_passes_a_confirmed_fault() -> None:
     assert_fault_fired(True, description="broker reached Docker's exited state")
+
+
+def test_count_order_violations_sees_a_reorder_and_is_zero_for_a_clean_run() -> None:
+    from tests.support.chaos_assertions import count_order_violations
+
+    assert count_order_violations({b"k": [0, 1, 2, 3]}) == 0
+    assert count_order_violations({b"k": [0, 2, 1, 3], b"j": [0, 1]}) == 1

@@ -46,6 +46,7 @@ from tributary.runtime.topics import raw_topic
 
 from benchmarks.gen import generate
 from tests.support.channel_spec import walking_skeleton_document, write_channel_spec_file
+from tests.support.chaos_assertions import record_chaos_row
 from tests.support.kafka_helpers import create_topics_with_retry
 from tests.support.mllp_client import is_application_accept, send_mllp
 from tests.support.processes import ManagedProcess, spawn_mllp_receiver
@@ -297,4 +298,12 @@ def test_broker_kill_mid_stream_loses_no_acknowledged_message(
     delivered = _drain_raw(bootstrap, expected=len(acked_ids))
     found_ids = {_control_id(value.decode("ascii")) for value in delivered}
     missing = acked_ids - found_ids
+    record_chaos_row(
+        scenario="broker-kill-mid-stream",
+        sent=MESSAGE_COUNT,
+        delivered_total=len(delivered),
+        delivered_distinct=len(found_ids),
+        order_violations=None,
+        fault_fired=exit_code != 0,
+    )
     assert not missing, f"invariant 1 violated: {len(missing)} acknowledged message(s) missing from raw: {missing}"
