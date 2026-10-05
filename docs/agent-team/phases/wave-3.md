@@ -17,7 +17,7 @@ lists under "Escalate to a human" (section 7).
 
 | Item | State |
 |---|---|
-| Wave 2 | **Closed with one condition** (STATUS, Wave 2 exit): criteria 1-4 met; `security-reviewer` closure of the `fb60f3a` High is not yet recorded. CI green on `06fd4b6` (lead-relayed). **Not merged to `main`** (still `2c25448`); merging is a human action |
+| Wave 2 | **Closed; condition lifted 2026-10-05** (STATUS, Wave 2 exit): criteria 1-4 met; `security-reviewer` closed `fb60f3a` and three other findings at `b6b0c97`. CI green on `06fd4b6` (lead-relayed). **Not merged to `main`** (still `2c25448`); merging is a human action |
 | Contracts | Sets 1.0-1.7.1. Sets 1.2-1.7 **verified 2026-10-05**: `validate.py` 156 / 0, 110 pinned pairs all matching, conformance 150 passed (`docs/spikes/wave-2-ci-confirmation.md`) |
 | Packages | No `tributary-archiver`, `tributary-api` or `tributary-cli` yet. The workspace globs `packages/*`, so a new package needs no root-config change |
 | Licences pre-staged | `licence_check.py` already names `tributary-archiver` as the only runtime importer allowed for `certifi` (`MPL_RUNTIME_IMPORTERS`, `BUNDLED_LICENCE_FILES`). It has not run against a real archiver |
@@ -141,7 +141,7 @@ Verbatim from `phase-1.md`, with the reading this wave is gated on.
 | 4 | `security-reviewer` clean on authn, audit and PHI handling of the API | No unresolved Critical or High. Needs the audit retention answer (7.2) before the reviewer can close audit |
 
 **Also gate-tracked (not phase-1 criteria):** no image published before W3-13 is green; ADR-004
-drafted with its human questions listed; the wave 2 condition (`fb60f3a` closure) recorded.
+drafted with its human questions listed; the wave 2 condition (`fb60f3a` closure) recorded (**done 2026-10-05**, STATUS).
 
 ---
 

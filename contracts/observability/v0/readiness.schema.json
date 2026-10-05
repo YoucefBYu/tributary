@@ -1,0 +1,132 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tributary.dev/contracts/observability/v0/readiness.schema.json",
+  "title": "Tributary readiness document (GET /readyz body), v0",
+  "description": "Returned with HTTP 200 when status is ready and 503 when it is not_ready. See README.md section 2. Every value is a fixed code or a spec-defined name: no free text, no exception text, no host, no peer address (invariant 6). Producers validate strictly; probe consumers (kubelet, load balancers) read only the HTTP status, and humans and dashboards ignore fields they do not know.",
+  "type": "object",
+  "required": ["v", "component", "status", "checks"],
+  "additionalProperties": false,
+  "properties": {
+    "v": { "const": 0 },
+    "component": { "enum": ["receiver", "worker", "loader", "archiver", "api"] },
+    "status": { "enum": ["ready", "not_ready"] },
+    "channel": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,63}$" },
+    "channel_version": { "type": "integer", "minimum": 0 },
+    "receiver_type": { "enum": ["mllp", "http", "sftp", "kafka"] },
+    "sync_reply": {
+      "type": "boolean",
+      "$comment": "True when the applied spec has source.reply. Makes the reply_consumer check mandatory, so a sync receiver cannot report ready while omitting it."
+    },
+    "checks": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 8,
+      "items": { "$ref": "#/$defs/check" },
+      "$comment": "Gating checks only. status is ready exactly when every check is ok."
+    },
+    "degraded": {
+      "type": "array",
+      "maxItems": 8,
+      "uniqueItems": true,
+      "items": { "enum": ["spec_source_unproven", "lite_profile", "channels_publisher_unavailable"] },
+      "$comment": "Informational, never gating. spec_source_unproven: _tb.<env>.channels cannot be shown readable and the last good spec is serving (invariant 3: this must not take the receiver out of service)."
+    }
+  },
+  "allOf": [
+    {
+      "$comment": "ready means every gating check passed.",
+      "if": { "properties": { "status": { "const": "ready" } }, "required": ["status"] },
+      "then": { "properties": { "checks": { "items": { "properties": { "ok": { "const": true } } } } } }
+    },
+    {
+      "$comment": "not_ready must say which check failed.",
+      "if": { "properties": { "status": { "const": "not_ready" } }, "required": ["status"] },
+      "then": {
+        "properties": {
+          "checks": { "contains": { "properties": { "ok": { "const": false } }, "required": ["ok"] } }
+        }
+      }
+    },
+    {
+      "$comment": "A receiver reports its channel and the three checks every receiver has (README 2.3).",
+      "if": { "properties": { "component": { "const": "receiver" } }, "required": ["component"] },
+      "then": {
+        "required": ["channel", "receiver_type"],
+        "properties": {
+          "checks": {
+            "items": { "properties": { "name": { "enum": ["spec", "component", "raw_producer", "reply_consumer"] } } },
+            "allOf": [
+              { "contains": { "properties": { "name": { "const": "spec" } }, "required": ["name"] } },
+              { "contains": { "properties": { "name": { "const": "component" } }, "required": ["name"] } },
+              { "contains": { "properties": { "name": { "const": "raw_producer" } }, "required": ["name"] } }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "$comment": "A sync-reply receiver must report the reply consumer (topics/v0 3.3.1 rule 2).",
+      "if": { "properties": { "sync_reply": { "const": true } }, "required": ["sync_reply"] },
+      "then": {
+        "properties": {
+          "checks": { "contains": { "properties": { "name": { "const": "reply_consumer" } }, "required": ["name"] } }
+        }
+      }
+    },
+    {
+      "$comment": "The control-plane API has no channel and its own check names (contracts/openapi/v0, /readyz).",
+      "if": { "properties": { "component": { "const": "api" } }, "required": ["component"] },
+      "then": {
+        "not": { "anyOf": [{ "required": ["channel"] }, { "required": ["receiver_type"] }, { "required": ["sync_reply"] }] },
+        "properties": {
+          "checks": { "items": { "properties": { "name": { "enum": ["database", "oidc_keys"] } } } }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "check": {
+      "type": "object",
+      "required": ["name", "ok"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "enum": ["spec", "component", "raw_producer", "reply_consumer", "database", "oidc_keys"]
+        },
+        "ok": { "type": "boolean" },
+        "reason": {
+          "enum": [
+            "no_spec",
+            "spec_refused",
+            "undeployed",
+            "starting",
+            "bind_failed",
+            "stopping",
+            "component_failed",
+            "not_warmed",
+            "all_brokers_down",
+            "fatal",
+            "no_partition",
+            "not_established",
+            "disconnected",
+            "unreachable",
+            "keys_unavailable"
+          ],
+          "$comment": "A closed list on purpose: a free-text reason is where a broker error string, a peer address or exception text would arrive."
+        }
+      },
+      "allOf": [
+        {
+          "$comment": "A failing check names its reason.",
+          "if": { "properties": { "ok": { "const": false } }, "required": ["ok"] },
+          "then": { "required": ["reason"] }
+        },
+        {
+          "$comment": "A passing check carries no reason, so a stale reason cannot linger after recovery.",
+          "if": { "properties": { "ok": { "const": true } }, "required": ["ok"] },
+          "then": { "not": { "required": ["reason"] } }
+        }
+      ]
+    }
+  }
+}

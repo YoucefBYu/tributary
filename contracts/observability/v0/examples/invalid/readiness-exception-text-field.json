@@ -1,0 +1,14 @@
+{
+  "v": 0,
+  "component": "receiver",
+  "status": "not_ready",
+  "channel": "adt-synth-in",
+  "channel_version": 4,
+  "receiver_type": "mllp",
+  "checks": [
+    { "name": "spec", "ok": true },
+    { "name": "component", "ok": false, "reason": "component_failed" },
+    { "name": "raw_producer", "ok": true }
+  ],
+  "error": "KafkaException: _TRANSPORT kafka-synth-1:9093/1: Disconnected (after 3 ms in state UP)"
+}

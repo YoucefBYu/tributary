@@ -338,6 +338,7 @@ loader path ran end to end. Set 1.4 rebuilds the table from what each role's cod
 | pipeline worker | READ `raw`; WRITE `out.*`, `dlq`, `_tb.<env>.events`; READ `_tb.<env>.channels`; sync-reply only: WRITE `reply` | `tb.<env>.<ch>.pipeline` (literal), `tb.<env>.<ch>.pipeline.shadow-` (prefixed), `tb.<env>.<ch>.channels.` (prefixed) | transactional channels only: WRITE on transactional id prefix `tb.<env>.<ch>.pipeline.` |
 | loader | READ `out.<dest>`; WRITE `dlq`, `_tb.<env>.events`; READ `_tb.<env>.channels` | `tb.<env>.<ch>.loader.<dest>` (literal), `tb.<env>.<ch>.channels.` (prefixed) | none |
 | control plane (channel publisher) | WRITE `_tb.<env>.channels`, `_tb.<env>.audit` | none | DESCRIBE |
+| archiver (set 1.8) | READ `_tb.<env>.events` | `tb.<env>.archiver` (literal) | none |
 
 **Rules the table follows.**
 
@@ -419,8 +420,14 @@ likewise an ADR-004 question; the requirement that encryption be on is not.
 ### 3.6 Consumer group naming
 
 ```
-tb.<env>.<channel>.<role>[.<destination>]     role = pipeline | loader | replier | archiver | receiver
+tb.<env>.<channel>.<role>[.<destination>]     role = pipeline | loader | replier | receiver
+tb.<env>.archiver                             environment-wide platform group (set 1.8)
 ```
+
+**Set 1.8: the archiver's group has no channel segment.** It consumes `_tb.<env>.events` for every
+channel, so a per-channel `archiver` role described a group nothing builds. Its ACL is **LITERAL**
+`tb.<env>.archiver`. The set 1.4 grant was PREFIXED `tb.<env>.archiver*`, which broke rule 2 of 3.4.1
+and would also have matched the groups of a channel named `archiver` (`tb.<env>.archiver.pipeline`).
 
 For example `tb.prod.adt-to-fhir.loader.fhir-server`. A shadow deployment appends
 `.shadow-<label>`, which is what makes shadow deploys free: a second group on the same `raw` topic.

@@ -196,8 +196,8 @@
       "pipeline_worker_transactional": "Set 1.4. Only for a channel with pipeline.transactional true, in addition to pipeline_worker: WRITE on the TRANSACTIONAL_ID resource PREFIXED tb.<env>.<channel>.pipeline. (the clients.transactional_stage_producer transactional.id template). Kept out of the pipeline_worker string because the lite parser has no transactional-id target and the demo channel is not transactional; without the grant the worker fails at init_transactions with TRANSACTIONAL_ID_AUTHORIZATION_FAILED, before consuming (fail closed).",
       "loader": "READ on <env>.<channel>.out.<dest>; WRITE on <env>.<channel>.dlq; WRITE on _tb.<env>.events; READ on _tb.<env>.channels; READ on group tb.<env>.<channel>.loader.<dest>; READ on group tb.<env>.<channel>.channels.*",
       "loader_retry_topic": "Set 1.4, NOT GRANTED in v0: retry.policy retry-topic is refused by the schema and no code reads or writes <env>.<channel>.retry. When it lifts (channel-spec README 4.1.1), the loader gains READ, WRITE on <env>.<channel>.retry and consumes it in its OWN destination group tb.<env>.<channel>.loader.<dest>, filtering on tb-destination. A channel-wide retry group is forbidden: topics README 3.4.1.",
-      "archiver": "READ on _tb.<env>.events; READ on group tb.<env>.archiver*",
-      "archiver_note": "Set 1.4: UNVERIFIED against code, because no archiver package exists yet (wave 3). Reconcile when it lands.",
+      "archiver": "READ on _tb.<env>.events; READ on group tb.<env>.archiver",
+      "archiver_note": "Set 1.8: group grant LITERAL (was PREFIXED tb.<env>.archiver*, which broke rule 2 of README 3.4.1 and would also have matched the groups of a channel named 'archiver'). Group name as built in W3-2a (tributary.archiver.config.archiver_group, per archive-engineer's report; the architect has not read the code). Still owed: confirm the archiver touches no other topic, group or cluster resource (W3-23 style exact-grant test).",
       "control_plane": "WRITE on _tb.<env>.channels and _tb.<env>.audit; DESCRIBE on the cluster",
       "forbidden": "No data-plane component gets cluster-wide WRITE, DELETE or ALTER, and none gets WRITE on _tb.<env>.channels — a compromised worker must not be able to deploy a channel spec.",
       "open_question": "The complete role model, credential rotation and key management are ADR-004 plus a human decision. This block is the minimum shape that the config contract must state, not the finished model."
@@ -263,7 +263,11 @@
   },
   "consumer_groups": {
     "pattern": "tb.<env>.<channel>.<role>[.<destination>][.shadow-<label>]",
-    "roles": ["pipeline", "loader", "replier", "archiver", "receiver"],
+    "roles": ["pipeline", "loader", "replier", "receiver"],
+    "platform_groups": {
+      "$comment": "Set 1.8. Environment-wide groups with no channel segment. The archiver reads _tb.<env>.events for every channel, so 'archiver' moved out of roles, where the pattern implied a per-channel group nothing builds.",
+      "archiver": "tb.<env>.archiver"
+    },
     "roles_note": "replier (set 1.2) = the receivers' reply-consumer group in synchronous reply mode, on this engine's cluster (clients.reply_consumer). receiver (set 1.1) = a kafka source's group on the EXTERNAL cluster it reads; README 3.6 added it in set 1.1 and this list omitted it until set 1.2",
     "spec_reader": {
       "$comment": "Set 1.4. The _tb.<env>.channels reader every data-plane process builds (tributary.runtime.channels.open_spec_source). It uses assign(), never subscribe(), and never commits, but librdkafka still looks up the coordinator for a configured group.id, which needs READ (implying DESCRIBE) on the group: without it the worker logged GROUP_AUTHORIZATION_FAILED (error_code 30) at start on the lite stack. One group per process, so readers never share offsets or partitions.",

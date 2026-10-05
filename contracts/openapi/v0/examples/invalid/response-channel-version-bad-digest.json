@@ -1,0 +1,14 @@
+{
+  "channel": "adt-fanout",
+  "version": 3,
+  "created_at": "2026-10-05T09:00:00.000Z",
+  "created_by": "synth-developer-0001",
+  "origin": { "kind": "api" },
+  "spec_sha256": "sha256:5D41402ABC4B2A76",
+  "document": {
+    "apiVersion": "tributary.dev/v1",
+    "kind": "Channel",
+    "metadata": { "name": "adt-fanout", "version": 3 },
+    "spec": {}
+  }
+}

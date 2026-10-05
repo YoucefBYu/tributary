@@ -23,21 +23,37 @@ wave's exit criteria here.
   draft (`architect`).
 - **Branch:** `wave/1-2` until `wave/1-3` is created. Neither wave is merged to `main` (`2c25448`).
 - **Human-only questions for wave 3:** `phases/wave-3.md` section 7, mirrored under Open questions below.
+- **Architect batch 1, delivered 2026-10-05, ALL UNVERIFIED (the architect has no shell; the lead
+  runs the verify lines):**
 
-### Wave 2 exit, 2026-10-05: CLOSED, one condition outstanding
+  | Task | Delivered | Verify owed |
+  |---|---|---|
+  | W3-12 | `contracts/observability/v0`: readiness section 2 (**unblocks W3-17**), metric registry (35 metrics, 19 labels), log line schema | `validate.py` N / 0; observability adds 30 checks, 19 pinned pairs |
+  | W3-1a | `contracts/openapi/v0` part 1; ADR-009 Proposed | `validate.py --with openapi-spec-validator`: predicted **210 / 0** in total; openapi adds 24 checks, 10 pairs |
+  | W3-11 | `validate.py --check-expectations` | Exit 0 on the tree (predicted `139 invalid examples, 0 drifted`); exit 1 on a scratchpad copy with one pair altered |
+  | W3-10 | ADR-004 draft, H1-H7 `TODO(human)` | `security-reviewer` reads it |
+
+  **CI note:** the `contracts` job must add `--with openapi-spec-validator`, or the default run fails by
+  design (W3-14, `devops-engineer`).
+
+### Wave 2 exit, 2026-10-05: CLOSED, condition lifted
 
 **Verdict: criteria 1-4 met.** Closed by the lead and the architect under the human's delegation
 (decisions log, 2026-10-05). It is not a human signature on a gate report, and no merge is implied.
 
-**Condition (DoD item 6, not an exit criterion):** the `fb60f3a` security High (context extensions) has
-**no recorded closure** by `security-reviewer` in this file or in `docs/security/`. L1-L7 enforcement
-is in `runtime/extensions.py` (11 rule references; read, not run). CI green shows the tests pass. It
-does not show that the reviewer has cleared the finding. Same logic as the wave 1 gate: an open High
-blocks through DoD item 6, not through the functional criterion. **Lead: record the reviewer's closure
-here, or reopen.** Three more review closures are also unrecorded here. In each case the fix is in the
-tree, but the clearance is missing. They are the W2-3 `Encounter` Critical (PV1-19 keying, `adt.py`, `4998f33`), the W2-5
-reviews, and the `EnvelopeError` fix (`2a16e24`, `8af0d63`, `6daf4f4`). The lead confirms these from
-the reviewers' handoffs.
+**Condition (DoD item 6): LIFTED 2026-10-05.** `security-reviewer` re-checked the four outstanding
+closures at `b6b0c97` (lead-relayed; the architect has not read the review itself):
+
+| # | Finding | Closure | Evidence the reviewer cited |
+|---|---|---|---|
+| 1 | `fb60f3a` High, context extensions L1-L7 | **CLOSED** | `runtime/extensions.py:146-276`, `worker.py:450-497` |
+| 2 | W2-3 `Encounter` Critical (PV1-19 keying) | **CLOSED** | Fix `e48d937`, follow-ups `1aba292`, `ab4a4bf`. **Citation corrected:** `4998f33` introduced the bug; earlier text here named it as the fix |
+| 3 | W2-5 findings | **CLOSED** | `EnvelopeError` crash loop (`worker.py:589-603`), splitters as generators, time budget, filter allow-list, DLQ-unwritable halt |
+| 4 | `EnvelopeError` PHI in exception text | **CLOSED** | Same review |
+
+**Caveat:** bandit, pip-audit and gitleaks were **not installed** for this review, so it is a manual
+review without scanner evidence. **New Medium, not a reopen:** empty assigning authority in conditional
+FHIR keys (risk row "Conditional FHIR keys collide across senders", `healthcare-standards-engineer`).
 
 **CI evidence (lead-relayed; the architect has not seen the logs):** head `06fd4b6`, GitHub Actions,
 `youcefbyu/tributary`, branch `wave/1-2`, all jobs green. These were lint/types/unit/conformance,
@@ -428,7 +444,7 @@ All six filed and synthesised. Full threshold table with evidence ratings quoted
 |---|---|---|---|
 | Phase 0 go/no-go | **GO WITH CONDITIONS (signed by the human)** | 2026-09-22 | Instruction: *"Approve orjson, hypothesis and pathspec; record Phase 0 GO WITH CONDITIONS signed"*. All four blocking conditions were met first. **The conditions still standing are the non-blocking open items only:** audit retention (open, blocks the `_tb.<env>.audit` contract), the Mirth corpus (not decided), the keyed-hash mechanism (unresolved until before the archiver is built), and the Phase 1 requirements table in `gates/phase-0-spikes.md` 7.1. **Signing does NOT start Phase 1 — Phase 1 needs the human's separate go-ahead.** |
 | Phase 1 wave 1 exit | **CI passed on the pushed branch; starting wave 2 approved** | 2026-09-24 | Recorded exactly as relayed by the lead: the human confirmed that CI passed and approved starting wave 2. That met the gate's one remaining condition. **Not recorded here, because it was not stated:** a merge to `main` (none has happened; `main` is at `2c25448`) and any separate signature on the gate report |
-| Phase 1 wave 2 exit | **Closed by the lead and architect under the human's delegation; one condition outstanding** | 2026-10-05 | The human's words, relayed by the lead: *"Execute them by priority and let the lead and architect decide."* Criteria 1-4 met (Current, Wave 2 exit). Condition: the `security-reviewer` closure of the `fb60f3a` High is not recorded. **Not a human signature on a gate report. No merge to `main`** |
+| Phase 1 wave 2 exit | **Closed by the lead and architect under the human's delegation; condition lifted 2026-10-05** | 2026-10-05 | The human's words, relayed by the lead: *"Execute them by priority and let the lead and architect decide."* Criteria 1-4 met (Current, Wave 2 exit). Condition lifted: `security-reviewer` closed `fb60f3a` and three other wave 2 findings at `b6b0c97` (lead-relayed, no scanners run). **Not a human signature on a gate report. No merge to `main`** |
 | Phase 1 wave 3 exit | pending | | |
 | MVP release decision | pending | | |
 | Phase 2 v1.0 release decision | pending | | |
@@ -533,14 +549,31 @@ All six filed and synthesised. Full threshold table with evidence ratings quoted
 | 2026-10-05 | **Invariant-3 receiver item closed for invariant 3; the exact-grants ACL test is carried as W3-23.** Reverses the 2026-09-29 "wave 2 does not exit with this open" for the ACL half only. That half verifies the role table, not the spec source, and no wave 2 criterion needs it | Current, Wave 2 exit |
 | 2026-10-05 | **Set 1.7 (additive, no schema change).** (1) **N4 shadowing: no runtime refusal** of same-named installations; resolve against the first on `sys.path` (what `import` loads), log hidden ones `duplicate`, refuse duplicate names at image build. Rejected: refusal at run time, which an actor with import-path write access bypasses with no metadata or a `.pth`, and which breaks stale-metadata and dev editable installs. (2) **`body: step` body unwritable → `AE` with new codes** `REPLY_BODY_INVALID` (framing byte) and `REPLY_BODY_OVER_BUDGET`; rejected reusing `REPLY_BUSY` (an `AR` code) and `REPLY_BODY_MISSING` (worker code). (3) **Per-connection fairness `max(1, maxPending // 4)` ratified**, not a spec field; give up: one connection uses a quarter of the pool. (4) **`--instance` required with sync reply, unique per replica, Helm from pod name.** (5) **Replier reads `clients.reply_consumer`** (typed since 1.2); `isolation.level` now in `must_not_hardcode`. (6) README 3.0: MLLP sync reply Built, HTTP not built | ADR-007 D24, ADR-003 D10 amendment, channel-spec README 3.0/3.2.6/3.3.5, `topics/v0` 3.3.1, `error-codes.json` |
 
+| 2026-10-05 | **Wave 2 condition lifted.** `security-reviewer` closed four findings at `b6b0c97` (lead-relayed): `fb60f3a` High, W2-3 `Encounter` Critical (fix `e48d937` + `1aba292`, `ab4a4bf`; `4998f33` was the cause, earlier citation corrected), W2-5 findings, `EnvelopeError` PHI in exception text. New Medium (empty assigning authority in conditional FHIR keys) tracked as a wave 3 risk, owner `healthcare-standards-engineer`. **Give up:** nothing; scanner evidence is missing from that review and is carried as a risk | Current, Wave 2 exit; sign-offs table |
+
+| 2026-10-05 | **Archive rulings on W3-2a (set 1.8).** (1) `message_id` non-nullable, nil UUID means no identity; archive dedup key `(channel, scope, message_id, stage, destination, attempt)`. (2) Archiver group is the platform group `tb.<env>.archiver`, and its ACL is LITERAL (the PREFIXED set 1.4 grant matched a channel named `archiver`). (3) Archive event TTL defaults to 90 d; the final value is human, decided with audit retention (7.2). (4) Month partitions accepted; dedup at read in the query library. Lead decision recorded: `*_hmac` and deny-listed `attrs` keys are dropped and counted, and the event is stored. Rejected: partitioning on UUIDv7 time. **Give up:** rare cross-month duplicates in storage; a duplicate partition event without `offset` | events README 4.1, `topics/v0` 3.6, CHANGELOG set 1.8 |
+
+| 2026-10-05 | **Receiver readiness (`observability/v0` 2, W3-12).** Separate ops listener, loopback `127.0.0.1:9180` by default, explicit non-loopback for Kubernetes, fail closed on bind, no I/O on the request path. `/livez` never depends on Kafka. Gating checks: `spec`, `component`, `raw_producer`, `reply_consumer` (sync). R1: all-brokers-down makes a receiver not ready. R3: a channels-topic outage after the first spec is `degraded` only (invariant 3); W3-18's "not ready" applies before the first spec. W1: one `raw` metadata round trip before the listener binds. Whether that alone removes the S2 first-ACK outlier is unverified; W3-17 measures. Rejected: liveness tied to Kafka (restart storms); readiness dropping on spec staleness (turns a control-plane fault into an ingest outage); a warm-up record on `raw` (only sender messages go there). **Give up:** in a total Kafka outage senders see connection refused rather than NACK; a receiver keeps serving a spec the control plane has since changed | `observability/v0` README 2 |
+| 2026-10-05 | **Metric labels are a closed list; log lines get a schema** (`observability/v0` 3-4). No id, key, partition, peer, URL or subject label; route templates only. `message_id` is the canonical log spelling, with `tb_msg_id` and `msg_id` accepted as deprecated aliases. New content deny-list (`payload`, `body`, `message`, `traceback`, ...). **Give up:** per-partition halt detail lives in events, not metrics | `observability/v0` README 3-4 |
+| 2026-10-05 | **OpenAPI part 1 (W3-1a).** The channel document is typed loosely, with `channel-spec/v0` the authority (no cross-file `$ref` to an unserved `$id`). The server numbers versions. **Rollback republishes the old document unchanged**, so `tb-channel-version` is not monotonic. `published` means committed, not applied. Optimistic concurrency. Per-environment sub-resource paths instead of ADR-001's `:verb` sketch. Restricted problem bodies (closed codes, no `instance`, no echo). `openapi-spec-validator` added to `validate.py`; its licence closure was checked from PyPI metadata and is all permissive, no `certifi`; a missing library fails the run. Rejected: minting `n+1` on rollback (misattributes code in the archive) | `openapi/v0` README 3 |
+| 2026-10-05 | **ADR-009 Proposed: OIDC bearer, API as resource server, PyJWT.** Header-only tokens; `RS256`/`PS256`/`ES256` allow-list; `iss`/`aud`/`exp` required; JWKS refresh on unknown `kid` rate-limited, with bounded staleness; roles from a configured claim through a role map, global in v0; a local issuer for lite and tests, never an auth-off flag. Rejected: API-issued sessions and tokens (key management, escalated), introspection per request (IdP becomes a hard dependency), mTLS only. **Give up:** revocation bounded by token lifetime | ADR-009 |
+| 2026-10-05 | **ADR-004 drafted (Proposed).** Content archiver as a separate process and principal consuming `raw`/`out`/`dlq`; content off by default in `production` until H1/H4 are answered; per-channel principals; temporary provisioning grant (W3-16 spec); structured grants. Seven human questions H1-H7. Rejected: workers writing content (invariant 9), object-store-only content before custody is decided, per-channel content archivers | ADR-004 |
+
 ## Open questions for the human
+
+**ADR-004 (2026-10-05), H1-H7, `TODO(human)` in the ADR:** H1 key custody for encryption at rest
+(= 7.4); H2 application-level encryption of archived content (new); H3 `_hmac` construction, key and
+de-identification (= 7.3); H4 retention values and the audit system of record (= 7.2, now also archived
+content at a 30-day placeholder); H5 credential rotation cadence and secret store (new); H6 erasure:
+delete, crypto-shred, or neither (new); H7 sign-off on the Kafka role model, including the content
+archiver reading every channel's PHI in its environment (new).
 
 **Seven of the nine Phase 0 gate items were decided on 2026-09-21, and the MPL approval plus the gate
 sign-off followed on 2026-09-22** — see the decisions log above. What remains open is listed here. Items
 struck through were decided and are kept for one revision so the change is visible.
 
 **Nothing blocks the Phase 0 gate any more — it is signed.** Wave 1 is complete. Wave 2 closed on
-2026-10-05 with one condition, and wave 3 has started under the human's delegation to the lead and
+2026-10-05 and its one condition was lifted the same day, and wave 3 has started under the human's delegation to the lead and
 architect.
 
 **Open, new in wave 2:**
@@ -583,6 +616,8 @@ architect.
   - **ADR-004 key custody** (archive volumes, claim-check bucket, `_hmac` key). W3-10 drafts options
     only. The answer gates production use of the archive, not the build.
   - **Audit retention**, below, now blocks wave 3 exit criterion 4 (audit), not only the contract.
+    **Same answer, one more place (2026-10-05):** archived lifecycle events in ClickHouse default to
+    90 days (`TB_ARCHIVE_TTL_DAYS`, placeholder). Say whether the retention duty reaches them.
   - **Merge `wave/1-1` and `wave/1-2` to `main`**: a human action, not blocking.
 - **`psycopg` 3 in the CLAUDE.md stack table. Default chosen 2026-10-05: W3-4a builds on `asyncpg`;
   the human answer is still needed** (approve `psycopg` or amend the table). CLAUDE.md names it for
@@ -689,7 +724,7 @@ version is `docs/spikes/PHASE-0-DECISION.md` section 9 and ADR-001 section 13.
 | **ClickHouse duplicate test passes falsely**, because deduplication is eventual | Medium | Medium | Assert a `FINAL` count (README 5.1) |
 | **Exit criterion 4 reported against laptop numbers only** | High | Medium | Run the Linux re-run, or say so in the report rather than compare as if the numbers were comparable |
 | **Claim-check is unscheduled** while file and HTTP sources make large inputs more common | Medium | Medium | Every source refuses input over 1 MB; the lead decides whether to schedule the spike (`wave-2.md` 5.2) |
-| **A produce-time `EnvelopeError` crashes the pipeline worker** (W2-5; **fix delivered, pending review**) | Low once reviewed | High: a crash loop on one record halts the partition, which is the envelope 2.3 failure class | Dead-letter the consumed record as `TB_OUTPUT_ENVELOPE_INVALID`, producing nothing (`2a16e24`, `8af0d63`, `6daf4f4`). Closes when the reviewers clear it |
+| ~~**A produce-time `EnvelopeError` crashes the pipeline worker**~~ **CLOSED 2026-10-05** (`security-reviewer` at `b6b0c97`, `worker.py:589-603`; PHI-in-exception-text also closed) | — | — | Dead-letter the consumed record as `TB_OUTPUT_ENVELOPE_INVALID`, producing nothing (`2a16e24`, `8af0d63`, `6daf4f4`) |
 | **A `raw` payload over 1 MB halts its partition** (W2-5 residual, accepted for wave 2) | Low: needs WRITE on `raw`, which is receiver-only (`topics/v0` 3.4). Broker `max.message.bytes` does not stop it, because it checks the compressed batch | Medium: the partition halts until an operator clears it; nothing is lost | Claim-check (unscheduled). Interim done (`361935e`): `partition_halted` with `TB_DLQ_UNWRITABLE` instead of a crash loop. No clear or skip tooling yet |
 | **Contract and code drift on names nobody checks** (latest: `STEP_ERROR` vs `TRANSFORM_ERROR`, found only while writing the registry) | Medium | Medium | Registry plus a two-way cross-check test in `tributary-sdk`. The same shape as the wave 1 finding: a green conformance run says the contracts are self-consistent, not that they agree with the code |
 | **Sync reply answers `AE` or `AA` before the commit is confirmed** (W2-8; the proposal allowed it on a revoke before the callback) | Low once tested | High: invariant 1 in its sync form, a false "committed" | Amended in channel-spec 3.2.6: neither answer precedes the successful `raw` callback. The proposal's Hypothesis property is extended to `AE`, with a broken-implementation control. **2026-09-29: proved on the `sync_answer.py` model only; the receiver is not built.** Open until the receiver uses the model or the property runs against it. **2026-10-05:** the MLLP receiver's `pending.py` delegates every answer to `SyncRequest`, and its docstring says the property test drives the map (read, not run). Closes when `qa-engineer` confirms that test, with its broken-receiver control red, in CI. **CLOSED 2026-10-05:** 16 passed; four controls neutralised → 6 failed, exactly the control tests (`wave-2-ci-confirmation.md`); a named CI step runs both property suites. Oracle move to `tests/support` is W3-20 |
@@ -699,5 +734,15 @@ version is `docs/spikes/PHASE-0-DECISION.md` section 9 and ADR-001 section 13.
 | **A future retry implementation shares a consumer group across destinations**, so one loader's commits skip another's retries (silent loss, invariant 4) | Low: ruled, and the LITERAL group ACL refuses a shared name at start | High | ADR-008 D9; the lift checklist gains a two-destination test with a shared-group control that must go red |
 | **Sync reply latency tail, not reproduced in isolation** (W2-8). **Measured 2026-10-05** (`docs/spikes/wave-2-sync-reply-latency.md`, `qa-engineer`, tree `ec4b9d1`). Real MLLP receiver and worker, single broker RF=1, about 50 msg/s, 5 runs x 300: **p50 17.4-18.4 ms, p90 20.7-22.5 ms, p99 25.0-29.4 ms, max 42.5 ms, 0 of 1,500 over 100 ms**. With the CPU saturated (2 probe runs): p99 42.6-55.2 ms, still none over 100 ms. Receiver `raw` commit: p50 7.1-7.4 ms, p99 10.2-12.0 ms. *History:* an informal first reading had p99 about 440-500 ms, then the lead reported p99 about 270 ms in one run of four, both inside full integration sessions | **Low** in isolation (was High); **unknown** inside a busy integration session, which is where the outliers were seen | Medium: sync senders wait on it; not a correctness issue | **W3-24 (`qa-engineer`):** reproduce inside a full integration session, at least 3,000 requests per run, with receiver and broker logs. `platform-engineer` takes the cause only if it reproduces. Open hypotheses, none measured: a broker or group-coordinator event, Docker disk or network contention, a `replier` rebalance, producer cold start. **Not measured:** p99 at n = 300 rests on 3 samples, so a 1-in-1,000 event would usually not show. Single host, RF=1. No latency claim for RF=3 |
 | **Receivers have no readiness probe** (2026-10-05). The contract's "not ready" states (no reply partition, reply consumer disconnected or `_FATAL`; `topics/v0` 3.3.1 rule 2) are computed but nothing exposes them, so an orchestrator routes senders to a process that answers every sync request `AR` / `REPLY_UNAVAILABLE` | Certain until built | Medium: safe (`AR`, nothing lost) but an avoidable outage for sync senders; Helm needs it | **Wave 3 batch 1:** W3-12 (`architect`, readiness contract section first), W3-17 (`connector-engineer`, probe on every receiver, producer warmed before ready), W3-8 wiring (`devops-engineer`). The probe's listener goes to `security-reviewer` (network listener) |
-| **Plugin code runs beside steps without being named in the spec** (`tributary.context`, security High on `fb60f3a`): a transitive or typosquatted registrant sees every payload and `ctx.secrets` | Was High until L1 landed. **2026-10-05:** L1-L7 are in `runtime/extensions.py` and CI is green. `security-reviewer` closure is not recorded (the wave 2 condition) | High: invariant 6, secrets exposure | Set 1.5: spec-declared allow-list plus distribution pin (ADR-007 D21). **Residual:** a package replacing `tributary-fhir` under its own name is not detected at runtime (lockfile hashes, image digest and SBOM are the controls), and P2-P7 rest on review |
+| **Plugin code runs beside steps without being named in the spec** (`tributary.context`, security High on `fb60f3a`): a transitive or typosquatted registrant sees every payload and `ctx.secrets` | Was High until L1 landed. **High CLOSED 2026-10-05** by `security-reviewer` at `b6b0c97` (`extensions.py:146-276`, `worker.py:450-497`); the residual below stays | High: invariant 6, secrets exposure | Set 1.5: spec-declared allow-list plus distribution pin (ADR-007 D21). **Residual:** a package replacing `tributary-fhir` under its own name is not detected at runtime (lockfile hashes, image digest and SBOM are the controls), and P2-P7 rest on review |
 | **Licence data bundled inside a package is invisible to metadata checks** (botocore's MPL-2.0 `cacert.pem`, 2026-09-29; found by review, not CI) | Medium: CA bundles and vendored data are common | Medium: an unapproved licence ships unnoticed | **Mitigated:** `licence_check.py` has a scoped `BUNDLED_LICENCE_FILES` check that reads each wheel's `RECORD` and allows `botocore/cacert.pem` only in `tributary-loaders` and `certifi/cacert.pem` only in the archiver. **Residual:** it matches file **names** (`BUNDLED_FILE_NAMES`, today only `cacert.pem`), so a licensed file under any other name still passes. `security-reviewer` keeps inspecting new dependencies' contents; the W4-7 SBOM should scan file contents, not only metadata |
+
+### Risks added in wave 3
+
+| Risk | Likelihood | Impact | Mitigation |
+|---|---|---|---|
+| **Conditional FHIR keys collide across senders** (`security-reviewer` Medium at `b6b0c97`, new, not a reopen). `adt.py:182` and `patient.py:42` build conditional keys with an empty assigning authority (`urn:id:` or `identifier=\|value`), so two senders' identical local identifiers resolve to one resource: one patient's data can be merged into another's (PHI integrity, not a log leak) | Medium: any channel with more than one sending facility | High: wrong-patient write in the customer's FHIR server | **Assigned to `healthcare-standards-engineer`.** Expected shape (architect, not yet a ruling): refuse to build a conditional key without an assigning authority, dead-letter with a registered code rather than write unconditionally; regression test with two senders sharing an identifier value. Any new code goes through `envelope/v0` `error-codes.json` |
+| **Set 1.8 counts and pairs are architect predictions** (139 pinned pairs, 29 new; 54 new checks), and the `contracts` CI job fails until it installs `openapi-spec-validator` | High until run | Low: a red run, not a silent pass | Lead runs `validate.py` (both modes) before pushing. W3-14 adds the flag and retires `check_expectations.py` |
+| **Readiness R1 flaps under a broker blip** (all-brokers-down clears only on delivery or a metadata probe) | Medium | Medium: brief loss of endpoints | W3-17 measures time to recovery; the 5 s probe interval is judgement, not measured |
+| **The content archiver reads every channel's PHI** (ADR-004 K2) | Certain once built | High if its credential leaks | Own process, principal and secret; no WRITE; human sign-off H7 before production |
+| **The 2026-10-05 wave 2 closures carry no scanner evidence** (bandit, pip-audit, gitleaks not installed for that review) | Low | Medium | CI's licence, SBOM and secret-scan jobs still run. Install the scanners for the wave 3 exit review (criterion 4) |

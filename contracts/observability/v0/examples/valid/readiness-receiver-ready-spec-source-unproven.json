@@ -1,0 +1,14 @@
+{
+  "v": 0,
+  "component": "receiver",
+  "status": "ready",
+  "channel": "lab-synth-http",
+  "channel_version": 9,
+  "receiver_type": "http",
+  "checks": [
+    { "name": "spec", "ok": true },
+    { "name": "component", "ok": true },
+    { "name": "raw_producer", "ok": true }
+  ],
+  "degraded": ["spec_source_unproven", "lite_profile"]
+}

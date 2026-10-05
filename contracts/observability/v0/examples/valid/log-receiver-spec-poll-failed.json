@@ -1,0 +1,11 @@
+{
+  "ts": "2026-10-05T09:15:40.001Z",
+  "level": "warning",
+  "event": "spec_poll_failed",
+  "component": "receiver",
+  "channel": "lab-synth-http",
+  "error": "ChannelsUnavailableError",
+  "error_code": "TOPIC_AUTHORIZATION_FAILED",
+  "serving_last_good": true,
+  "ready": true
+}

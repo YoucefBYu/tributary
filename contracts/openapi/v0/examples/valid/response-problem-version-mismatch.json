@@ -1,0 +1,8 @@
+{
+  "type": "https://tributary.dev/problems/current-version-mismatch",
+  "title": "The deployed version is not the one you expected",
+  "status": 409,
+  "code": "CURRENT_VERSION_MISMATCH",
+  "detail": "Re-read the deployment and retry with the current version.",
+  "request_id": "0192f3a4-7300-7abc-8def-0123456789ab"
+}

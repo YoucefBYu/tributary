@@ -1,0 +1,33 @@
+{
+  "contract": "tributary.openapi/v0",
+  "schema_note": "No manifest-level schema: every entry names the component it is checked against, as '../openapi.json#/components/schemas/<Name>'. validate.py validates with the whole OpenAPI document as the root, so internal references resolve.",
+  "note": "All values synthetic. PHI and leak guards: response-problem-echoes-input, response-validation-issue-with-message, response-problem-unknown-code. Proposed as OPENAPI_PHI_GUARDS (3) for tests/conformance. The readiness entry is the observability/v0 example itself, checked against ApiReadiness here too, so the two contracts cannot drift on the api case.",
+  "expectation_note": "Pairs written 2026-10-05 by the architect WITHOUT a run: predictions until validate.py measures them.",
+  "valid": [
+    { "file": "valid/request-create-channel-git.json", "schema": "../openapi.json#/components/schemas/ChannelVersionCreate", "note": "POST /v1/channels or /versions: authored document (no metadata.version), git origin with commit and path" },
+    { "file": "valid/request-deploy-guarded.json", "schema": "../openapi.json#/components/schemas/DeployRequest", "note": "Optimistic concurrency guard" },
+    { "file": "valid/request-deploy-first.json", "schema": "../openapi.json#/components/schemas/DeployRequest", "note": "expected_current_version null: deploy only if nothing is deployed" },
+    { "file": "valid/request-rollback.json", "schema": "../openapi.json#/components/schemas/RollbackRequest", "note": "to_version defaults to the previously published version" },
+    { "file": "valid/response-channel-version.json", "schema": "../openapi.json#/components/schemas/ChannelVersion", "note": "Stored document carries metadata.version = version" },
+    { "file": "valid/response-deployment-pending.json", "schema": "../openapi.json#/components/schemas/Deployment", "note": "202 body: pending" },
+    { "file": "valid/response-deployment-rollback-published.json", "schema": "../openapi.json#/components/schemas/Deployment", "note": "Rollback republishes version 2 unchanged" },
+    { "file": "valid/response-deployment-undeploy.json", "schema": "../openapi.json#/components/schemas/Deployment", "note": "Undeploy: version null; failed carries failure_code" },
+    { "file": "valid/response-validation-report-invalid.json", "schema": "../openapi.json#/components/schemas/ValidationReport", "note": "Paths and keywords or rule names only; a control-plane warning code" },
+    { "file": "valid/response-problem-version-mismatch.json", "schema": "../openapi.json#/components/schemas/Problem", "note": "409 with fixed detail text" },
+    { "file": "valid/response-environment-list.json", "schema": "../openapi.json#/components/schemas/EnvironmentList", "note": "Management mode and profile per environment" },
+    { "file": "valid/response-channel.json", "schema": "../openapi.json#/components/schemas/Channel", "note": "Latest version and per-environment state" },
+    { "file": "../../../observability/v0/examples/valid/readiness-api-ready.json", "schema": "../openapi.json#/components/schemas/ApiReadiness", "note": "Cross-contract: the observability api readiness example must also satisfy the OpenAPI response schema" }
+  ],
+  "invalid": [
+    { "file": "invalid/request-origin-git-without-commit.json", "schema": "../openapi.json#/components/schemas/ChannelVersionCreate", "violates": "a git origin names its commit and path", "expected_json_path": "$.origin", "expected_validator": "required" },
+    { "file": "invalid/request-deploy-unknown-field.json", "schema": "../openapi.json#/components/schemas/DeployRequest", "violates": "no force flag or any other unknown field: strict producers", "expected_json_path": "$", "expected_validator": "additionalProperties" },
+    { "file": "invalid/request-rollback-without-expected-version.json", "schema": "../openapi.json#/components/schemas/RollbackRequest", "violates": "rollback requires expected_current_version, so a double rollback fails instead of going two versions back", "expected_json_path": "$", "expected_validator": "required" },
+    { "file": "invalid/request-create-channel-name-invalid.json", "schema": "../openapi.json#/components/schemas/ChannelVersionCreate", "violates": "metadata.name follows the topic-segment grammar", "expected_json_path": "$.document.metadata.name", "expected_validator": "pattern" },
+    { "file": "invalid/response-problem-echoes-input.json", "schema": "../openapi.json#/components/schemas/Problem", "violates": "a problem never echoes the request (invariant 6; a URL can carry a token)", "expected_json_path": "$", "expected_validator": "additionalProperties" },
+    { "file": "invalid/response-validation-issue-with-message.json", "schema": "../openapi.json#/components/schemas/ValidationReport", "violates": "a validation issue is json_path plus keyword; the jsonschema message embeds the failing value", "expected_json_path": "$.errors[0]", "expected_validator": "additionalProperties" },
+    { "file": "invalid/response-deployment-undeploy-with-version.json", "schema": "../openapi.json#/components/schemas/Deployment", "violates": "an undeploy publishes a tombstone, so version is null", "expected_json_path": "$.version", "expected_validator": "type" },
+    { "file": "invalid/response-deployment-published-without-time.json", "schema": "../openapi.json#/components/schemas/Deployment", "violates": "published means committed to _tb.<env>.channels, and says when", "expected_json_path": "$", "expected_validator": "required" },
+    { "file": "invalid/response-problem-unknown-code.json", "schema": "../openapi.json#/components/schemas/Problem", "violates": "problem codes are a closed list; a library exception name is not one", "expected_json_path": "$.code", "expected_validator": "enum" },
+    { "file": "invalid/response-channel-version-bad-digest.json", "schema": "../openapi.json#/components/schemas/ChannelVersion", "violates": "spec_sha256 is 64 lowercase hex, no prefix", "expected_json_path": "$.spec_sha256", "expected_validator": "pattern" }
+  ]
+}

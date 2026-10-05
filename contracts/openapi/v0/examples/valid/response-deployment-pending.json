@@ -1,0 +1,11 @@
+{
+  "id": "0192f3a4-7000-7abc-8def-0123456789ab",
+  "environment": "prod",
+  "channel": "adt-fanout",
+  "kind": "deploy",
+  "version": 3,
+  "previous_version": 2,
+  "status": "pending",
+  "requested_by": "synth-operator-0002",
+  "requested_at": "2026-10-05T09:05:00.000Z"
+}

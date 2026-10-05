@@ -3,7 +3,103 @@
 Newest first. Each entry names the contract, the version, whether the change is additive or
 breaking, and the reason. Breaking changes reference an ADR.
 
-## 2026-10-05 (latest) — contract set 1.7.1 (patch): status table and `REPLY_` emitters corrected
+## 2026-10-05 (latest) — contract set 1.8, part 1: `observability/v0` (W3-12), `openapi/v0` part 1 (W3-1a), archive rulings, `--check-expectations` (W3-11)
+
+**Additive. Two new contract directories. No existing schema, example or manifest changes validity,
+and no existing pinned pair moves. No invariant changes.** Part 2 of set 1.8 (W3-1b: messages,
+reprocess, replay, stats, events, audit shape) follows.
+
+### `tributary.openapi/v0` (new, part 1)
+
+- `openapi.json` (OpenAPI 3.1.0): health, environments, channels and immutable versions, validate,
+  deploy, rollback and undeploy per environment, with `x-tributary-roles` per operation. Error bodies
+  are restricted RFC 9457 problems with a closed `code` list and no `instance`.
+- Decisions (README 3): the channel document is typed loosely, with `channel-spec/v0` as the
+  authority; the server numbers versions; **rollback republishes the old document unchanged**, so
+  `tb-channel-version` is not monotonic; `published` means committed to `_tb.<env>.channels`, not
+  applied; optimistic concurrency on `expected_current_version`; sub-resource paths, not `:verb`
+  (ADR-001 6.7 annotated).
+- **ADR-009 (Proposed): OIDC bearer, resource server, PyJWT.** Awaiting `security-reviewer`.
+- `validate.py` checks the document with `openapi-spec-validator` (licence closure checked from PyPI
+  metadata, all permissive, no `certifi`; README 5). **A missing library fails the run.** It is not
+  skipped.
+
+### `tributary.observability/v0` (new)
+
+- **Section 2, readiness and liveness (normative, published first for W3-17).** Ops listener separate
+  from ingest, `127.0.0.1:9180` by default, non-loopback only when explicit, fail closed on bind, no I/O
+  on the request path. `/livez` never depends on Kafka. Receiver `/readyz` gates on `spec`,
+  `component`, `raw_producer` and, with sync reply, `reply_consumer`, each with a closed reason list.
+  Rulings R1-R6: Kafka all-brokers-down makes a receiver not ready; a channels-topic outage after the
+  first spec is `degraded` only (invariant 3); warm-up (one `raw` metadata round trip on the receiver's
+  own producer) before the listener binds. Whether metadata alone removes the S2 first-ACK outlier is
+  **unverified** and measured by W3-17.
+- **Section 3, metric registry** `metrics.json` (35 metrics, 19 label names, closed) and
+  `metrics.schema.json`. Seeded from the counters in code today and ADR-001 6.10.
+- **Section 4, log line** `log-line.schema.json`: the `JsonLogger` shape, identifier deny-list (same as
+  `events/v0` attrs), a new content deny-list, `message_id` as the canonical spelling with `tb_msg_id`
+  and `msg_id` as deprecated aliases.
+
+### `tributary.events/v0` and `tributary.topics/v0`: archive rulings (W3-2a report, 2026-10-05)
+
+`archive-engineer` raised four gaps through the lead. README and `$defs`/description changes only. No
+validated document changes validity, because `$defs.consumerGroup` is not referenced by the root topic
+schema.
+
+| # | Gap | Ruling |
+|---|---|---|
+| 1 | `message_id` is `Nullable(UUID)` in events 4, but the sort key cannot be Nullable; partition and record events have no message identity | **Ratified as built:** non-nullable `UUID`, nil UUID means no identity (UUIDv7 is never nil). Archive dedup key `(channel, scope, message_id, stage, destination, attempt)`, with `scope` defined per kind (events README 4.1 rule 1) |
+| 2 | Group `tb.<env>.archiver` does not match `$defs.consumerGroup`; the ACL said PREFIXED `tb.<env>.archiver*` | **Both fixed:** `consumerGroup` gains the platform alternative `^tb\.<env>\.archiver$` and loses the per-channel `archiver` role. The ACL becomes LITERAL: the PREFIXED form broke 3.4.1 rule 2 and matched a channel named `archiver`. `topic-defaults.json` gains `consumer_groups.platform_groups`; README 3.4.1 and 3.6 |
+| 3 | Archive event retention (`TB_ARCHIVE_TTL_DAYS` 90) | **Default 90 d stands as an engineering placeholder; the final value is TODO(human)**, decided with audit retention (wave-3 7.2), because it is the same legal reading. Not a build blocker |
+| 4 | Month partitions do not collapse a redelivery that crosses a month | **Accepted and documented.** The W3-3 query library deduplicates on the key at read (`LIMIT 1 BY`); `FINAL` count tests must not straddle a month. Rejected: partitioning on the UUIDv7 time (nil-id events would all land in one partition) |
+| — | Lead decision | A `*_hmac` or deny-listed `attrs` key is dropped and counted (`tb_archiver_attrs_dropped_total{reason}`), and the rest of the event is stored (events README 4.1 rule 3) |
+
+Change requests: **`platform-engineer`**: `runtime/topics.py` `Role` still lists `archiver` for a
+per-channel group. Remove it, or keep it unused, but no code may build `tb.<env>.<ch>.archiver`.
+**`devops-engineer`**: when the archiver joins Compose, provision the LITERAL group grant.
+**`archive-engineer`**: set the nil-UUID and `scope` rules in code comments, and use the counter name
+above.
+
+### `contracts/validate.py`
+
+- **Per-entry `schema` in a manifest** (an entry's own key overrides the manifest's), and a schema
+  reference may carry a JSON pointer (`file.json#/pointer`), used by `openapi/v0` next.
+- `observability` added to the file contracts; new `check_metric_registry()` cross-check (adds no
+  count).
+
+### Change requests that follow
+
+- **`connector-engineer` (W3-17):** build to section 2. Receivers' `print(json.dumps(...))` lines
+  (`kafka_source/receiver.py`, `sftp/poller.py`, the `listening` events) move to `JsonLogger`;
+  `tb_msg_id` and `msg_id` fields become `message_id`.
+- **`qa-engineer`:** `tests/conformance` honours per-entry `schema` and adds `observability`;
+  `OBSERVABILITY_PHI_GUARDS` (10, listed in the manifest `note`).
+- **`platform-engineer` (on call):** the L4 content deny-list in `tributary.sdk.guards`; a runtime test
+  validating `JsonLogger` output against `log-line.schema.json`; the exporter, once `security-reviewer`
+  has cleared the listener.
+- **`devops-engineer` (W3-8):** probes and the `partition_halted` alert from `tb_partitions_halted`;
+  NetworkPolicy on the ops port; `--ops-bind` set to the pod IP.
+
+### Verification owed
+
+Not run by the architect, who has no shell.
+
+- **First run (lead) crashed** with `FileNotFoundError`: `openapi/v0/examples/manifest.json` named the
+  cross-contract readiness example as `../../observability/...`. Manifest `file` and `schema` paths
+  resolve against the manifest's own directory, so it is `../../../observability/...`; fixed. Also
+  hardened in `validate.py`: `check_metric_registry` no longer raises `TypeError` on a list-valued
+  `buckets` or a non-list `labels`, and `openapi-spec-validator` before 0.7 (`validate_spec`) is accepted.
+- `validate.py` (with `--with openapi-spec-validator`): **predicted 210 / 0**. That is 156 measured at
+  set 1.7, plus observability 30 (11 valid, 19 invalid), plus openapi 24 (13 valid including the
+  cross-contract readiness example, 10 invalid, and the document itself). Without the library:
+  **209 passed, 1 failed** (the document check), exit 1, by design.
+- Pinned pairs: **139** (110 + 19 + 10 new, all predictions).
+- `--check-expectations`: predicted `139 invalid examples, 0 drifted`, exit 0.
+- `pytest tests/conformance`: unchanged until `qa-engineer` adds both contracts.
+- **CI:** the `contracts` job must add `--with openapi-spec-validator` in the same push, or it goes red
+  (`devops-engineer`, W3-14).
+
+## 2026-10-05 — contract set 1.7.1 (patch): status table and `REPLY_` emitters corrected
 
 **Patch. Documentation only: no schema, example, manifest or code-list change, so every count is
 unchanged from set 1.7 (`validate.py` 156 / 0 predicted). No invariant changes.** Both edits correct

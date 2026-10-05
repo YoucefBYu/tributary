@@ -1,0 +1,6 @@
+{
+  "items": [
+    { "name": "dev", "management_mode": "ui-managed", "profile": "lite" },
+    { "name": "prod", "management_mode": "git-managed", "profile": "production" }
+  ]
+}

@@ -193,10 +193,40 @@ tested against one.
 | `v` | `UInt8` |
 | `kind` | `LowCardinality(String)` |
 | `ts` | `DateTime64(3, 'UTC')` |
-| `message_id` | `Nullable(UUID)` — nullable because partition events have none |
+| `message_id` | `UUID`, **not nullable** (set 1.8). The nil UUID `00000000-0000-0000-0000-000000000000` means "no message identity" (partition events without a triggering message). It cannot collide: the engine mints UUIDv7, which is never nil. *Was `Nullable(UUID)`; ClickHouse refuses a Nullable column in a sort key* |
 | `duration_ms` | `Nullable(Float32)` |
 | `claim_check`, `topic`, `offset`, `partition` | `String`, `String`, `Nullable(Int64)`, `Nullable(Int32)` |
 | everything else | as ADR-001 6.6 |
+
+### 4.1 Archive rules (set 1.8, ruled 2026-10-05 on `archive-engineer`'s W3-2a report)
+
+1. **Dedup key.** Section 2.2's `(message_id, stage, destination, attempt)` becomes, in the archive,
+   `(channel, scope, message_id, stage, destination, attempt)`. `scope` is `''` for `kind=message`;
+   `<topic>:<partition>:<offset>` for `kind=record` (all three are required there); and
+   `<topic>:<partition>` plus `:<offset>` when present for `kind=partition`. A missing `attempt` is
+   stored as `0`. `channel` adds nothing for message events (UUIDv7 is unique) and separates the rest.
+   **Give up:** a partition event re-emitted after a restart, without an `offset`, is kept twice when
+   its `ts` differs. Partition events are a low-volume operator timeline, and alerting reads
+   `tb_partitions_halted`, not the archive. Producers SHOULD set `offset` on partition events (the
+   blocked record's offset); the schema keeps it optional, because requiring it would be breaking.
+2. **Month partitions are accepted.** With `PARTITION BY toYYYYMM(ts)`, `ReplacingMergeTree` collapses
+   duplicates only inside one partition. A redelivery that crosses a month boundary is kept twice.
+   The replay window is `commit_every` records (seconds of traffic), so this affects a tail at month
+   end only. **Rule:** the W3-3 query library deduplicates on the key at read time (`LIMIT 1 BY` the
+   key), so the browser never shows the duplicate. A `FINAL` count test must not straddle a month.
+   **Rejected:** partitioning on the UUIDv7 time of `message_id`, which puts every nil-id partition
+   event in one epoch partition and breaks partition-level TTL for them. **Give up:** storage for a
+   rare duplicate, and unqualified `count()` over a month boundary can overcount by that tail.
+3. **Attributes the archive refuses (lead decision, 2026-10-05).** An incoming `attrs` entry whose key
+   ends `_hmac`, or whose key is on the identifier deny-list, is **dropped and counted**
+   (`tb_archiver_attrs_dropped_total{reason}`), and the rest of the event is stored. `_hmac` is
+   dropped even though its shape is schema-valid, because the mechanism is unresolved (3.1) and the
+   human has not answered 7.3. This follows "lenient consumers": one bad entry does not lose the event.
+4. **Retention of archived events.** Default **90 days** (`TB_ARCHIVE_TTL_DAYS`), an engineering
+   placeholder matching ADR-001 6.6's illustrative content TTL. **TODO(human)**, decided together with
+   audit retention (`topics/v0` 2.1, question 3, and `phases/wave-3.md` 7.2): whether a retention duty
+   reaches event metadata is the same legal reading. The archiver keeps the value configurable. It is
+   not a blocker for the build.
 
 ---
 

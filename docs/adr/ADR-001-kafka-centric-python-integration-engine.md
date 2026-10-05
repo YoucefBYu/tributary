@@ -555,6 +555,8 @@ REST with OpenAPI (FastAPI) as the primary API, gRPC optional later for the data
 
 Later: an optional Mirth-REST-compatible shim so that existing CI and tooling that talks to Mirth's API can be pointed at the new engine.
 
+**Superseded in detail 2026-10-05 (set 1.8):** the table above is illustrative. The contract is `contracts/openapi/v0`, which models deploy, rollback and undeploy per environment (`/v1/environments/{env}/channels/{channel}/deploy`) rather than as `:verb` methods on a channel, and puts validation at `POST /v1/validate`. Authentication is ADR-009 (OIDC bearer, resource server).
+
 ### 6.8 Web UI
 
 Mirth users expect a GUI, so it is a first-class requirement, not an afterthought:

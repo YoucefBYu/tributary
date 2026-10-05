@@ -1,0 +1,133 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tributary.dev/contracts/observability/v0/metrics.schema.json",
+  "title": "Tributary metric registry, v0",
+  "description": "Schema for metrics.json: every metric a Tributary process may export, its type and its labels. Label NAMES are a closed list; that list is the invariant-6 control for metrics (README section 3). A metric or label not in metrics.json is a contract change, proposed to the architect.",
+  "type": "object",
+  "required": ["contract", "labels", "metrics"],
+  "additionalProperties": false,
+  "properties": {
+    "contract": { "const": "tributary.observability/v0" },
+    "set": { "type": "string", "pattern": "^1\\.[0-9]+(\\.[0-9]+)?$" },
+    "note": { "type": "string", "maxLength": 2000 },
+    "buckets": {
+      "type": "object",
+      "maxProperties": 8,
+      "propertyNames": { "pattern": "^[a-z][a-z0-9_]{0,31}$" },
+      "additionalProperties": {
+        "type": "array",
+        "minItems": 3,
+        "maxItems": 20,
+        "items": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    },
+    "labels": {
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/labelName" },
+      "additionalProperties": { "$ref": "#/$defs/labelDef" }
+    },
+    "metrics": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 128,
+      "items": { "$ref": "#/$defs/metric" }
+    }
+  },
+  "$defs": {
+    "labelName": {
+      "enum": [
+        "channel",
+        "destination",
+        "destination_type",
+        "receiver_type",
+        "component",
+        "stage",
+        "status",
+        "scope",
+        "step",
+        "check",
+        "outcome",
+        "reason",
+        "code",
+        "answer",
+        "to",
+        "version",
+        "route",
+        "method",
+        "http_status"
+      ],
+      "$comment": "CLOSED. Never: any message, correlation or parent id; the record key or anything derived from it; a partition number or offset; a peer address, host, file name, object key or URL; a user or subject id; free text. Each of those is unbounded cardinality, PHI, or both (README 3.2)."
+    },
+    "labelDef": {
+      "type": "object",
+      "required": ["description"],
+      "additionalProperties": false,
+      "properties": {
+        "description": { "type": "string", "maxLength": 400 },
+        "pattern": { "type": "string", "maxLength": 200 },
+        "enum": { "type": "array", "minItems": 1, "maxItems": 32, "uniqueItems": true, "items": { "type": "string" } },
+        "per_metric": {
+          "const": true,
+          "$comment": "The allowed values are fixed per metric in that metric's label_values."
+        }
+      },
+      "oneOf": [
+        { "required": ["pattern"] },
+        { "required": ["enum"] },
+        { "required": ["per_metric"] }
+      ]
+    },
+    "metric": {
+      "type": "object",
+      "required": ["name", "type", "help", "labels", "emitters"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "pattern": "^tb_[a-z][a-z0-9_]{1,62}$" },
+        "type": { "enum": ["counter", "gauge", "histogram"] },
+        "help": { "type": "string", "minLength": 1, "maxLength": 300 },
+        "labels": {
+          "type": "array",
+          "maxItems": 5,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/labelName" }
+        },
+        "label_values": {
+          "type": "object",
+          "propertyNames": { "$ref": "#/$defs/labelName" },
+          "additionalProperties": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 24,
+            "uniqueItems": true,
+            "items": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_]{0,31}$" }
+          }
+        },
+        "buckets": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,31}$" },
+        "emitters": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "enum": ["receiver", "worker", "loader", "archiver", "api"] }
+        },
+        "note": { "type": "string", "maxLength": 600 }
+      },
+      "allOf": [
+        {
+          "$comment": "Prometheus naming: a counter ends in _total.",
+          "if": { "properties": { "type": { "const": "counter" } }, "required": ["type"] },
+          "then": { "properties": { "name": { "pattern": "_total$" } } }
+        },
+        {
+          "$comment": "A histogram carries its base unit and names a bucket set.",
+          "if": { "properties": { "type": { "const": "histogram" } }, "required": ["type"] },
+          "then": { "required": ["buckets"], "properties": { "name": { "pattern": "_(seconds|bytes)$" } } }
+        },
+        {
+          "$comment": "A gauge is not named like a counter.",
+          "if": { "properties": { "type": { "const": "gauge" } }, "required": ["type"] },
+          "then": { "properties": { "name": { "not": { "pattern": "_total$" } } } }
+        }
+      ]
+    }
+  }
+}

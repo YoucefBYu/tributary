@@ -14,6 +14,8 @@ for approval before implementing.
 | Channel spec (source, steps, destinations, ordering, retry) | v0 | Draft | [`channel-spec/v0/README.md`](channel-spec/v0/README.md) | `channel-spec/v0/channel.schema.json`, `channel-spec/v0/step-namespaces.json` (engine step-namespace registry, set 1.6; cross-checked against the examples and `packages/*/pyproject.toml` by `validate.py`) |
 | Engine Kafka connection (every data-plane process's link to the engine cluster) | v0 | Draft, **new in set 1.3** | [`engine-kafka/v0/README.md`](engine-kafka/v0/README.md) | `engine-kafka/v0/engine-kafka.schema.json` |
 | Context extensions (`tributary.context` entry points: signature, loading rules, what a plugin must keep) | v0 | Draft, **new in set 1.5** | [`context-extension/v0/README.md`](context-extension/v0/README.md) | `context-extension/v0/capabilities.json` (capability registry; cross-checked against the channel-spec schema by `validate.py`) |
+| Observability (readiness and liveness endpoints, metric names and labels, log line) | v0 | Draft, **new in set 1.8** | [`observability/v0/README.md`](observability/v0/README.md) | `observability/v0/readiness.schema.json`, `metrics.json` + `metrics.schema.json` (cross-checked by `validate.py`), `log-line.schema.json` |
+| Control-plane API (OpenAPI 3.1): part 1, channels, versions, validate, deploy, rollback, health | v0 | Draft, **new in set 1.8** (part 2, W3-1b, pending) | [`openapi/v0/README.md`](openapi/v0/README.md) | `openapi/v0/openapi.json` (checked by `openapi-spec-validator` in `validate.py`) |
 
 ### Contract set 1.0 — what "contracts v1" means
 
@@ -30,9 +32,10 @@ directory rename: set 1.0 is the four contracts above, frozen together at the wa
 | 1.5 | The five directories plus **`context-extension/v0` (new)**. **Additive for every document**: optional `pipeline.context` in `channel-spec/v0`, the capability registry, and the loading rules and plugin obligations for the `tributary.context` group (ADR-007 D21-D22). **Runtime behaviour changes** for a channel that omits `context`: it no longer receives installed extensions | Published 2026-09-29, **unverified** (expected `validate.py` 153 / 0; three predicted pairs). Freezes at the wave 2 gate with 1.2-1.4 |
 | 1.6 | Same six directories. **Additive for every document**: the engine step-namespace registry `channel-spec/v0/step-namespaces.json` and the optional `pipeline.stepNamespaces` for third-party namespaces (ADR-007 D23). **Runtime behaviour changes**: a `uses` step loads only from the one distribution its namespace is bound to, and a duplicate, mismatched or unbound name refuses the spec | Published 2026-09-30, **unverified** (expected `validate.py` 156 / 0; two predicted pairs). Freezes at the wave 2 gate with 1.2-1.5 |
 | 1.7 | Same six directories. **Additive, no schema or example change**: receiver-side sync-reply rules in `channel-spec/v0` 3.2.6 (step-body edge cases, per-connection fairness bound, unique `--instance`), two codes in `envelope/v0` (`REPLY_BODY_INVALID`, `REPLY_BODY_OVER_BUDGET`), the reply consumer reading its own `topics/v0` profile, and N4/L5 treatment of shadowed installations (ADR-007 D24, ADR-003 D10 amendment) | Published 2026-10-05, **unverified** (expected `validate.py` unchanged from 1.6: 156 / 0). Freezes at the wave 2 gate with 1.2-1.6. **1.7.1 (patch, same day):** `channel-spec/v0` 3.0 status table (receivers `http`, `sftp`, `kafka` and loaders `clickhouse`, `mllp`, `kafka` built; the `mllp` reply consumer reads its own profile) and the `envelope/v0` `error-codes.json` emitter strings of the five receiver-side `REPLY_` codes (`mllp` only; `http` refuses `source.reply`). No code added or removed, no schema or example change, counts unchanged |
+| 1.8 | The six directories plus **`observability/v0` and `openapi/v0` (new)**. **Additive.** Readiness and liveness, metric registry, log line (W3-12); OpenAPI part 1 and ADR-009 (W3-1a); archive rulings in `events/v0` 4.1 and the platform group `tb.<env>.archiver` in `topics/v0`; per-entry manifest `schema`; `validate.py --check-expectations` (W3-11). Part 2 (W3-1b) follows | Part 1 published 2026-10-05, **unverified** (expected `validate.py` 210 / 0 with `openapi-spec-validator`; 29 predicted pairs). Freezes at the wave 3 gate |
 
 A minor set version is additive by definition: every document valid under 1.0 is valid under 1.1,
-1.2, 1.3, 1.4, 1.5, 1.6 and 1.7.
+1.2, 1.3, 1.4, 1.5, 1.6, 1.7 and 1.8.
 A change that would make a 1.0-valid document invalid is breaking, creates a `v1/` directory and needs
 an ADR.
 
@@ -51,7 +54,7 @@ overrule it, and it is much cheaper to overrule now than after wave 1 references
 
 | Contract | Format | Target | Consumers |
 |---|---|---|---|
-| Control-plane API | OpenAPI 3.1 | Phase 1 wave 3 (W3-1) | API, UI client generation, CLI, tests |
+| Control-plane API, part 2 (messages, reprocess, replay, stats, events) | OpenAPI 3.1 | Phase 1 wave 3 (W3-1b) | API, UI client generation, CLI, tests |
 | Audit events (`_tb.<env>.audit`) | JSON Schema | Phase 1, with RBAC — **blocked on the retention decision** (`topics/v0/README.md` 2.1): whether Kafka, ClickHouse or object storage is the system of record changes the contract, so settle that first | control plane, archive |
 
 ## Rules
@@ -85,9 +88,16 @@ Two ways to run it. [`validate.py`](validate.py) is the architect-owned checker:
 exists, and it is what a contract author runs while editing a schema.
 
 ```
-uv run --no-project --python 3.12 --with jsonschema python contracts/validate.py
+uv run --no-project --python 3.12 --with jsonschema --with openapi-spec-validator python contracts/validate.py
 uv run --no-project --python 3.12 --with jsonschema python contracts/validate.py --emit-expectations
+uv run --no-project --python 3.12 --with jsonschema python contracts/validate.py --check-expectations
 ```
+
+**Set 1.8:** the default mode also checks `openapi/v0/openapi.json` with `openapi-spec-validator`
+(Apache-2.0, permissive closure; `openapi/v0` README 5). Without it the run **fails**; it does not
+skip. `--check-expectations` (W3-11) exits 1 when any pinned pair does not match a measured one, or
+when no invalid example was checked. It replaces piping `--emit-expectations` into
+`.github/scripts/check_expectations.py` (retired by `devops-engineer` in W3-14).
 
 `--emit-expectations` prints the **measured** `(json_path, validator)` pair for every invalid
 example, paste-ready. It exists because the architect session has no shell: pairs written without

@@ -1,0 +1,12 @@
+{
+  "v": 0,
+  "component": "receiver",
+  "status": "not_ready",
+  "channel": "files-synth-sftp",
+  "receiver_type": "sftp",
+  "checks": [
+    { "name": "spec", "ok": false, "reason": "no_spec" },
+    { "name": "component", "ok": false, "reason": "starting" },
+    { "name": "raw_producer", "ok": true }
+  ]
+}
