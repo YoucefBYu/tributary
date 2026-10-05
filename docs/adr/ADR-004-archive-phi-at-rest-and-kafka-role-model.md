@@ -53,7 +53,7 @@ Evidence and constraints:
 | A2 | **`message_content`** holds one row per `(message_id, stage, destination)`: `received` from `raw`, `routed` from `out.<dest>` (destination set), `dlq` from `dlq`. Payload bytes are stored as received, plus `content_type`, `size_bytes` and the envelope headers needed to show them, but **not** `tb-usr-*`: they are not projected anywhere outside Kafka (`envelope/v0` 2.2). Idempotent on the key under `ReplacingMergeTree`. The same month-partition caveat as `events/v0` 4.1 rule 2 applies | Stages inside a pipeline run in process (invariant 2), so there is no content for `transformed` separately from `routed`. The browser shows input, per-destination output and dead letters |
 | A3 | **Claim-checked payloads are stored as locators only** (`claim_ref`), never fetched into ClickHouse. The browser fetches through the API, which audits the view (W3-6) | Two places to look, one of them the operator's bucket |
 | A4 | **Content storage is a deployment switch, `TB_ARCHIVE_CONTENT`**: on by default in the `lite` profile, **off by default in `production` until the human answers 7.1 and 7.2**. A production operator can turn it on, and the startup log says which custody and retention placeholders apply | Production sites get events without content until they opt in. That is the point: the system does not create a long-lived PHI store under placeholder decisions |
-| A5 | **ClickHouse access:** the archiver users hold INSERT on the archive database only; the API user holds SELECT; no other user exists in shipped configuration. Content is read only through the API, which emits an audit event for every content view (W3-6, exit criterion 4). Row-level policies are not in v0 | Operators with ClickHouse admin bypass the audit, which is an operational control, not a technical one |
+| A5 | **ClickHouse access:** the archiver users hold INSERT on the archive database only; the API user holds SELECT; no other runtime user exists in shipped configuration. **Schema migration is a separate step** (an init job or `tributary-archiver migrate`, run before the archivers start) **with its own migration credential** holding CREATE/ALTER on the archive database. The archiver processes never run DDL and never receive that credential; at startup they check that the expected schema version is present and exit non-zero if it is not. (Today the archiver runs CREATE/ALTER at startup; `archive-engineer` is moving it out.) Content is read only through the API, which emits an audit event for every content view (W3-6, exit criterion 4). Who may view content: ADR-009 D14. Row-level policies are not in v0 | Operators with ClickHouse admin bypass the audit, which is an operational control, not a technical one. One more job to order before the archivers in Compose and Helm |
 | A6 | **Backfill** (W3-2b) re-reads `raw` from a given offset or time and writes through the same idempotent path. A second run changes nothing (W3-2b verify) | Only within `raw` retention (7 d default) |
 
 ## 4. Retention mechanics (proposal; the values are `TODO(human)`)
@@ -92,6 +92,14 @@ Rules:
   its environment. That is inherent to an archive. Mitigations: its own principal and process (A1),
   no WRITE anywhere, and a separate secret. **Rejected:** per-channel content archivers (one more
   consumer per channel against the S4 budget, for no gain in what the ClickHouse store then holds).
+  **Scope of the PREFIXED `<env>.` READ grant (`security-reviewer`, 2026-10-05):** a Kafka PREFIXED
+  ACL matches every topic whose name starts with `<env>.`, not only the three patterns in the table.
+  It therefore also covers each channel's `reply` and `retry` topics and **any topic added under
+  `<env>.` later**, whatever it holds. Kafka ACLs have no wildcard in the middle of a name, so
+  `<env>.*.raw` cannot be granted as such. Alternatives: LITERAL grants per channel topic, added and
+  removed by provisioning on every deploy (exact, but provisioning becomes part of deploy); or a
+  topic naming change that puts the stage first (breaking, `topics/v0`). The proposal keeps PREFIXED
+  and records the wider scope under H7.
 - **K3. Provisioning grants are temporary.** `users-init` receives ALTER on CLUSTER at provisioning
   start (from the broker identity, as today) and **revokes its own grant at the end**. The next run
   re-grants it, so the job stays re-run safe. This is W3-16's specification. ALTER on CLUSTER also
@@ -165,6 +173,10 @@ PostgreSQL, the claim-check bucket and backups.
 **H7. Role model sign-off.**
 - `TODO(human)`: approve section 5, including the K2 accepted exposure and per-channel principals
   (K1).
+- **Know before approving K2:** the content archiver's PREFIXED `<env>.` READ also covers every
+  channel's `reply` and `retry` topics and any topic created under `<env>.` in future (K2, last
+  paragraph). Approve that wider scope, or choose per-topic LITERAL grants maintained by provisioning
+  on deploy.
 
 ## 8. Consequences, contracts and follow-ups
 

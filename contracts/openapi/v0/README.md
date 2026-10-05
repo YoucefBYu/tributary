@@ -26,7 +26,15 @@ Consumers: `tributary-api` (W3-4b, contract tests), the UI's generated client, t
 | Deployments | `GET /v1/environments/{env}/deployments`; `GET /v1/environments/{env}/channels/{channel}/deployments`; `POST .../deploy`, `.../rollback`, `.../undeploy` |
 
 Every operation names its roles in `x-tributary-roles`. Authentication and role mapping are
-[ADR-009](../../../docs/adr/ADR-009-control-plane-api-authentication.md).
+[ADR-009](../../../docs/adr/ADR-009-control-plane-api-authentication.md) (rev 2). Rules this contract
+carries from it:
+
+- **Deny by default (D6).** An operation without `x-tributary-roles` is refused to every caller. An
+  empty list is valid only with `security: []` (health). A contract test checks every operation.
+- **PHI content (D14).** Only `operator` and `admin` read message content or act on it (reprocess,
+  replay). Part 2 marks those operations `x-tributary-phi-content: true`; their roles must be a subset
+  of `["operator", "admin"]`. `viewer`, `developer` and `auditor` get metadata only. Part 1 has no
+  content operation.
 
 ## 2. Invariants this API must keep
 
@@ -36,7 +44,8 @@ Every operation names its roles in `x-tributary-roles`. Authentication and role 
    are `json_path` plus keyword, never the jsonschema message, which embeds the failing value. Problem
    bodies have no `instance` member, because it would echo the path. `detail` is fixed text per code.
    Metrics label the route **template** (`observability/v0` 3.2). Application logs never contain the
-   `Authorization` header, a token or a claim.
+   `Authorization` header, a token or a claim. The server access log is off; the request log carries
+   the route template, never the raw path or query string (ADR-009 D1).
 3. **Strict producers.** Request bodies are `additionalProperties: false`, except the channel document,
    which `channel-spec/v0` types (3.1).
 

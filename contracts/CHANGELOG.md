@@ -19,7 +19,12 @@ reprocess, replay, stats, events, audit shape) follows.
   `tb-channel-version` is not monotonic; `published` means committed to `_tb.<env>.channels`, not
   applied; optimistic concurrency on `expected_current_version`; sub-resource paths, not `:verb`
   (ADR-001 6.7 annotated).
-- **ADR-009 (Proposed): OIDC bearer, resource server, PyJWT.** Awaiting `security-reviewer`.
+- **ADR-009 (Proposed): OIDC bearer, resource server, PyJWT.** `security-reviewer` read rev 1 (no
+  Critical or High). **Rev 2 (same day)** settles the Mediums; `openapi/v0` text follows it, wording
+  only, no schema or example changes validity: the `oidcBearer` description now states `typ`, required
+  `exp`/`iss`/`aud`/`sub`, ignored key headers and one-method-only; README 1 adds deny-by-default
+  `x-tributary-roles` and the PHI content rule (`operator`, `admin` only; `x-tributary-phi-content` in
+  part 2).
 - `validate.py` checks the document with `openapi-spec-validator` (licence closure checked from PyPI
   metadata, all permissive, no `certifi`; README 5). **A missing library fails the run.** It is not
   skipped.

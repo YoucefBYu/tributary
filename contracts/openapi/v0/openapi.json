@@ -286,7 +286,7 @@
         "type": "http",
         "scheme": "bearer",
         "bearerFormat": "JWT",
-        "description": "An access token from the operator's OIDC provider, validated as a resource server: signature against the issuer's JWKS, iss, aud, exp, nbf, an asymmetric algorithm allow-list, and roles from a configured claim (ADR-009). Authorization header only; a token in a query string is refused. The API issues no tokens and keeps no sessions."
+        "description": "An access token from the operator's OIDC provider, validated as a resource server (ADR-009 rev 2): signature against the issuer's JWKS, keys selected by kid from a cached key set (jku, x5u, x5c and jwk headers ignored); algorithm allow-list RS256, PS256, ES256; typ at+jwt (JWT only when the operator enables it, and never an ID token); exp, iss, aud and sub required; nbf and iat honoured. Roles come from a configured claim that must be an array of strings, mapped to Tributary roles; an operation is allowed only to the roles in its x-tributary-roles. Authorization header only, sent once: a token in a query string or form body is refused, even alongside a header. The API issues no tokens and keeps no sessions."
       }
     },
     "parameters": {
@@ -299,7 +299,7 @@
     "responses": {
       "BadRequest": { "description": "Malformed request: not JSON, wrong type, bad cursor (REQUEST_INVALID).", "content": { "application/problem+json": { "schema": { "$ref": "#/components/schemas/Problem" } } } },
       "Unauthorized": {
-        "description": "No token (AUTH_REQUIRED) or a token that failed validation (TOKEN_INVALID). Which check failed is not disclosed.",
+        "description": "No token (AUTH_REQUIRED) or a token that failed validation (TOKEN_INVALID), including a token sent by more than one method, a malformed roles claim, or no usable signing keys. Which check failed is not disclosed.",
         "headers": { "WWW-Authenticate": { "description": "RFC 6750: Bearer, with error=\"invalid_token\" when a token was sent. Never an error_description built from claims.", "schema": { "type": "string", "maxLength": 200 } } },
         "content": { "application/problem+json": { "schema": { "$ref": "#/components/schemas/Problem" } } }
       },
