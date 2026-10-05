@@ -59,12 +59,14 @@ def ordered_document(
 ) -> dict[str, Any]:
     """The same walking-skeleton shape, but `ordering: per-key`.
 
-    The MLLP receiver refuses `per-key` channels in this wave (no `keyExpression` evaluator yet --
-    `tributary.receivers.mllp.config`, W2-4) -- so a test using this document must publish directly to
-    `raw` (`tests.support.kafka_helpers.publish_messages`) with its own record key rather than run a
-    receiver against it. The worker and loader do not care where the key came from; they only need
-    `spec.ordering` and `spec.partitionKey` to be set so `check_partition_counts` and
-    `validate_for_produce` apply the per-key rules W2-9's chaos suite is testing.
+    The receivers (MLLP, HTTP, SFTP) now accept `per-key` channels: each parses `spec.partitionKey` with
+    `tributary.sdk.keys` at start-up and keys every `raw` record by it, and a message whose key cannot be
+    resolved is NACKed. This document is therefore valid to run a receiver against. The chaos suites still
+    publish directly to `raw` (`tests.support.kafka_helpers.publish_messages`) with their own record keys,
+    on purpose: the test then controls the key and the per-key sequence it asserts on, and the fault under
+    test is not confounded with receiver key extraction. The worker and loader only need `spec.ordering` and
+    `spec.partitionKey` to be set so `check_partition_counts` and `validate_for_produce` apply the per-key
+    rules W2-9's chaos suite is testing.
     """
     document = walking_skeleton_document(
         mllp_port=mllp_port, http_url=http_url, channel=channel, destination=destination, version=version

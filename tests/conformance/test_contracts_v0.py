@@ -17,7 +17,7 @@ from jsonschema.validators import validator_for
 CONTRACTS = Path(__file__).resolve().parents[2] / "contracts"
 # Contracts with a manifest.json of {schema, valid[], invalid[]} under v0/examples/. Add a new
 # contract here (one line) rather than in each function below.
-FILE_CONTRACTS = ("envelope", "events", "channel-spec")
+FILE_CONTRACTS = ("envelope", "events", "channel-spec", "observability", "openapi")
 EVENT_PHI_GUARDS = {
     "invalid/payload-in-event.json",
     "invalid/attrs-clear-text-mrn.json",
@@ -27,6 +27,23 @@ EVENT_PHI_GUARDS = {
     "invalid/attrs-hl7-delimiters.json",
     "invalid/claim-check-presigned-url.json",
     "invalid/record-with-attrs.json",
+}
+OBSERVABILITY_PHI_GUARDS = {
+    "invalid/readiness-free-text-reason.json",
+    "invalid/readiness-exception-text-field.json",
+    "invalid/log-field-mrn.json",
+    "invalid/log-field-payload.json",
+    "invalid/log-value-multiline.json",
+    "invalid/log-message-id-not-uuid.json",
+    "invalid/log-nested-object.json",
+    "invalid/log-error-exception-text.json",
+    "invalid/metrics-label-message-id.json",
+    "invalid/metrics-label-partition-key.json",
+}
+OPENAPI_PHI_GUARDS = {
+    "invalid/response-problem-echoes-input.json",
+    "invalid/response-validation-issue-with-message.json",
+    "invalid/response-problem-unknown-code.json",
 }
 ENVELOPE_PHI_GUARDS = {
     "invalid/claim-check-presigned-url.json",
@@ -67,8 +84,21 @@ def _load(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _validator(schema_path: Path) -> Draft202012Validator:
+SchemaRef = tuple[Path, str]  # (file, JSON pointer into it or "")
+
+
+def _ref(base: Path, text: str) -> SchemaRef:
+    """`file.json#/pointer` as the manifests write it, resolved against the manifest's directory (set 1.8)."""
+    file_part, _, pointer = text.partition("#")
+    return (base / file_part).resolve(), pointer
+
+
+def _validator(ref: SchemaRef | Path) -> Draft202012Validator:
+    schema_path, pointer = (ref, "") if isinstance(ref, Path) else ref
     schema = _load(schema_path)
+    if pointer:
+        # Whole document as root so internal `#/components/schemas/...` refs resolve; OpenAPI 3.1 schema objects are 2020-12.
+        schema = {**schema, "$schema": "https://json-schema.org/draft/2020-12/schema", "$ref": "#" + pointer}
     cls = validator_for(schema, default=Draft202012Validator)
     cls.check_schema(schema)
     return cls(schema, format_checker=FormatChecker())
@@ -80,13 +110,16 @@ def _file_cases() -> list[Any]:
         manifest_path = CONTRACTS / name / "v0" / "examples" / "manifest.json"
         m = _load(manifest_path)
         base = manifest_path.parent
-        schema = (base / m["schema"]).resolve()
+
+        def ref_of(e: dict[str, Any], m: dict[str, Any] = m, base: Path = base) -> SchemaRef:
+            return _ref(base, e.get("schema", m.get("schema")))  # an entry's own schema overrides the manifest's
+
         cases += [
-            pytest.param(schema, base / e["file"], True, None, id=f"{name}:valid:{e['file']}") for e in m["valid"]
+            pytest.param(ref_of(e), base / e["file"], True, None, id=f"{name}:valid:{e['file']}") for e in m["valid"]
         ]
         cases += [
             pytest.param(
-                schema,
+                ref_of(e),
                 base / e["file"],
                 False,
                 _expected(f"{name}:{e['file']}", e),
@@ -98,7 +131,7 @@ def _file_cases() -> list[Any]:
 
 
 @pytest.mark.parametrize(("schema", "example", "should_pass", "expected"), _file_cases())
-def test_example(schema: Path, example: Path, should_pass: bool, expected: Failure | None) -> None:
+def test_example(schema: SchemaRef, example: Path, should_pass: bool, expected: Failure | None) -> None:
     validator = _validator(schema)
     if should_pass:
         errors = list(validator.iter_errors(_load(example)))
@@ -152,7 +185,7 @@ def test_negative_control_wrong_reason_fails() -> None:
     """An example that fails for a different reason than documented must make test_example fail."""
     env = CONTRACTS / "envelope/v0/examples"
     m = _load(env / "manifest.json")
-    schema = (env / m["schema"]).resolve()
+    schema = _ref(env, m["schema"])
     by_file = {e["file"]: e for e in m["invalid"]}
     example = env / "invalid/missing-msg-id.json"
     wrong = _expected("wrong", by_file["invalid/msg-id-not-uuid7.json"])
@@ -170,15 +203,21 @@ def test_negative_control_wrong_reason_fails() -> None:
 
 @pytest.mark.parametrize(
     ("contract", "guards"),
-    [("events", EVENT_PHI_GUARDS), ("envelope", ENVELOPE_PHI_GUARDS)],
+    [
+        ("events", EVENT_PHI_GUARDS),
+        ("envelope", ENVELOPE_PHI_GUARDS),
+        ("observability", OBSERVABILITY_PHI_GUARDS),
+        ("openapi", OPENAPI_PHI_GUARDS),
+    ],
 )
 def test_guards_are_listed_and_enforced(contract: str, guards: set[str]) -> None:
     """Guards must stay in the manifest (not silently dropped) and must fail validation."""
     mp = CONTRACTS / contract / "v0/examples/manifest.json"
     m = _load(mp)
     assert guards <= {e["file"] for e in m["invalid"]}
-    v = _validator((mp.parent / m["schema"]).resolve())
+    by_file = {e["file"]: e for e in m["invalid"]}
     for g in guards:
+        v = _validator(_ref(mp.parent, by_file[g].get("schema", m.get("schema"))))
         assert not v.is_valid(_load(mp.parent / g)), g
 
 
