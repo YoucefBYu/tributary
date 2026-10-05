@@ -59,6 +59,7 @@ from tributary.runtime.engine_kafka import load_engine_kafka
 from tributary.runtime.topics import channels_topic, dlq_topic, events_topic, out_topic, raw_topic, reply_topic
 
 from tests.support.channel_spec import walking_skeleton_document
+from tests.support.engine_kafka import receiver_env
 from tests.support.kafka_helpers import drain_topic, free_port
 from tests.support.mllp_receiver import publish_channel_spec
 from tests.support.processes import ManagedProcess
@@ -176,7 +177,7 @@ def start(
         "--secrets-dir",
         str(broker.secrets_dir),
     ]
-    proc = ManagedProcess(args, env=broker.process_env(d.workdir, d.principal))
+    proc = ManagedProcess(args, env=receiver_env(broker.process_env(d.workdir, d.principal)))
     procs.append(proc)
     return proc
 
@@ -417,7 +418,7 @@ def test_without_the_spec_reader_group_grant_the_receiver_logs_the_authorization
     assert denials and "DefaultDeny" in denials[0]  # the broker refused the group
     proc.collect_pending()
     errors = [e for e in proc.lines if e.get("event") == "channels_consumer_error"]
-    assert errors and errors[0]["error_code"] == "GROUP_AUTHORIZATION_FAILED"  # and the receiver said so
+    assert errors and errors[0]["kafka_error"] == "GROUP_AUTHORIZATION_FAILED"  # and the receiver said so
     assert http_post(port) == 202  # serving, so nothing but the group was refused
     assert broker.denials_for(d.principal, resource=f"Topic:LITERAL:{raw_topic(ENV, channel)}") == []
 

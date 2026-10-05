@@ -24,6 +24,7 @@ from tributary.runtime.errors import ChannelSpecError
 from tributary.runtime.logs import JsonLogger
 
 from .fakes import FakeError
+from .log_line_schema import assert_lines_conform
 
 EXAMPLES = Path(__file__).resolve().parents[3] / "contracts" / "channel-spec" / "v0" / "examples" / "valid"
 TOPIC = "_tb.dev.channels"
@@ -344,7 +345,7 @@ def test_an_unreachable_broker_raises_a_typed_error_and_the_spec_keeps_serving()
 
     logged = [line for line in events(stream) if line["event"].startswith("channels_")]
     assert [line["event"] for line in logged] == ["channels_unavailable"], "logged once per streak"
-    assert logged[0]["error_code"] == "_TRANSPORT"
+    assert logged[0]["kafka_error"] == "_TRANSPORT" and "error_code" not in logged[0]  # L6: not a registered code
     assert "SYNTHPATIENT" not in stream.getvalue()
 
 
@@ -407,6 +408,7 @@ def test_a_long_outage_does_not_delay_recovery_beyond_one_probe_interval() -> No
         "channels_unavailable",
         "channels_recovered",
     ]
+    assert_lines_conform(stream.getvalue())  # observability/v0: `_TRANSPORT` goes in kafka_error, not error_code
 
 
 def test_the_probe_is_rate_limited_while_healthy() -> None:
@@ -455,6 +457,7 @@ def test_a_consumer_error_event_is_an_outage_until_a_fetch_succeeds() -> None:
     with pytest.raises(ChannelsUnavailableError):
         subject.poll_once(timeout_s=0.0)
     assert [line["event"] for line in events(stream)][-2:] == ["channels_consumer_error", "channels_unavailable"]
+    assert_lines_conform(stream.getvalue())
 
     consumer.records.append(FakeChannelsRecord(CHANNEL.encode(), spec_bytes(version=5), _offset=1))
     assert subject.poll_once(timeout_s=0.0) is True, "the record is applied, and nothing is raised"

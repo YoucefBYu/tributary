@@ -111,6 +111,14 @@ class WorkerSettings:
     flush_timeout_s: float = 30.0
     shadow: str | None = None
 
+    def __post_init__(self) -> None:
+        """Refuse a name the consumer group cannot carry when the settings are made, not at `build()`.
+
+        Builds the group once and throws it away: that checks `env`, `channel` and the shadow label
+        against `contracts/topics/v0` (`TopicNameError`) before any Kafka client exists.
+        """
+        consumer_group(self.env, self.channel, "pipeline", shadow=self.shadow)
+
     @property
     def instance(self) -> str:
         """The `instance` field of every event: `<component>:<instance>@<host>` (events contract 2)."""
@@ -862,17 +870,23 @@ class PipelineHandler:
         destination: str | None,
         error_code: str,
     ) -> None:
-        self._log.warning(
-            "dead_lettered",
-            message_id=subject.get(h.TB_MSG_ID) or "",
-            parent_id=subject.get(h.TB_PARENT_ID),
-            destination=destination,
-            error_code=error_code,
-            stage="transformed",
-            topic=record.topic,
-            partition=record.partition,
-            offset=record.offset,
-        )
+        # observability/v0 L6: `message_id`, `parent_id` and `destination` have a fixed shape, so an absent
+        # one is omitted, never written as null or "" (which the log-line schema refuses).
+        fields: dict[str, object] = {
+            "error_code": error_code,
+            "stage": "transformed",
+            "topic": record.topic,
+            "partition": record.partition,
+            "offset": record.offset,
+        }
+        for name, value in (
+            ("message_id", subject.get(h.TB_MSG_ID)),
+            ("parent_id", subject.get(h.TB_PARENT_ID)),
+            ("destination", destination),
+        ):
+            if value:
+                fields[name] = value
+        self._log.warning("dead_lettered", **fields)
         self._emit(
             spec,
             record,

@@ -42,6 +42,7 @@ from tributary.sdk.projection import MAX_INLINE_PAYLOAD_BYTES
 from tributary.sdk.testing import make_message, run_splitter
 
 from .fakes import FakeConsumer, FakeProducer, FakeRecord
+from .log_line_schema import assert_lines_conform
 
 EXAMPLES = Path(__file__).resolve().parents[3] / "contracts" / "channel-spec" / "v0" / "examples" / "valid"
 CHANNEL = "adt-passthrough"
@@ -265,6 +266,7 @@ def test_too_many_headers_on_the_out_record_dead_letters_the_consumed_record() -
     assert consumer.committed
     logged = [json.loads(line) for line in stream.getvalue().splitlines() if '"event":"dead_lettered"' in line]
     assert logged[-1]["headers_dropped"] == h.MAX_HEADERS - 8
+    assert_lines_conform(stream.getvalue())  # observability/v0: no null parent_id or destination
 
 
 def test_tb_parent_id_pushing_a_child_over_the_cap_is_handled_the_same_way() -> None:

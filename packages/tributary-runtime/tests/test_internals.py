@@ -36,7 +36,7 @@ def logger(stream: io.StringIO) -> JsonLogger:
 
 def test_log_lines_are_single_line_json_with_the_base_fields() -> None:
     stream = io.StringIO()
-    logger(stream).info("delivered", message_id="0192", attempt=1, duration_ms=3.5)
+    logger(stream).info("delivered", message_id="0192f3a4-5b6c-7d8e-9f01-23456789abcd", attempt=1, duration_ms=3.5)
     lines = stream.getvalue().splitlines()
     assert len(lines) == 1
     record = orjson.loads(lines[0])

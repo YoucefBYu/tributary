@@ -74,6 +74,20 @@ REPLY_BODY_INVALID: Final = "REPLY_BODY_INVALID"
 #: `queue.maxBytes` when it arrives (MLLP AE). Sender-facing and metrics only.
 REPLY_BODY_OVER_BUDGET: Final = "REPLY_BODY_OVER_BUDGET"
 
+# Set 1.8 log-only codes (error-codes.json `log_only`): the field `error_code` of a receiver's
+# `reply_consumer_unauthorized` or `spec_unavailable` log line, and readiness reasons. Never in a header
+# or an event; registered so a channel's `Reject` cannot borrow them.
+#: The broker refused the sync-reply consumer's principal (authorization or authentication).
+REPLY_CONSUMER_UNAUTHORIZED: Final = "REPLY_CONSUMER_UNAUTHORIZED"
+#: The principal may not describe or read `_tb.<env>.channels`.
+CHANNELS_UNAUTHORIZED: Final = "CHANNELS_UNAUTHORIZED"
+#: `_tb.<env>.channels` does not exist (yet).
+CHANNELS_TOPIC_MISSING: Final = "CHANNELS_TOPIC_MISSING"
+#: The channels topic is readable and holds no record for this channel (a tombstone is `undeployed`).
+CHANNEL_NOT_DEPLOYED: Final = "CHANNEL_NOT_DEPLOYED"
+#: The spec could not be read for any other reason (a catch-up timeout, say).
+CHANNEL_SPEC_UNAVAILABLE: Final = "CHANNEL_SPEC_UNAVAILABLE"
+
 # Built-in step codes. Named here so the built-ins and the reserved list cannot drift apart.
 FILTER_UNRESOLVED: Final = "FILTER_UNRESOLVED"
 VALIDATE_NOT_HL7: Final = "VALIDATE_NOT_HL7"
@@ -136,6 +150,12 @@ ENGINE_CODES: Final = frozenset(
         "MLLP_TIMEOUT",
         "MLLP_NO_ACK",
         "TLS_PEER_NOT_ALLOWED",  # log line and metrics only; never a header or event
+        # set 1.8, log_only: receiver spec-reader and reply-consumer refusals
+        REPLY_CONSUMER_UNAUTHORIZED,
+        CHANNELS_UNAUTHORIZED,
+        CHANNELS_TOPIC_MISSING,
+        CHANNEL_NOT_DEPLOYED,
+        CHANNEL_SPEC_UNAVAILABLE,
         # built-in steps (channel-spec README 3.3.2)
         FILTER_UNRESOLVED,
         VALIDATE_NOT_HL7,

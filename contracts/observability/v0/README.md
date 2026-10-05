@@ -41,7 +41,7 @@ it later is additive.
 | **O1. Separate listener.** | The ops endpoints are **never** served on an ingest port (MLLP, HTTP receiver). The HTTP receiver's port faces senders; `/metrics` names every channel on the process |
 | **O2. Loopback by default.** | Bind `127.0.0.1`, port `9180`. Flags `--ops-bind`, `--ops-port`; environment `TB_OPS_BIND`, `TB_OPS_PORT`; the flag wins. `--ops-port 0` picks an ephemeral port (tests); the chosen port is logged in the `listening` event as `ops_port` |
 | **O3. Non-loopback is explicit.** | A non-loopback `--ops-bind` (Kubernetes needs the pod IP, because the kubelet probes the pod address) is allowed only when set explicitly, and logs `ops_listener_non_loopback` at WARN at startup. Plaintext is permitted there because every body is PHI-free by this contract; Helm restricts the port with a NetworkPolicy (W3-8) |
-| **O4. Fail closed on bind.** | If the ops listener cannot bind, the process refuses to start (`startup_refused`, exit 2). A receiver that runs without its probe is never ready to an orchestrator and looks healthy to a human |
+| **O4. Fail closed on bind.** | If the ops listener cannot bind, the process refuses to start (`startup_refused` with `code: OPS_LISTENER_BIND_FAILED`, `error: OSError` and the numeric `errno`, exit 2). A receiver that runs without its probe is never ready to an orchestrator and looks healthy to a human |
 | **O5. Minimal HTTP surface.** | `GET` only (others 405, empty body). Unknown path 404, empty body. Query strings ignored; request bodies never read; request line plus headers capped at 8 KiB; 1 s read timeout; at most 8 concurrent connections. **No response echoes the request path, a header, or a peer address**, and no ops request is logged per request |
 | **O6. No I/O on the request path.** | `/readyz` serialises a state snapshot the components maintain. It never calls Kafka. Measured reason: a `list_topics` on a busy consumer took 470-490 ms (`runtime/channels.py` docstring), longer than a probe timeout |
 
@@ -65,7 +65,28 @@ exactly when every gating check is `ok`.** Probe consumers read only the status 
 | `spec` | A spec for this receiver's channel has been applied: present, not tombstoned, not refused | `no_spec` (none ever read), `spec_refused` (the only spec seen is refused), `undeployed` (tombstone) |
 | `component` | The listener is bound, or the poller or consumer loop runs, and the process is not stopping | `starting`, `bind_failed`, `stopping`, `component_failed` |
 | `raw_producer` | Warm-up (2.4) succeeded since start, and the producer is neither fatal nor in an all-brokers-down state | `not_warmed`, `all_brokers_down`, `fatal` |
-| `reply_consumer` (**required when `sync_reply` is true**) | `topics/v0` 3.3.1: holds at least one reply partition **with an established fetch position** (rule 1), the consumer is connected, not fatal | `no_partition`, `not_established`, `disconnected`, `fatal` |
+| `reply_consumer` (**required when `sync_reply` is true**) | `topics/v0` 3.3.1: holds at least one reply partition **with an established fetch position** (rule 1), the consumer is connected, not fatal, and its principal is not being refused | `no_partition`, `not_established`, `disconnected`, `fatal`, `unauthorized` (set 1.8) |
+
+Each check carries only the reasons in its own row; the schema binds them (set 1.8). A reason must be
+**true of the state**; the finer cause goes in the log line's `error_code` (section 4, L6), from the
+`log_only` list of `envelope/v0` `error-codes.json`.
+
+- **`reply_consumer`: `unauthorized` (set 1.8, W3-17).** The broker refuses the reply consumer's
+  principal: `GROUP_`, `TOPIC_` or `CLUSTER_AUTHORIZATION_FAILED`, `SASL_AUTHENTICATION_FAILED` or
+  `_AUTHENTICATION`. Before set 1.8 this reported `no_partition`, which is false when partitions are
+  still held. The first refusal of a streak logs `reply_consumer_unauthorized` with `error_code`
+  `REPLY_CONSUMER_UNAUTHORIZED`. It clears when no refusal has recurred for a decay window chosen and
+  documented by the implementation (30 s in W3-17), because librdkafka re-raises a standing refusal and
+  sends no "fixed" signal. When more than one reason holds, report the first of: `fatal`,
+  `disconnected`, `unauthorized`, `not_established`, `no_partition`.
+- **`spec` has no `unauthorized` reason (set 1.8 ruling).** A refused channels-topic principal before
+  the first spec is `no_spec`, which is true: no spec was ever read. The cause is in the
+  `spec_unavailable` log line's `error_code`: `CHANNELS_UNAUTHORIZED`, `CHANNELS_TOPIC_MISSING`,
+  `CHANNEL_NOT_DEPLOYED` (topic readable, no record for this channel; a tombstone is `undeployed`) or
+  `CHANNEL_SPEC_UNAVAILABLE` (anything else, such as a catch-up timeout). After the first spec, R3
+  applies: `degraded: spec_source_unproven`, never a gating reason. **Gain:** the probe body stays a
+  state summary, not a mirror of the log taxonomy. **Give up:** an operator reading only `/readyz` sees
+  `no_spec` and must read the log line to tell a missing ACL from a channel nobody deployed.
 
 Rulings, with what each gives up:
 
@@ -116,8 +137,8 @@ receiver cannot send a warm-up record: `raw` carries only sender messages.
 ### 2.5 What W3-17 must show (restates its verify line against this section)
 
 Per receiver type: `503` with `raw_producer: not_warmed` until the first `raw` metadata round trip;
-`503` with `reply_consumer` failing while the replier is disconnected, holds no partition or is
-`_FATAL`; `200` otherwise; `stopping` before drain; an ops-port bind conflict exits 2. Each test proves
+`503` with `reply_consumer` failing while the replier is disconnected, holds no partition, is refused
+by the broker (`unauthorized`, set 1.8) or is `_FATAL`; `200` otherwise; `stopping` before drain; an ops-port bind conflict exits 2. Each test proves
 its fault fired (Phase 0 lesson). A broken-implementation control (readiness hard-wired to `ready`)
 must go red.
 
@@ -181,6 +202,7 @@ One JSON object per line on stderr, as `tributary.runtime.logs.JsonLogger` write
 | L4 Content deny-list (**new**) | `payload`, `body`, `content`, `raw`, `message`, `msg`, `text`, `segment`, `headers`, `traceback`, `stack`, `stack_trace`, `exc_info`, `exception`, `exc_text`, `query`, `query_string`, `sql` |
 | L5 Values | Scalars only, at most 256 characters, no CR or LF (`guards.validate_log_field`) |
 | L6 Well-known fields | `message_id`, `parent_id`, `correlation_id` (uuid shape); `channel`, `channel_version`, `destination`; `error_code` (registered code); `error` (an exception **class name**, never `str(exc)`); `ready`; `instance`; `trace_id`, `span_id` (W3C hex, for log-trace correlation) |
+| L6a Two code fields (set 1.8) | `error_code` holds a code **registered** in `envelope/v0` `error-codes.json` (`codes` or `log_only`) or a minted member of a reserved prefix. `code` on a `startup_refused` line is a startup-refusal code (`OPS_LISTENER_BIND_FAILED`, `SECRET_UNRESOLVED`, `ENGINE_KAFKA_SECRET_UNRESOLVED`): an exit reason for the operator, never on a record, an event or a metric label, and **not registered in v0** (section 6) |
 | L7 Message id spelling | **`message_id`** (as in `events/v0`). `tb_msg_id` and `msg_id` (receivers, wave 2) are accepted in v0 as deprecated aliases with the same uuid shape |
 
 **What the schema cannot check:** that a permitted name like `reason` or `path` carries no PHI. Code
@@ -210,3 +232,6 @@ lines (`kafka_source/receiver.py`, `sftp/poller.py`, the `listening` events) lac
 - Trace attribute rules (invariant 6 names trace attributes). The likely shape: the same closed
   vocabulary as the labels plus `message_id`. Not written yet; no code emits spans with attributes today.
 - Whether metadata warm-up alone removes the first-ACK outlier (2.4, W3-17 measures).
+- A registry for `startup_refused` `code` values (L6a). Today they are named where they are defined
+  (O4 for `OPS_LISTENER_BIND_FAILED`). Registering one family member alone would make the list look
+  complete when it is not.

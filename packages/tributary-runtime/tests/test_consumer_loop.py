@@ -25,6 +25,7 @@ from tributary.sdk.ids import uuid7
 from tributary.sdk.testing import make_message
 
 from .fakes import FakeConsumer, FakeError, FakeRecord
+from .log_line_schema import assert_lines_conform
 
 TOPIC = "dev.adt-passthrough.raw"
 BLOCKING = RetryPolicy(
@@ -107,6 +108,7 @@ def build(
     dlq: Any = None,
     clock: Clock | None = None,
     emitter: RecordingEmitter | None = None,
+    stream: io.StringIO | None = None,
 ) -> tuple[ConsumerLoop, RecordingEmitter]:
     events = emitter or RecordingEmitter()
     loop = ConsumerLoop(
@@ -116,7 +118,7 @@ def build(
         retry=retry,
         settings=LoopSettings(commit_every=commit_every, poll_timeout_s=0.0),
         emitter=events,
-        log=JsonLogger("test", stream=io.StringIO()),
+        log=JsonLogger("test", stream=stream if stream is not None else io.StringIO()),
         channel="adt-passthrough",
         channel_version=1,
         instance="worker:test@localhost",
@@ -501,9 +503,12 @@ def test_partition_eof_is_not_an_error() -> None:
 def test_a_fatal_consumer_error_stops_the_loop() -> None:
     consumer = FakeConsumer()
     consumer.append(FakeRecord(TOPIC, 0, 0, None, None, None, FakeError(-1, True)))  # type: ignore[arg-type]
-    loop, _ = build(consumer, ScriptedHandler())
+    stream = io.StringIO()
+    loop, _ = build(consumer, ScriptedHandler(), stream=stream)
     with pytest.raises(RuntimeError):
         loop.run(max_iterations=2)
+    [logged] = [line for line in assert_lines_conform(stream.getvalue()) if line["event"] == "consumer_error"]
+    assert logged["kafka_error"] == "-1" and "error_code" not in logged  # L6: error_code is registered codes only
 
 
 def test_a_cooperative_revoke_commits_before_handing_the_partition_over() -> None:
@@ -660,9 +665,12 @@ def test_a_commit_refused_by_a_rebalance_keeps_the_offsets_pending_and_does_not_
     consumer = RefusingConsumer(refusals=1, code=code)
     consumer.append(record(0))
     consumer.append(record(1))
-    loop, _ = build(consumer, ScriptedHandler(), commit_every=1)
+    stream = io.StringIO()
+    loop, _ = build(consumer, ScriptedHandler(), commit_every=1, stream=stream)
     loop.run(max_iterations=2)
     assert loop.stats.commits_refused == 1
+    [refused] = [line for line in assert_lines_conform(stream.getvalue()) if line["event"] == "commit_refused"]
+    assert refused["kafka_error"] == KafkaError(code).name() and "error_code" not in refused
     # The refused offset rode along with the next commit: nothing was skipped or lost.
     assert consumer.committed[-1] == [(TOPIC, 0, 2)]
 
@@ -673,6 +681,7 @@ def test_any_other_commit_error_still_raises() -> None:
     loop, _ = build(consumer, ScriptedHandler(), commit_every=1)
     with pytest.raises(KafkaException):
         loop.run(max_iterations=1)
+    assert (loop.stats.commits_failed, loop.stats.commits_refused) == (1, 0)  # tb_commits_total{outcome="failed"}
 
 
 def test_a_revoke_whose_commit_is_refused_forgets_the_revoked_partitions() -> None:

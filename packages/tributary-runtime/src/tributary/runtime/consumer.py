@@ -172,6 +172,8 @@ class LoopStats:
     rejected: int = 0
     commits: int = 0
     commits_refused: int = 0
+    #: A commit error that is not a rebalance refusal; the loop re-raises it (`tb_commits_total` `failed`).
+    commits_failed: int = 0
     pauses: int = 0
     resumes: int = 0
     halts: int = 0
@@ -303,7 +305,7 @@ class ConsumerLoop:
         if error is not None:
             if error.code() == PARTITION_EOF:
                 return
-            self._log.warning("consumer_error", error_code=str(error.code()), fatal=bool(error.fatal()))
+            self._log.warning("consumer_error", kafka_error=_kafka_error_name(error), fatal=bool(error.fatal()))
             if error.fatal():
                 raise RuntimeError("fatal consumer error")
             return
@@ -392,10 +394,11 @@ class ConsumerLoop:
             error = exc.args[0] if exc.args else None
             code = error.code() if isinstance(error, KafkaError) else None
             if code not in REBALANCE_COMMIT_ERRORS:
+                self.stats.commits_failed += 1
                 raise
             # Nothing delivered is undone: keep the offsets pending for the next commit or the revoke.
             self.stats.commits_refused += 1
-            self._log.warning("commit_refused", channel=self._channel, error_code=str(error.name()) if error else "")
+            self._log.warning("commit_refused", channel=self._channel, kafka_error=_kafka_error_name(error))
             return
         self.stats.commits += 1
         self._since_commit = 0
@@ -775,3 +778,21 @@ class ConsumerLoop:
             self._retry_state.pop((partition.topic, partition.partition), None)
         consumer.incremental_unassign(partitions)
         self._log.warning("partitions_lost", channel=self._channel, count=len(partitions))
+
+
+def _kafka_error_name(error: Any) -> str:
+    """A librdkafka error's symbolic name (`REBALANCE_IN_PROGRESS`), else its numeric code, else `UNKNOWN`.
+
+    Logged as `kafka_error`, never as `error_code`: observability/v0 L6 reserves `error_code` for codes
+    registered in `envelope/v0` `error-codes.json`, and librdkafka's internal names (`_TRANSPORT`) do not
+    even fit its pattern. Never the error's text, which can quote broker-side detail.
+    """
+    if error is None:
+        return "UNKNOWN"
+    name = getattr(error, "name", None)
+    if callable(name):
+        value = name()
+        if isinstance(value, str) and value:
+            return value
+    code = getattr(error, "code", None)
+    return str(code()) if callable(code) else "UNKNOWN"

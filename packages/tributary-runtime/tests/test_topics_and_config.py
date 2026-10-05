@@ -9,10 +9,13 @@ about — the planning value of 12 survived in the plan after S4 disproved it.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 from pathlib import Path
+from typing import Any, cast, get_args
 
 import pytest
+from jsonschema import Draft202012Validator
 from tributary.runtime import topics
 from tributary.runtime.config import find_contracts_dir, load_topic_defaults
 from tributary.runtime.errors import ConfigError, TopicNameError
@@ -65,6 +68,74 @@ def test_consumer_group_naming() -> None:
         == "tb.prod.adt-to-fhir.loader.fhir-server"
     )
     assert topics.consumer_group("prod", "a", "pipeline", shadow="v2") == "tb.prod.a.pipeline.shadow-v2"
+
+
+def _consumer_group_schema() -> Any:
+    schema = json.loads((CONTRACTS / "topics" / "v0" / "topic-name.schema.json").read_text(encoding="utf-8"))
+    return Draft202012Validator({**schema["$defs"]["consumerGroup"], "$defs": schema["$defs"]})
+
+
+def test_roles_and_platform_groups_match_the_contract() -> None:
+    """Set 1.8: `archiver` is a platform group, not a per-channel role. The schema's role alternation and
+    `consumer_groups.platform_groups` are the source; the type aliases must not drift from them."""
+    pattern = json.loads((CONTRACTS / "topics" / "v0" / "topic-name.schema.json").read_text(encoding="utf-8"))["$defs"][
+        "consumerGroup"
+    ]["anyOf"][0]["pattern"]
+    match = re.search(r"\\\.\(([a-z|]+)\)", pattern)
+    assert match is not None, "role alternation not found in the consumerGroup pattern"
+    assert set(get_args(topics.Role)) == set(match.group(1).split("|"))
+    platform = json.loads((CONTRACTS / "topics" / "v0" / "topic-defaults.json").read_text(encoding="utf-8"))[
+        "consumer_groups"
+    ]["platform_groups"]
+    assert {k: v for k, v in platform.items() if not k.startswith("$")} == {
+        kind: f"tb.<env>.{kind}" for kind in get_args(topics.PlatformGroup)
+    }
+    assert "archiver" not in get_args(topics.Role)
+
+
+def test_archiver_is_refused_as_a_per_channel_role() -> None:
+    # A role that arrives untyped (configuration, the pre-1.8 call) must not build `tb.<env>.<ch>.archiver`,
+    # a group no ACL grants, nor anything a PREFIXED `tb.<env>.archiver` grant would once have covered.
+    with pytest.raises(TopicNameError):
+        topics.consumer_group("prod", "adt", cast(Any, "archiver"))
+    with pytest.raises(TopicNameError):
+        topics.consumer_group("prod", "adt", cast(Any, "pipeline.x"))
+
+
+def test_archiver_platform_group_is_the_literal_contract_name() -> None:
+    validator = _consumer_group_schema()
+    group = topics.platform_group("prod", "archiver")
+    assert group == "tb.prod.archiver"
+    assert validator.is_valid(group)
+    with pytest.raises(TopicNameError):
+        topics.platform_group("Prod", "archiver")
+    with pytest.raises(TopicNameError):
+        topics.platform_group("prod", cast(Any, "pipeline"))
+    # The literal grant cannot reach a channel named `archiver`: its groups have more segments.
+    assert topics.consumer_group("prod", "archiver", "pipeline") != group
+    assert validator.is_valid(topics.consumer_group("prod", "archiver", "pipeline"))
+
+
+@pytest.mark.parametrize(
+    ("role", "destination", "shadow"),
+    [
+        ("pipeline", None, None),
+        ("pipeline", None, "v2"),
+        ("pipeline", None, "a" + "b" * 31),
+        ("loader", "fhir-server", None),
+        ("replier", None, None),
+    ],
+)
+def test_every_built_consumer_group_validates_against_the_schema(
+    role: topics.Role, destination: str | None, shadow: str | None
+) -> None:
+    assert _consumer_group_schema().is_valid(topics.consumer_group("prod", "adt", role, destination, shadow))
+
+
+@pytest.mark.parametrize("shadow", ["a" + "b" * 32, "V2", "", "-x", "a.b"])
+def test_a_shadow_label_the_schema_would_refuse_is_refused(shadow: str) -> None:
+    with pytest.raises(TopicNameError):
+        topics.consumer_group("prod", "adt", "pipeline", shadow=shadow)
 
 
 def test_spec_reader_group_matches_the_contract_pattern_and_acl_prefix() -> None:

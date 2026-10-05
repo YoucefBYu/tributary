@@ -17,7 +17,7 @@ import pytest
 from jsonschema import Draft202012Validator
 from tributary.runtime.clients import KafkaSettings
 from tributary.runtime.config import load_topic_defaults
-from tributary.runtime.errors import DeliveryError, PartitionMismatchError
+from tributary.runtime.errors import DeliveryError, PartitionMismatchError, TopicNameError
 from tributary.runtime.events import RecordingEmitter
 from tributary.runtime.executor import StepFailure
 from tributary.runtime.logs import JsonLogger
@@ -403,3 +403,27 @@ def test_a_hot_reload_that_flips_transactional_is_logged_once_per_version() -> N
     pipeline.handle(consumed())
     pipeline.handle(consumed(offset=8))
     assert stream.getvalue().count("transactional_change_needs_restart") == 2  # two handlers, once each
+
+
+@pytest.mark.parametrize("shadow", ["a" + "b" * 32, "V2", "", "a.b", "-x"])
+def test_a_shadow_label_the_contract_refuses_is_refused_when_the_settings_are_made(shadow: str) -> None:
+    """Code review MEDIUM: refused at parse time, before any client exists, not at `build()`."""
+    with pytest.raises(TopicNameError):
+        WorkerSettings(
+            env="dev",
+            channel="adt-passthrough",
+            kafka=KafkaSettings(bootstrap_servers="localhost:9092"),
+            instance_id="pipeline-1",
+            shadow=shadow,
+        )
+
+
+def test_a_valid_shadow_label_is_kept() -> None:
+    settings = WorkerSettings(
+        env="dev",
+        channel="adt-passthrough",
+        kafka=KafkaSettings(bootstrap_servers="localhost:9092"),
+        instance_id="pipeline-1",
+        shadow="v2",
+    )
+    assert settings.shadow == "v2"

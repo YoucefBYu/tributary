@@ -5,10 +5,14 @@ fixtures from ADR-001 6.2 without a conftest:
 
     def test_a01_is_kept(run_step, make_message):
         assert not isinstance(run_step(only_admits, make_message(b"...")), Drop)
+
+One hook besides the fixtures: `pytest_configure` turns on strict logging (`TB_LOG_STRICT=1`), so a
+refused log line fails the test instead of being written as `log_refused` (`tributary.runtime.logs`).
 """
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 
 import pytest
@@ -18,6 +22,20 @@ from .testing import make_message as _make_message
 from .testing import run_pipeline as _run_pipeline
 from .testing import run_splitter as _run_splitter
 from .testing import run_step as _run_step
+
+#: `tributary.runtime.logs.STRICT_ENV`, repeated here because the SDK cannot import the runtime.
+LOG_STRICT_ENV = "TB_LOG_STRICT"
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Test runs log strictly: a refused log line raises `LogFieldError` instead of becoming `log_refused`.
+
+    In production `JsonLogger` never raises (a debugging line must not stop a worker loop or replace
+    the exception being reported), so the refusal would be one counted line nobody reads. In a test it
+    should fail the test. `setdefault`: a suite that sets `TB_LOG_STRICT=0` keeps the production path,
+    and a test can always pass `strict=False` to exercise it.
+    """
+    os.environ.setdefault(LOG_STRICT_ENV, "1")
 
 
 @pytest.fixture

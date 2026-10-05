@@ -48,3 +48,10 @@ def engine_kafka_env(bootstrap: str, base: Mapping[str, str] | None = None) -> d
     directory.mkdir(exist_ok=True)
     env[ENV_ENGINE_KAFKA_FILE] = str(write_engine_kafka_file(directory, bootstrap))
     return env
+
+
+def receiver_env(env: Mapping[str, str]) -> dict[str, str]:
+    """`env` plus `TB_OPS_PORT=0`: every receiver binds an ops listener on 127.0.0.1:9180 by default and exits 2
+    when that port is taken, so tests that spawn receivers (several at once, or beside a dev stack) must ask
+    for an ephemeral port. The one place this is set; every receiver spawn in `tests/` goes through it."""
+    return {**env, "TB_OPS_PORT": "0"}

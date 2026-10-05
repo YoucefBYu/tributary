@@ -17,7 +17,7 @@ from confluent_kafka import Producer
 from confluent_kafka.admin import AdminClient, NewTopic
 from tributary.runtime.topics import channels_topic
 
-from tests.support.engine_kafka import engine_kafka_env
+from tests.support.engine_kafka import engine_kafka_env, receiver_env
 from tests.support.kafka_helpers import create_topics_with_retry
 from tests.support.processes import ManagedProcess
 
@@ -67,7 +67,7 @@ def start_receiver(
     args = [sys.executable, "-m", module, "--channel", channel, "--env", env, "--instance", instance]
     if secrets_dir is not None:
         args += ["--secrets-dir", str(secrets_dir)]
-    return ManagedProcess([*args, *extra_args], env=engine_kafka_env(bootstrap))
+    return ManagedProcess([*args, *extra_args], env=receiver_env(engine_kafka_env(bootstrap)))
 
 
 def start_mllp_receiver(

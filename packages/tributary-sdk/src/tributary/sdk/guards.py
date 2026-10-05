@@ -5,7 +5,8 @@ the SDK, the runtime and the connectors cannot disagree about them:
 
 * `_tb.events.attrs` rules — `contracts/events/v0/README.md` section 3.
 * `tb-usr-*` rules — `contracts/envelope/v0/README.md` section 2.1.
-* structured-log fields — invariant 6, which names log lines first.
+* structured-log fields — invariant 6, which names log lines first, and
+  `contracts/observability/v0/README.md` section 4 (L3 identifier deny-list, L4 content deny-list).
 
 None of this is a proof. A surname is a valid short code, so the deny-list catches the common mistake
 and makes intent reviewable; `security-reviewer` and code review remain the real control (events
@@ -71,6 +72,34 @@ IDENTIFIER_NAMES = frozenset(
         "key",
         "message_key",
         "partition_key",
+    }
+)
+
+#: Log field names that carry content or free text (`contracts/observability/v0` README 4, rule L4).
+#: Kept byte-for-byte in step with the second `propertyNames` deny-list in
+#: `contracts/observability/v0/log-line.schema.json`; `tests/test_guards.py` fails if the two drift.
+#: Log lines only: an exception's text quotes the offending field value, and a payload or body is PHI
+#: by default, so the name itself is refused before any value is looked at.
+LOG_CONTENT_NAMES = frozenset(
+    {
+        "payload",
+        "body",
+        "content",
+        "raw",
+        "message",
+        "msg",
+        "text",
+        "segment",
+        "headers",
+        "traceback",
+        "stack",
+        "stack_trace",
+        "exc_info",
+        "exception",
+        "exc_text",
+        "query",
+        "query_string",
+        "sql",
     }
 )
 
@@ -155,14 +184,19 @@ def validate_log_field(name: str, value: object) -> None:
     """Check one structured-log field. Raises `LogFieldError`.
 
     Scalars only, bounded length, no CR/LF (a newline in a log value forges a second log line), and no
-    deny-listed name. `bytes` is rejected on purpose: the two `bytes` values in the system are the
-    payload and the record key.
+    deny-listed name: neither a direct identifier (L3) nor a content carrier (L4). `bytes` is rejected
+    on purpose: the two `bytes` values in the system are the payload and the record key.
     """
     if not isinstance(name, str) or not LOG_FIELD_NAME.match(name):
         raise LogFieldError(f"log field name {safe_token(name)} must match ^[a-z][a-z0-9_]{{0,31}}$")
     if _denotes_identifier(name):
         raise LogFieldError(
             f"log field {safe_token(name)} denotes a direct identifier; log message ids only (invariant 6)"
+        )
+    if name in LOG_CONTENT_NAMES:
+        raise LogFieldError(
+            f"log field {safe_token(name)} carries content or free text; log codes and message ids only "
+            "(invariant 6, observability/v0 L4)"
         )
     if isinstance(value, bytes | bytearray | memoryview):
         raise LogFieldError(f"log field {safe_token(name)}: bytes are never logged (payload and record key are bytes)")

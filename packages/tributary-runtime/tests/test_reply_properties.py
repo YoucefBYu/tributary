@@ -4,8 +4,12 @@
 `tributary.runtime.sync_answer.SyncRequest`, a pure state machine. It fixes what the answers must be. It
 does not show that any receiver gives them: that holds only for a receiver that delegates to
 `SyncRequest`, or one this property is run against (`violations` takes a factory, so a receiver's
-pending-map entry can be adapted to the same five events) with a broken-receiver control that goes red.
+pending-map entry can be adapted to the same six events) with a broken-receiver control that goes red.
 Until then the invariant-1 risk row for W2-8 stays open.
+
+**The oracle is shared (W3-20).** `traces`, `violations`, the oracle and the seven broken controls live in
+`tests/support/sync_reply_oracle.py`, so this suite and the receivers' suite judge with one copy of the
+rules. Its own controls are in `tests/support/test_sync_reply_oracle.py`.
 
 **Answer property.** Over random interleavings of the receiver's `raw` delivery callback, reply records
 (`accepted`, `rejected`, absent status, unknown status), the reply timer, a revoke of the advertised
@@ -27,116 +31,30 @@ non-reply record carries a reply-routing header.
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from typing import Any
 
 import pytest
 from hypothesis import HealthCheck, find, given, settings
 from hypothesis import strategies as st
 from tributary.runtime.reply import PRODUCE_FAILED
-from tributary.runtime.sync_answer import Resolution, SyncRequest, answer_for_reply
+from tributary.runtime.sync_answer import Resolution, SyncRequest
 from tributary.sdk import Drop, Message, Reject, step
 from tributary.sdk import headers as h
 from tributary.sdk.codes import REPLY_ROUTE_LOST, REPLY_TIMEOUT, TRANSFORM_ERROR
 
+from tests.support.sync_reply_oracle import (
+    BROKEN_REQUESTS,
+    AnswersHeldReplyOnFailedCommit,
+    LastReplyWins,
+    SwapsAeCodes,
+    TrustsUnrecognisedStatus,
+    traces,
+    violations,
+)
+
 from .reply_harness import DLQ, REPLY, make_spec, rig, sync_request
 
 # -- the answer state machine ----------------------------------------------------------------------
-
-REPLIES = {
-    "reply_accepted": ("accepted", None),
-    "reply_rejected": ("rejected", "LAB_QUERY_UNSUPPORTED"),
-    "reply_failed": ("failed", TRANSFORM_ERROR),
-    "reply_absent": (None, None),
-    "reply_unknown": ("partially-accepted", None),
-}
-NOISE = [*REPLIES, "timeout", "revoke", "disconnect"]
-
-
-@st.composite
-def traces(draw: st.DrawFn) -> list[str]:
-    """Noise events in any order, exactly one `raw` callback somewhere, and a final timer firing."""
-    noise = draw(st.lists(st.sampled_from(NOISE), max_size=8))
-    commit = draw(st.sampled_from(["commit_ok", "commit_failed"]))
-    position = draw(st.integers(min_value=0, max_value=len(noise)))
-    # The timer always fires eventually unless something resolved first: it closes every trace.
-    return [*noise[:position], commit, *noise[position:], "timeout"]
-
-
-def drive(request: SyncRequest, event: str) -> Resolution | None:
-    if event == "commit_ok":
-        return request.commit_succeeded()
-    if event == "commit_failed":
-        return request.commit_failed()
-    if event in REPLIES:
-        status, code = REPLIES[event]
-        return request.reply_received(status, code)
-    if event == "timeout":
-        return request.reply_timed_out()
-    if event == "revoke":
-        return request.partition_revoked()
-    if event == "disconnect":
-        return request.disconnected()
-    raise AssertionError(event)
-
-
-def oracle(cause: str, first_reply: str | None, revoked: bool) -> Resolution | None:
-    """The one right answer, written from channel-spec 3.2.6's table without reading `SyncRequest`.
-
-    `cause` is the event that resolved the request. A reply-derived answer comes from the **first**
-    reply (held before the callback or received after it): `AA` only for `accepted`, else `AE` with that
-    reply's own code. A revoke answers `REPLY_ROUTE_LOST`, the timer `REPLY_TIMEOUT`. `None`: nothing
-    justifies an answer at this event.
-    """
-    if cause == "disconnect":
-        return Resolution(answer=None)
-    if cause == "commit_failed":
-        return Resolution("AR")
-    if cause == "timeout":
-        return Resolution("AE", REPLY_TIMEOUT)
-    if cause == "revoke":
-        return Resolution("AE", REPLY_ROUTE_LOST)
-    if first_reply is not None:  # cause is a reply, or the callback releasing a held one
-        status, code = REPLIES[first_reply]
-        return Resolution("AA") if status == "accepted" else Resolution("AE", code)
-    if cause == "commit_ok" and revoked:  # the callback releasing a held revoke
-        return Resolution("AE", REPLY_ROUTE_LOST)
-    return None
-
-
-def violations(trace: list[str], factory: Callable[[], SyncRequest]) -> list[str]:
-    """Every broken rule in one run of `trace`. Empty means the implementation held."""
-    request = factory()
-    found: list[str] = []
-    resolutions: list[Resolution] = []
-    committed = False
-    disconnected = False
-    revoked = False
-    first_reply: str | None = None
-    for event in trace:
-        committed = committed or event == "commit_ok"
-        if first_reply is None and event in REPLIES and not resolutions:
-            first_reply = event
-        revoked = revoked or (event == "revoke" and not resolutions)
-        resolution = drive(request, event)
-        disconnected = disconnected or event == "disconnect"
-        if resolution is None:
-            continue
-        resolutions.append(resolution)
-        if resolution.answer in ("AA", "AE") and not committed:
-            found.append(f"{resolution.answer} before the raw callback succeeded (invariant 1)")
-        if resolution.answer == "AR" and committed:
-            found.append("AR after a confirmed commit: tells the sender a resend is safe when it is not")
-        if resolution.answer == "AA" and first_reply != "reply_accepted":
-            found.append("AA without the first reply being accepted")
-        if resolution.answer is not None and disconnected:
-            found.append("an answer written to a sender that had gone")
-        expected = oracle(event, first_reply, revoked)
-        if len(resolutions) == 1 and resolution != expected:
-            found.append(f"{resolution} where the rules give {expected} (cause {event})")
-    if len(resolutions) != 1:
-        found.append(f"{len(resolutions)} resolutions, expected exactly one")
-    return found
 
 
 @given(traces())
@@ -145,85 +63,7 @@ def test_every_request_gets_exactly_one_answer_and_never_ahead_of_the_commit(tra
     assert violations(trace, SyncRequest) == []
 
 
-class AnswersOnReplyAlone(SyncRequest):
-    """The proposal's control: resolves on the reply without waiting for the raw callback."""
-
-    def reply_received(self, status: str | None, code: str | None) -> Resolution | None:
-        if self.resolved:
-            return None
-        self.resolution = answer_for_reply(status, code)
-        return self.resolution
-
-
-class AnswersRevokeEagerly(SyncRequest):
-    """The amendment's control: `AE` / `REPLY_ROUTE_LOST` on a revoke before the callback."""
-
-    def partition_revoked(self) -> Resolution | None:
-        if self.resolved:
-            return None
-        self.resolution = Resolution("AE", REPLY_ROUTE_LOST)
-        return self.resolution
-
-
-class TrustsAbsentStatus(SyncRequest):
-    """Envelope 2.3.3's control: reads an absent `tb-reply-status` as accepted."""
-
-    def reply_received(self, status: str | None, code: str | None) -> Resolution | None:
-        return super().reply_received("accepted" if status is None else status, code)
-
-
-class LastReplyWins(SyncRequest):
-    """A later reply overwrites the one held before the callback (the rule is: the first one counts)."""
-
-    def reply_received(self, status: str | None, code: str | None) -> Resolution | None:
-        if self.resolved or self._committed:
-            return super().reply_received(status, code)
-        self._reply = None  # forget the held one, so the base class holds this one instead
-        return super().reply_received(status, code)
-
-
-class SwapsAeCodes(SyncRequest):
-    """The timer answers `REPLY_ROUTE_LOST` and a revoke `REPLY_TIMEOUT`: right answer, wrong code."""
-
-    def reply_timed_out(self) -> Resolution | None:
-        resolved = super().reply_timed_out()
-        return None if resolved is None else self._resolve(Resolution("AE", REPLY_ROUTE_LOST))
-
-    def partition_revoked(self) -> Resolution | None:
-        resolved = super().partition_revoked()
-        return None if resolved is None else self._resolve(Resolution("AE", REPLY_TIMEOUT))
-
-
-class TrustsUnrecognisedStatus(SyncRequest):
-    """`AA` for any status that is not `rejected` or `failed`, so `partially-accepted` becomes `AA`."""
-
-    def reply_received(self, status: str | None, code: str | None) -> Resolution | None:
-        trusted = "accepted" if status not in (None, "rejected", "failed") else status
-        return super().reply_received(trusted, code)
-
-
-class AnswersHeldReplyOnFailedCommit(SyncRequest):
-    """A reply held before the callback is answered even when the callback then fails (never `AR`)."""
-
-    def commit_failed(self) -> Resolution | None:
-        if not self.resolved and self._committed is None and self._reply is not None:
-            self._committed = False
-            return self._resolve(answer_for_reply(self._reply.status, self._reply.code))
-        return super().commit_failed()
-
-
-BROKEN = [
-    AnswersOnReplyAlone,
-    AnswersRevokeEagerly,
-    TrustsAbsentStatus,
-    LastReplyWins,
-    SwapsAeCodes,
-    TrustsUnrecognisedStatus,
-    AnswersHeldReplyOnFailedCommit,
-]
-
-
-@pytest.mark.parametrize("broken", BROKEN)
+@pytest.mark.parametrize("broken", BROKEN_REQUESTS)
 def test_each_broken_receiver_is_caught(broken: type[SyncRequest]) -> None:
     """A property that cannot go red is not evidence (PHASE-0-DECISION section 4)."""
     counterexample = find(traces(), lambda trace: bool(violations(trace, broken)), settings=settings(max_examples=5000))

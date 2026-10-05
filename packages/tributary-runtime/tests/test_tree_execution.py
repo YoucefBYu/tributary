@@ -37,6 +37,7 @@ from tributary.sdk.ids import derived_uuid7
 from tributary.sdk.testing import make_message
 
 from .fakes import FakeProducer
+from .log_line_schema import assert_lines_conform
 
 EXAMPLES = Path(__file__).resolve().parents[3] / "contracts" / "channel-spec" / "v0" / "examples" / "valid"
 PHI_MARKER = "SYNTH^JANE"
@@ -239,6 +240,9 @@ def test_a_failing_destination_step_is_retried_then_dead_lettered_for_that_desti
     assert harness.producer.flushes == 1, "out and dlq records are flushed together before the commit"
     [dead] = harness.events("dlq")
     assert (dead.destination, dead.error_code) == ("rows", "TRANSFORM_ERROR")
+    # observability/v0: a record with no parent omits `parent_id` rather than logging it as null.
+    [logged] = [line for line in assert_lines_conform(harness.stream.getvalue()) if line["event"] == "dead_lettered"]
+    assert "parent_id" not in logged and logged["destination"] == "rows"
 
 
 def test_reject_in_a_destination_step_skips_the_retries() -> None:
@@ -328,6 +332,8 @@ def test_a_failing_child_is_dead_lettered_alone_and_the_others_proceed() -> None
     assert dlq_headers[h.TB_PARENT_ID] == source.message.msg_id
     assert dlq_headers[h.TB_ERROR_CODE] == "CHILD_B_REFUSED"
     assert h.TB_DESTINATION not in dlq_headers
+    [logged] = [line for line in assert_lines_conform(harness.stream.getvalue()) if line["event"] == "dead_lettered"]
+    assert logged["parent_id"] == source.message.msg_id and "destination" not in logged  # omitted, never null
     [filtered] = harness.events("filtered")
     assert filtered.message_id == derived_uuid7(source.message.msg_id, 2)
 

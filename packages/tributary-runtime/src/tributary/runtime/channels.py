@@ -203,7 +203,7 @@ class ChannelCache:
                 self._recovered()  # a fetch reached the end of a partition: the topic is readable
                 return False
             code = _error_name(error)
-            self._log.warning("channels_consumer_error", error_code=code)
+            self._log.warning("channels_consumer_error", kafka_error=code)
             self._error_event_at = self._clock()
             self._unavailable(code)
             return False
@@ -297,7 +297,7 @@ class ChannelCache:
         self._log.warning(
             "channels_unavailable",
             topic=self._topic,
-            error_code=error_code,
+            kafka_error=error_code,
             serving_last_applied=True,
             channels=len(self._specs),
         )
@@ -310,7 +310,7 @@ class ChannelCache:
         self._log.info(
             "channels_recovered",
             topic=self._topic,
-            error_code=outage.error_code,
+            kafka_error=outage.error_code,
             outage_s=round(max(0.0, self._clock() - outage.since), 1),
         )
 

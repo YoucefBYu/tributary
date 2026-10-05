@@ -109,13 +109,34 @@
             "no_partition",
             "not_established",
             "disconnected",
+            "unauthorized",
             "unreachable",
             "keys_unavailable"
           ],
-          "$comment": "A closed list on purpose: a free-text reason is where a broker error string, a peer address or exception text would arrive."
+          "$comment": "A closed list on purpose: a free-text reason is where a broker error string, a peer address or exception text would arrive. Which reasons each receiver check may carry is bound below (README 2.3 table)."
         }
       },
       "allOf": [
+        {
+          "$comment": "Receiver check reasons, bound per check (README 2.3 table, set 1.8). The api checks are bound in openapi/v0 ApiReadiness.",
+          "if": { "properties": { "name": { "const": "spec" } }, "required": ["name"] },
+          "then": { "properties": { "reason": { "enum": ["no_spec", "spec_refused", "undeployed"] } } }
+        },
+        {
+          "if": { "properties": { "name": { "const": "component" } }, "required": ["name"] },
+          "then": { "properties": { "reason": { "enum": ["starting", "bind_failed", "stopping", "component_failed"] } } }
+        },
+        {
+          "if": { "properties": { "name": { "const": "raw_producer" } }, "required": ["name"] },
+          "then": { "properties": { "reason": { "enum": ["not_warmed", "all_brokers_down", "fatal"] } } }
+        },
+        {
+          "$comment": "unauthorized (set 1.8): the broker refuses the reply consumer's principal. Precedence when several hold: fatal, disconnected, unauthorized, not_established, no_partition (README 2.3).",
+          "if": { "properties": { "name": { "const": "reply_consumer" } }, "required": ["name"] },
+          "then": {
+            "properties": { "reason": { "enum": ["fatal", "disconnected", "unauthorized", "not_established", "no_partition"] } }
+          }
+        },
         {
           "$comment": "A failing check names its reason.",
           "if": { "properties": { "ok": { "const": false } }, "required": ["ok"] },

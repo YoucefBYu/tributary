@@ -246,7 +246,7 @@ an ordinary `dlq` record — which is exactly what normalising is for. It is a c
 test per placeholder, in the same category as the rules in 5.2.1 and in the channel-spec contract's
 section 6.
 
-### 2.3.2 Engine error-code registry (set 1.1, 2026-09-25; `REPLY_` added in set 1.2; loader fixed names in set 1.3; two `REPLY_BODY_` codes in set 1.7)
+### 2.3.2 Engine error-code registry (set 1.1, 2026-09-25; `REPLY_` added in set 1.2; loader fixed names in set 1.3; two `REPLY_BODY_` codes in set 1.7; five receiver `log_only` codes in set 1.8)
 
 **Machine-readable:** [`error-codes.json`](error-codes.json). This section is its rationale; the file
 is the list.

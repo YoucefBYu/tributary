@@ -45,6 +45,35 @@ reprocess, replay, stats, events, audit shape) follows.
   `events/v0` attrs), a new content deny-list, `message_id` as the canonical spelling with `tb_msg_id`
   and `msg_id` as deprecated aliases.
 
+### W3-17 amendment (same day, `connector-engineer` request): `unauthorized` reason, five `log_only` codes
+
+**Additive within set 1.8.** No previously valid document becomes invalid: the existing examples
+already used only their own check's reasons, and no existing pinned pair moves.
+
+- **`observability/v0` readiness.** `reply_consumer` gains reason `unauthorized` (broker refuses the
+  principal; it used to report `no_partition`, which is false while partitions are held). Precedence:
+  `fatal`, `disconnected`, `unauthorized`, `not_established`, `no_partition`. The schema now **binds each
+  receiver check to its own reasons** (README 2.3 table, which was already normative). **Ruling: `spec`
+  gets no `unauthorized`.** Before the first spec, `no_spec` is true; the cause is the log code. After
+  it, R3 keeps a channels-topic fault `degraded`. Examples: +1 valid
+  (`readiness-receiver-sync-reply-unauthorized`), +2 invalid (`readiness-spec-unauthorized`,
+  `readiness-reason-from-another-check`).
+- **`observability/v0` README.** O4 names `code: OPS_LISTENER_BIND_FAILED`. New L6a: `error_code` is
+  registered; `code` on `startup_refused` is a startup-refusal code, not registered in v0 (open item in
+  section 6, so `OPS_LISTENER_BIND_FAILED` is not registered alone).
+- **`envelope/v0` `error-codes.json` (set `1.8`).** `log_only` gains `REPLY_CONSUMER_UNAUTHORIZED`,
+  `CHANNELS_UNAUTHORIZED`, `CHANNELS_TOPIC_MISSING`, `CHANNEL_NOT_DEPLOYED`,
+  `CHANNEL_SPEC_UNAVAILABLE`. They are written as `error_code` in log lines (L6), so they must be
+  registered. A channel's `Reject` can no longer use them.
+- **Change requests.** `platform-engineer`: add the five codes to `tributary.sdk.codes.ENGINE_CODES`
+  **in the same push**, or `tributary-sdk/tests/test_codes_contract.py` goes red (it checks both
+  directions). `connector-engineer`: `reply/feed.py` `readiness_reason()` returns `unauthorized`
+  where it now returns `no_partition` for a refused principal. `qa-engineer`: the conformance suite
+  picks up the three examples.
+- **Verification owed:** `validate.py` predicted **213 / 0** (210 + 1 valid + 2 invalid);
+  `--check-expectations` predicted `141 invalid examples, 0 drifted`. Both are predictions on top of
+  set 1.8 part 1's own unmeasured 210 and 139.
+
 ### `tributary.events/v0` and `tributary.topics/v0`: archive rulings (W3-2a report, 2026-10-05)
 
 `archive-engineer` raised four gaps through the lead. README and `$defs`/description changes only. No

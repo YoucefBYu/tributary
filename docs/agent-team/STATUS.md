@@ -32,6 +32,7 @@ wave's exit criteria here.
   | W3-1a | `contracts/openapi/v0` part 1; ADR-009 Proposed | `validate.py --with openapi-spec-validator`: predicted **210 / 0** in total; openapi adds 24 checks, 10 pairs |
   | W3-11 | `validate.py --check-expectations` | Exit 0 on the tree (predicted `139 invalid examples, 0 drifted`); exit 1 on a scratchpad copy with one pair altered |
   | W3-10 | ADR-004 draft, H1-H7 `TODO(human)` | `security-reviewer` reads it |
+  | W3-17 amend | `reply_consumer` reason `unauthorized`; per-check reason binding; `spec` gets no `unauthorized` (ruling, README 2.3); five `log_only` codes in `error-codes.json` (set `1.8`); `OPS_LISTENER_BIND_FAILED` named in O4, not registered (L6a) | `validate.py` predicted **213 / 0**; `--check-expectations` `141 ..., 0 drifted`; `platform-engineer` adds the five codes to `sdk.codes` in the same push or `test_codes_contract.py` goes red |
 
   **CI note:** the `contracts` job must add `--with openapi-spec-validator`, or the default run fails by
   design (W3-14, `devops-engineer`).

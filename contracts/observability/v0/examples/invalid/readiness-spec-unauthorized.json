@@ -1,0 +1,12 @@
+{
+  "v": 0,
+  "component": "receiver",
+  "status": "not_ready",
+  "channel": "adt-synth-in",
+  "receiver_type": "mllp",
+  "checks": [
+    { "name": "spec", "ok": false, "reason": "unauthorized" },
+    { "name": "component", "ok": false, "reason": "starting" },
+    { "name": "raw_producer", "ok": true }
+  ]
+}

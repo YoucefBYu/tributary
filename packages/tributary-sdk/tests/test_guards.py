@@ -113,3 +113,48 @@ def test_ordinary_log_fields_pass() -> None:
 def test_usr_header_values_are_bounded(value: str) -> None:
     with pytest.raises(UsrHeaderError):
         guards.validate_usr("batch-id", value)
+
+
+# -- observability/v0 section 4: the log-line deny-lists (L3, L4) --------------------------------------
+
+LOG_LINE_SCHEMA = CONTRACTS / "observability" / "v0" / "log-line.schema.json"
+
+
+def _log_line_deny_lists() -> tuple[set[str], set[str]]:
+    assert LOG_LINE_SCHEMA.is_file(), "log-line schema not found: the drift tests would pass vacuously"
+    schema = json.loads(LOG_LINE_SCHEMA.read_text(encoding="utf-8"))
+    identifier, content = schema["propertyNames"]["allOf"][1:3]
+    return set(identifier["not"]["enum"]), set(content["not"]["enum"])
+
+
+def test_log_identifier_deny_list_matches_the_log_line_contract() -> None:
+    """L3: byte-for-byte the events/v0 attrs deny-list and `IDENTIFIER_NAMES`."""
+    identifier, _ = _log_line_deny_lists()
+    assert identifier == set(guards.IDENTIFIER_NAMES)
+
+
+def test_log_content_deny_list_matches_the_log_line_contract() -> None:
+    _, content = _log_line_deny_lists()
+    assert set(guards.LOG_CONTENT_NAMES) == content
+    assert not content & set(guards.IDENTIFIER_NAMES), "the two lists are disjoint in the contract"
+
+
+@pytest.mark.parametrize("name", sorted(guards.LOG_CONTENT_NAMES))
+def test_every_content_name_is_refused_as_a_log_field_whatever_the_value(name: str) -> None:
+    # A harmless-looking value: the name is refused on its own, before the value is looked at.
+    with pytest.raises(LogFieldError) as caught:
+        guards.validate_log_field(name, "A01")
+    assert "L4" in str(caught.value)
+
+
+@pytest.mark.parametrize("name", ["payload", "message", "exception", "traceback"])
+def test_content_names_stay_legal_as_attrs_and_usr_is_unaffected(name: str) -> None:
+    """L4 is a log-line rule. The events/v0 attrs deny-list is the identifier list only; widening it here
+    would refuse events the contract accepts."""
+    guards.validate_attr(name, "A01")
+
+
+@pytest.mark.parametrize("name", ["payload_bytes", "message_id", "body_size", "error", "reason"])
+def test_names_that_only_contain_a_content_word_are_allowed(name: str) -> None:
+    """The contract's list is exact names, not substrings: `message_id` is the canonical field (L7)."""
+    guards.validate_log_field(name, "A01")

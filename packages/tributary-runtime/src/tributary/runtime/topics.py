@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, get_args
 
 from .errors import TopicNameError, safe_token
 
@@ -22,10 +22,20 @@ DESTINATION = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
 #: `spec_reader` group ACL is a PREFIXED grant on `tb.<env>.<ch>.channels.`, so the instance is the
 #: only free-form part of the group id.
 INSTANCE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")
+#: A shadow-deployment label. The intersection of the old destination-shaped rule and the contract's
+#: `shadow-[a-z0-9-]{1,32}` (`topic-name.schema.json` `consumerGroup`): every label accepted here
+#: builds a group the schema accepts.
+SHADOW = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 
 TopicKind = Literal["raw", "out", "retry", "dlq", "reply"]
 PlatformKind = Literal["channels", "events", "audit"]
-Role = Literal["pipeline", "loader", "replier", "archiver"]
+#: Per-channel consumer-group roles (`contracts/topics/v0` 3.6, `topic-name.schema.json`). Set 1.8 took
+#: `archiver` out: the archiver consumes `_tb.<env>.events` for every channel, so its group is the
+#: environment-wide platform group `tb.<env>.archiver` (`platform_group`), and its ACL is LITERAL. A
+#: per-channel `tb.<env>.<ch>.archiver` group is one nothing grants.
+Role = Literal["pipeline", "loader", "replier"]
+#: Environment-wide consumer groups with no channel segment (set 1.8, `consumer_groups.platform`).
+PlatformGroup = Literal["archiver"]
 
 MAX_TOPIC_LENGTH = 249
 
@@ -96,13 +106,31 @@ def consumer_group(
     destination: str | None = None,
     shadow: str | None = None,
 ) -> str:
-    """`tb.<env>.<channel>.<role>[.<destination>][.shadow-<label>]` (`contracts/topics/v0` 3.6)."""
+    """`tb.<env>.<channel>.<role>[.<destination>][.shadow-<label>]` (`contracts/topics/v0` 3.6).
+
+    The role is checked at run time as well as by the type: a role read from configuration (or the
+    pre-1.8 `archiver`) must fail here, not build a group the ACL never grants.
+    """
+    if role not in get_args(Role):
+        raise TopicNameError(f"consumer-group role {safe_token(role)} is not one of {', '.join(get_args(Role))}")
     parts = ["tb", _segment("env", env, ENV), _segment("channel", channel, CHANNEL), role]
     if destination is not None:
         parts.append(_segment("destination", destination, DESTINATION))
     if shadow is not None:
-        parts.append(f"shadow-{_segment('shadow label', shadow, DESTINATION)}")
+        parts.append(f"shadow-{_segment('shadow label', shadow, SHADOW)}")
     return ".".join(parts)
+
+
+def platform_group(env: str, kind: PlatformGroup) -> str:
+    """`tb.<env>.<kind>`: an environment-wide platform group, today only `tb.<env>.archiver` (set 1.8).
+
+    No channel segment and no suffix: the ACL is LITERAL on exactly this name. A PREFIXED
+    `tb.<env>.archiver` grant would also match the groups of a channel named `archiver`
+    (`tb.<env>.archiver.pipeline`), which is why the set 1.4 grant was withdrawn.
+    """
+    if kind not in get_args(PlatformGroup):
+        raise TopicNameError(f"platform group {safe_token(kind)} is not one of {', '.join(get_args(PlatformGroup))}")
+    return ".".join(["tb", _segment("env", env, ENV), kind])
 
 
 def spec_reader_group(env: str, channel: str, instance: str) -> str:

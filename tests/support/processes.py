@@ -6,8 +6,8 @@ receiver cooperating, and an e2e test should exercise the actual `python -m trib
 `deploy/compose/docker-compose.yml` runs — the same reasoning
 `packages/tributary-runtime/tests/test_integration_kafka.py::spawn_worker` uses for the worker alone.
 
-Each component prints one JSON line to stdout (or stderr, merged here) when it is actually ready to
-receive traffic: the receiver prints `{"event": "listening", ...}` itself
+Each component prints one JSON line when it is actually ready to receive traffic (receivers log to stderr since W3-17,
+loaders and workers to stdout or stderr; `ManagedProcess` merges both): the receiver logs `{"event": "listening", ...}`
 (`tributary.receivers.mllp.server.main`), the loader and worker log `{"event": "loader_started", ...}`
 / `{"event": "worker_started", ...}` through `tributary.runtime.logs.JsonLogger`. `wait_for_event`
 follows those rather than a fixed sleep, and fails fast if the process exits first instead of hanging
@@ -28,7 +28,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from tests.support.engine_kafka import engine_kafka_env
+from tests.support.engine_kafka import engine_kafka_env, receiver_env
 
 
 class ProcessDiedError(AssertionError):
@@ -203,7 +203,7 @@ def spawn_mllp_receiver_from_topic(
     ]
     if secrets_dir is not None:
         args += ["--secrets-dir", str(secrets_dir)]
-    proc = ManagedProcess(args, env=engine_kafka_env(bootstrap))
+    proc = ManagedProcess(args, env=receiver_env(engine_kafka_env(bootstrap)))
     proc.wait_for_event("listening", timeout_s=timeout_s)
     return proc
 
