@@ -7,7 +7,7 @@ is `tributary` is reserved to this registry (N2); any other namespace is bound p
 and only an entry point from that distribution is ever imported (N4, `steps.StepResolver`).
 
 A copy, not a file read at startup, for the same reason as `capabilities.py`: the worker must not need
-`contracts/` on disk to refuse a spec. `tests/test_step_namespaces_registry.py` checks the copy against
+`contracts/` on disk to refuse a spec. `tests/test_step_namespaces.py` checks the copy against
 the contract both ways. Adding an engine namespace is a contract change first, then a line here.
 """
 

@@ -545,10 +545,13 @@ def test_a_ref_module_that_fails_at_import_is_a_channel_spec_error(
 
 
 class _Dist:
-    """What `EntryPoint.dist` offers the resolver: a name and a version, read without importing."""
+    """What `EntryPoint.dist` offers the resolver, read without importing: a name, a version, the install
+    folder (`_path`) and the `RECORD` (`files`), which lists the target module."""
 
     name = "tributary-runtime"
     version = "0.0.0"
+    files = ("synth_steps/module.py",)
+    _path = Path("/site-packages/tributary_runtime-0.0.0.dist-info")
 
 
 def _raising_point(name: str, raised: BaseException) -> object:

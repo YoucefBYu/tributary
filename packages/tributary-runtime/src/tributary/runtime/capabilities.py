@@ -22,6 +22,16 @@ NAME_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,31}")
 CAPABILITIES: Mapping[str, str] = MappingProxyType({"fhir": "tributary-fhir"})
 
 
+#: ASCII upper case to lower case, and nothing else.
+_ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+
+
 def normalise_distribution(name: str) -> str:
-    """PEP 503: lowercase, and every run of `-`, `_` or `.` becomes one `-`."""
-    return re.sub(r"[-_.]+", "-", name).lower()
+    """PEP 503: lowercase, and every run of `-`, `_` or `.` becomes one `-`.
+
+    ASCII lowercasing only. `str.lower()` folds some non-ASCII letters into ASCII (U+212A KELVIN SIGN
+    becomes `k`), which would let a look-alike name normalise onto a registered one. A non-ASCII
+    character survives here unchanged, so it can never equal an (ASCII) registry value. To refuse such
+    a name outright, use `provenance.canonical_distribution`.
+    """
+    return re.sub(r"[-_.]+", "-", name).translate(_ASCII_LOWER)

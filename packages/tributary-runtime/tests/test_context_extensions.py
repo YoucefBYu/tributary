@@ -286,8 +286,17 @@ def test_a_reply_from_a_failed_attempt_is_discarded_before_the_retry_through_the
 
 @dataclass
 class FakeDist:
+    """Duck-types an installed distribution's metadata: `name`, `version`, its install folder (`_path`,
+    as `PathDistribution` has) and its `RECORD` (`files`), which lists the fake entry points' module."""
+
     name: str
     version: str = "0.0.0"
+    files: tuple[str, ...] = ("pkg/module.py",)
+    folder: str | None = None  # the install folder's name part; defaults to the claimed name
+
+    @property
+    def _path(self) -> Path:
+        return Path("/site-packages") / f"{self.folder or self.name.replace('-', '_')}-{self.version}.dist-info"
 
 
 @dataclass
@@ -402,6 +411,25 @@ def test_a_declared_capability_registered_twice_is_refused() -> None:
     with pytest.raises(ContextExtensionError, match="more than one distribution"):
         resolver(real, squat).resolve(declaring_fhir())
     assert real.loads == 0 and squat.loads == 0
+
+
+@pytest.mark.parametrize(
+    ("dist", "value", "match"),
+    [
+        (FakeDist("tributary-fhir", "1.2.3"), "os:system", "targets a module its distribution does not ship"),
+        (FakeDist("tributary-fhir", "1.2.3", folder="fhir_tools"), "pkg.module:factory", "does not match its install"),
+        (FakeDist("tributary-\N{KELVIN SIGN}hir", "1.2.3"), "pkg.module:factory", "outside PEP 508 ASCII"),
+    ],
+)
+def test_a_registrant_whose_provenance_does_not_hold_is_refused_without_importing(
+    dist: FakeDist, value: str, match: str
+) -> None:
+    """Security review of a1219af, Lows 1 and 3, for the second code-loading path: a target outside the
+    registered distribution, metadata that lies about its install folder, or a non-ASCII look-alike name."""
+    point = FakePoint("fhir", _raise(AssertionError("must not be imported")), dist, value=value)
+    with pytest.raises(ContextExtensionError, match=match):
+        resolver(point).resolve(declaring_fhir())
+    assert point.loads == 0
 
 
 def test_a_declared_capability_that_is_not_installed_is_refused() -> None:

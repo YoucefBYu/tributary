@@ -41,16 +41,16 @@ import importlib
 import sys
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from importlib.metadata import EntryPoint, entry_points
+from importlib.metadata import EntryPoint, distributions
 from types import MappingProxyType
 
 from tributary.sdk import Splitter, Step
 from tributary.sdk.context import Logger
 from tributary.sdk.errors import StepDefinitionError, safe_token
 
-from .capabilities import normalise_distribution
 from .errors import ChannelSpecError
 from .executor import ChannelPlan, PipelineExecutor, StepStats
+from .provenance import canonical_distribution, install_folder_name, provenance_problem
 from .spec import ChannelSpec, Pipeline, StepRef
 from .step_namespaces import ENTRY_POINT_GROUP, RESERVED_FIRST_SEGMENT, STEP_NAMESPACES, is_reserved, namespace_of
 
@@ -91,6 +91,50 @@ def load_step(reference: StepRef, *, namespaces: Mapping[str, str] | None = None
     return StepResolver().load(reference, namespaces=namespaces)
 
 
+def _all_entry_points() -> list[EntryPoint]:
+    """Every `tributary.steps` entry point of every installed distribution, **without** de-duplication.
+
+    `importlib.metadata.entry_points()` keeps only the first distribution per name on `sys.path`, so a
+    same-named package earlier on the path would hide the real one without a trace (security review of
+    a1219af, Low 2). Reading every distribution lets the resolver see the hidden one and say so (N5).
+    """
+    return [point for dist in distributions() for point in dist.entry_points.select(group=ENTRY_POINT_GROUP)]
+
+
+@dataclass(frozen=True, slots=True)
+class _Installed:
+    """What one metadata scan found: the entry points `importlib.metadata` would show, and the hidden rest.
+
+    `visible` keeps the first installation per distribution name in `sys.path` order, which is what
+    `entry_points()` returns and what N4 counts. `shadowed` are entry points of a later installation
+    with the same name: never loaded, and logged as `duplicate` when they matter (N5).
+    """
+
+    visible: tuple[EntryPoint, ...]
+    shadowed: tuple[EntryPoint, ...]
+
+    @classmethod
+    def split(cls, points: Iterable[EntryPoint]) -> _Installed:
+        first: dict[str, object] = {}
+        visible: list[EntryPoint] = []
+        shadowed: list[EntryPoint] = []
+        for point in points:
+            dist = point.dist
+            if dist is None:
+                visible.append(point)
+                continue
+            name = install_folder_name(dist) or canonical_distribution(str(dist.name)) or str(dist.name)
+            install = getattr(dist, "_path", None) or id(dist)
+            if first.setdefault(name, install) == install:
+                visible.append(point)
+            else:
+                shadowed.append(point)
+        return cls(visible=tuple(visible), shadowed=tuple(shadowed))
+
+
+_NOTHING = _Installed(visible=(), shadowed=())
+
+
 @dataclass(frozen=True, slots=True)
 class _Scope:
     """What one resolution logs against: the channel version, and which lines it has already written."""
@@ -114,7 +158,7 @@ class StepResolver:
         registry: Mapping[str, str] = STEP_NAMESPACES,
     ) -> None:
         self._log: Logger = log if log is not None else _Quiet()
-        self._points = points if points is not None else lambda: entry_points(group=ENTRY_POINT_GROUP)
+        self._points = points if points is not None else _all_entry_points
         self._registry = registry
 
     def bind(self, spec: ChannelSpec) -> Resolver:
@@ -123,12 +167,15 @@ class StepResolver:
         The image-wide check runs here, once per version: every installed entry point in a reserved
         `tributary.*` namespace that the registry would not load is logged, named by a spec or not.
         """
-        installed = list(self._points())
+        installed = _Installed.split(self._points())
         scope = _Scope(channel=spec.name, channel_version=spec.version, logged=set())
-        for point in installed:
+        for point in installed.visible:
             reason = self._reserved_failure(point)
             if reason is not None:
                 self._skipped(point, reason, scope)
+        for point in installed.shadowed:  # a hidden installation of an engine distribution's name
+            if point.name.split(".", 1)[0] == RESERVED_FIRST_SEGMENT:
+                self._skipped(point, DUPLICATE, scope)
         namespaces = spec.pipeline.step_namespaces
 
         def resolve(reference: StepRef) -> Node:
@@ -138,15 +185,13 @@ class StepResolver:
 
     def load(self, reference: StepRef, *, namespaces: Mapping[str, str] | None = None) -> Node:
         """One step, outside any channel version. Discovery runs only for a `uses` step."""
-        installed = list(self._points()) if reference.uses else []
+        installed = _Installed.split(self._points()) if reference.uses else _NOTHING
         scope = _Scope(channel=None, channel_version=None, logged=set())
         return self._node(reference, namespaces if namespaces is not None else _NO_BINDINGS, installed, scope)
 
     # -- one step ------------------------------------------------------------------------------------
 
-    def _node(
-        self, reference: StepRef, namespaces: Mapping[str, str], installed: list[EntryPoint], scope: _Scope
-    ) -> Node:
+    def _node(self, reference: StepRef, namespaces: Mapping[str, str], installed: _Installed, scope: _Scope) -> Node:
         loaded = (
             self._from_entry_point(reference.uses, namespaces, installed, scope)
             if reference.uses
@@ -155,7 +200,7 @@ class StepResolver:
         return _as_node(reference, loaded)
 
     def _from_entry_point(
-        self, name: str | None, namespaces: Mapping[str, str], installed: list[EntryPoint], scope: _Scope
+        self, name: str | None, namespaces: Mapping[str, str], installed: _Installed, scope: _Scope
     ) -> object:
         if not name:
             raise ChannelSpecError("step has no `uses` value")
@@ -165,7 +210,10 @@ class StepResolver:
                 f"uses {safe_token(name)} has no namespace: a uses name needs at least three segments "
                 "(channel-spec README 3.3.5 N1)"
             )
-        carriers = [point for point in installed if point.name == name]
+        carriers = [point for point in installed.visible if point.name == name]
+        for point in installed.shadowed:  # hidden by an earlier same-named installation: never loaded
+            if point.name == name:
+                self._skipped(point, DUPLICATE, scope)
         expected = self._registry.get(namespace) if is_reserved(namespace) else namespaces.get(namespace)
         if expected is None:  # N2, N3
             for point in carriers:
@@ -184,11 +232,12 @@ class StepResolver:
                 f"uses {safe_token(name)} is registered by more than one entry point; none is loaded"
             )
         point = carriers[0]
-        distribution = _metadata(point)[0]
-        if point.dist is None or normalise_distribution(distribution) != expected:
+        # Name (PEP 508 ASCII), install folder and target module, all from metadata, before any import.
+        problem = provenance_problem(point.dist, point.value, expected)
+        if problem is not None:
             self._skipped(point, DISTRIBUTION_MISMATCH, scope)
             raise ChannelSpecError(
-                f"uses {safe_token(name)} comes from distribution {safe_token(distribution)}, "
+                f"uses {safe_token(name)} {problem}: distribution {safe_token(_metadata(point)[0])}, "
                 f"bound to {safe_token(expected)}"
             )
         try:
@@ -208,7 +257,7 @@ class StepResolver:
         expected = self._registry.get(namespace) if namespace is not None else None
         if expected is None:
             return UNREGISTERED_NAMESPACE
-        if point.dist is None or normalise_distribution(_metadata(point)[0]) != expected:
+        if provenance_problem(point.dist, point.value, expected) is not None:
             return DISTRIBUTION_MISMATCH
         return None
 

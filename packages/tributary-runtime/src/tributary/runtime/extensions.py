@@ -12,8 +12,9 @@ registers a `tributary.context` entry point whose value is a zero-argument facto
 **Only what the spec declares runs (L1, L2).** A channel names its capabilities in
 `spec.pipeline.context` (channel-spec README 3.3.4). `ContextResolver.resolve` reads entry-point
 *metadata* for the whole group, but calls `EntryPoint.load()` only for a declared name, and only when
-exactly one installed entry point carries it and that entry point's distribution (PEP 503 normalised) is
-the one `capabilities.CAPABILITIES` pins it to. Anything else refuses the spec with
+exactly one installed entry point carries it, that entry point's distribution (PEP 503 normalised) is
+the one `capabilities.CAPABILITIES` pins it to, and the factory's module is one of that distribution's
+own installed files (`provenance.py`). Anything else refuses the spec with
 `ContextExtensionError`, a `ChannelSpecError`: at startup the worker does not start; on a hot reload the
 previous version keeps running, exactly as for an unresolvable `uses` step. An installed registrant that
 is not loaded is never imported, and is logged as `context_extension_skipped` with its reason (L5).
@@ -48,6 +49,7 @@ from tributary.sdk.ids import new_traceparent, uuid7
 from .capabilities import CAPABILITIES, ENTRY_POINT_GROUP, normalise_distribution
 from .context import ContextExtension, WorkerContext
 from .errors import ChannelSpecError, safe_token
+from .provenance import provenance_problem
 from .spec import ChannelSpec
 
 __all__ = [
@@ -146,7 +148,7 @@ class ContextResolver:
         expected = self._registry.get(point.name)
         if expected is None:
             return UNREGISTERED
-        if normalise_distribution(_metadata(point)[0]) != expected:
+        if provenance_problem(point.dist, point.value, expected) is not None:
             return DISTRIBUTION_MISMATCH
         if point.name not in declared:
             return NOT_DECLARED
@@ -164,9 +166,11 @@ class ContextResolver:
             raise ContextExtensionError(f"{where} is registered by more than one distribution")
         point = matches[0]
         distribution, version = _metadata(point)
-        if normalise_distribution(distribution) != expected:
+        # Name (PEP 508 ASCII), install folder and target module, all from metadata, before any import.
+        problem = provenance_problem(point.dist, point.value, expected)
+        if problem is not None:
             raise ContextExtensionError(
-                f"{where} comes from distribution {safe_token(distribution)}, registered to {safe_token(expected)}"
+                f"{where} {problem}: distribution {safe_token(distribution)}, registered to {safe_token(expected)}"
             )
         key = (name, normalise_distribution(distribution), point.value)
         cached = self._loaded.get(key)

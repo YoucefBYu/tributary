@@ -10,8 +10,10 @@ never be imported.
 from __future__ import annotations
 
 import importlib
+import importlib.metadata
 import io
 import json
+import re
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -26,6 +28,7 @@ from tributary.runtime.errors import ChannelSpecError
 from tributary.runtime.events import RecordingEmitter
 from tributary.runtime.logs import JsonLogger
 from tributary.runtime.producer import RecordProducer
+from tributary.runtime.provenance import canonical_distribution, provenance_problem, ships_module
 from tributary.runtime.records import ConsumedRecord
 from tributary.runtime.spec import ChannelSpec, StepRef
 from tributary.runtime.step_namespaces import (
@@ -166,8 +169,17 @@ def test_a_malformed_or_reserved_binding_refuses_the_spec(value: Any, match: str
 
 @dataclass
 class FakeDist:
+    """Duck-types an installed distribution's metadata: `name`, `version`, its install folder (`_path`,
+    as `PathDistribution` has) and its `RECORD` (`files`), which lists the fake entry points' module."""
+
     name: str
     version: str = "1.0.0"
+    files: tuple[str, ...] = ("synth_module.py",)
+    folder: str | None = None  # the install folder's name part; defaults to the claimed name
+
+    @property
+    def _path(self) -> Path:
+        return Path("/site-packages") / f"{self.folder or self.name.replace('-', '_')}-{self.version}.dist-info"
 
 
 @step
@@ -263,14 +275,17 @@ def test_a_duplicate_is_refused_and_neither_entry_point_is_imported() -> None:
 def test_a_distribution_mismatch_is_refused_without_importing() -> None:
     """A look-alike registering a `tributary.*` name while the real package is absent."""
     squat = lookalike("tributary.hl7v2.parse", dist="tributary-hl7-v2")
-    with pytest.raises(ChannelSpecError, match="comes from distribution tributary-hl7-v2, bound to tributary-hl7v2"):
+    with pytest.raises(
+        ChannelSpecError,
+        match="comes from another distribution: distribution tributary-hl7-v2, bound to tributary-hl7v2",
+    ):
         resolver(squat).load(uses("tributary.hl7v2.parse"))
     assert squat.loads == 0
 
 
 def test_an_entry_point_without_distribution_metadata_never_matches() -> None:
     orphan = lookalike("tributary.core.passthrough", dist=None)
-    with pytest.raises(ChannelSpecError, match="comes from distribution unknown"):
+    with pytest.raises(ChannelSpecError, match="has no distribution metadata"):
         resolver(orphan).load(uses("tributary.core.passthrough"))
     assert orphan.loads == 0
 
@@ -360,17 +375,31 @@ def test_no_refusal_repeats_exception_text() -> None:
 # -- real importlib.metadata: what "exactly one" counts (N4) ----------------------------------------
 
 
-def _distribution(root: Path, dist: str, *, entry: str, module: str) -> None:
-    """A minimal installed distribution: `.dist-info` metadata plus one module, on a path of its own."""
-    info = root / f"{dist.replace('-', '_')}-1.0.dist-info"
+def _distribution(
+    root: Path,
+    dist: str,
+    *,
+    entry: str,
+    module: str,
+    target: str | None = None,
+    folder: str | None = None,
+    version: str = "1.0",
+) -> None:
+    """A minimal installed distribution on a path of its own: `.dist-info` metadata, a `RECORD`, and one
+    module. `target` overrides the entry point's value; `folder` the install folder's name part."""
+    info = root / f"{folder or dist.replace('-', '_')}-{version}.dist-info"
     info.mkdir(parents=True)
-    (info / "METADATA").write_text(f"Metadata-Version: 2.1\nName: {dist}\nVersion: 1.0\n", encoding="utf-8")
-    (info / "entry_points.txt").write_text(f"[{ENTRY_POINT_GROUP}]\n{entry} = {module}:step\n", encoding="utf-8")
+    (info / "METADATA").write_text(f"Metadata-Version: 2.1\nName: {dist}\nVersion: {version}\n", encoding="utf-8")
+    (info / "entry_points.txt").write_text(
+        f"[{ENTRY_POINT_GROUP}]\n{entry} = {target or f'{module}:step'}\n", encoding="utf-8"
+    )
     (root / f"{module}.py").write_text(
         "from tributary.sdk import Message, step\n\n\n@step\ndef step(message: Message) -> Message:\n"
         "    return message\n",
         encoding="utf-8",
     )
+    record = [f"{module}.py,,", f"{info.name}/METADATA,,", f"{info.name}/entry_points.txt,,", f"{info.name}/RECORD,,"]
+    (info / "RECORD").write_text("\n".join(record) + "\n", encoding="utf-8")
 
 
 @pytest.fixture
@@ -464,3 +493,145 @@ def test_the_worker_refuses_a_look_alike_at_startup_and_keeps_the_previous_versi
     )
     with pytest.raises(ChannelSpecError, match="more than one entry point"):
         fresh.prepare(specs[-1])
+
+
+# -- provenance: name, install folder, target module (security review of a1219af, Lows 1-3) -------------
+
+
+KELVIN = "\N{KELVIN SIGN}"  # KELVIN SIGN: `str.lower()` turns it into ASCII "k"
+
+
+def test_a_non_ascii_look_alike_name_never_normalises_onto_a_binding() -> None:
+    """Low 1: a name spelled with U+212A KELVIN SIGN used to normalise to `acme-kit` through `str.lower()`."""
+    assert f"acme-{KELVIN}it".lower() == "acme-kit", "the Unicode fold this guards against"
+    assert normalise_distribution(f"ACME-{KELVIN}IT") != "acme-kit"
+    assert canonical_distribution(f"acme-{KELVIN}it") is None
+    assert canonical_distribution("Acme_Kit") == "acme-kit"
+    squat = lookalike("acme.kit.run", dist=f"acme-{KELVIN}it")
+    with pytest.raises(ChannelSpecError, match="outside PEP 508 ASCII"):
+        resolver(squat).load(uses("acme.kit.run"), namespaces={"acme.kit": "acme-kit"})
+    assert squat.loads == 0
+
+
+def test_metadata_claiming_another_name_than_its_install_folder_is_refused() -> None:
+    """Low 1: `METADATA` says `Name: tributary-runtime` from a folder named `evil_steps-1.0.dist-info`,
+    and registers an engine step name the real runtime does not have."""
+    stream = io.StringIO()
+    impostor = FakePoint(
+        "tributary.core.only_here", FakeDist("tributary-runtime", folder="evil_steps"), target=never_imported
+    )
+    with pytest.raises(ChannelSpecError, match="Name does not match its install folder"):
+        resolver(impostor, stream=stream).load(uses("tributary.core.only_here"))
+    assert impostor.loads == 0
+
+
+def test_a_real_impostor_install_folder_is_refused(
+    site: Callable[[str], Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _distribution(
+        site("impostor"),
+        "tributary-runtime",
+        entry="tributary.core.only_here",
+        module="synth_impostor",
+        folder="evil_steps",
+    )
+    monkeypatch.delitem(sys.modules, "synth_impostor", raising=False)
+    importlib.invalidate_caches()
+    with pytest.raises(ChannelSpecError, match="Name does not match its install folder"):
+        StepResolver().load(uses("tributary.core.only_here"))
+    assert "synth_impostor" not in sys.modules
+
+
+def test_a_same_named_install_earlier_on_sys_path_is_reported_as_a_duplicate(
+    site: Callable[[str], Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Low 2: `entry_points()` keeps the first distribution per name, so this install hides the real
+    `tributary-runtime` without a trace. The scan reads every distribution and logs each hidden engine
+    entry point as a `duplicate` warning. Whether to refuse is a contract question (README 3.3.5 N4
+    counts after de-duplication, and its threat table lists same-name replacement as undetected)."""
+    _distribution(
+        site("shadow"), "tributary-runtime", entry="tributary.core.shadow_only", module="synth_shadow", version="9.9"
+    )
+    monkeypatch.delitem(sys.modules, "synth_shadow", raising=False)
+    importlib.invalidate_caches()
+    stream = io.StringIO()
+    StepResolver(log=JsonLogger("worker", stream=stream)).bind(channel())
+    hidden = {line["step"] for line in lines(stream) if line.get("reason") == "duplicate"}
+    real = {point.name for point in entry_points(group=ENTRY_POINT_GROUP) if point.name.startswith("tributary.core.")}
+    assert "tributary.core.passthrough" in hidden, "the real runtime's steps are the hidden ones"
+    assert real == {"tributary.core.shadow_only"}, "what importlib.metadata alone shows: only the impostor"
+    assert "synth_shadow" not in sys.modules
+
+
+@pytest.mark.parametrize("target", ["subprocess:getoutput", "os:system", "synth_elsewhere:step", "a..b:c"])
+def test_a_target_outside_the_bound_distribution_is_refused_before_import(target: str) -> None:
+    """Low 3: the bound distribution's own `entry_points.txt` could name any importable callable."""
+    stray = FakePoint(
+        "acme.lab.run", FakeDist("acme-lab-steps", files=("acme_lab/steps.py",)), target=never_imported, value=target
+    )
+    with pytest.raises(ChannelSpecError, match="targets a module its distribution does not ship"):
+        resolver(stray).load(uses("acme.lab.run"), namespaces={"acme.lab": "acme-lab-steps"})
+    assert stray.loads == 0
+
+
+def test_a_real_stdlib_target_is_refused(site: Callable[[str], Path]) -> None:
+    _distribution(
+        site("stray"), "acme-synth-steps", entry="acme.synth.run", module="synth_own", target="subprocess:getoutput"
+    )
+    importlib.invalidate_caches()
+    with pytest.raises(ChannelSpecError, match="targets a module its distribution does not ship"):
+        StepResolver().load(uses("acme.synth.run"), namespaces={"acme.synth": "acme-synth-steps"})
+
+
+def test_an_editable_install_ships_what_its_pth_directory_holds(tmp_path: Path) -> None:
+    """The uv workspace installs editable: `RECORD` lists a `.pth`, and the module lives in `src/`."""
+    site_dir, src = tmp_path / "site-packages", tmp_path / "src"
+    (src / "acme" / "lab").mkdir(parents=True)
+    (src / "acme" / "lab" / "steps.py").write_text("", encoding="utf-8")
+    info = site_dir / "acme_lab_steps-1.0.dist-info"
+    info.mkdir(parents=True)
+    (site_dir / "_editable_acme_lab_steps.pth").write_text(f"import os\n{src}\n", encoding="utf-8")
+    (info / "METADATA").write_text("Metadata-Version: 2.1\nName: acme-lab-steps\nVersion: 1.0\n", encoding="utf-8")
+    (info / "RECORD").write_text(
+        "_editable_acme_lab_steps.pth,,\nacme_lab_steps-1.0.dist-info/METADATA,,\n", encoding="utf-8"
+    )
+    dist = importlib.metadata.PathDistribution(info)
+    assert ships_module(dist, "acme.lab.steps")
+    assert not ships_module(dist, "acme.lab.other")
+    assert not ships_module(dist, "os")
+    assert provenance_problem(dist, "acme.lab.steps:normalise", "acme-lab-steps") is None
+
+
+def test_every_installed_engine_and_context_entry_point_passes_provenance() -> None:
+    """Real metadata: every engine step and every registered capability in this image passes all three
+    checks, so the rule refuses nothing the repo ships (editable installs included)."""
+    from tributary.runtime.capabilities import CAPABILITIES
+    from tributary.runtime.capabilities import ENTRY_POINT_GROUP as CONTEXT_GROUP
+
+    checked = 0
+    for point in entry_points(group=ENTRY_POINT_GROUP):
+        namespace = namespace_of(point.name)
+        if namespace in STEP_NAMESPACES:
+            assert provenance_problem(point.dist, point.value, STEP_NAMESPACES[namespace]) is None, point.name
+            checked += 1
+    for point in entry_points(group=CONTEXT_GROUP):
+        if point.name in CAPABILITIES:
+            assert provenance_problem(point.dist, point.value, CAPABILITIES[point.name]) is None, point.name
+            checked += 1
+    assert checked >= 9, "eight engine steps and the fhir capability"
+
+
+def test_every_test_file_a_runtime_docstring_names_exists() -> None:
+    """Low 4: `step_namespaces.py` named `tests/test_step_namespaces_registry.py`, which never existed."""
+    source = ROOT / "packages" / "tributary-runtime" / "src"
+    named = {
+        (path.name, ref)
+        for path in source.rglob("*.py")
+        for ref in re.findall(r"`(tests/[A-Za-z0-9_/]+\.py)", path.read_text(encoding="utf-8"))
+    }
+    assert named, "no references found: the check would pass vacuously"
+    package_tests = ROOT / "packages" / "tributary-runtime"
+    missing = sorted(
+        (name, ref) for name, ref in named if not (package_tests / ref).is_file() and not (ROOT / ref).is_file()
+    )
+    assert not missing, missing
