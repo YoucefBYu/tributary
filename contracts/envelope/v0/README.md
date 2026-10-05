@@ -246,7 +246,7 @@ an ordinary `dlq` record — which is exactly what normalising is for. It is a c
 test per placeholder, in the same category as the rules in 5.2.1 and in the channel-spec contract's
 section 6.
 
-### 2.3.2 Engine error-code registry (set 1.1, 2026-09-25; `REPLY_` added in set 1.2; loader fixed names in set 1.3)
+### 2.3.2 Engine error-code registry (set 1.1, 2026-09-25; `REPLY_` added in set 1.2; loader fixed names in set 1.3; two `REPLY_BODY_` codes in set 1.7)
 
 **Machine-readable:** [`error-codes.json`](error-codes.json). This section is its rationale; the file
 is the list.
@@ -332,6 +332,15 @@ engine code for an engine-initiated skip. `Drop` reasons stay in `error_message`
 events schema already allows this, so there is no schema change. **What we give up:** the "`dropped`
 never has a code" symmetry, and `ENGINE_CODES` must gain the code in the same commit, or the
 registry cross-check goes red.
+
+**Set 1.7 (2026-10-05): `REPLY_BODY_INVALID` and `REPLY_BODY_OVER_BUDGET`.** Receiver codes, like the
+set 1.2 four: they reach the sender in `MSA-3` and the receiver's metrics, never a header or an event.
+Both answer `AE`, because the message was committed and routed and only the `body: step` answer could
+not be written: a framing byte in the body, or no room in `queue.maxBytes` to hold it (channel-spec
+README 3.2.6). The first build reused `REPLY_BUSY` and `REPLY_BODY_MISSING`. That is **rejected**:
+`REPLY_BUSY` is an `AR` code (not published), so reusing it under `AE` gives one code two opposite
+resend meanings; `REPLY_BODY_MISSING` is the worker's code for a step that never called `ctx.reply`.
+`ENGINE_CODES` gains both in the same commit, or the cross-check goes red.
 
 ### 2.3.3 Reply-routing headers: a parse failure disables the reply, not the message (set 1.2)
 

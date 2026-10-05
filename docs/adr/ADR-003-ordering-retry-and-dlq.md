@@ -280,6 +280,22 @@ reasons remain a channel concept. **Chosen: (b).** (a) leaves operators grepping
 turns a post-outage backlog into an error-rate alert. **Give up:** `dropped` is no longer always
 code-free. The rule is that it may carry only a registered engine skip code. Envelope README 2.3.2.
 
+**Receiver rules from the built MLLP receiver (ruled 2026-10-05, set 1.7).** Evidence: commits
+`8bfe205`, `33b2207`, `f420634`, `4134ab3`, `c051002` (`connector-engineer`), read, not run.
+(1) **A `body: step` body the receiver cannot write** (an MLLP framing byte, or no room in
+`queue.maxBytes`) makes the reply `failed` and answers `AE`, as built. **Options:** reuse `REPLY_BUSY`
+/ `REPLY_BODY_MISSING` (as built); new codes; answer the built `AA` and drop the body. **Chosen: new
+codes `REPLY_BODY_INVALID` and `REPLY_BODY_OVER_BUDGET`.** Reusing `REPLY_BUSY` gives an `AR` code an
+`AE` meaning, so "resend is safe" and "resend duplicates" share a key. A built `AA` would hide that a
+query sender never got its response. Waiting for budget would hold the body outside the budget.
+**Give up:** two more codes in the registry and the SDK. (2) **Per-connection fairness** at
+`max(1, maxPending // 4)` is **ratified as a bound inside the per-process cap, not a spec field.**
+**Give up:** a single-connection channel uses a quarter of `maxPending`; original-mode MLLP senders
+(depth 1) are unaffected. A field stays possible later, additively. (3) **`--instance` is required
+with `source.reply`**, unique per replica, templated by Helm from the pod name; `group.instance.id` is
+`<instance>-p<pid>`. Rejected: keeping a default, which fenced replicas. **Give up:** one more required
+deployment parameter. Contract: channel-spec README 3.2.6, `topics/v0` 3.3.1.
+
 **Retry groups (ruled 2026-09-29, set 1.4; applies to D2 when `retry-topic` lifts).** The shared
 per-channel `retry` topic is consumed by each destination in its own group
 `tb.<env>.<ch>.loader.<dest>`, filtering on `tb-destination`. A shared group would let one

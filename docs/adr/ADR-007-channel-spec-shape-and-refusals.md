@@ -192,6 +192,26 @@ is in one of the three.
 until ADR-005, because none is needed yet. Steps must have one now: `ref` is unimplemented (README
 3.3.1), so `uses` is the only way a customer's code runs at all.
 
+## 5e. Amendment 5 — contract set 1.7, shadowed installations under N4 (2026-10-05)
+
+**Decided by the architect. No invariant changes. Documentation and log lines only; no document
+changes validity.** Contract text: channel-spec README 3.3.5 N4 and threat table,
+`context-extension/v0` L5, `contracts/CHANGELOG.md` 2026-10-05.
+
+**Context (evidence).** `a120747` (`platform-engineer`, after the security review of `a1219af`, Low 2):
+`importlib.metadata.entry_points()` keeps only the first distribution per name on `sys.path`. A
+same-named installation earlier on the path therefore passes the PEP 503, install-folder and `RECORD`
+target checks, and its step loads. The runtime now scans every distribution and logs each hidden
+installation as `step_entry_point_skipped`, `duplicate`. Question: refuse instead? Read from
+`steps.py` and `provenance.py`; not run.
+
+| # | Decision | Options considered | What it gives up |
+|---|---|---|---|
+| D24 | **N4 resolves against the installation `importlib.metadata` shows (the first on `sys.path`, which is also what `import` loads). A hidden same-named installation is logged `duplicate` and neither loaded nor refused. Duplicate distribution names are refused at image build, not at run time. Same rule for context extensions (L5)** | (a) as built: resolve, log, no refusal (chosen); (b) refuse the spec whenever two installations share a distribution name; (c) refuse only when the shadowed name is a bound or reserved distribution | (b) and (c) do not stop the threat they target. An actor who can write to an earlier `sys.path` entry can shadow the target module with no `.dist-info` at all, or drop a `.pth` file that runs at interpreter start; neither leaves a second distribution to count. They do cost availability: a stale `.dist-info` left by an interrupted upgrade, or an editable install beside a wheel in a dev workspace, becomes a refused channel. **Cost of (a):** an accidental double install runs whichever copy is first on the path, visible only as a warning until the image-build check exists (follow-up 18, now required to cover duplicate distribution names); the threat remains "write access to the image's import path", controlled by the digest-pinned image (and a read-only root filesystem, recommended for Helm, not yet required anywhere), not by the resolver |
+
+`extensions.py` uses `entry_points()` (read, not run), so a shadowed context extension is invisible
+today: follow-up 19.
+
 ## 6. Follow-ups
 
 1. ~~**Measure the expected-failure pairs.**~~ **DONE 2026-09-22.** `contracts/validate.py` 96 / 0
@@ -233,4 +253,9 @@ until ADR-005, because none is needed yet. Steps must have one now: `ref` is uni
     `minProperties` is the less certain.
 18. **Image-build check** (optional, `devops-engineer`): fail the build if an installed
     `tributary.steps` entry point in a `tributary.*` namespace is not from its registered distribution.
-    Can share the follow-up 15 script.
+    Can share the follow-up 15 script. **Set 1.7 (D24): no longer optional, and it also fails the
+    build if any two installed distributions share a PEP 503 name**, because the runtime deliberately
+    does not refuse that.
+19. **Shadow-aware discovery for context extensions** (`platform-engineer`, D24): `extensions.py`
+    scans every distribution as `steps.py` does and logs hidden installations
+    `context_extension_skipped`, `duplicate`. Loading is unchanged.

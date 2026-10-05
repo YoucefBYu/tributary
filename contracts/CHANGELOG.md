@@ -3,7 +3,72 @@
 Newest first. Each entry names the contract, the version, whether the change is additive or
 breaking, and the reason. Breaking changes reference an ADR.
 
-## 2026-09-30 (latest) — contract set 1.6: each `uses` step loads from one pinned distribution
+## 2026-10-05 (latest) — contract set 1.7: receiver-side sync-reply rules, two codes, N4 shadowing
+
+**Additive. No schema, example or manifest change, so no document changes validity and no
+expected-failure pair moves. No invariant changes.** A minor set rather than a 1.6.1 patch because
+`envelope/v0` `error-codes.json` gains two codes, which is how set 1.4 treated `REPLY_EXPIRED`.
+Sources: the lead's batch on the MLLP sync-reply receiver (`8bfe205`, `33b2207`, `f420634`,
+`4134ab3`, `c051002`) and `platform-engineer`'s `a120747`. Checked by reading the code, not by a run.
+Decisions and what they give up: **ADR-007 D24**, **ADR-003 D10 amendment (set 1.7)**.
+
+| # | Question | Ruling and why |
+|---|---|---|
+| 1 | N4: refuse when two installations share a distribution name? | **No. Resolve against the installation `importlib.metadata` shows (first on `sys.path`, also what `import` loads), log each hidden one `duplicate`, refuse duplicates at image build.** A refusal does not stop the threat: write access to an earlier `sys.path` entry can shadow the module with no metadata, or drop a `.pth`. It does turn a stale `.dist-info` or an editable-plus-wheel dev install into a refused channel. Same rule for context extensions (L5 gains `duplicate`). ADR-007 D24, follow-ups 18 (now required, covers duplicate names) and 19 |
+| 2 | `body: step` body with a framing byte, or over the `queue.maxBytes` budget | **Outcome ratified (`failed` reply, `AE`; the message was committed and routed). Codes not ratified:** `REPLY_BUSY` is an `AR` code and `REPLY_BODY_MISSING` is the worker's no-`ctx.reply` code. **New: `REPLY_BODY_INVALID`** (`0x0B`/`0x1C` in the body, MLLP) **and `REPLY_BODY_OVER_BUDGET`** (body cannot be charged when it arrives; the receiver does not wait). Sender-facing and metrics only, like `REPLY_TIMEOUT` |
+| 3 | Per-connection `maxPending` fairness | **Ratified as built, documented as normative:** `max(1, maxPending // 4)` per connection, over it `AR` / `REPLY_BUSY`, nothing published; the two refusals counted separately. Not a spec field. Give up: a single-connection channel uses a quarter of the pool |
+| 4 | `group.instance.id` for the replier | **Deployment rule recorded:** `<instance>-p<pid>`; `--instance` required with `source.reply`; unique per replica; Helm templates it from the pod name; a fenced process is not ready and exits non-zero (`c051002`) |
+| 5 | Typed `reply_consumer` defaults | **Already typed in `topics/v0` since set 1.2** (15000 / 5000 / `latest` / `read_uncommitted`). The defect is the receiver borrowing `worker_consumer` and writing literals. Ruled: read `clients.reply_consumer`; `isolation.level` added to `must_not_hardcode`; new `group.instance.id_format` and `read_from_here` notes |
+| 6 | README 3.0 | `mllp` sync reply **Built** (`body: ack` and `body: step`); `http` sync reply **not built**, refused at startup |
+
+### `tributary.channel-spec/v0`
+
+README only: status line; 3.0 `mllp` and `http` rows; 3.2.6 `maxPending` row, two answer-table rows,
+the fairness wording on the `AR` row, **new "Receiver rules added in set 1.7"**; 3.3.5 N4 shadowing
+paragraph and one threat-table row.
+
+### `tributary.envelope/v0`
+
+`error-codes.json` set 1.7: `REPLY_BODY_INVALID`, `REPLY_BODY_OVER_BUDGET`. README 2.3.2 heading and a
+set 1.7 paragraph.
+
+### `tributary.topics/v0`
+
+`topic-defaults.json`: `must_not_hardcode` gains `clients.reply_consumer.isolation.level`;
+`clients.reply_consumer` gains `group.instance.id_format` and `read_from_here` (descriptive strings; no
+value changed). README: status line, 3.3.1.
+
+### `tributary.context-extension/v0`
+
+README: status line, L5 `duplicate` reason for a shadowed installation.
+
+### Change requests that follow
+
+- **`platform-engineer`, with this contract commit or immediately after:** `REPLY_BODY_INVALID` and
+  `REPLY_BODY_OVER_BUDGET` in `ENGINE_CODES`, or the `tributary-sdk` registry cross-check goes red.
+  Also: `TopicDefaults` parses `clients.reply_consumer` as its own typed profile, and `consumer_config`
+  accepts it; shadow-aware discovery and the `duplicate` line in `extensions.py` (ADR-007 follow-up 19).
+- **`connector-engineer`:** `pending.py` emits the two new codes in place of `REPLY_BODY_MISSING` and
+  `REPLY_BUSY` on the body paths, with tests; `feed.py` reads `clients.reply_consumer` (no literals) with
+  the 3.7 effective-configuration test; a separate metric for the per-connection refusal; confirm the
+  `http` receiver refuses `source.reply` at startup (grep finds no `reply` in `receivers/http`).
+- **`devops-engineer`:** Helm sets a unique `--instance` per receiver pod from the pod name; Compose
+  per service; the image-build check (ADR-007 follow-up 18) is now required and also refuses duplicate
+  distribution names.
+- **`qa-engineer`:** the counts below.
+
+### Verification owed
+
+Not run by the architect, who has no shell.
+
+- `validate.py`: expected **156 / 0, unchanged from set 1.6** (itself predicted, unverified). If set 1.6
+  measured N, expect N. `validate.py` reads none of the edited JSON files' changed keys
+  (`error-codes.json` and `topic-defaults.json` are outside it; `step-namespaces.json` is unchanged).
+- `--emit-expectations`: not needed; no invalid example or schema changed.
+- `pytest tests/conformance`: unchanged from the set 1.6 measurement.
+- `uv run pytest packages/tributary-sdk`: **red** until `ENGINE_CODES` gains the two codes.
+
+## 2026-09-30 — contract set 1.6: each `uses` step loads from one pinned distribution
 
 **Additive for every document.** Every channel spec valid under set 1.5 stays valid:
 `pipeline.stepNamespaces` is optional, and the `uses` pattern is unchanged. **No invariant changes.**

@@ -11,6 +11,10 @@ optional `pipeline.context` (3.3.4), which declares the context extensions a cha
 additive.** **Set 1.6 (2026-09-30) pins each `uses` step to one distribution: a registry for the
 engine's `tributary.*` namespaces ([`step-namespaces.json`](step-namespaces.json)) and the optional
 `pipeline.stepNamespaces` for every other namespace (3.3.5), also additive for documents.**
+**Set 1.7 (2026-10-05) writes down receiver-side sync-reply rules found while building the MLLP
+receiver (3.2.6: step-body edge cases with two new codes, the per-connection fairness bound, the unique
+`--instance` rule) and states how N4 treats a shadowed installation (3.3.5). No schema or example
+change.**
 Breaking changes create `../v1/`.
 **Owner:** `architect`. Propose changes by message with the exact diff and impact.
 **Source:** ADR-001 sections 6.1 and 6.4, ADR-003 D1/D3/D4/D6, ADR-007 (D1-D9, and D10-D17 for set
@@ -131,8 +135,8 @@ when a connector lands with its tests.
 
 | Kind | Type | Task | Status |
 |---|---|---|---|
-| source | `mllp` | W1-5 | **Implemented** |
-| source | `http` (HTTP and FHIR ingest) | W2-7 | Contracted, not built |
+| source | `mllp` | W1-5 | **Implemented.** **Sync reply (`source.reply`, 3.2.6): Built** (set 1.7, 2026-10-05), `body: ack` and `body: step`. Receiver side `8bfe205`, `33b2207`, `f420634`, `4134ab3`, plus `c051002` (step-body charge released after a cancelled wait; real-Kafka test that a fenced replier exits 1); worker side earlier (reply producer, `ReplyContext`, `REPLY_` codes). Not yet "Implemented": the round-trip latency risk is open (STATUS), receivers have no readiness probe, and the reply consumer still borrows the worker's settings (`topics/v0` 3.3.1) |
+| source | `http` (HTTP and FHIR ingest) | W2-7 | Contracted, not built. **Sync reply: not built**; a spec with `source.reply` must be refused at receiver startup (3.2.6) |
 | source | `sftp` (poller) | W2-7 | Contracted, not built. `paramiko`, human-approved (section 10.2) |
 | source | `kafka` | W2-7 | Contracted, not built |
 | destination | `http` | W1-6 | **Implemented** |
@@ -302,7 +306,7 @@ with the amendments marked below. Decisions and what they give up: ADR-003 D9 (a
 | `timeoutMs` | 10000 | 1000-60000 | Wait for the reply, counted from the receiver's successful `raw` delivery callback. Expiry answers `AE` / `REPLY_TIMEOUT` |
 | `after` | `routed` | `routed` only | Every `out.<dest>` record acknowledged by Kafka, or deliberately dropped. `delivered` is reserved: it needs loader WRITE on `reply` and a rule for which destination answers |
 | `body` | `ack` | `ack`, `step` | `ack`: the receiver builds the answer from the reply status. `step`: a pipeline step supplies the response payload through `ctx.reply`. `step` may ship after `ack`; until then it is refused at startup |
-| `maxPending` | 10000 | 1-50000 | In-flight requests per receiver process (S3: about 4.6 KB each). Over it: `AR` / `REPLY_BUSY`, nothing published |
+| `maxPending` | 10000 | 1-50000 | In-flight requests per receiver process (S3: about 4.6 KB each). Over it: `AR` / `REPLY_BUSY`, nothing published. **Set 1.7:** one connection may hold at most `max(1, maxPending // 4)` of them (receiver rules, fairness bound) |
 | `partitions` | 3 | 1-64 | Partition count of `<env>.<ch>.reply`, and the only thing that sizes it (`spec.partitions` does not apply). **At least the number of receiver processes** |
 
 The block's presence switches sync mode on; `reply: {}` means every default. `ack.mode` stays
@@ -337,11 +341,13 @@ never payload or exception text.
 | Reply `accepted` (routed; includes a whole-message `Drop`) | yes | `AA`, or the step body |
 | Reply `rejected` (a `Reject` code) | yes | `AE` + code |
 | Reply `failed` (e.g. `TRANSFORM_ERROR`, `REPLY_BODY_MISSING`) | yes | `AE` + code |
+| Reply `accepted` under `body: step`, but the body contains `0x0B` or `0x1C` (set 1.7) | yes | `AE` `REPLY_BODY_INVALID`. The body is never written |
+| Reply `accepted` under `body: step`, but `queue.maxBytes` cannot hold the body (set 1.7) | yes | `AE` `REPLY_BODY_OVER_BUDGET` |
 | Reply with `tb-reply-status` absent or unrecognised (fail-safe, amendment) | yes | `AE`, with the reply's `tb-error-code` if it has one. Never `AA` |
 | No reply by the deadline | yes | `AE` `REPLY_TIMEOUT` |
 | Reply partition revoked with the request in flight | yes | `AE` `REPLY_ROUTE_LOST`, at once — **but only after the `raw` callback has succeeded** (amendment) |
 | Kafka down, publish failed or timed out (existing path) | not confirmed | `AR` |
-| Pending map full / process holds no reply partition | no, not published | `AR` `REPLY_BUSY` / `REPLY_UNAVAILABLE` |
+| Pending map full, or this connection at its fairness bound / process holds no reply partition | no, not published | `AR` `REPLY_BUSY` / `REPLY_UNAVAILABLE` |
 
 Rules behind the table:
 
@@ -424,6 +430,44 @@ and here that resend is a duplicate.
   on `body: step`:** a resolved step body waiting behind a slower request on the same connection holds
   up to 1 MB, so its implementation must charge those bodies to `queue.maxBytes`, with a test. Without
   that, `maxPending` × 1 MB is the bound.
+
+**Receiver rules added in set 1.7** (ruled 2026-10-05 on the built MLLP receiver; ADR-003 D10
+amendment):
+
+- **A step body the receiver cannot write is a failed reply, answered `AE` with its own code.** The
+  message was committed and routed, so `AR` would be false and `AA` would hide that the sender did not
+  get the application answer it waits for (a query response, for example). The reply is replaced, in
+  the receiver, by a `failed` one before it reaches the answer rules, so every rule above still holds:
+  - the body contains an MLLP framing byte (`0x0B` start or `0x1C` end): **`REPLY_BODY_INVALID`**.
+    Writing it would desynchronise the sender's framing for every later answer on the connection. MLLP
+    only; the check is the receiver's, because only the receiver knows the framing;
+  - `ByteBudget` cannot charge the body to `queue.maxBytes` now: **`REPLY_BODY_OVER_BUDGET`**. The
+    receiver does not wait for room: the body is already in memory, and waiting would hold it outside
+    the budget, which is the unbounded case the `body: step` condition above exists to prevent.
+  **Rejected:** reusing `REPLY_BUSY` and `REPLY_BODY_MISSING`, as first built. `REPLY_BUSY` means
+  "not published, resend is safe" (`AR`); under `AE` the same code would tell an integrator or an alert
+  rule the opposite. `REPLY_BODY_MISSING` is the worker's "no step called `ctx.reply`", a channel-logic
+  fault; a framing byte is a content fault in a step that did answer. One code, one meaning. Both new
+  codes are sender-facing (`MSA-3`) and metrics only, never a header or an event, like `REPLY_TIMEOUT`.
+  The worker's `replied` event still says `accepted`: what the worker produced, not what the sender got
+  (see "What the browser shows").
+- **Per-connection fairness bound.** One connection may hold at most `max(1, maxPending // 4)` pending
+  entries. Over it, the request is answered `AR` / `REPLY_BUSY` before anything is published, exactly
+  as at `maxPending`. It is a bound **inside** the per-process cap, not a new setting: it stops one
+  pipelining peer from taking the whole pool and pushing every other connection into `REPLY_BUSY`. The
+  receiver counts the two refusals separately in its metrics, so an operator can tell a full pool from
+  one greedy peer. **Give up:** a channel with a single sending connection can use only a quarter of
+  `maxPending`. Size `maxPending` at four times the deepest pipelining one sender uses. An original-mode
+  MLLP sender waits for each answer, so its depth is 1 and the bound does not bind. **Not a spec
+  field** yet: no sender has needed another ratio, and adding an optional field later is additive.
+- **One `group.instance.id` per process, from an explicit `--instance`.** The reply consumer's
+  `group.instance.id` is `<instance>-p<pid>`. With `source.reply` present the receiver **refuses to
+  start without an explicit `--instance`**: a built-in default is identical in every replica (and the
+  pid is 1 in every container), so replicas fence one another. **Deployment rule:** every receiver
+  replica of a channel in one environment gets a unique `--instance`. Helm templates it from the pod
+  name (downward API `metadata.name`, or a StatefulSet ordinal); Compose sets it per service. A process
+  that is fenced anyway (librdkafka `_FATAL`) is not ready and exits non-zero, so a supervisor restarts
+  it (`c051002` tests the exit on a real broker). `topics/v0` 3.3.1.
 
 **`ctx.reply` (SDK, approved with amendments).** `ctx.reply(body: bytes, *, content_type: str) -> None`.
 
@@ -870,6 +914,17 @@ Normative for `tributary-runtime`. Rules N1-N6.
    own de-duplication by normalised distribution name (CPython 3.12 `entry_points()`; **unverified
    by the architect**, and `platform-engineer` pins it with a test), so one distribution visible twice
    on `sys.path` is not a duplicate. Two different distributions carrying the name always are.
+   **Shadowed installations (set 1.7, ADR-007 D24).** When two installations share a distribution
+   name, `importlib.metadata` keeps the one earlier on `sys.path`. N4 resolves against that one, which
+   is also the one `import` would load, and it must still pass every check above (name, install
+   folder, `RECORD` target). Each hidden installation is **not loaded and not refused**: it is logged
+   as `step_entry_point_skipped`, `reason: duplicate` (N5) whenever a spec names one of its entry
+   points or it is in a reserved `tributary.*` namespace. **Rejected:** refusing the spec whenever two
+   installations share a name. It does not stop the threat, because whoever can write to an earlier
+   `sys.path` entry can shadow the target module with no metadata at all, or drop a `.pth` file, and
+   neither leaves a second distribution to count. It would turn a stale `.dist-info` or a dev
+   workspace's editable-plus-wheel install into a refused channel. A duplicate distribution name is
+   refused where it is cheap to fix: the image build (ADR-007 follow-up 18).
 5. **N5. Log lines** (structured, no payload, no header values, invariant 6). Names are package
    metadata:
    - `step_entry_point_loaded` (info): `step` (the `uses` name), `distribution`, `version` (from the
@@ -901,6 +956,7 @@ third-party connectors and steps as Python packages via entry points") and 6.2 r
 | A spec binds `tributary.core` to another distribution | Refused by the schema (N2) |
 | A look-alike registers `acme.lab.normalise_units` beside `acme-lab-steps` | Duplicate, refused (N4) |
 | A package that **replaces** a bound distribution under the same name | **Not detected at runtime.** The controls are the locked, hash-pinned dependency set, the digest-pinned image, `licence_check.py` and the SBOM, as for context extensions |
+| A second installation with the bound distribution's name, **earlier on `sys.path`** (set 1.7) | **Loaded if it passes N4's checks, not refused**; the hidden installation is logged `duplicate` (warning). It needs write access to the image's import path, which also allows shadowing modules with no metadata at all, so a runtime refusal would add no protection. Control: the image-build check refuses any duplicate distribution name (ADR-007 follow-up 18) |
 | A spec author binds a namespace to a distribution that is in the image for another reason | Loads only entry points that distribution itself registers under that exact name. The spec is trusted input (`_tb.<env>.channels` is written only by the control plane, `topics/v0` 3.4) |
 
 **Give up.** Every `uses` name now carries a three-segment shape, and a channel using a customer step

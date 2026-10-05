@@ -3,7 +3,9 @@
 **Contract id:** `tributary.topics/v0`
 **Status:** Draft. Partition defaults and `session.timeout.ms` are **measured** (S4, S5, 2026-09-20) and are lower bounds from a laptop-hosted cluster; `_tb.<env>.events` partitions and audit retention are still open. **Set 1.4 (2026-09-29):** ACL role table
 reconciled with the code (3.4.1), `super.users` restated, spec-reader group named (3.6). **Set 1.4.1
-(patch):** 3.4 `super.users` row: a user-provisioning identity is no longer a super user.
+(patch):** 3.4 `super.users` row: a user-provisioning identity is no longer a super user. **Set 1.7
+(2026-10-05):** 3.3.1: the reply consumer reads its own `clients.reply_consumer` values, and the unique
+`--instance` deployment rule; `isolation.level` joins `must_not_hardcode`.
 **Owner:** `architect`.
 **Source:** ADR-001 sections 5.3 and 6.4, refined by ADR-002.
 **Schema:** [`topic-name.schema.json`](topic-name.schema.json) · **Defaults:** [`topic-defaults.json`](topic-defaults.json) · **Examples:** [`examples/topic-names.json`](examples/topic-names.json)
@@ -255,8 +257,22 @@ on a reply partition**, so no coordinator is involved and invariant 3 holds.
 | `auto.offset.reset` | `latest` | Same reason |
 | `isolation.level` | `read_uncommitted` | The reply producer is not transactional (sync reply is refused on transactional channels) |
 | `partition.assignment.strategy` | `cooperative-sticky` | A joining process takes partitions without revoking everyone's |
-| `group.instance.id` | unique **per process** | A duplicate id fences a live process out of the group |
+| `group.instance.id` | unique **per process**: `<instance>-p<pid>` | A duplicate id fences a live process out of the group. **Set 1.7:** `--instance` is required with `source.reply` (below) |
 | `session.timeout.ms` / `heartbeat.interval.ms` | 15000 / 5000 | As 3.3. Bounds how long a killed process's partition stays unusable; stalls no other process |
+
+**Set 1.7: read these from `clients.reply_consumer`, not from `worker_consumer`.** The values are typed
+there since set 1.2 (`session.timeout.ms`, `heartbeat.interval.ms`, `auto.offset.reset`, and now
+`isolation.level` in `must_not_hardcode`). The first receiver build borrowed the worker's session and
+heartbeat values and wrote `latest` and `read_uncommitted` as literals. The numbers are equal today, so
+nothing is wrong at run time, but it is the 3.7 failure: a re-measurement of one profile would silently
+move, or fail to move, the other. The effective-configuration test (3.7) covers the replier.
+
+**Set 1.7: deployment rule for `--instance`.** With `source.reply` present, a receiver refuses to start
+without an explicit `--instance`. A built-in default is the same in every replica, and the pid is 1 in
+every container, so replicas fenced one another (found in the first multi-replica run). Every receiver
+replica of a channel in one environment gets a unique value: Helm templates it from the pod name
+(downward API `metadata.name`, or a StatefulSet ordinal), Compose sets it per service. A process that
+is fenced anyway (librdkafka `_FATAL`) reports not ready and exits non-zero for its supervisor.
 
 Two rules that are not client settings:
 

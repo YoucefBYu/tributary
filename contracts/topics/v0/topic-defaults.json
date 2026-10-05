@@ -21,6 +21,7 @@
       "clients.reply_consumer.session.timeout.ms",
       "clients.reply_consumer.heartbeat.interval.ms",
       "clients.reply_consumer.auto.offset.reset",
+      "clients.reply_consumer.isolation.level",
       "clients.receiver_producer.acks",
       "clients.receiver_producer.enable.idempotence",
       "clients.receiver_producer.delivery.timeout.ms",
@@ -242,9 +243,11 @@
       "isolation.level_source": "the reply producer is not transactional: sync reply is refused on transactional channels (channel-spec README 3.2.6)",
       "partition.assignment.strategy": "cooperative-sticky",
       "group.instance.id": "unique PER PROCESS (not per pod or receiver instance): a duplicate fences a live process out of the group",
+      "group.instance.id_format": "<instance>-p<pid>. Set 1.7: --instance is REQUIRED when source.reply is present (no default; the pid is 1 in every container, so a default collides across replicas). Deployment rule: unique per receiver replica of a channel per environment; Helm templates it from the pod name (downward API metadata.name or StatefulSet ordinal), Compose sets it per service. A fenced process (librdkafka _FATAL) is not ready and exits non-zero",
       "session.timeout.ms": 15000,
       "heartbeat.interval.ms": 5000,
       "session.timeout.ms_source": "same measured value as worker_consumer (S5, S4). Here it bounds how long a killed process's reply partition stays unusable; it stalls no other process",
+      "read_from_here": "Set 1.7. These are the reply consumer's own typed values (int ms; auto.offset.reset and isolation.level strings). The receiver reads them from clients.reply_consumer, NOT from clients.worker_consumer and not as literals: equal today, but a Linux re-measurement of the worker's session timeout must not move the replier's silently, nor the reverse (README 3.7)",
       "advertise_rule": "A process advertises partition p in tb-reply-partition only after it holds p AND its consumer has an established fetch position on p. With auto.offset.reset=latest and no committed offsets, a reply written between assignment and the offset reset would otherwise be skipped",
       "not_ready_rule": "A process holding no reply partition, or whose reply consumer is disconnected, answers sync requests AR / REPLY_UNAVAILABLE before publishing and fails its readiness probe"
     }

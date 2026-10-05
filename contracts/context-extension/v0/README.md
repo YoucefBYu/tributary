@@ -2,7 +2,8 @@
 
 **Contract id:** `tributary.context-extension/v0`
 **Status:** Draft, **new in contract set 1.5 (2026-09-29)**. Additive: no document valid under set 1.4
-becomes invalid. Breaking changes create `../v1/` and need an ADR.
+becomes invalid. Breaking changes create `../v1/` and need an ADR. **Set 1.7 (2026-10-05):** L5
+gains the `duplicate` reason for a shadowed installation (log line only; no loading change).
 **Owner:** `architect`. Propose changes by message with the exact diff and the reason.
 **Source:** ADR-007 D21-D22 (amendment 3); security review High on `fb60f3a` (any installed
 distribution registering `tributary.context` ran in every worker with the payload and `ctx.secrets`).
@@ -78,6 +79,10 @@ Normative for `tributary-runtime`. Rules L1-L7.
      registrant that is not loaded. `reason` is `not-declared` (info level), or `unregistered` or
      `distribution-mismatch` (warning level). The last two are the signal for a transitive or
      typosquatted package in the image, and they do not stop the worker, because nothing was imported.
+   - **Set 1.7:** a hidden installation (same distribution name, later on `sys.path`, so
+     `importlib.metadata` does not show it) is logged with `reason: duplicate` (warning) and is never
+     loaded or refused. Same rule and reasons as `uses` steps (channel-spec README 3.3.5 N4, ADR-007
+     D24). Discovery therefore reads every installed distribution, not only `entry_points()`.
 6. **L6. Hot reload.** A new channel version's `context` is resolved together with its steps, all or
    nothing. A capability dropped from `context` is no longer applied to new branches. Its module stays
    imported, because Python cannot unload one. That is acceptable because it was a declared, reviewed
