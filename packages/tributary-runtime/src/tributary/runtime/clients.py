@@ -17,10 +17,10 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from .config import TopicDefaults
-from .errors import KafkaSecurityError
+from .errors import ConfigError, KafkaSecurityError
 from .kafka_security import check_link, split_bootstrap
 from .spec import ChannelSpec
 
@@ -121,6 +121,10 @@ def _merge(settings: KafkaSettings, contract: Mapping[str, Any]) -> dict[str, An
     return {**dict(settings.security), **dict(contract)}
 
 
+#: A consumer profile in `contracts/topics/v0` `clients` that `consumer_config` can build.
+ConsumerProfile = Literal["worker_consumer", "reply_consumer"]
+
+
 def consumer_config(
     settings: KafkaSettings,
     defaults: TopicDefaults,
@@ -128,21 +132,49 @@ def consumer_config(
     group_id: str,
     group_instance_id: str | None = None,
     max_poll_interval: int = MIN_MAX_POLL_INTERVAL_MS,
-    auto_offset_reset: str = "earliest",
+    auto_offset_reset: str | None = None,
     enable_partition_eof: bool = False,
+    profile: ConsumerProfile = "worker_consumer",
 ) -> dict[str, Any]:
-    """A worker or loader consumer. Manual commit, cooperative-sticky, static membership."""
-    contract: dict[str, Any] = {
-        "bootstrap.servers": settings.bootstrap_servers,
-        "group.id": group_id,
-        "enable.auto.commit": False,
-        "partition.assignment.strategy": defaults.consumer.partition_assignment_strategy or "cooperative-sticky",
-        "session.timeout.ms": defaults.consumer.session_timeout_ms,
-        "heartbeat.interval.ms": defaults.consumer.heartbeat_interval_ms,
-        "max.poll.interval.ms": max_poll_interval,
-        "auto.offset.reset": auto_offset_reset,
-        "enable.partition.eof": enable_partition_eof,
-    }
+    """A consumer built from one contract client profile. Manual commit, cooperative-sticky, static
+    membership.
+
+    `worker_consumer` (the default) is the worker and loader profile; `auto_offset_reset` defaults to
+    `earliest` there, because a new group must not skip records already acknowledged to a sender.
+
+    `reply_consumer` (set 1.7, topics README 3.3.1) is the receiver's consumer of
+    `<env>.<channel>.reply`. Session, heartbeat, assignment, `auto.offset.reset` and `isolation.level`
+    all come from `clients.reply_consumer`, never from the worker's profile or a literal. Passing an
+    `auto_offset_reset` that differs from the contract is a `ConfigError`: it is in `must_not_hardcode`.
+    """
+    if profile == "reply_consumer":
+        reply = defaults.reply_consumer
+        if auto_offset_reset is not None and auto_offset_reset != reply.auto_offset_reset:
+            raise ConfigError("clients.reply_consumer auto.offset.reset comes from the contract; do not override it")
+        contract: dict[str, Any] = {
+            "bootstrap.servers": settings.bootstrap_servers,
+            "group.id": group_id,
+            "enable.auto.commit": reply.enable_auto_commit,
+            "partition.assignment.strategy": reply.partition_assignment_strategy,
+            "session.timeout.ms": reply.session_timeout_ms,
+            "heartbeat.interval.ms": reply.heartbeat_interval_ms,
+            "max.poll.interval.ms": max_poll_interval,
+            "auto.offset.reset": reply.auto_offset_reset,
+            "isolation.level": reply.isolation_level,
+            "enable.partition.eof": enable_partition_eof,
+        }
+    else:
+        contract = {
+            "bootstrap.servers": settings.bootstrap_servers,
+            "group.id": group_id,
+            "enable.auto.commit": False,
+            "partition.assignment.strategy": defaults.consumer.partition_assignment_strategy or "cooperative-sticky",
+            "session.timeout.ms": defaults.consumer.session_timeout_ms,
+            "heartbeat.interval.ms": defaults.consumer.heartbeat_interval_ms,
+            "max.poll.interval.ms": max_poll_interval,
+            "auto.offset.reset": auto_offset_reset or "earliest",
+            "enable.partition.eof": enable_partition_eof,
+        }
     if group_instance_id is not None:
         contract["group.instance.id"] = group_instance_id
     return _merge(settings, contract)

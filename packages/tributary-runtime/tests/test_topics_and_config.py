@@ -251,3 +251,122 @@ def test_kafka_settings_repr_never_shows_the_security_block() -> None:
     assert "SYNTH-SECRET-MARKER" not in repr(settings.security)
     assert "SYNTH-SECRET-MARKER" not in repr(dataclasses.asdict(settings))
     assert "broker:9093" in repr(settings)
+
+
+# --- clients.reply_consumer (set 1.7, topics README 3.3.1 and 3.7) ---------------------------------
+
+REPLY_KEYS = (
+    "session.timeout.ms",
+    "heartbeat.interval.ms",
+    "auto.offset.reset",
+    "isolation.level",
+    "partition.assignment.strategy",
+    "enable.auto.commit",
+)
+
+
+def _contract_clients() -> dict[str, dict[str, object]]:
+    document = json.loads((CONTRACTS / "topics" / "v0" / "topic-defaults.json").read_text(encoding="utf-8"))
+    return document["clients"]  # type: ignore[no-any-return]
+
+
+def _reply_config(root: Path | None = None) -> dict[str, object]:
+    from tributary.runtime.clients import KafkaSettings, consumer_config
+
+    return consumer_config(
+        KafkaSettings(bootstrap_servers="localhost:9092"),
+        load_topic_defaults(root),
+        group_id="tb.dev.adt.replier",
+        group_instance_id="mllp-0-p1",
+        profile="reply_consumer",
+    )
+
+
+def test_reply_consumer_effective_config_equals_the_contract() -> None:
+    """3.7 acceptance for the replier: every value the contract types is the one the client gets."""
+    contract = _contract_clients()["reply_consumer"]
+    config = _reply_config()
+    for key in REPLY_KEYS:
+        assert config[key] == contract[key], key
+    assert config["group.instance.id"] == "mllp-0-p1"
+    # Every must_not_hardcode key of this profile is covered by the comparison above.
+    document = json.loads((CONTRACTS / "topics" / "v0" / "topic-defaults.json").read_text(encoding="utf-8"))
+    pinned = {
+        key.removeprefix("clients.reply_consumer.")
+        for key in document["must_not_hardcode"]["values"]
+        if key.startswith("clients.reply_consumer.")
+    }
+    assert "isolation.level" in pinned
+    assert pinned <= set(REPLY_KEYS)
+
+
+def test_reply_consumer_values_move_with_the_contract_not_with_the_worker(tmp_path: Path) -> None:
+    """Mutation control in both directions: a reply-profile edit moves only the replier, and a
+    worker-profile edit moves only the worker (the defect set 1.7 rules out)."""
+    root = tmp_path / "contracts"
+    shutil.copytree(CONTRACTS / "topics", root / "topics")
+    path = root / "topics" / "v0" / "topic-defaults.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["clients"]["reply_consumer"]["session.timeout.ms"] = 12000
+    document["clients"]["reply_consumer"]["heartbeat.interval.ms"] = 4000
+    document["clients"]["reply_consumer"]["auto.offset.reset"] = "earliest"
+    document["clients"]["reply_consumer"]["isolation.level"] = "read_committed"
+    document["clients"]["worker_consumer"]["session.timeout.ms"] = 9000
+    document["clients"]["worker_consumer"]["heartbeat.interval.ms"] = 3000
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    config = _reply_config(root)
+    assert config["session.timeout.ms"] == 12000
+    assert config["heartbeat.interval.ms"] == 4000
+    assert config["auto.offset.reset"] == "earliest"
+    assert config["isolation.level"] == "read_committed"
+    defaults = load_topic_defaults(root)
+    assert defaults.consumer.session_timeout_ms == 9000
+    assert defaults.reply_consumer.session_timeout_ms == 12000
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("isolation.level", None),
+        ("isolation.level", "read_whatever"),
+        ("auto.offset.reset", None),
+        ("session.timeout.ms", "15 s"),
+        ("heartbeat.interval.ms", 14000),
+        ("enable.auto.commit", True),
+    ],
+)
+def test_a_reply_consumer_profile_without_its_typed_values_is_refused(tmp_path: Path, key: str, value: object) -> None:
+    root = tmp_path / "contracts"
+    shutil.copytree(CONTRACTS / "topics", root / "topics")
+    path = root / "topics" / "v0" / "topic-defaults.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    if value is None:
+        del document["clients"]["reply_consumer"][key]
+    else:
+        document["clients"]["reply_consumer"][key] = value
+    path.write_text(json.dumps(document), encoding="utf-8")
+    with pytest.raises(ConfigError):
+        load_topic_defaults(root)
+
+
+def test_reply_consumer_refuses_an_auto_offset_reset_override() -> None:
+    from tributary.runtime.clients import KafkaSettings, consumer_config
+
+    with pytest.raises(ConfigError):
+        consumer_config(
+            KafkaSettings(bootstrap_servers="localhost:9092"),
+            load_topic_defaults(),
+            group_id="tb.dev.adt.replier",
+            auto_offset_reset="earliest",
+            profile="reply_consumer",
+        )
+
+
+def test_worker_profile_is_unchanged_by_the_reply_profile() -> None:
+    from tributary.runtime.clients import KafkaSettings, consumer_config
+
+    config = consumer_config(KafkaSettings(bootstrap_servers="localhost:9092"), load_topic_defaults(), group_id="g")
+    assert config["auto.offset.reset"] == "earliest"
+    assert "isolation.level" not in config
+    assert config["session.timeout.ms"] == _contract_clients()["worker_consumer"]["session.timeout.ms"]
