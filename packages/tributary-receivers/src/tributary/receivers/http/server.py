@@ -27,6 +27,7 @@ import re
 import ssl
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -298,8 +299,10 @@ class HttpServer:
             remaining -= len(chunk)
         return bytes(body)
 
-    async def _publish(self, message: Message, deadline: float) -> bool:
+    async def _publish(self, message: Message, deadline: float, *, gate: Callable[[], None] | None = None) -> bool:
         async with self._inflight:
+            if gate is not None:
+                gate()  # under the semaphore: the wait for a slot can be long, and the last look comes after it
             timeout = max(deadline - time.monotonic(), 0.001)
             t0 = time.monotonic()
             try:
@@ -395,18 +398,23 @@ class HttpServer:
             )
             msg_id = message.require(h.TB_MSG_ID)
             ctx["msg_id"] = msg_id
-            # Tombstoned or revoked while this request waited for the queue or for its body: not published.
-            self._check_open(conn)
-            current = self._live
-            if current.cfg.auth != cfg.auth or current.bearer_tokens != live.bearer_tokens:
-                # The auth settings changed after this request passed them (a token was removed, or the mode
-                # changed): its credentials are checked again under the current ones, nothing published on 401.
-                self._check_auth(current, headers)
             conn.publishing = True  # from here its answer is owed: revocation and drain wait for it
             # The ACK budget starts now, once the body is in: a slow upload must not eat it and turn a
             # healthy Kafka into a 503 (whose retry would duplicate the message).
             ack_deadline = time.monotonic() + cfg.ack_timeout_s
-            ok = await self._publish(message, ack_deadline)
+
+            def last_look() -> None:
+                # Run by `_publish` after it holds an in-flight slot, immediately before the produce, because
+                # the wait for the slot is the longest gap since the checks above. Tombstoned or revoked while
+                # waiting for the queue, the body or the slot: not published. Then the credentials again under
+                # the settings now in force (a token removed or the mode changed since this request passed
+                # them): nothing is published on a 401.
+                self._check_open(conn)
+                current = self._live
+                if current.cfg.auth != cfg.auth or current.bearer_tokens != live.bearer_tokens:
+                    self._check_auth(current, headers)
+
+            ok = await self._publish(message, ack_deadline, gate=last_look)
         finally:
             await self.budget.release(content_length)
         if not ok:

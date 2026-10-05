@@ -351,6 +351,44 @@ def test_bearer_auth_is_mandatory_and_checked_before_the_body(token_dir: DirSecr
     asyncio.run(run(cfg, pub, client, resolver=token_dir))
 
 
+def test_credentials_are_checked_again_after_the_wait_for_an_in_flight_slot(tmp_path: Path) -> None:
+    """A request that passed auth, then waited for a slot, is judged by the credentials in force when it gets
+    the slot: a token removed during the wait means a 401 and nothing published (the check sits under the
+    `_inflight` semaphore, not before it)."""
+    (tmp_path / "old").mkdir()
+    (tmp_path / "old" / "token").write_text(f"{TOKEN}\n{ROTATED}\n", encoding="utf-8")
+    (tmp_path / "new").mkdir()
+    (tmp_path / "new" / "token").write_text(f"{ROTATED}\n", encoding="utf-8")
+
+    class CountingGate(Gated):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls: list[Message] = []
+
+        async def publish(self, message: Message, *, timeout_s: float) -> bool:
+            self.calls.append(message)
+            return await super().publish(message, timeout_s=timeout_s)
+
+    pub = CountingGate()
+    cfg = settings(auth=AuthSpec("bearer", "old"), max_inflight=1)
+
+    async def client(port: int, srv: HttpServer) -> None:
+        try:
+            first = asyncio.create_task(post(port, request(token=TOKEN)))
+            await asyncio.wait_for(pub.entered.wait(), 2.0)  # the only slot is held
+            second = asyncio.create_task(post(port, request(token=TOKEN)))
+            await eventually(lambda: srv.metrics.messages_received == 2)
+            await asyncio.sleep(0.1)  # the second request is now waiting for the slot, having passed auth
+            await srv.apply_settings(replace(cfg, auth=AuthSpec("bearer", "new")))  # TOKEN is no longer valid
+        finally:
+            pub.release()
+        assert (await first)[0] == 202
+        assert (await second)[0] == 401
+        assert len(pub.calls) == 1, "the request whose token was removed while it waited was never published"
+
+    asyncio.run(run(cfg, pub, client, resolver=DirSecretResolver(tmp_path)))
+
+
 def test_two_authorization_headers_are_refused(token_dir: DirSecretResolver) -> None:
     async def client(port: int, srv: HttpServer) -> None:
         status, _, _ = await post(port, request(token=TOKEN, extra=[f"Authorization: Bearer {TOKEN}"]))

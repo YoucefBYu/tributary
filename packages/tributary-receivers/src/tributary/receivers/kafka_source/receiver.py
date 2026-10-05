@@ -402,8 +402,10 @@ def main() -> None:
         return publisher
 
     def make_service(cfg: KafkaSourceSettings, publisher: RawPublisher, metrics: Metrics) -> KafkaSourceService:
-        # The topic, the foreign connection and its credentials are restart-only, so the startup settings
-        # build the consumer for the life of the process.
+        # The topic, the foreign connection and its credentials are restart-only, so a running service never
+        # changes them in place. A service is built per start, not per process: a tombstone followed by a
+        # redeploy starts a new one, and this builds it a new consumer from the redeployed spec's settings (the
+        # old one was committed and closed on the pause).
         return KafkaSourceService(cfg, publisher, build_consumer(cfg, resolver), metrics=metrics)
 
     runner = KafkaSourceRunner(

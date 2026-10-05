@@ -494,3 +494,67 @@ def test_usage_errors_are_one_startup_refused_line_and_echo_nothing(
     err = capsys.readouterr()
     assert exc.value.code == 2 and "SYNTH-VALUE-77" not in err.err + err.out and "usage:" not in err.err
     assert len([x for x in err.err.splitlines() if "startup_refused" in x]) == 1
+
+
+# -- a consume loop that dies (service.py `_task_done`) ---------------------------------------------------
+
+LOOP_BOOM = "SYNTH-LOOP-BOOM-TEXT-58"
+
+
+def test_a_consume_loop_that_dies_is_reported_and_the_process_exits_1(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A loop that ends with an error nothing handles must not leave a receiver that looks healthy and takes
+    nothing in: the lifecycle logs the class name only, drains, closes the consumer and exits 1 so the
+    supervisor restarts it."""
+
+    def explode(self: Consumer, timeout: float) -> Msg | None:
+        raise RuntimeError(LOOP_BOOM)
+
+    monkeypatch.setattr(Consumer, "poll", explode)
+
+    async def go() -> Harness:
+        h = Harness(FakeFeed(parse(doc())))
+        code = await asyncio.wait_for(h.runner.run(), 15)
+        assert code == 1
+        return h
+
+    h = asyncio.run(go())
+    [failed] = h.log.of("component_failed")
+    assert failed["error"] == "RuntimeError" and failed["ready"] is False
+    assert LOOP_BOOM not in repr(h.log.events), "the class name only, never the message"
+    assert h.cluster.open_consumers == 0, "the dead loop's consumer was closed (committing only what was acked)"
+    assert h.publisher.calls == []
+
+
+def test_the_service_reports_a_dead_loop_to_its_handler_but_not_a_cancelled_one() -> None:
+    async def go() -> None:
+        cfg = kafka_source_settings_from_spec(parse(doc()), env="dev", commit_every=1)
+        reported: list[BaseException] = []
+
+        class FatalConsumer(Consumer):
+            def poll(self, timeout: float) -> Msg | None:
+                raise RuntimeError(LOOP_BOOM)
+
+        cluster = SourceCluster()
+        dead = KafkaSourceService(cfg, Publisher(), FatalConsumer(cluster), metrics=Metrics())  # type: ignore[arg-type]
+        dead.set_failure_handler(reported.append)
+        await dead.start()
+        await asyncio.sleep(0.2)
+        assert [type(exc) for exc in reported] == [RuntimeError]
+        assert dead.open_connections == 0, "a finished loop is not an open connection"
+        assert await dead.drain(1.0) is True
+        assert cluster.open_consumers == 0
+
+        quiet = KafkaSourceService(cfg, Publisher(), Consumer(SourceCluster()), metrics=Metrics())  # type: ignore[arg-type]
+        quiet.set_failure_handler(reported.append)
+        await quiet.start()
+        await asyncio.sleep(0.05)
+        assert quiet.open_connections == 1
+        assert await quiet.drain(1.0) is True  # an orderly stop is not a failure
+        assert len(reported) == 1
+
+        unhandled = KafkaSourceService(cfg, Publisher(), FatalConsumer(SourceCluster()), metrics=Metrics())  # type: ignore[arg-type]
+        await unhandled.start()  # no handler set: the failure is dropped, not raised into the event loop
+        await asyncio.sleep(0.1)
+        assert unhandled.open_connections == 0
+
+    asyncio.run(go())
