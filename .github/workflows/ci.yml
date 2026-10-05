@@ -29,6 +29,12 @@ jobs:
         with:
           python-version: "3.12"
       - run: uv run --no-project --python 3.12 --with jsonschema python contracts/validate.py
+      # --emit-expectations always exits 0, so the drift check is in a script: it fails if any pinned
+      # (json_path, validator) pair no longer matches what the schema measures.
+      - name: pinned failure pairs have not drifted
+        run: |
+          uv run --no-project --python 3.12 --with jsonschema python contracts/validate.py --emit-expectations \
+            | python3 .github/scripts/check_expectations.py
 
   python:
     name: lint, types, unit tests, conformance
@@ -46,6 +52,13 @@ jobs:
       # Explicit so a contracts/** change can never skip it, even if testpaths change.
       - name: contract conformance
         run: uv run pytest tests/conformance -q
+      # Named so a marker, testpaths or collection change cannot silently drop the sync-reply
+      # property tests.
+      - name: sync-reply property tests
+        run: >
+          uv run pytest -q
+          packages/tributary-receivers/tests/reply/test_properties.py
+          packages/tributary-runtime/tests/test_reply_properties.py
 
   integration:
     name: integration (testcontainers)
@@ -58,8 +71,13 @@ jobs:
           python-version: "3.12"
           enable-cache: true
       - run: uv sync
-      # Exit code 5 means "no tests collected": allowed until the first integration test lands.
-      - run: uv run pytest -m integration || [ $? -eq 5 ]
+      # Exit 5 (nothing collected) now fails the job. Also fail if the summary shows 0 passed, so an
+      # all-skipped run (for example Docker missing) cannot pass.
+      - name: integration tests
+        run: |
+          set -o pipefail
+          uv run pytest -m integration -ra 2>&1 | tee integration.log
+          grep -Eq '(^|[ =])[1-9][0-9]* passed' integration.log || { echo "no integration tests passed"; exit 1; }
 
   supply-chain:
     name: licence and SBOM, secret scan, gitignore guard
