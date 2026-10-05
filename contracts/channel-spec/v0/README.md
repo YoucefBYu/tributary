@@ -14,7 +14,8 @@ engine's `tributary.*` namespaces ([`step-namespaces.json`](step-namespaces.json
 **Set 1.7 (2026-10-05) writes down receiver-side sync-reply rules found while building the MLLP
 receiver (3.2.6: step-body edge cases with two new codes, the per-connection fairness bound, the unique
 `--instance` rule) and states how N4 treats a shadowed installation (3.3.5). No schema or example
-change.**
+change.** **Set 1.7.1 (2026-10-05, patch, README only) brings the 3.0 status table up to date: the
+`http`, `sftp` and `kafka` receivers and the `clickhouse`, `mllp` and `kafka` loaders are built.**
 Breaking changes create `../v1/`.
 **Owner:** `architect`. Propose changes by message with the exact diff and impact.
 **Source:** ADR-001 sections 6.1 and 6.4, ADR-003 D1/D3/D4/D6, ADR-007 (D1-D9, and D10-D17 for set
@@ -135,18 +136,26 @@ when a connector lands with its tests.
 
 | Kind | Type | Task | Status |
 |---|---|---|---|
-| source | `mllp` | W1-5 | **Implemented.** **Sync reply (`source.reply`, 3.2.6): Built** (set 1.7, 2026-10-05), `body: ack` and `body: step`. Receiver side `8bfe205`, `33b2207`, `f420634`, `4134ab3`, plus `c051002` (step-body charge released after a cancelled wait; real-Kafka test that a fenced replier exits 1); worker side earlier (reply producer, `ReplyContext`, `REPLY_` codes). Not yet "Implemented": the round-trip latency risk is open (STATUS), receivers have no readiness probe, and the reply consumer still borrows the worker's settings (`topics/v0` 3.3.1) |
-| source | `http` (HTTP and FHIR ingest) | W2-7 | Contracted, not built. **Sync reply: not built**; a spec with `source.reply` must be refused at receiver startup (3.2.6) |
-| source | `sftp` (poller) | W2-7 | Contracted, not built. `paramiko`, human-approved (section 10.2) |
-| source | `kafka` | W2-7 | Contracted, not built |
+| source | `mllp` | W1-5 | **Implemented.** **Sync reply (`source.reply`, 3.2.6): Built** (set 1.7, 2026-10-05), `body: ack` and `body: step`. Receiver side `8bfe205`, `33b2207`, `f420634`, `4134ab3`, plus `c051002` (step-body charge released after a cancelled wait; real-Kafka test that a fenced replier exits 1); worker side earlier (reply producer, `ReplyContext`, `REPLY_` codes). The reply consumer reads its own `clients.reply_consumer` profile, no worker settings and no literals (`c5fc09a`, `e563d42`; set 1.7 ruling 5). Not yet "Implemented": the round-trip latency tail is unexplained (STATUS) and receivers have no readiness probe (both wave 3) |
+| source | `http` (HTTP and FHIR ingest) | W2-7 | **Built** (set 1.7.1). Spec read from `_tb.<env>.channels`, `--channel-spec` refused at startup. **Sync reply: not built** (wave 3); a spec with `source.reply` is refused at receiver startup (`receivers/http/config.py`, 3.2.6), so it emits no `REPLY_` code |
+| source | `sftp` (poller) | W2-7 | **Built** (set 1.7.1). Spec read from `_tb.<env>.channels`. `paramiko`, human-approved (section 10.2) |
+| source | `kafka` | W2-7 | **Built** (set 1.7.1). Spec read from `_tb.<env>.channels` |
 | destination | `http` | W1-6 | **Implemented** |
 | destination | `fhir` | W2-6 | **Built** (2026-09-29, `tributary.loaders.fhir`): HAPI FHIR integration test; `auth` `bearer` and `basic` only (3.4.1). A 5.1 redelivery test exists (`tests/integration/test_fhir_loader_duplicate_delivery_uncommitted_redelivery.py`); **Implemented** once `qa-engineer` confirms it green in CI |
-| destination | `postgresql` | W2-6 | **Built** (`eca445a`, `asyncpg`): integration test against a real PostgreSQL, startup uniqueness check. **Genuine-redelivery duplicate test pending** (W2-9 harness, 5.1) |
-| destination | `clickhouse` | W2-6 | Contracted, not built |
+| destination | `postgresql` | W2-6 | **Built** (`eca445a`, `asyncpg`): integration test against a real PostgreSQL, startup uniqueness check. A 5.1 redelivery test exists (`tests/integration/test_postgresql_loader_duplicate_delivery_uncommitted_redelivery.py`); **Implemented** once confirmed green in CI |
+| destination | `clickhouse` | W2-6 | **Built** (`tributary.loaders.clickhouse`, stdlib HTTP interface, human decision 2026-09-25). A 5.1 redelivery test asserting a `FINAL` count exists (`tests/integration/test_clickhouse_loader_duplicate_delivery_uncommitted_redelivery.py`); **Implemented** once confirmed green in CI |
 | destination | `sftp` | W2-6 | **Built** (2026-09-29, `tributary.loaders.sftp`): `paramiko`, human-approved (section 10.2). A 5.1 redelivery test exists (`tests/integration/test_sftp_loader_duplicate_delivery_uncommitted_redelivery.py`); **Implemented** once confirmed green in CI |
 | destination | `s3` | W2-6 | **Built** (2026-09-29, `tributary.loaders.s3`). **Licence questions resolved by the human 2026-09-29** (ADR-001 2.3): `botocore` is approved in the runtime for this loader only, including its bundled, unmodified `cacert.pem` (MPL-2.0 data), and the loader still prefers the OS CA file; MinIO (AGPL-3.0) is allowed **only** as the test container for its integration and redelivery tests, never in Compose, Helm or a shipped artefact. A 5.1 redelivery test exists (`tests/integration/test_s3_loader_duplicate_delivery_uncommitted_redelivery.py`); **Implemented** once confirmed green in CI |
-| destination | `mllp` (client) | W2-6 | Contracted, not built |
-| destination | `kafka` | W2-6 | Contracted, not built |
+| destination | `mllp` (client) | W2-6 | **Built** (`tributary.loaders.mllp`). A 5.1 redelivery test exists, in the package rather than `tests/integration/` (`packages/tributary-loaders/tests/mllp/test_integration_mllp_loader.py`, marked `integration`); **Implemented** once confirmed green in CI |
+| destination | `kafka` | W2-6 | **Built** (`tributary.loaders.kafka`). A 5.1 redelivery test exists (`tests/integration/test_kafka_loader_duplicate_delivery_uncommitted_redelivery.py`); **Implemented** once confirmed green in CI |
+
+**Receivers, set 1.7.1 (2026-10-05).** `http`, `sftp` and `kafka` were built and moved onto
+`_tb.<env>.channels` in `1cd9fe4`, `359f5fd` and `737fcd8`, with a security review, as relayed by the
+lead; the architect read the code (`receivers/cli.py` uses `open_spec_source`, `receivers/startup.py`
+refuses `--channel-spec`) and did not run it. The lead reports 105-112 integration tests passing in
+CI. They become "Implemented" when their integration tests are confirmed by name in that log. Each
+receiver also applies a republished spec live (`*/reload.py`); `nackOn: spec-invalid` stays refused
+until that live reload defines it (3.2.8, ADR-007 follow-up 11).
 
 A connector is "Implemented" when it has its integration test and, for a destination, its
 duplicate-delivery test (invariant 4, wave 2 exit criterion 3) — not when its config parses. The

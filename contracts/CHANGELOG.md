@@ -3,7 +3,30 @@
 Newest first. Each entry names the contract, the version, whether the change is additive or
 breaking, and the reason. Breaking changes reference an ADR.
 
-## 2026-10-05 (latest) — contract set 1.7: receiver-side sync-reply rules, two codes, N4 shadowing
+## 2026-10-05 (latest) — contract set 1.7.1 (patch): status table and `REPLY_` emitters corrected
+
+**Patch. Documentation only: no schema, example, manifest or code-list change, so every count is
+unchanged from set 1.7 (`validate.py` 156 / 0 predicted). No invariant changes.** Both edits correct
+statements that had become false; neither changes behaviour.
+
+- **`tributary.channel-spec/v0` README 3.0.** Receivers `http`, `sftp` and `kafka`: **Built**, spec read
+  from `_tb.<env>.channels` (`1cd9fe4`, `359f5fd`, `737fcd8`, security-reviewed, as relayed by the lead;
+  lead reports 105-112 integration tests green in CI; the architect read `receivers/cli.py` and
+  `receivers/startup.py`, did not run them). `http` keeps the caveat: sync reply not built, `source.reply`
+  refused at startup. `mllp` row: the reply consumer no longer borrows the worker's settings
+  (`c5fc09a`, `e563d42`). Loaders `clickhouse`, `mllp`, `kafka` were still "Contracted, not built";
+  now **Built**, each with its 5.1 redelivery test named; `postgresql`'s redelivery test now exists.
+  All of them become "Implemented" when the tests are confirmed green by name in the CI log.
+- **`tributary.envelope/v0` `error-codes.json`.** `REPLY_BODY_OVER_BUDGET` listed the `http` receiver
+  as an emitter, and so did `REPLY_TIMEOUT`, `REPLY_ROUTE_LOST`, `REPLY_BUSY` and `REPLY_UNAVAILABLE`
+  since set 1.2. The `http` receiver refuses `source.reply`, so it emits none of them. Emitter strings
+  now say `mllp` only. `set` is `1.7.1`. The `tributary-sdk` cross-check compares codes only, so it is
+  unaffected.
+
+**Verification owed:** none beyond set 1.7's. `uv run pytest packages/tributary-sdk/tests/test_codes_contract.py`
+stays green (no code changed), and `error-codes.json` must still parse as JSON.
+
+## 2026-10-05 — contract set 1.7: receiver-side sync-reply rules, two codes, N4 shadowing
 
 **Additive. No schema, example or manifest change, so no document changes validity and no
 expected-failure pair moves. No invariant changes.** A minor set rather than a 1.6.1 patch because
