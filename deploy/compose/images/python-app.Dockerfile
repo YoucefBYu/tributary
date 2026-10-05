@@ -35,7 +35,12 @@ ENV UV_PROJECT_ENVIRONMENT=/opt/venv \
     UV_FROZEN=1 \
     UV_NO_CACHE=1 \
     UV_PYTHON_DOWNLOADS=never
-RUN uv sync --frozen --no-dev --no-editable --package "${TB_PACKAGE}"
+# Optional build secret `ca`: an extra CA bundle for networks that re-terminate TLS (corporate or CI
+# egress proxies). Never copied into a layer; absent in normal builds:
+#   docker build --secret id=ca,src=/path/ca-bundle.crt ...
+RUN --mount=type=secret,id=ca,required=false \
+    if [ -s /run/secrets/ca ]; then export SSL_CERT_FILE=/run/secrets/ca UV_SYSTEM_CERTS=1; fi; \
+    uv sync --frozen --no-dev --no-editable --package "${TB_PACKAGE}"
 
 FROM python:3.12-slim@sha256:2f17fc044b579bab302c2e8054d3a686e2cb9a83de48e70534b94cd8ebbe06a9 AS runtime
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \

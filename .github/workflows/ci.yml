@@ -100,6 +100,19 @@ jobs:
           name: sbom
           path: sbom.cdx.json
 
+  image-check:
+    # ADR-007 follow-up 18 / D24, W3-13: builds each package image from the repo Dockerfile and runs
+    # .github/scripts/image_env_check.py inside it (no duplicate distribution names, tributary.context and
+    # tributary.* step entry points match the registries), plus a negative control per image. No image is
+    # published until this is green.
+    name: image environment check (duplicates, entry-point registries)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - run: .github/scripts/image_check.sh
+
   ui:
     name: ui lint, typecheck, test
     runs-on: ubuntu-24.04
