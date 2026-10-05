@@ -351,6 +351,45 @@ def test_recovery_is_proven_by_the_next_probe_and_logged_once() -> None:
     assert len(recovered) == 1 and recovered[0]["outage_s"] == 5.0
 
 
+def test_a_long_outage_does_not_delay_recovery_beyond_one_probe_interval() -> None:
+    """Pins the code half of the integration test's recovery bound (`recovery_bound_s`): however many
+    probes failed, the cache keeps probing at the same cadence, caches no error from them, and recovers
+    on the first probe after the broker answers. So any longer delay is librdkafka's reconnect backoff
+    or the environment, never the cache."""
+    from tributary.runtime.errors import ChannelsUnavailableError
+
+    consumer = FlakyChannelsConsumer(records=[FakeChannelsRecord(CHANNEL.encode(), spec_bytes()), eof(0)])
+    clock, stream = FakeClock(), io.StringIO()
+    subject = started(consumer, clock, stream)
+    consumer.down = True
+    clock.now += 5.0
+    with pytest.raises(ChannelsUnavailableError):
+        subject.poll_once(timeout_s=0.0)  # detected by the first probe due after `start()`'s
+    for _ in range(720):  # an hour more of failed probes at a 5 s interval, polled ten times per interval
+        for _tick in range(10):
+            clock.now += 0.5
+            with pytest.raises(ChannelsUnavailableError):
+                subject.poll_once(timeout_s=0.0)
+    failed_probes = consumer.probes - 1  # less `start()`'s own metadata read
+    assert failed_probes == 721, "one probe per interval for the whole outage, no back-off of its own"
+
+    consumer.down = False
+    back_at = clock.now
+    while True:
+        clock.now += 0.5
+        try:
+            subject.poll_once(timeout_s=0.0)
+        except ChannelsUnavailableError:
+            continue
+        break
+    assert clock.now - back_at <= 5.0, "recovered on the first probe after the broker answered"
+    assert subject.available is True and subject.outages == 1
+    assert [line["event"] for line in events(stream) if line["event"].startswith("channels_")] == [
+        "channels_unavailable",
+        "channels_recovered",
+    ]
+
+
 def test_the_probe_is_rate_limited_while_healthy() -> None:
     """One metadata request per interval, however often a worker asks for its spec."""
     consumer = FlakyChannelsConsumer(records=[FakeChannelsRecord(CHANNEL.encode(), spec_bytes()), eof(0)])
