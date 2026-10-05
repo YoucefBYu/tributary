@@ -16,7 +16,14 @@ from tributary.receivers.reply.pending import Outcome
 from tributary.receivers.reply.settings import ReplySettings
 from tributary.runtime.sync_answer import Resolution
 from tributary.sdk import headers as h
-from tributary.sdk.codes import REPLY_BODY_MISSING, REPLY_BUSY, REPLY_ROUTE_LOST, REPLY_TIMEOUT, REPLY_UNAVAILABLE
+from tributary.sdk.codes import (
+    REPLY_BODY_INVALID,
+    REPLY_BODY_OVER_BUDGET,
+    REPLY_BUSY,
+    REPLY_ROUTE_LOST,
+    REPLY_TIMEOUT,
+    REPLY_UNAVAILABLE,
+)
 
 from .support import CONTROL_ID_MARKER, FakePartitions, new_map, open_entry, record
 
@@ -211,7 +218,7 @@ def test_a_body_that_does_not_fit_the_budget_answers_ae_reply_busy(loop: asyncio
     entry = open_entry(pending)
     pending.commit(entry, ok=True)
     matched, resolution = pending.deliver_reply(record(entry, body=BODY))
-    assert matched and resolution == Resolution("AE", REPLY_BUSY), "committed, so AE; the body is not held"
+    assert matched and resolution == Resolution("AE", REPLY_BODY_OVER_BUDGET), "committed, so AE; the body is not held"
     assert budget.used_bytes == 0
 
 
@@ -223,7 +230,7 @@ def test_waiting_bodies_count_against_the_same_budget_as_one_another(loop: async
         entry = open_entry(pending)
         pending.commit(entry, ok=True)
         answers.append(pending.deliver_reply(record(entry, body=BODY))[1])
-    assert answers == [Resolution("AA"), Resolution("AA"), Resolution("AE", REPLY_BUSY)]
+    assert answers == [Resolution("AA"), Resolution("AA"), Resolution("AE", REPLY_BODY_OVER_BUDGET)]
     assert budget.used_bytes == len(BODY) * 2
 
 
@@ -234,7 +241,7 @@ def test_a_body_that_would_break_mllp_framing_is_refused(loop: asyncio.AbstractE
     entry = open_entry(pending)
     pending.commit(entry, ok=True)
     _, resolution = pending.deliver_reply(record(entry, body=b"MSH|x" + framing_byte + b"y"))
-    assert resolution == Resolution("AE", REPLY_BODY_MISSING) and budget.used_bytes == 0
+    assert resolution == Resolution("AE", REPLY_BODY_INVALID) and budget.used_bytes == 0
 
 
 def test_a_body_is_ignored_in_ack_mode_and_for_a_refusal(loop: asyncio.AbstractEventLoop) -> None:
@@ -287,7 +294,7 @@ def test_one_connection_cannot_take_the_whole_pool(loop: asyncio.AbstractEventLo
     held = [open_entry(pending, connection=greedy), open_entry(pending, connection=greedy)]
     assert pending.connection_cap == 2
     assert pending.open(sender_control_id="c", connection=greedy) == REPLY_BUSY
-    assert metrics.nacked_reply_busy == 1
+    assert metrics.nacked_reply_connection_cap == 1 and metrics.nacked_reply_busy == 0, "counted apart from the pool"
     assert not isinstance(pending.open(sender_control_id="c", connection=other), str), "another peer is unaffected"
     pending.commit(held[0], ok=False)
     assert not isinstance(pending.open(sender_control_id="c", connection=greedy), str), (

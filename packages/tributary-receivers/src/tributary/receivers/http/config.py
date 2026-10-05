@@ -191,6 +191,14 @@ def _settings(
 ) -> HttpSettings:
     if source.get("type") != "http":
         raise ConfigError(f"channel {channel!r}: source.type is {source.get('type')!r}, not 'http'")
+    if "reply" in source:
+        # Synchronous reply is built for MLLP only; the HTTP status mapping is decided with W2-7 (channel-spec
+        # README 3.2.6). Refused loudly rather than accepted and answered as async: the sender would believe it
+        # gets the routed outcome and would get "accepted" instead.
+        raise ConfigError(
+            f"channel {channel!r}: source.reply is not supported by the http receiver yet; "
+            "remove it or use an mllp source (the channel is not started)"
+        )
 
     ack = _require(source, "ack", "source")
     if ack.get("mode") != "after-commit":

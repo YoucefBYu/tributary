@@ -116,3 +116,12 @@ def test_ordering_none_with_a_key_is_refused() -> None:
     spec["spec"]["ordering"] = "none"
     with pytest.raises(ConfigError, match="forbidden"):
         build(spec)
+
+
+def test_sync_reply_is_refused_because_http_does_not_implement_it() -> None:
+    """`source.reply` is schema-valid on http, but only MLLP answers synchronously: accepting it and answering
+    `202` would tell the sender its message was routed when only the commit is known."""
+    spec = load()
+    spec["spec"]["source"]["reply"] = {}
+    with pytest.raises(ConfigError, match=r"source\.reply is not supported by the http receiver"):
+        build(spec)

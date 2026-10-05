@@ -45,6 +45,7 @@ class Metrics:
     publish_failures: int = 0
     # Synchronous reply mode (channel-spec README 3.2.6). Counts only; no id, key or header value.
     nacked_reply_busy: int = 0  # AR REPLY_BUSY, nothing published
+    nacked_reply_connection_cap: int = 0  # AR REPLY_BUSY from the per-connection fairness bound, not the pool
     nacked_reply_unavailable: int = 0  # AR REPLY_UNAVAILABLE, no reply partition held, nothing published
     reply_aa: int = 0
     reply_ae: int = 0
@@ -85,6 +86,7 @@ class Metrics:
             "offset_commits": self.offset_commits,
             "publish_failures": self.publish_failures,
             "nacked_reply_busy": self.nacked_reply_busy,
+            "nacked_reply_connection_cap": self.nacked_reply_connection_cap,
             "nacked_reply_unavailable": self.nacked_reply_unavailable,
             "reply_aa": self.reply_aa,
             "reply_ae": self.reply_ae,

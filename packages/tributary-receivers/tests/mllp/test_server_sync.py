@@ -22,7 +22,7 @@ from tributary.receivers.reply.feed import ReplyRecord
 from tributary.receivers.reply.settings import ReplySettings
 from tributary.sdk import Message
 from tributary.sdk import headers as h
-from tributary.sdk.codes import REPLY_BUSY, REPLY_ROUTE_LOST, REPLY_TIMEOUT, REPLY_UNAVAILABLE
+from tributary.sdk.codes import REPLY_BODY_OVER_BUDGET, REPLY_BUSY, REPLY_ROUTE_LOST, REPLY_TIMEOUT, REPLY_UNAVAILABLE
 
 from ..reply.support import CONTROL_ID_MARKER, KEY_MARKER, FakePartitions
 from .test_server import AlwaysFail, Gated, _read_frames, adt, frame, settings
@@ -432,7 +432,7 @@ def test_a_body_beyond_the_budget_answers_ae_reply_busy() -> None:
         message = await publisher.nth(1)
         deliver(server, reply_for(message, body=RESPONSE))
         [f] = await _read_frames(r, 1)
-        assert msa3(f)[0] == "AE" and msa3(f)[2].startswith(REPLY_BUSY)
+        assert msa3(f)[0] == "AE" and msa3(f)[2].startswith(REPLY_BODY_OVER_BUDGET)
         w.close()
 
     run(

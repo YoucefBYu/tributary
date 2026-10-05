@@ -313,3 +313,56 @@ def test_open_reply_feed_refuses_without_an_explicit_instance() -> None:
             log=RecordingLog(),
             metrics=Metrics(),
         )
+
+
+def test_the_replier_effective_config_equals_the_topics_contract(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`topics/v0` `clients.reply_consumer`: every `must_not_hardcode` key reaches the real consumer with the
+    contract's value, and nothing is borrowed from the worker profile (the acceptance line of the contract)."""
+    import json
+    from pathlib import Path
+
+    import confluent_kafka
+    from tributary.receivers.reply.feed import open_reply_feed
+    from tributary.runtime.clients import KafkaSettings
+    from tributary.runtime.config import load_topic_defaults
+
+    seen: dict[str, object] = {}
+
+    class Capture:
+        def __init__(self, config: dict[str, object]) -> None:
+            seen.update(config)
+
+    monkeypatch.setattr(confluent_kafka, "Consumer", Capture)
+    contract = json.loads(
+        (Path(__file__).resolve().parents[4] / "contracts" / "topics" / "v0" / "topic-defaults.json").read_text()
+    )
+    profile = contract["clients"]["reply_consumer"]
+    must_not_hardcode = set(contract["must_not_hardcode"]["values"])
+    open_reply_feed(
+        KafkaSettings(bootstrap_servers="localhost:9092"),
+        load_topic_defaults(),
+        env="dev",
+        channel="lab",
+        instance="rx-1",
+        pid=7,
+        log=RecordingLog(),
+        metrics=Metrics(),
+    )
+    expected = {
+        key: profile[key]
+        for key in (
+            "enable.auto.commit",
+            "auto.offset.reset",
+            "isolation.level",
+            "partition.assignment.strategy",
+            "session.timeout.ms",
+            "heartbeat.interval.ms",
+        )
+    }
+    for key, value in expected.items():
+        assert seen[key] == value, key
+    # Each must_not_hardcode key of the replier is asserted against the effective config above.
+    for key in (k for k in must_not_hardcode if k.startswith("clients.reply_consumer.")):
+        assert seen[key.removeprefix("clients.reply_consumer.")] == profile[key.removeprefix("clients.reply_consumer.")]
+    assert seen["group.id"] == "tb.dev.lab.replier" and seen["group.instance.id"] == "rx-1-p7"
+    assert seen["isolation.level"] == "read_uncommitted"

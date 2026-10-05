@@ -19,7 +19,7 @@ What the map adds around the state machine (channel-spec README 3.2.6, ADR-003 D
   restart replayed it) finds no entry.
 * **`body: step`.** The first reply's body is held with the entry and charged to `queue.maxBytes`
   (`ByteBudget.try_charge`) until the answer is written. If the budget cannot take it, or the body would break
-  MLLP framing, the reply is replaced by a `failed` one (`REPLY_BUSY` / `REPLY_BODY_MISSING`) so the sender
+  MLLP framing, the reply is replaced by a `failed` one (`REPLY_BODY_OVER_BUDGET` / `REPLY_BODY_INVALID`, set 1.7) so the sender
   gets an honest `AE`; the message was committed either way.
 * **PHI.** The sender's MSH-10 lives only in the entry, in memory. The map never logs and never puts a value in
   a header; the correlation id and `tb-msg-id` it exposes are engine-minted.
@@ -40,7 +40,7 @@ from typing import Protocol
 
 from tributary.runtime.sync_answer import Resolution, SyncRequest
 from tributary.sdk import headers as h
-from tributary.sdk.codes import REPLY_BODY_MISSING, REPLY_BUSY, REPLY_UNAVAILABLE
+from tributary.sdk.codes import REPLY_BODY_INVALID, REPLY_BODY_OVER_BUDGET, REPLY_BUSY, REPLY_UNAVAILABLE
 from tributary.sdk.ids import new_correlation_id
 
 from ..backpressure import ByteBudget
@@ -178,10 +178,11 @@ class PendingMap:
         if partition is None:
             self._metrics.nacked_reply_unavailable += 1
             return REPLY_UNAVAILABLE
-        if len(self._by_id) >= self._settings.max_pending or (
-            self._per_connection.get(id(connection), 0) >= self.connection_cap
-        ):
+        if len(self._by_id) >= self._settings.max_pending:
             self._metrics.nacked_reply_busy += 1
+            return REPLY_BUSY
+        if self._per_connection.get(id(connection), 0) >= self.connection_cap:
+            self._metrics.nacked_reply_connection_cap += 1  # same answer (AR / REPLY_BUSY), counted apart
             return REPLY_BUSY
         entry = Pending(
             correlation_id=new_correlation_id(),
@@ -224,11 +225,11 @@ class PendingMap:
         status, code, body = record.status, _safe_code(record.code), record.body
         if status == "accepted" and entry.body_mode == "step" and body:
             if any(byte in body for byte in _FRAMING):
-                status, code, body = "failed", REPLY_BODY_MISSING, b""  # would break the sender's framing
+                status, code, body = "failed", REPLY_BODY_INVALID, b""  # would break the sender's framing
             elif self._budget.try_charge(len(body)):
                 entry.body, entry.body_charged = body, len(body)
             else:
-                status, code, body = "failed", REPLY_BUSY, b""  # committed, but the body cannot be held
+                status, code, body = "failed", REPLY_BODY_OVER_BUDGET, b""  # committed, but no room to hold it
         return True, self._settle(entry, entry.request.reply_received(status, code))
 
     def timer_fire(self, entry: Pending) -> Resolution | None:

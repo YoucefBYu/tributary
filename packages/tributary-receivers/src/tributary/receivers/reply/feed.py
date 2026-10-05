@@ -432,8 +432,8 @@ def open_reply_feed(
 
     `group.instance.id` is `<instance>-p<pid>`: unique per **process**, since a duplicate fences a live process
     out of the group, and stable across a container's restarts (pid 1), so a planned restart re-takes its
-    partitions without a rebalance. Session and heartbeat timeouts come from the contract's consumer profile
-    (`clients.reply_consumer` says: the same measured values as the worker's)."""
+    partitions without a rebalance. Every other setting comes from `clients.reply_consumer` through
+    `consumer_config(profile="reply_consumer")` (set 1.7): no literal and no value borrowed from the worker."""
     from confluent_kafka import Consumer
     from tributary.runtime.topics import reply_topic
 
@@ -454,16 +454,9 @@ def open_reply_feed(
         defaults,
         group_id=f"tb.{env}.{channel}.replier",
         group_instance_id=f"{instance}-p{pid}",
-        auto_offset_reset="latest",
+        profile="reply_consumer",  # session, heartbeat, strategy, auto.offset.reset, isolation.level: the contract's
     )
-    config.update(
-        {
-            "isolation.level": "read_uncommitted",
-            "client.id": f"mllp-replier-{channel}",
-            "error_cb": error_cb,
-            "socket.keepalive.enable": True,
-        }
-    )
+    config.update({"client.id": f"mllp-replier-{channel}", "error_cb": error_cb, "socket.keepalive.enable": True})
     feed = ReplyFeed(Consumer(config), reply_topic(env, channel), log=log, metrics=metrics)
     feed_box.append(feed)
     return feed
