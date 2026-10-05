@@ -28,13 +28,12 @@ jobs:
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
         with:
           python-version: "3.12"
-      - run: uv run --no-project --python 3.12 --with jsonschema python contracts/validate.py
-      # --emit-expectations always exits 0, so the drift check is in a script: it fails if any pinned
-      # (json_path, validator) pair no longer matches what the schema measures.
+      # Without openapi-spec-validator the default run fails by design (209 passed, 1 failed).
+      - name: contracts validate
+        run: uv run --no-project --python 3.12 --with jsonschema --with openapi-spec-validator python contracts/validate.py
+      # Exits non-zero if any pinned (json_path, validator) pair has drifted from what the schema measures.
       - name: pinned failure pairs have not drifted
-        run: |
-          uv run --no-project --python 3.12 --with jsonschema python contracts/validate.py --emit-expectations \
-            | python3 .github/scripts/check_expectations.py
+        run: uv run --no-project --python 3.12 --with jsonschema --with openapi-spec-validator python contracts/validate.py --check-expectations
 
   python:
     name: lint, types, unit tests, conformance
@@ -71,13 +70,16 @@ jobs:
           python-version: "3.12"
           enable-cache: true
       - run: uv sync
-      # Exit 5 (nothing collected) now fails the job. Also fail if the summary shows 0 passed, so an
-      # all-skipped run (for example Docker missing) cannot pass.
+      # Collection check first (no Docker needed): the -m integration selection must equal
+      # tests/support/integration_expected.json. Then the run itself: passed == expected count and
+      # skipped == 0, so Docker missing or a skip/deselect cannot pass. The same -m integration selector is
+      # used for both, so chaos tests also marked integration are counted on both sides.
+      - name: integration collection matches expected
+        run: uv run python -m tests.support.integration_expected --check
       - name: integration tests
-        run: |
-          set -o pipefail
-          uv run pytest -m integration -ra 2>&1 | tee integration.log
-          grep -Eq '(^|[ =])[1-9][0-9]* passed' integration.log || { echo "no integration tests passed"; exit 1; }
+        run: uv run pytest -m integration -ra --junitxml=integration-junit.xml
+      - name: integration passed count equals expected, none skipped
+        run: uv run python .github/scripts/check_integration_counts.py integration-junit.xml
 
   supply-chain:
     name: licence and SBOM, secret scan, gitignore guard
