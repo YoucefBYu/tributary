@@ -12,9 +12,17 @@ the real client has driver retries off.
 
 from __future__ import annotations
 
+import contextlib
+import os
+import socket
+import struct
+import subprocess
+import sys
+import threading
 import uuid
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import orjson
 import pytest
@@ -29,7 +37,9 @@ pytestmark = pytest.mark.integration
 
 @pytest.fixture(scope="module")
 def clickhouse() -> Iterator[ClickHouseContainer]:
-    with ClickHouseContainer("clickhouse/clickhouse-server:24.8") as container:
+    with ClickHouseContainer("clickhouse/clickhouse-server:24.8").with_env(
+        "CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT", "1"
+    ) as container:
         yield container
 
 
@@ -211,3 +221,162 @@ def test_insert_failure_is_a_sinkerror_without_server_text(db: tuple[object, Cli
     with pytest.raises(SinkError) as caught:
         missing.insert(rows(base()))
     assert "no_such_table" not in str(caught.value)
+
+
+class _ResettingProxy:
+    """Forwards to ClickHouse until `armed`, then accepts and RSTs every connection (counting them)."""
+
+    def __init__(self, host: str, port: int) -> None:
+        self.upstream = (host, port)
+        self.armed = False
+        self.after_armed = 0
+        self.server = socket.socket()
+        self.server.bind(("127.0.0.1", 0))
+        self.server.listen(16)
+        self.port = self.server.getsockname()[1]
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _pump(self, a: socket.socket, b: socket.socket) -> None:
+        try:
+            while data := a.recv(65536):
+                b.sendall(data)
+        except OSError:
+            pass
+        finally:
+            for s in (a, b):
+                with contextlib.suppress(OSError):
+                    s.shutdown(socket.SHUT_RDWR)
+
+    def _serve(self) -> None:
+        while True:
+            try:
+                conn, _ = self.server.accept()
+            except OSError:
+                return
+            if not self.armed:
+                up = socket.create_connection(self.upstream)
+                threading.Thread(target=self._pump, args=(conn, up), daemon=True).start()
+                threading.Thread(target=self._pump, args=(up, conn), daemon=True).start()
+            else:
+                self.after_armed += 1
+                conn.recv(65536)
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+                conn.close()
+
+
+def test_reset_during_insert_on_a_connected_client_is_one_attempt_and_transient(
+    clickhouse: ClickHouseContainer,
+) -> None:
+    from tributary.archiver.errors import SinkError
+
+    proxy = _ResettingProxy(clickhouse.get_container_host_ip(), int(clickhouse.get_exposed_port(8123)))
+    client = connect(
+        ClickhouseTarget(
+            host="127.0.0.1",
+            port=proxy.port,
+            database=clickhouse.dbname,
+            username=clickhouse.username,
+            password=clickhouse.password,
+            secure=False,
+        )
+    )
+    ensure_schema(client, database=clickhouse.dbname)
+    proxy.armed = True
+    try:
+        with pytest.raises(SinkError) as caught:
+            ClickhouseSink(client).insert(rows(base()))
+        assert caught.value.transient is True
+        assert proxy.after_armed == 1, "exactly one connection: the insert was not re-sent"
+    finally:
+        proxy.server.close()
+        client.close()
+
+
+def test_insert_only_credential_inserts_but_cannot_migrate(clickhouse: ClickHouseContainer) -> None:
+    """ADR-004 A5: after a migration credential created the table, the runtime user needs INSERT only."""
+    from tributary.archiver.errors import SinkError
+
+    name = f"t_{uuid.uuid4().hex[:12]}"
+    admin = connect(
+        ClickhouseTarget(
+            host=clickhouse.get_container_host_ip(),
+            port=int(clickhouse.get_exposed_port(8123)),
+            database=clickhouse.dbname,
+            username=clickhouse.username,
+            password=clickhouse.password,
+            secure=False,
+        )
+    )
+    admin.command(f"CREATE DATABASE {name}")
+    ensure_schema(admin, database=name)
+    admin.command(f"CREATE USER IF NOT EXISTS ins_{name} IDENTIFIED BY 'synth-ins-pw'")
+    admin.command(f"GRANT INSERT ON {name}.message_events TO ins_{name}")
+    runtime = connect(
+        ClickhouseTarget(
+            host=clickhouse.get_container_host_ip(),
+            port=int(clickhouse.get_exposed_port(8123)),
+            database=name,
+            username=f"ins_{name}",
+            password="synth-ins-pw",  # noqa: S106
+            secure=False,
+        )
+    )
+    try:
+        ClickhouseSink(runtime).insert(rows(base()))
+        assert int(admin.command(f"SELECT count() FROM {name}.message_events FINAL")) == 1  # noqa: S608
+        with pytest.raises(Exception):  # noqa: B017
+            ensure_schema(runtime, database=name, ttl_days=7)
+    finally:
+        runtime.close()
+        admin.command(f"DROP DATABASE IF EXISTS {name}")
+        admin.command(f"DROP USER IF EXISTS ins_{name}")
+        admin.close()
+        assert SinkError  # imported for symmetry with the sibling tests
+
+
+def test_migrate_only_creates_the_table_with_the_migration_credential_and_needs_no_kafka(
+    clickhouse: ClickHouseContainer, tmp_path: Path
+) -> None:
+    name = f"t_{uuid.uuid4().hex[:12]}"
+    admin = connect(
+        ClickhouseTarget(
+            host=clickhouse.get_container_host_ip(),
+            port=int(clickhouse.get_exposed_port(8123)),
+            database=clickhouse.dbname,
+            username=clickhouse.username,
+            password=clickhouse.password,
+            secure=False,
+        )
+    )
+    admin.command(f"CREATE DATABASE {name}")
+    ref = tmp_path / "ch-migrate"
+    ref.mkdir()
+    (ref / "user").write_text(clickhouse.username)
+    (ref / "password").write_text(clickhouse.password)
+    for f in ref.iterdir():
+        f.chmod(0o600)
+    env = {k: v for k, v in os.environ.items() if k not in ("TB_ENGINE_KAFKA_FILE", "TB_BOOTSTRAP_SERVERS")}
+    env.update(
+        {
+            "TB_ARCHIVE_CLICKHOUSE_HOST": clickhouse.get_container_host_ip(),
+            "TB_ARCHIVE_CLICKHOUSE_PORT": str(clickhouse.get_exposed_port(8123)),
+            "TB_ARCHIVE_CLICKHOUSE_SECURE": "false",
+            "TB_ARCHIVE_CLICKHOUSE_DATABASE": name,
+            "TB_ARCHIVE_CLICKHOUSE_MIGRATE_SECRET_REF": "ch-migrate",
+            "TB_SECRETS_DIR": str(tmp_path),
+            "TB_ARCHIVE_TTL_DAYS": "45",
+        }
+    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "tributary.archiver", "--env", "dev", "--migrate-only"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert result.returncode == 0, result.stderr[-300:]
+        assert "toIntervalDay(45)" in str(admin.command(f"SHOW CREATE TABLE {name}.message_events"))
+    finally:
+        admin.command(f"DROP DATABASE IF EXISTS {name}")
+        admin.close()

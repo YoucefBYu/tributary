@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import socket
 import struct
@@ -221,3 +222,60 @@ def test_proxy_environment_is_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
         )
     server.close()
     assert len(accepted) == 1, "the connection went to the target, not the proxy"
+
+
+def test_tls_verification_failure_is_distinguishable_by_code_only(tmp_path: Path) -> None:
+    import ssl
+    import subprocess
+
+    from tributary.archiver.errors import SinkError
+
+    cert, key = tmp_path / "c.pem", tmp_path / "k.pem"
+    subprocess.run(  # noqa: S603
+        ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(key), "-out", str(cert),  # noqa: S607
+         "-days", "1", "-subj", "/CN=localhost"],
+        check=True,
+        capture_output=True,
+    )  # fmt: skip
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(str(cert), str(key))
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(4)
+
+    def serve() -> None:
+        while True:
+            try:
+                conn, _ = server.accept()
+                with contextlib.suppress(OSError):
+                    context.wrap_socket(conn, server_side=True).recv(10)
+            except OSError:
+                return
+
+    threading.Thread(target=serve, daemon=True).start()
+    try:
+        with pytest.raises(SinkError) as caught:
+            connect(ClickhouseTarget(host="127.0.0.1", port=server.getsockname()[1], database="d", username="u"))
+        assert caught.value.code == "TLS_VERIFY_FAILED"
+        with pytest.raises(SinkError) as other:
+            connect(ClickhouseTarget(host="127.0.0.1", port=1, database="d", username="u", secure=False))
+        assert other.value.code == "SINK_ERROR"
+    finally:
+        server.close()
+
+
+def test_driver_logging_cannot_reach_a_handler() -> None:
+    import logging
+
+    connect_target = ClickhouseTarget(host="127.0.0.1", port=1, database="d", username="u", secure=False)
+    with contextlib.suppress(Exception):
+        connect(connect_target)
+    driver = logging.getLogger("clickhouse_connect")
+    assert driver.propagate is False and driver.level > logging.CRITICAL
+
+
+def test_migration_credential_ref_is_separate() -> None:
+    environ = {**ENVIRON, "TB_ARCHIVE_CLICKHOUSE_MIGRATE_SECRET_REF": "ch-migrate"}
+    assert load_config("dev", environ, Resolver(), ref_env_name="TB_ARCHIVE_CLICKHOUSE_MIGRATE_SECRET_REF")
+    with pytest.raises(ArchiverConfigError):
+        load_config("dev", ENVIRON, Resolver(), ref_env_name="TB_ARCHIVE_CLICKHOUSE_MIGRATE_SECRET_REF")

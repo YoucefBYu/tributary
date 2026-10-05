@@ -31,6 +31,9 @@ class SinkError(ArchiverError):
     bad column type, authentication or access refused). The archiver halts on it; it never drops the batch.
     """
 
-    def __init__(self, message: str, *, transient: bool = True) -> None:
+    def __init__(self, message: str, *, transient: bool = True, code: str = "SINK_ERROR") -> None:
         super().__init__(message)
         self.transient = transient
+        #: `TLS_VERIFY_FAILED` (certificate or hostname check refused) or `SINK_ERROR`. By code only: the
+        #: driver's text is never kept.
+        self.code = code

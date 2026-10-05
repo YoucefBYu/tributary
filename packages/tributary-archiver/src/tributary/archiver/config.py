@@ -60,7 +60,13 @@ def _int(environ: Mapping[str, str], name: str, default: int, low: int, high: in
     return value
 
 
-def load_config(env: str, environ: Mapping[str, str], resolver: SecretResolver) -> ArchiverConfig:
+def load_config(
+    env: str,
+    environ: Mapping[str, str],
+    resolver: SecretResolver,
+    *,
+    ref_env_name: str = "TB_ARCHIVE_CLICKHOUSE_SECRET_REF",
+) -> ArchiverConfig:
     """Names and numbers only in errors: never a secret value."""
     host = environ.get("TB_ARCHIVE_CLICKHOUSE_HOST", "")
     if not _HOST.fullmatch(host):
@@ -69,9 +75,9 @@ def load_config(env: str, environ: Mapping[str, str], resolver: SecretResolver) 
     if not _IDENT.fullmatch(database):
         raise ArchiverConfigError("TB_ARCHIVE_CLICKHOUSE_DATABASE is invalid")
     secure = _bool(environ, "TB_ARCHIVE_CLICKHOUSE_SECURE", default=True)
-    ref = environ.get("TB_ARCHIVE_CLICKHOUSE_SECRET_REF", "")
+    ref = environ.get(ref_env_name, "")
     if not _SECRET_REF.fullmatch(ref):
-        raise ArchiverConfigError("TB_ARCHIVE_CLICKHOUSE_SECRET_REF is unset or invalid")
+        raise ArchiverConfigError(f"{ref_env_name} is unset or invalid")
     try:
         username = resolver.resolve_text(ref, "user")
         password = resolver.resolve_text(ref, "password")

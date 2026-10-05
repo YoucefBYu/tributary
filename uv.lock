@@ -1967,6 +1967,7 @@ dependencies = [
     { name = "orjson" },
     { name = "tributary-runtime" },
     { name = "tributary-sdk" },
+    { name = "urllib3" },
 ]
 
 [package.metadata]
@@ -1976,6 +1977,7 @@ requires-dist = [
     { name = "orjson", specifier = ">=3.10" },
     { name = "tributary-runtime", editable = "packages/tributary-runtime" },
     { name = "tributary-sdk", editable = "packages/tributary-sdk" },
+    { name = "urllib3", specifier = ">=2.0" },
 ]
 
 [[package]]

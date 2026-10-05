@@ -26,9 +26,12 @@ from __future__ import annotations
 
 import contextlib
 import ipaddress
+import logging
 import re
+import ssl
 from collections.abc import Sequence
 from dataclasses import dataclass
+from ssl import CertificateError
 from typing import Any, Final, Protocol
 
 import clickhouse_connect
@@ -99,14 +102,52 @@ def is_loopback(host: str) -> bool:
         return False
 
 
+class _TlsVerifyError(urllib3.exceptions.HTTPError):
+    """Marks a refused certificate or hostname check. Carries no cause: only the marker survives."""
+
+
+def _is_tls_verify_failure(exc: BaseException) -> bool:
+    seen: set[int] = set()
+    stack: list[BaseException | None] = [exc]
+    while stack:
+        current = stack.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, ssl.SSLCertVerificationError | CertificateError):
+            return True
+        stack.extend([current.__cause__, current.__context__, getattr(current, "reason", None)])
+        stack.extend(a for a in current.args if isinstance(a, BaseException))
+    return False
+
+
+def quiet_driver_logging() -> None:
+    """The driver logs tracebacks on stream errors (`streaming.py`, `transform.py`) that can carry values.
+    Nothing it logs is wanted: failures reach us as exceptions, which `SinkError` reduces to a class name."""
+    driver_logger = logging.getLogger("clickhouse_connect")
+    driver_logger.setLevel(logging.CRITICAL + 1)
+    driver_logger.propagate = False
+    if not any(isinstance(h, logging.NullHandler) for h in driver_logger.handlers):
+        driver_logger.addHandler(logging.NullHandler())
+    urllib3_logger = logging.getLogger("urllib3.connectionpool")  # "Retrying ... after connection broken by <err>"
+    urllib3_logger.setLevel(logging.CRITICAL + 1)
+
+
 class _NoResendPoolManager(urllib3.PoolManager):
     """Hides the cause of a transport error from the driver so its resend-once path cannot trigger."""
 
     def request(self, method: str, url: str, **kwargs: Any) -> Any:  # type: ignore[override]
-        with contextlib.suppress(urllib3.exceptions.HTTPError):
+        tls_failure = False
+        try:
             return super().request(method, url, **kwargs)
-        # Raised outside the `except` handling on purpose: inside it, `__context__` would carry the original.
-        raise urllib3.exceptions.HTTPError("transport error")
+        except urllib3.exceptions.HTTPError as exc:
+            tls_failure = _is_tls_verify_failure(exc)
+        # Raised outside the `except` block on purpose: inside it, `__context__` would carry the original.
+        raise _TlsVerifyError("tls verification failed") if tls_failure else urllib3.exceptions.HTTPError("transport")
+
+
+def _code(exc: BaseException) -> str:
+    return "TLS_VERIFY_FAILED" if isinstance(exc.__cause__, _TlsVerifyError) else "SINK_ERROR"
 
 
 def build_pool(target: ClickhouseTarget) -> urllib3.PoolManager:
@@ -120,6 +161,7 @@ def build_pool(target: ClickhouseTarget) -> urllib3.PoolManager:
 
 def connect(target: ClickhouseTarget) -> Any:
     """A client with driver-side retries off. Raises `SinkError` (fixed text) if the server is unreachable."""
+    quiet_driver_logging()
     pool = build_pool(target)
     try:
         client = clickhouse_connect.get_client(
@@ -141,7 +183,7 @@ def connect(target: ClickhouseTarget) -> Any:
         )
     except Exception as exc:
         pool.clear()
-        raise SinkError(f"clickhouse connect failed ({type(exc).__name__})") from None
+        raise SinkError(f"clickhouse connect failed ({type(exc).__name__})", code=_code(exc)) from None
     driver: Any = client
     driver.http_retries = 0  # the pool-level retry budget; see module doc
     driver.tb_pool = pool  # closed with the client: the driver does not own a pool it was handed
@@ -162,7 +204,7 @@ class ClickhouseSink:
             self._client.insert(self._table, list(rows), column_names=list(COLUMNS))
         except Exception as exc:
             raise SinkError(
-                f"clickhouse insert failed ({type(exc).__name__})", transient=not is_permanent(exc)
+                f"clickhouse insert failed ({type(exc).__name__})", transient=not is_permanent(exc), code=_code(exc)
             ) from None
 
     def close(self) -> None:
