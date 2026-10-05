@@ -98,7 +98,7 @@ def test_status_to_answer(
     assert pending.deliver_reply(record(entry, status=status, code=code)) == (True, expected)
 
 
-@pytest.mark.parametrize("hostile", ["AE|MSA", "lower_case", "X" * 65, "A B", "CODE\r", ""])
+@pytest.mark.parametrize("hostile", ["AE|MSA", "lower_case", "X" * 65, "A B", "CODE\r", "CODE\n", "CODE\r\nMSA|AA", ""])
 def test_a_malformed_reply_code_never_reaches_the_sender(loop: asyncio.AbstractEventLoop, hostile: str) -> None:
     """The code lands in MSA-3: only a registered-shape code passes (envelope 2.3.3: tolerated, never trusted)."""
     pending, _, _, _ = new_map(loop)
@@ -278,3 +278,21 @@ def test_the_routing_headers_carry_ids_and_a_deadline_never_the_control_id(loop:
     assert headers[h.TB_REPLY_DEADLINE] == "2026-10-01T12:00:17.000Z", "produce + ack.timeoutMs + reply.timeoutMs"
     assert CONTROL_ID_MARKER not in "".join(headers.values())
     assert h.is_well_formed(h.TB_CORRELATION_ID, headers[h.TB_CORRELATION_ID])
+
+
+def test_one_connection_cannot_take_the_whole_pool(loop: asyncio.AbstractEventLoop) -> None:
+    """Per-connection fairness: a quarter of maxPending (at least 1) per connection, inside the process cap."""
+    pending, _, metrics, _ = new_map(loop, settings=ReplySettings(max_pending=8))
+    greedy, other = object(), object()
+    held = [open_entry(pending, connection=greedy), open_entry(pending, connection=greedy)]
+    assert pending.connection_cap == 2
+    assert pending.open(sender_control_id="c", connection=greedy) == REPLY_BUSY
+    assert metrics.nacked_reply_busy == 1
+    assert not isinstance(pending.open(sender_control_id="c", connection=other), str), "another peer is unaffected"
+    pending.commit(held[0], ok=False)
+    assert not isinstance(pending.open(sender_control_id="c", connection=greedy), str), (
+        "a settled entry frees its share"
+    )
+    assert ReplySettings(max_pending=1).max_pending == 1
+    tiny, _, _, _ = new_map(loop, settings=ReplySettings(max_pending=1))
+    assert tiny.connection_cap == 1

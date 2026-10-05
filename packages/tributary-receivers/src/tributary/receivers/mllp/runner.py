@@ -106,6 +106,7 @@ class MllpRunner(PublishingLifecycle[MllpSettings]):
             if self._make_reply_feed is None:
                 raise ConfigError("source.reply is set but this process has no reply consumer")
             feed = self._make_reply_feed(self.metrics)
+            feed.fatal_handler = self.report_failure
             feed.start(asyncio.get_running_loop())
             self._reply_feed = feed
         return self._reply_feed

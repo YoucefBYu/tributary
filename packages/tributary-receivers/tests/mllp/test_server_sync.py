@@ -553,3 +553,58 @@ def test_async_channels_are_untouched_by_a_reply_feed() -> None:
         listener.close()
 
     asyncio.run(go())
+
+
+def test_a_live_timeout_change_and_a_half_close_neither_leak_capacity_nor_drop_the_answer() -> None:
+    """Regression (security review): the writer's wait was bounded by the *current* reply timeout. A request opened
+    under 5 s, `timeoutMs` lowered to 1 s live, then a half-close: the handler gave up on the writer, cancelled it
+    while it waited on the outcome, and the frame's reservation was never returned (`used_messages` stuck at 1)."""
+    publisher = Recorder()
+
+    async def client(server: MllpServer, port: int) -> None:
+        r, w = await send(port, "C1")
+        await publisher.nth(1)
+        await asyncio.sleep(0.2)
+        await server.apply_settings(replace(server.cfg, reply=ReplySettings(timeout_s=1.0)))
+        w.write_eof()  # the sender still waits for its answer
+        [f] = await _read_frames(r, 1, timeout=10.0)
+        assert msa3(f)[:2] == ("AE", "C1") and REPLY_TIMEOUT in msa3(f)[2], "answered at the 5 s it was opened under"
+        async with asyncio.timeout(5):
+            while server.budget.used_messages or len(server.pending or []):
+                await asyncio.sleep(0.02)
+        assert server.budget.used_bytes == 0
+        w.close()
+
+    run(sync_settings(ack_timeout_s=1.0, write_timeout_s=0.5, reply=ReplySettings(timeout_s=5.0)), publisher, client)
+
+
+def test_a_writer_cancelled_while_waiting_on_an_outcome_returns_its_reservation() -> None:
+    async def go() -> None:
+        server = MllpServer(sync_settings(), Recorder())  # type: ignore[arg-type]
+        server.use_reply_feed(FakePartitions(0))  # type: ignore[arg-type]
+        await server.start()
+        assert server.pending is not None
+        entry = server.pending.open(sender_control_id="C1", connection=object())
+        assert not isinstance(entry, str)
+        assert await server.budget.reserve(100, 1.0)
+        q: asyncio.Queue = asyncio.Queue()  # type: ignore[type-arg]
+
+        class Sink:
+            def write(self, data: bytes) -> None: ...
+
+            async def drain(self) -> None: ...
+
+            def close(self) -> None: ...
+
+        waiter = asyncio.ensure_future(entry.outcome)
+        await q.put(("C1", waiter, 100))
+        writer = asyncio.create_task(server._ack_writer(q, Sink()))  # type: ignore[arg-type]
+        await asyncio.sleep(0.05)
+        assert server.budget.used_messages == 1
+        writer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await writer
+        assert server.budget.used_messages == 0 and server.budget.used_bytes == 0
+        server.stop_accepting("test")
+
+    asyncio.run(go())

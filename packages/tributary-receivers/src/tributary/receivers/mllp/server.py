@@ -86,6 +86,9 @@ class _Conn:
     revoked: bool = False
     pending: int = 0
     reading: bool = False
+    #: The longest reply timeout among entries this connection opened: a live `timeoutMs` change must not shorten
+    #: the wait for a request opened under a longer one.
+    reply_wait_s: float = 0.0
 
 
 class MllpServer:
@@ -306,29 +309,37 @@ class MllpServer:
         while (item := await q.get()) is not None:
             cid, outcome, reserved = item
             charged = 0
-            out: bytes | None
-            if isinstance(outcome, str):
-                out = build_ack("AR", cid, outcome)
-            else:
-                result = await outcome
-                if isinstance(result, Outcome):
-                    charged = result.take_charge()
-                    out = self._sync_ack(result)
-                elif result:
-                    out = build_ack("AA", cid)
-                    self.metrics.acked += 1
-                else:
-                    out = build_ack("AR", cid, "unavailable")
-                    self.metrics.publish_failures += 1
-                    self.metrics.nacked_unavailable += 1
+            # Everything from the wait for the outcome to the write sits inside one try/finally: a writer cancelled
+            # while it waits on a synchronous answer (or on a slow peer) still returns this frame's reservation
+            # and any body charge. Otherwise the capacity leaks for the life of the process.
             try:
-                if not dead and out is not None:  # keep draining so the reader never blocks on a dead peer
-                    w.write(out)
-                    await asyncio.wait_for(w.drain(), self.cfg.write_timeout_s)
-            except (ConnectionError, OSError, TimeoutError):
-                dead = True
-                if self._pending is not None:
-                    self._pending.abandon(conn)  # nothing more can be written to this sender
+                out: bytes | None
+                if isinstance(outcome, str):
+                    out = build_ack("AR", cid, outcome)
+                else:
+                    try:
+                        result = await outcome
+                    except asyncio.CancelledError:
+                        outcome.add_done_callback(self._release_body_when_done)  # a body charged later is returned
+                        raise
+                    if isinstance(result, Outcome):
+                        charged = result.take_charge()
+                        out = self._sync_ack(result)
+                    elif result:
+                        out = build_ack("AA", cid)
+                        self.metrics.acked += 1
+                    else:
+                        out = build_ack("AR", cid, "unavailable")
+                        self.metrics.publish_failures += 1
+                        self.metrics.nacked_unavailable += 1
+                try:
+                    if not dead and out is not None:  # keep draining so the reader never blocks on a dead peer
+                        w.write(out)
+                        await asyncio.wait_for(w.drain(), self.cfg.write_timeout_s)
+                except (ConnectionError, OSError, TimeoutError):
+                    dead = True
+                    if self._pending is not None:
+                        self._pending.abandon(conn)  # nothing more can be written to this sender
             finally:
                 if charged:
                     await self.budget.release_bytes(charged)
@@ -446,6 +457,7 @@ class MllpServer:
                             await q.put((cid, opened, None))  # AR, MSA-3 = the REPLY_ code
                             continue
                         waiting = opened
+                        conn.reply_wait_s = max(conn.reply_wait_s, opened.timeout_s)
                     conn.pending += 1
                     task: asyncio.Task[Any]
                     if waiting is None:
@@ -462,7 +474,7 @@ class MllpServer:
             if self._pending is not None and not isinstance(exc, TimeoutError):
                 self._pending.abandon(conn)  # a reset or failed peer cannot be written to: end its waiting entries now
         finally:
-            reply_wait = self.cfg.reply.timeout_s if self.cfg.reply is not None else 0.0
+            reply_wait = max(conn.reply_wait_s, self.cfg.reply.timeout_s if self.cfg.reply is not None else 0.0)
             try:
                 await asyncio.wait_for(q.put(None), self.cfg.write_timeout_s)
                 await asyncio.wait_for(writer_task, self.cfg.ack_timeout_s + reply_wait + self.cfg.write_timeout_s)
@@ -549,7 +561,12 @@ def main() -> None:
     p = QuietArgumentParser(log, description=__doc__)
     p.add_argument("--channel", required=True, help="the deployed channel name (spec.metadata.name)")
     p.add_argument("--env", required=True, help="the topic-name env segment, e.g. 'dev' or 'prod'")
-    p.add_argument("--instance", default="mllp-0", help="this process's identity, for tb-source")
+    p.add_argument(
+        "--instance",
+        default=None,
+        help="this process's identity, for tb-source (default mllp-0). REQUIRED and unique per replica when the "
+        "channel has source.reply: it names the replier group member, and a duplicate fences a live replica",
+    )
     p.add_argument("--secrets-dir", help="overrides TB_SECRETS_DIR / the default secrets mount")
     p.add_argument("--contracts-dir", help="overrides TB_CONTRACTS_DIR / the default contracts/ search")
     p.add_argument("--metrics-file")
@@ -560,6 +577,9 @@ def main() -> None:
         help="topic-defaults.json profile in use; 'lite' emits the mandatory RF=1 startup warning",
     )
     a = p.parse_args(argv)
+    instance_explicit = a.instance is not None
+    if a.instance is None:
+        a.instance = "mllp-0"
     emit_lite_profile_warning(profile=a.profile)
     # Operator input is validated (and refused without being echoed) before it becomes a log field.
     spec_group = spec_reader_group_or_exit(a.env, a.channel, a.instance, log)
@@ -596,7 +616,7 @@ def main() -> None:
             defaults,
             env=a.env,
             channel=a.channel,
-            instance=a.instance,
+            instance=a.instance if instance_explicit else None,
             pid=os.getpid(),
             log=log,
             metrics=metrics,

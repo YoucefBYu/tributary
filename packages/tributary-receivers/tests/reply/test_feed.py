@@ -9,6 +9,7 @@ import threading
 from collections.abc import Iterator
 
 import pytest
+from tributary.receivers.metrics import Metrics
 from tributary.receivers.reply.feed import parse_reply_record
 from tributary.runtime.sync_answer import Resolution
 from tributary.sdk import headers as h
@@ -21,6 +22,7 @@ from .support import (
     FakeConsumer,
     FakeKafkaError,
     FakeMessage,
+    RecordingLog,
     new_feed,
     new_map,
     open_entry,
@@ -262,3 +264,52 @@ def test_nothing_the_feed_logs_names_a_key_a_control_id_or_a_correlation_id(loop
     text = log.text() + repr(metrics.snapshot())
     for secret in (KEY_MARKER, CONTROL_ID_MARKER, entry.correlation_id, entry.msg_id or "?"):
         assert secret not in text
+
+
+def test_a_fatal_consumer_error_stops_advertising_answers_the_entries_and_asks_for_a_restart(
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    """A second member with the same `group.instance.id` makes librdkafka return `_FATAL` from `poll`, with no
+    revoke or lost callback (measured): the fenced process must refuse before publishing, not keep advertising."""
+    consumer = FakeConsumer()
+    feed, metrics, log = new_feed(consumer)
+    consumer.rebalance_assign(0)
+    pending, _, _, _ = new_map(loop, partitions=feed, metrics=metrics)  # type: ignore[arg-type]
+    feed.attach(pending)
+    entry = open_entry(pending)
+    pending.commit(entry, ok=True)
+    failures: list[BaseException] = []
+    feed.fatal_handler = failures.append
+
+    consumer.messages.append(FakeMessage(error=FakeKafkaError("_FATAL")))
+    feed.tick()
+
+    assert feed.choose_partition() is None and not feed.ready and metrics.reply_ready == 0
+    assert entry.outcome.result().resolution == Resolution("AE", REPLY_ROUTE_LOST)
+    assert len(failures) == 1 and "reply_consumer_fatal" in log.events()
+    consumer.list_topics_ok = True
+    feed._down_probe_at = 0.001
+    feed.tick()
+    assert not feed.ready, "a metadata answer does not revive a fatally broken consumer"
+    consumer.messages.append(FakeMessage(error=FakeKafkaError("_FATAL")))
+    feed.tick()
+    assert len(failures) == 1, "reported once"
+
+
+def test_open_reply_feed_refuses_without_an_explicit_instance() -> None:
+    from tributary.receivers.errors import ConfigError
+    from tributary.receivers.reply.feed import open_reply_feed
+    from tributary.runtime.clients import KafkaSettings
+    from tributary.runtime.config import load_topic_defaults
+
+    with pytest.raises(ConfigError, match="--instance"):
+        open_reply_feed(
+            KafkaSettings(bootstrap_servers="localhost:9092"),
+            load_topic_defaults(),
+            env="dev",
+            channel="lab",
+            instance=None,
+            pid=1,
+            log=RecordingLog(),
+            metrics=Metrics(),
+        )

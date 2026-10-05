@@ -50,7 +50,7 @@ from .settings import ReplySettings
 
 #: A reply's `tb-error-code` is tolerated, never trusted (envelope 2.3.3): it reaches the sender in `MSA-3`,
 #: so only a registered-shape code (`^[A-Z][A-Z0-9_]{0,63}$`) passes. Anything else is answered with no code.
-_CODE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+_CODE = re.compile(r"[A-Z][A-Z0-9_]{0,63}")  # matched with `fullmatch`: `$` would accept a trailing newline
 
 #: MLLP framing bytes a body must not contain (`0x0B` starts a frame, `0x1C` ends it).
 _FRAMING = (b"\x0b", b"\x1c")
@@ -139,6 +139,7 @@ class PendingMap:
         self._schedule: Schedule = schedule if schedule is not None else loop.call_later
         self._request_factory = request_factory
         self._by_id: dict[str, Pending] = {}
+        self._per_connection: dict[int, int] = {}
         self._retired = False
 
     def __len__(self) -> int:
@@ -151,6 +152,13 @@ class PendingMap:
     def retire(self) -> None:
         """The server that owns this map stopped taking requests: the feed may drop it once it is empty."""
         self._retired = True
+
+    @property
+    def connection_cap(self) -> int:
+        """Most entries one connection may hold: a quarter of `maxPending`, at least 1, so one peer cannot take the
+        whole pool and starve the others into `REPLY_BUSY`. (The contract's `maxPending` is the per-process cap;
+        this is a fairness bound inside it, not a new setting.)"""
+        return max(1, self._settings.max_pending // 4)
 
     @property
     def settings(self) -> ReplySettings:
@@ -169,7 +177,9 @@ class PendingMap:
         if partition is None:
             self._metrics.nacked_reply_unavailable += 1
             return REPLY_UNAVAILABLE
-        if len(self._by_id) >= self._settings.max_pending:
+        if len(self._by_id) >= self._settings.max_pending or (
+            self._per_connection.get(id(connection), 0) >= self.connection_cap
+        ):
             self._metrics.nacked_reply_busy += 1
             return REPLY_BUSY
         entry = Pending(
@@ -183,6 +193,7 @@ class PendingMap:
             body_mode=self._settings.body,
         )
         self._by_id[entry.correlation_id] = entry
+        self._per_connection[id(connection)] = self._per_connection.get(id(connection), 0) + 1
         self._metrics.reply_pending = len(self._by_id)
         return entry
 
@@ -250,7 +261,13 @@ class PendingMap:
     def _settle(self, entry: Pending, resolution: Resolution | None) -> Resolution | None:
         if resolution is None:
             return None
-        self._by_id.pop(entry.correlation_id, None)
+        if self._by_id.pop(entry.correlation_id, None) is not None:
+            key = id(entry.connection)
+            left = self._per_connection.get(key, 1) - 1
+            if left > 0:
+                self._per_connection[key] = left
+            else:
+                self._per_connection.pop(key, None)
         self._metrics.reply_pending = len(self._by_id)
         if entry.timer is not None:
             entry.timer.cancel()
@@ -269,4 +286,4 @@ class PendingMap:
 
 
 def _safe_code(code: str | None) -> str | None:
-    return code if code is not None and _CODE.match(code) else None
+    return code if code is not None and _CODE.fullmatch(code) else None

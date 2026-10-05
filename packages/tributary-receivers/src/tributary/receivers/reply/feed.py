@@ -56,6 +56,9 @@ from ..metrics import Metrics
 
 #: Kafka error names for "the consumer cannot reach any broker".
 _DOWN = frozenset({"_ALL_BROKERS_DOWN", "_TRANSPORT", "_RESOLVE"})
+#: librdkafka's name for a consumer that can never continue (measured: a second member with the same
+#: `group.instance.id` makes the first one's `poll` return `_FATAL`, with no revoke or lost callback).
+_FATAL_NAME = "_FATAL"
 _MAX_ENUM_CHARS = 64
 _LOG_FIRST = 5
 _LOG_EVERY = 1000
@@ -165,6 +168,10 @@ class ReplyFeed:
         # event loop thread only
         self._held: list[int] = []
         self._connected = True
+        self._fatal = False
+        #: Called on the event loop thread when the consumer is fatally broken (fenced by a duplicate
+        #: `group.instance.id`, say). The runner makes the process exit so a supervisor restarts it.
+        self.fatal_handler: Callable[[BaseException], None] | None = None
         self._rr = 0
         self._sinks: list[ReplySink] = []
         self._dropped = 0
@@ -251,7 +258,21 @@ class ReplyFeed:
                     self._metrics.reply_route_lost += 1
         self._sinks = [s for s in self._sinks if not (s.retired and len(s) == 0)]
 
+    def _on_fatal(self) -> None:
+        """The consumer cannot continue: stop advertising at once, answer entries on its partitions, say so."""
+        if self._fatal:
+            return
+        self._fatal = True
+        self._log.error("reply_consumer_fatal")
+        self._on_revoked_event(frozenset(self._held))
+        self._connected = False
+        self._set_ready_gauge()
+        if self.fatal_handler is not None:
+            self.fatal_handler(RuntimeError("reply consumer fatal"))
+
     def _on_connection(self, up: bool) -> None:
+        if self._fatal:
+            return  # never ready again: the process restarts
         if up != self._connected:
             self._connected = up
             self._set_ready_gauge()
@@ -361,9 +382,14 @@ class ReplyFeed:
 
     def on_kafka_error(self, error: Any) -> None:
         name = ""
+        fatal = False
         with contextlib.suppress(Exception):
             name = str(error.name())
-        if name in _DOWN:
+            fatal = bool(error.fatal())
+        if fatal or name == _FATAL_NAME:
+            self._down_probe_at = 0.0
+            self._post(self._on_fatal)
+        elif name in _DOWN:
             self._down_probe_at = time.monotonic() + _RETRY_S
             self._post(self._on_connection, False)
 
@@ -395,7 +421,7 @@ def open_reply_feed(
     *,
     env: str,
     channel: str,
-    instance: str,
+    instance: str | None,
     pid: int,
     log: Logger,
     metrics: Metrics,
@@ -411,6 +437,12 @@ def open_reply_feed(
     from confluent_kafka import Consumer
     from tributary.runtime.topics import reply_topic
 
+    from ..errors import ConfigError
+
+    if not instance:
+        # The default `mllp-0-p1` would be the same in every container, and replicas sharing a
+        # `group.instance.id` fence one another out of the group.
+        raise ConfigError("source.reply needs an explicit --instance, unique per replica; none was given")
     feed_box: list[ReplyFeed] = []
 
     def error_cb(error: Any) -> None:
