@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import secrets
 import socket
 import struct
 import subprocess
@@ -297,6 +298,7 @@ def test_insert_only_credential_inserts_but_cannot_migrate(clickhouse: ClickHous
     from tributary.archiver.errors import SinkError
 
     name = f"t_{uuid.uuid4().hex[:12]}"
+    pw = secrets.token_hex(16)
     admin = connect(
         ClickhouseTarget(
             host=clickhouse.get_container_host_ip(),
@@ -309,7 +311,7 @@ def test_insert_only_credential_inserts_but_cannot_migrate(clickhouse: ClickHous
     )
     admin.command(f"CREATE DATABASE {name}")
     ensure_schema(admin, database=name)
-    admin.command(f"CREATE USER IF NOT EXISTS ins_{name} IDENTIFIED BY 'synth-ins-pw'")
+    admin.command(f"CREATE USER IF NOT EXISTS ins_{name} IDENTIFIED BY '{pw}'")
     admin.command(f"GRANT INSERT ON {name}.message_events TO ins_{name}")
     runtime = connect(
         ClickhouseTarget(
@@ -317,7 +319,7 @@ def test_insert_only_credential_inserts_but_cannot_migrate(clickhouse: ClickHous
             port=int(clickhouse.get_exposed_port(8123)),
             database=name,
             username=f"ins_{name}",
-            password="synth-ins-pw",  # noqa: S106
+            password=pw,
             secure=False,
         )
     )
