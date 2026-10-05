@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import io
 import json
+import threading
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -284,9 +287,25 @@ class FlakyChannelsConsumer(FakeChannelsConsumer):
         return metadata
 
 
-def started(consumer: FlakyChannelsConsumer, clock: FakeClock, stream: io.StringIO) -> ChannelCache:
+def inline(target: Callable[[], None]) -> None:
+    """Run the probe on the caller's thread, so a test sees its result in the same `poll_once`."""
+    target()
+
+
+def started(
+    consumer: FlakyChannelsConsumer,
+    clock: FakeClock,
+    stream: io.StringIO,
+    *,
+    spawn: Callable[[Callable[[], None]], None] | None = inline,
+) -> ChannelCache:
     subject = ChannelCache(
-        consumer, TOPIC, log=JsonLogger("test", stream=stream, level="debug"), probe_interval_s=5.0, clock=clock
+        consumer,
+        TOPIC,
+        log=JsonLogger("test", stream=stream, level="debug"),
+        probe_interval_s=5.0,
+        clock=clock,
+        spawn=spawn,
     )
     subject.start()
     subject.catch_up(timeout_s=1.0)
@@ -474,3 +493,99 @@ def test_the_mllp_receivers_feed_now_sees_the_outage() -> None:
     consumer.down = False
     clock.now += 5.0
     feed.poll()
+
+
+# -- the probe runs off the caller's thread (sync-reply p99 regression, 2026-10-05) -------------------
+
+
+@dataclass
+class SlowChannelsConsumer(FlakyChannelsConsumer):
+    """`list_topics` blocks until released, as a MetadataRequest queued behind a Fetch long-poll does."""
+
+    release: threading.Event = field(default_factory=threading.Event)
+    entered: threading.Event = field(default_factory=threading.Event)
+    fail: bool = False
+    #: Probes that have entered `list_topics` (the base class counts them only once they return).
+    entries: int = 0
+
+    def list_topics(self, topic: str | None = None, timeout: float = -1) -> Any:
+        if self.probes == 0:  # `start()`'s own metadata read is synchronous by design
+            return super().list_topics(topic, timeout)
+        self.entries += 1
+        self.entered.set()
+        self.release.wait(5.0)
+        if self.fail:
+            self.down = True
+        return super().list_topics(topic, timeout)
+
+
+def test_a_slow_probe_never_blocks_the_caller() -> None:
+    """Regression: the probe ran inline and took 470-490 ms on a healthy broker (its request waits
+    behind the consumer's own Fetch long-poll), stalling the worker thread and the MLLP event loop every
+    5 s: the sync-reply AA p99 of 440-500 ms. Now `poll_once` returns while the probe is in flight."""
+    consumer = SlowChannelsConsumer(records=[FakeChannelsRecord(CHANNEL.encode(), spec_bytes()), eof(0)])
+    clock = FakeClock()
+    subject = started(consumer, clock, io.StringIO(), spawn=None)  # the production daemon thread
+    source = LiveSpecSource(subject, CHANNEL)
+    clock.now += 5.0
+    began = time.monotonic()
+    assert source.current().name == CHANNEL
+    assert consumer.entered.wait(2.0), "the probe started"
+    for _ in range(20):  # however often the worker asks, while the probe is out
+        clock.now += 1.0
+        source.current()
+    assert time.monotonic() - began < 0.5, "no call waited for the probe"
+    assert consumer.entries == 1, "at most one probe in flight"
+    consumer.release.set()
+    assert subject._probe_idle.wait(2.0)
+    assert subject.available is True
+
+
+def test_a_failed_off_thread_probe_is_applied_and_logged_on_the_callers_thread() -> None:
+    from tributary.runtime.errors import ChannelsUnavailableError
+
+    consumer = SlowChannelsConsumer(records=[FakeChannelsRecord(CHANNEL.encode(), spec_bytes()), eof(0)], fail=True)
+    clock, stream = FakeClock(), io.StringIO()
+    subject = started(consumer, clock, stream, spawn=None)
+    clock.now += 5.0
+    subject.poll_once(timeout_s=0.0)  # starts the probe; nothing is known yet, so nothing is raised
+    assert subject.available is True
+    consumer.release.set()
+    assert subject._probe_idle.wait(2.0)
+    with pytest.raises(ChannelsUnavailableError) as raised:
+        subject.poll_once(timeout_s=0.0)
+    assert raised.value.error_code == "_TRANSPORT"
+    assert [line["event"] for line in events(stream) if line["event"].startswith("channels_")] == [
+        "channels_unavailable"
+    ]
+
+
+def test_a_probe_that_cannot_start_is_an_outage_not_a_crash() -> None:
+    from tributary.runtime.errors import ChannelsUnavailableError
+
+    def refuse(_target: Callable[[], None]) -> None:
+        raise RuntimeError("can't start new thread")
+
+    consumer = FlakyChannelsConsumer(records=[FakeChannelsRecord(CHANNEL.encode(), spec_bytes()), eof(0)])
+    clock = FakeClock()
+    subject = started(consumer, clock, io.StringIO(), spawn=refuse)
+    clock.now += 5.0
+    with pytest.raises(ChannelsUnavailableError) as raised:
+        subject.poll_once(timeout_s=0.0)
+    assert raised.value.error_code == "RuntimeError"
+    assert LiveSpecSource(subject, CHANNEL).current().name == CHANNEL, "invariant 3: still served"
+
+
+def test_close_waits_for_an_in_flight_probe_before_closing_the_consumer() -> None:
+    """Closing a librdkafka handle under a thread inside `list_topics` is a use-after-free."""
+    consumer = SlowChannelsConsumer(records=[FakeChannelsRecord(CHANNEL.encode(), spec_bytes()), eof(0)])
+    clock = FakeClock()
+    subject = started(consumer, clock, io.StringIO(), spawn=None)
+    clock.now += 5.0
+    subject.poll_once(timeout_s=0.0)
+    assert consumer.entered.wait(2.0)
+    threading.Timer(0.2, consumer.release.set).start()
+    began = time.monotonic()
+    subject.close()
+    assert time.monotonic() - began >= 0.15, "close waited for the probe"
+    assert consumer.closed
