@@ -61,7 +61,8 @@ from .datatypes import (
     cwe_components,
     cx_identifier,
     decimal_preserves_precision,
-    local_identifier_system,
+    facility_fallback_system,
+    require_scoped_system,
     sanitize_fhir_code,
     ts_to_fhir_datetime,
 )
@@ -206,7 +207,7 @@ def oru_r01_to_fhir(message: Message, ctx: FhirContext) -> Message:
 
     if obr is not None:
         report_identifier = _diagnostic_report_identifier(
-            obr, msg_id=message.msg_id, fallback_system=local_identifier_system(hl7["MSH.4.1"])
+            obr, msg_id=message.msg_id, fallback_system=facility_fallback_system(hl7["MSH.4.1"])
         )
         code, display, _system_alias = cwe_components(obr, 4)
 
@@ -242,7 +243,7 @@ def oru_r01_to_fhir(message: Message, ctx: FhirContext) -> Message:
     )
 
 
-def _diagnostic_report_identifier(obr: Segment, *, msg_id: str, fallback_system: str) -> Identifier:
+def _diagnostic_report_identifier(obr: Segment, *, msg_id: str, fallback_system: str | None) -> Identifier:
     """OBR-3 (Filler Order Number), else OBR-2 (Placer Order Number), else a message-scoped fallback.
 
     Neither OBR-2 nor OBR-3 in this reference set's fixtures carries its own CX assigning-authority
@@ -251,10 +252,10 @@ def _diagnostic_report_identifier(obr: Segment, *, msg_id: str, fallback_system:
     """
     filler = cx_identifier(obr, 3, fallback_system=fallback_system)
     if filler is not None:
-        return filler
+        return require_scoped_system(filler, path="OBR.3.4")
     placer = cx_identifier(obr, 2, fallback_system=fallback_system)
     if placer is not None:
-        return placer
+        return require_scoped_system(placer, path="OBR.2.4")
     obr_1 = obr.field(1)
 
     def build() -> Identifier:

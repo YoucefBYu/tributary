@@ -14,7 +14,8 @@ from .datatypes import (
     administrative_sex_to_gender,
     cx_identifier,
     dt8_to_fhir_date,
-    local_identifier_system,
+    facility_fallback_system,
+    require_scoped_system,
     xad_address,
     xpn_human_name,
     xtn_to_contact_point,
@@ -25,7 +26,8 @@ from .errors import RequiredFieldMissingError, safe_build
 def map_patient(hl7: Hl7Message, ctx: FhirContext) -> Patient:
     """PID -> `Patient`. Raises `RequiredFieldMissingError` if there is no PID segment at all, or if
     PID-3 is absent: with no identifier at all, there is nothing to key the `Patient` Bundle entry's
-    conditional PUT on (channel-spec README 3.4.2).
+    conditional PUT on (channel-spec README 3.4.2). Also raises `RequiredFieldMissingError("PID.3.4")` if
+    PID-3 carries no assigning authority: a conditional key with no system collides across senders.
 
     Every field assignment below is a single `safe_build` call (`errors.py`): if `fhir.resources`' own
     validation rejects something this module's datatype conversions did not already catch, the caller
@@ -43,8 +45,11 @@ def map_patient(hl7: Hl7Message, ctx: FhirContext) -> Patient:
     if identifier is None:
         raise RequiredFieldMissingError("PID.3", reason="no patient identifier to key the Patient entry on")
 
+    # No authority -> no conditional key: an empty-system key collides across senders (PHI integrity).
+    require_scoped_system(identifier, path="PID.3.4")
+
     identifiers: list[Identifier] = [identifier]
-    account = cx_identifier(pid, 18, fallback_system=local_identifier_system(hl7["MSH.4.1"]))
+    account = cx_identifier(pid, 18, fallback_system=facility_fallback_system(hl7["MSH.4.1"]))
     if account is not None:
         identifiers.append(account)
 

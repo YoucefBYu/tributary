@@ -266,3 +266,11 @@ def test_decimal_preserves_precision_rejects_beyond_float_precision() -> None:
 
 def test_decimal_preserves_precision_accepts_an_exact_ordinary_decimal() -> None:
     assert decimal_preserves_precision(Decimal("72.5")) is True
+
+
+def test_cx_identifier_reads_only_hd1_of_the_assigning_authority() -> None:
+    """CX.4 is an HD: only its Namespace ID (HD.1) scopes the system, not the universal id/type after it."""
+    pid = _segment("PID", "1||9000001^^^SYNTH-HOSPITAL&1.2.3&ISO^MR")
+    identifier = cx_identifier(pid, 3)
+    assert identifier is not None
+    assert identifier.system == "urn:id:SYNTH-HOSPITAL"

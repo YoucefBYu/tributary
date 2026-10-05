@@ -46,6 +46,19 @@ conditional identifier onto `.identifier` before the entry is built.
 they appear only as display-only `Reference`s on `Encounter`. No resource, so no identifier question to
 answer; a natural extension, out of scope for the first ADT/ORU mapping.
 
+## Conditional keys always carry an assigning authority
+
+A conditional create/update key never has an empty system: `identifier=|value` (or the bare `urn:id:`)
+would be shared by every sender using that value, so one sender's message could update another's
+resource and re-point its subject at the wrong patient. Rules (`datatypes.require_scoped_system`):
+
+- `Patient`: PID-3.4 is required. Absent -> `RequiredFieldMissingError("PID.3.4")`. No MSH-4 fallback.
+- `Encounter` (PV1-19) and `DiagnosticReport` (OBR-3, else OBR-2): CX.4, else MSH-4.1 as the system. If both
+  are empty -> `RequiredFieldMissingError("PV1.19.4" / "OBR.3.4" / "OBR.2.4")`.
+- Every `MappingError` is a `tributary.sdk.Reject` subclass, so the runtime dead-letters it at once (no
+  `stepRetries`) with `HL7_REQUIRED_FIELD_MISSING`, `HL7_INVALID_FIELD` or `HL7_UNSUPPORTED_TRIGGER`.
+- Errors carry the HL7 path and a fixed reason only, never the identifier value (invariant 6).
+
 ## MSH-9 is checked, not assumed
 
 Both steps check MSH-9.1 (message type) as well as the trigger event before mapping anything --

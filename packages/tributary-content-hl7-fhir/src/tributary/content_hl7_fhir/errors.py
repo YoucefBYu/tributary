@@ -9,16 +9,31 @@ from __future__ import annotations
 
 import contextlib
 from collections.abc import Callable
+from typing import ClassVar
+
+from tributary.sdk import Reject
 
 #: Distinguishes "the factory raised" from "the factory returned this exact object" -- `None` or `False`
 #: are both legitimate return values `safe_build` must not confuse with failure.
 _FAILED = object()
 
 
-class MappingError(Exception):
+class MappingError(Reject):
     """Base class for a mapping step's own errors (distinct from `tributary.hl7v2.errors.Hl7Error`,
     which is a parse-time failure, and `tributary.fhir.errors.BundleEntryError`, which is a
-    Bundle-construction failure this module also lets propagate unchanged)."""
+    Bundle-construction failure this module also lets propagate unchanged).
+
+    A `Reject` subclass: a mapping refusal is deterministic (the same message maps the same way on every
+    attempt), so the runtime dead-letters it at once with `reject_code` instead of retrying
+    `stepRetries` times. `HL7_*` is a channel-level family, not engine-reserved. The exception text stays
+    the path-only message below, never `Reject`'s default.
+    """
+
+    reject_code: ClassVar[str] = "HL7_MAPPING_ERROR"
+
+    def __init__(self, message: str) -> None:
+        super().__init__(self.reject_code)
+        self.args = (message,)
 
 
 class RequiredFieldMissingError(MappingError):
@@ -26,6 +41,8 @@ class RequiredFieldMissingError(MappingError):
 
     Carries the HL7 path only, e.g. `"PID.3.1"` -- never what (if anything) was actually there.
     """
+
+    reject_code: ClassVar[str] = "HL7_REQUIRED_FIELD_MISSING"
 
     def __init__(self, path: str, *, reason: str) -> None:
         super().__init__(f"cannot map: {path} is required and {reason}")
@@ -43,6 +60,8 @@ class InvalidFieldError(MappingError):
     See `safe_build` below for how a caller gets this instead of that.
     """
 
+    reject_code: ClassVar[str] = "HL7_INVALID_FIELD"
+
     def __init__(self, path: str, *, reason: str) -> None:
         super().__init__(f"cannot map {path}: {reason}")
         self.path = path
@@ -58,6 +77,8 @@ class UnsupportedTriggerError(MappingError):
     reintroduces the exact injection a security review found (a fixed placeholder like `"<non-
     structural>"` is what a caller should pass instead when the check fails).
     """
+
+    reject_code: ClassVar[str] = "HL7_UNSUPPORTED_TRIGGER"
 
     def __init__(self, message_type: str, trigger_event: str) -> None:
         super().__init__(f"no mapping registered for {message_type}^{trigger_event}")

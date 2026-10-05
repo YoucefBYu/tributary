@@ -10,7 +10,7 @@ import json
 
 import pytest
 from tributary.content_hl7_fhir import UnsupportedTriggerError, oru_r01_to_fhir
-from tributary.content_hl7_fhir.errors import InvalidFieldError
+from tributary.content_hl7_fhir.errors import InvalidFieldError, RequiredFieldMissingError
 from tributary.content_hl7_fhir.oru import _diagnostic_report_identifier
 from tributary.fhir.fakes import fake_fhir_context
 from tributary.hl7v2.step import parse
@@ -319,3 +319,54 @@ def test_dependency_pyproject_declares_fhir_resources() -> None:
 
     pyproject = pathlib.Path(__file__).resolve().parents[1] / "pyproject.toml"
     assert "fhir.resources" in pyproject.read_text()
+
+
+# -- Medium, security: no conditional key without an assigning authority --------------------------------
+
+
+def _oru_raw(*, msh4: str, pid3: str, obr2: str, obr3: str) -> bytes:
+    return (
+        f"MSH|^~\\&|TRIBUTARY-SYNTH|{msh4}|SYNTH-ORU-RECV|SYNTH-RECV-FACILITY|"
+        f"20260105101500||ORU^R01^ORU_R01|SYNTHMSG00130|P|2.5.1\r"
+        f"PID|1||{pid3}||SYNTHPATIENT^X||19900101|M\r"
+        f"OBR|1|{obr2}|{obr3}|CBC^COMPLETE BLOOD COUNT^L|||20260105100000\r"
+        f"OBX|1|NM|8867-4^Heart rate^LN||72|/min|60-100|N|||F\r"
+    ).encode()
+
+
+def _run_oru(raw: bytes) -> Message:
+    ctx = fake_fhir_context()
+    parsed = run_step(parse, make_message(raw, content_type="application/hl7-v2+er7"), ctx=ctx)
+    mapped = run_step(oru_r01_to_fhir, parsed, ctx=ctx)
+    assert isinstance(mapped, Message)
+    return mapped
+
+
+_PID3 = "9000130^^^SYNTH-HOSPITAL^MR"
+
+
+def test_oru_filler_number_with_no_authority_and_empty_msh4_is_refused() -> None:
+    with pytest.raises(RequiredFieldMissingError) as excinfo:
+        _run_oru(_oru_raw(msh4="", pid3=_PID3, obr2="", obr3="FILLSECRET130"))
+    assert excinfo.value.path == "OBR.3.4"
+    assert "FILLSECRET130" not in str(excinfo.value)
+
+
+def test_oru_placer_number_with_no_authority_and_empty_msh4_is_refused() -> None:
+    with pytest.raises(RequiredFieldMissingError) as excinfo:
+        _run_oru(_oru_raw(msh4="", pid3=_PID3, obr2="PLACSECRET130", obr3=""))
+    assert excinfo.value.path == "OBR.2.4"
+    assert "PLACSECRET130" not in str(excinfo.value)
+
+
+def test_oru_patient_with_no_pid3_authority_is_refused() -> None:
+    with pytest.raises(RequiredFieldMissingError) as excinfo:
+        _run_oru(_oru_raw(msh4="SYNTH-LAB", pid3="PIDSECRET130", obr2="", obr3="FILL130"))
+    assert excinfo.value.path == "PID.3.4"
+    assert "PIDSECRET130" not in str(excinfo.value)
+
+
+def test_oru_with_cx4_on_the_order_number_needs_no_msh4() -> None:
+    mapped = _run_oru(_oru_raw(msh4="", pid3=_PID3, obr2="", obr3="FILL130^^^SYNTH-LAB^FILL"))
+    bundle = json.loads(mapped.payload)  # type: ignore[arg-type]
+    assert bundle["entry"][-1]["resource"]["identifier"][0]["system"] == "urn:id:SYNTH-LAB"

@@ -321,8 +321,20 @@ def test_custom_delimiters_fixture_maps_without_misreading_data_as_components() 
     components. This end-to-end run is what would have broken under the old hard-coded `"^".split()`."""
     bundle = map_fixture("custom_delimiters.hl7", adt_to_fhir)
     patient_identifier = bundle["entry"][0]["resource"]["identifier"][0]  # type: ignore[index]
-    assert patient_identifier["value"] == "9000004^^^SYNTH-HOSPITAL^MR"
-    assert "system" not in patient_identifier
+    assert patient_identifier["value"] == "9000004"
+    assert patient_identifier["system"] == "urn:id:SYNTH-HOSPITAL"
+
+
+def test_literal_caret_in_custom_delimiter_pid3_is_data_so_no_authority_is_refused() -> None:
+    raw = (
+        b"MSH!@$\\*!TRIBUTARY-SYNTH!SYNTH-HOSPITAL!R!F!20260106140000!!ADT@A01@ADT_A01!SYNTHMSG00006!P!2.5.1\r"
+        b"PID!1!!9000004^^^SYNTH-HOSPITAL^MR!!SYNTHPATIENT@X\r"
+    )
+    ctx = fake_fhir_context()
+    parsed = run_step(parse, make_message(raw, content_type="application/hl7-v2+er7"), ctx=ctx)
+    with pytest.raises(RequiredFieldMissingError) as excinfo:
+        run_step(adt_to_fhir, parsed, ctx=ctx)
+    assert excinfo.value.path == "PID.3.4"
 
 
 # -- LOW, security: MSH-4 fallback system reads only HD.1, not the whole field --------------------------
@@ -354,7 +366,7 @@ def test_msh4_hd_value_uses_only_the_namespace_id_component_with_custom_delimite
     raw = (
         b"MSH!@$\\*!TRIBUTARY-SYNTH!SYNTH-HOSPITAL$UNIV-ID$ISO!SYNTH-ADT-RECV!SYNTH-RECV-FACILITY!"
         b"20260101120000!!ADT@A01@ADT_A01!SYNTHMSG00090!P!2.5.1\r"
-        b"PID!1!!9000090^^^SYNTH-HOSPITAL^MR!!SYNTHPATIENT@X!!19800101!M!!!!!!!!!!9000090-ACC\r"
+        b"PID!1!!9000090@@@SYNTH-HOSPITAL@MR!!SYNTHPATIENT@X!!19800101!M!!!!!!!!!!9000090-ACC\r"
     )
     ctx = fake_fhir_context()
     parsed = run_step(parse, make_message(raw, content_type="application/hl7-v2+er7"), ctx=ctx)
@@ -373,3 +385,68 @@ def test_repeated_run_produces_a_byte_identical_bundle() -> None:
     first = map_fixture("adt_a01_admit.hl7", adt_to_fhir)
     second = map_fixture("adt_a01_admit.hl7", adt_to_fhir)
     assert first == second
+
+
+# -- Medium, security: no conditional key without an assigning authority --------------------------------
+
+
+def _run_raw(raw: bytes) -> Message:
+    ctx = fake_fhir_context()
+    parsed = run_step(parse, make_message(raw, content_type="application/hl7-v2+er7"), ctx=ctx)
+    mapped = run_step(adt_to_fhir, parsed, ctx=ctx)
+    assert isinstance(mapped, Message)
+    return mapped
+
+
+def _adt_raw(*, msh4: str, pid3: str, pv1_19: str) -> bytes:
+    return (
+        f"MSH|^~\\&|TRIBUTARY-SYNTH|{msh4}|SYNTH-ADT-RECV|SYNTH-RECV-FACILITY|"
+        f"20260101120000||ADT^A01^ADT_A01|SYNTHMSG00120|P|2.5.1\r"
+        f"EVN|A01|20260101120000\r"
+        f"PID|1||{pid3}||SYNTHPATIENT^X||19800101|M\r"
+        f"PV1|1|I|SYNTHUNIT^101^A||||||||||||||||{pv1_19}\r"
+    ).encode()
+
+
+def test_encounter_with_no_authority_and_empty_msh4_is_refused_without_the_value() -> None:
+    raw = _adt_raw(msh4="", pid3="9000120^^^SYNTH-HOSPITAL^MR", pv1_19="VNSECRET120")
+    with pytest.raises(RequiredFieldMissingError) as excinfo:
+        _run_raw(raw)
+    assert excinfo.value.path == "PV1.19.4"
+    assert "VNSECRET120" not in str(excinfo.value)
+    assert "urn:id:" not in str(excinfo.value)
+
+
+def test_patient_with_no_pid3_authority_is_refused_without_the_value() -> None:
+    raw = _adt_raw(msh4="SYNTH-HOSPITAL", pid3="PIDSECRET120", pv1_19="VN120^^^SYNTH-HOSPITAL^VN")
+    with pytest.raises(RequiredFieldMissingError) as excinfo:
+        _run_raw(raw)
+    assert excinfo.value.path == "PID.3.4"
+    assert "PIDSECRET120" not in str(excinfo.value)
+
+
+def test_encounter_without_cx4_uses_msh4_namespace_when_present() -> None:
+    mapped = _run_raw(_adt_raw(msh4="SYNTH-HOSPITAL", pid3="9000120^^^SYNTH-HOSPITAL^MR", pv1_19="VN120"))
+    bundle = json.loads(mapped.payload)  # type: ignore[arg-type]
+    encounter = next(e for e in bundle["entry"] if e["resource"]["resourceType"] == "Encounter")
+    assert encounter["request"]["url"] == "Encounter?identifier=urn:id:SYNTH-HOSPITAL|VN120"
+
+
+# -- High, code review: a mapping refusal is non-retryable ------------------------------------------------
+
+
+def test_mapping_refusal_is_a_reject_with_a_stable_code_and_is_not_retried() -> None:
+    from tributary.runtime.executor import PipelineExecutor, StepFailure
+    from tributary.sdk import Reject
+
+    raw = _adt_raw(msh4="", pid3="PIDSECRET121", pv1_19="VN121")
+    ctx = fake_fhir_context()
+    message = make_message(raw, content_type="application/hl7-v2+er7")
+    executor = PipelineExecutor([parse, adt_to_fhir], step_retries=3)
+    with pytest.raises(StepFailure) as excinfo:
+        executor.run(message, ctx)
+    assert excinfo.value.rejected is True
+    assert excinfo.value.attempts == 1
+    assert excinfo.value.error_code == "HL7_REQUIRED_FIELD_MISSING"
+    assert "PIDSECRET121" not in str(excinfo.value)
+    assert issubclass(RequiredFieldMissingError, Reject)

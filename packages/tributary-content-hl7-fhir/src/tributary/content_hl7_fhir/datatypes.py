@@ -41,7 +41,7 @@ from fhir.resources.R4B.humanname import HumanName
 from fhir.resources.R4B.identifier import Identifier
 from tributary.hl7v2 import Segment
 
-from .errors import safe_build
+from .errors import RequiredFieldMissingError, safe_build
 
 #: HD.1 (Namespace ID) -> `Identifier.system`, for an assigning authority that carries no HD.2/HD.3
 #: universal id -- every fixture in this reference set is like this (a synthetic MRN authority named
@@ -55,6 +55,24 @@ _LOCAL_SYSTEM_PREFIX = "urn:id:"
 def local_identifier_system(namespace_id: str) -> str:
     """A locally-scoped `Identifier.system` URI for an HD with no universal id. See module docstring."""
     return f"{_LOCAL_SYSTEM_PREFIX}{namespace_id}"
+
+
+def facility_fallback_system(msh_4_1: str) -> str | None:
+    """`local_identifier_system(MSH-4.1)`, or `None` when MSH-4.1 is empty -- never the bare `urn:id:`,
+    which every sender with an empty MSH-4 would share (cross-sender collision on a conditional key)."""
+    return local_identifier_system(msh_4_1) if msh_4_1.strip() else None
+
+
+def require_scoped_system(identifier: Identifier, *, path: str) -> Identifier:
+    """Return `identifier` if it carries a non-empty `system`, else raise `RequiredFieldMissingError`.
+
+    A conditional create/update key (`identifier=<system>|<value>`) with no authority is shared by every
+    sender that uses the same value, so a collision would overwrite another sender's resource. `path` is
+    the structural HL7 path of the authority component (e.g. `"PV1.19.4"`); the value never appears.
+    """
+    if not identifier.system or identifier.system == _LOCAL_SYSTEM_PREFIX:
+        raise RequiredFieldMissingError(path, reason="no assigning authority to scope the conditional key")
+    return identifier
 
 
 # -- FHIR `code` sanitizing ----------------------------------------------------------------------------
@@ -107,7 +125,7 @@ def cx_identifier(segment: Segment, field: int, *, fallback_system: str | None =
     value = segment.field(field, component=1)
     if not value or not value.strip():
         return None
-    authority = segment.field(field, component=4) or None
+    authority = segment.field(field, component=4, subcomponent=1) or None
     system = local_identifier_system(authority) if authority else fallback_system
     type_code = segment.field(field, component=5) or None
 

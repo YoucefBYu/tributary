@@ -54,9 +54,10 @@ from tributary.sdk import Message, step
 
 from .datatypes import (
     cx_identifier,
-    local_identifier_system,
+    facility_fallback_system,
     patient_class_to_encounter_class,
     pl_display,
+    require_scoped_system,
     ts_to_fhir_datetime,
     xcn_display,
 )
@@ -179,9 +180,10 @@ def _encounter_identifier(pv1: Segment, hl7: Hl7Message, *, msg_id: str, trigger
     whatever A01 already created (or nothing, if A01 never ran through this mapping) rather than
     updating the original -- silently worse than simply not producing an `Encounter` entry.
     """
-    identifier = cx_identifier(pv1, 19, fallback_system=local_identifier_system(hl7["MSH.4.1"]))
+    identifier = cx_identifier(pv1, 19, fallback_system=facility_fallback_system(hl7["MSH.4.1"]))
     if identifier is not None:
-        return identifier
+        # Neither PV1-19.4 nor MSH-4.1: refuse rather than key on a sender-agnostic system (PHI integrity).
+        return require_scoped_system(identifier, path="PV1.19.4")
     if trigger_event == "A01":
         # `msg_id` (`tb-msg-id`, always a validated UUID) and the fixed literal `"encounter"` are the
         # only inputs here -- neither is sender-controlled, so unlike `cx_identifier` above (built from
