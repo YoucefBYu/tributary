@@ -1,9 +1,9 @@
 {
   "marker": "integration",
   "command": "uv run pytest -m integration",
-  "count": 211,
+  "count": 212,
   "modules": {
-    "packages/tributary-api/tests/api/test_db_tls_integration.py": 1,
+    "packages/tributary-api/tests/api/test_db_tls_integration.py": 2,
     "packages/tributary-api/tests/api/test_deploy_kafka_integration.py": 2,
     "packages/tributary-api/tests/api/test_invariant3_integration.py": 1,
     "packages/tributary-api/tests/api/test_routes_integration.py": 9,
