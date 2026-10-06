@@ -1,13 +1,23 @@
 # ADR-004: Archive Design, PHI at Rest, Retention Mechanics and the Kafka Role Model
 
-- **Status:** **Proposed, draft** (2026-10-05, W3-10). **No invariant changes.** Sections 3-6 are the
-  architect's proposal. Every key-custody, `_hmac` and retention item is a **`TODO(human)`** with
-  options (section 7) and is **not designed here**: CLAUDE.md escalates key management and
-  cryptography. The role model (section 5) is also a human decision under the 2026-09-21 ADR-004 scope
-  approval, so this ADR stays Proposed until a human approves section 5 and answers section 7.
-- **Date:** 2026-10-05
-- **Deciders:** `architect` (draft). **Owed:** `security-reviewer` must read it (W3-10 verify);
-  the human answers section 7 (`phases/wave-3.md` 7.2-7.4).
+- **Status:** **Proposed** (draft 2026-10-05, W3-10; **rev 2 2026-10-06** after the human's answers).
+  **No invariant changes.** Section 7 state per question:
+  - **H1 key custody, H2 application-level encryption, H5 rotation:** **DRAFT DECISION, pending
+    `security-reviewer` concurrence.** The human delegated H1 to *"the lead, architect and security
+    engineer"*. H2 and H5 follow from H1. Only documented KMS, cloud-volume and library features are
+    used. **No cryptography or key hierarchy is designed here** (CLAUDE.md escalation stays in force).
+  - **H3 `_hmac`:** **DEFERRED** by the lead and architect under the human's delegation, until H1 has
+    concurrence and before any per-patient search task starts.
+  - **H4 retention:** **DECIDED.** Operator-configurable with documented defaults (section 4).
+  - **H6 erasure and H7 role-model sign-off:** still **`TODO(human)`**. The human did not answer
+    them on 2026-10-06.
+
+  This ADR stays Proposed until `security-reviewer` concurs on H1/H2/H5 and a human approves section 5
+  (H7).
+- **Date:** 2026-10-05 (rev 2: 2026-10-06)
+- **Deciders:** `architect` (draft). H3 and H4 rev 2: lead and architect, under the human's 2026-10-06
+  delegation. H1/H2/H5 rev 2: lead, architect and `security-reviewer`; **concurrence pending**. Owed
+  from the human: H6, H7.
 - **Contracts:** `events/v0` 4 and 4.1; `topics/v0` 2.1, 3.4, 3.4.1, 3.5, 3.6; `envelope/v0` (claim
   check); `observability/v0` (archiver metrics). Contract changes named here land with the task that
   needs them (section 8).
@@ -52,19 +62,37 @@ Evidence and constraints:
 | A1 | **Two writers, two principals.** The events archiver (built, W3-2a) and a **content archiver** (W3-2b) are separate processes with separate principals, so the PHI-reading grant (section 5) sits on one process that does nothing else | One more deployment |
 | A2 | **`message_content`** holds one row per `(message_id, stage, destination)`: `received` from `raw`, `routed` from `out.<dest>` (destination set), `dlq` from `dlq`. Payload bytes are stored as received, plus `content_type`, `size_bytes` and the envelope headers needed to show them, but **not** `tb-usr-*`: they are not projected anywhere outside Kafka (`envelope/v0` 2.2). Idempotent on the key under `ReplacingMergeTree`. The same month-partition caveat as `events/v0` 4.1 rule 2 applies | Stages inside a pipeline run in process (invariant 2), so there is no content for `transformed` separately from `routed`. The browser shows input, per-destination output and dead letters |
 | A3 | **Claim-checked payloads are stored as locators only** (`claim_ref`), never fetched into ClickHouse. The browser fetches through the API, which audits the view (W3-6) | Two places to look, one of them the operator's bucket |
-| A4 | **Content storage is a deployment switch, `TB_ARCHIVE_CONTENT`**: on by default in the `lite` profile, **off by default in `production` until the human answers 7.1 and 7.2**. A production operator can turn it on, and the startup log says which custody and retention placeholders apply | Production sites get events without content until they opt in. That is the point: the system does not create a long-lived PHI store under placeholder decisions |
+| A4 | **Content storage is a deployment switch, `TB_ARCHIVE_CONTENT`**: on by default in the `lite` profile, **off by default in `production`**. A production operator turns it on after meeting H1's custody requirement (rev 2: a customer-managed key on the ClickHouse volume). The startup log states the effective content retention (section 4) and that the custody requirement is the operator's to meet. *(Rev 1 text tied the default to the human answering 7.1 and 7.2. Those were the wrong references: 7.1 is the PostgreSQL driver. H1 and H4 were meant.)* | Production sites get events without content until they opt in. That is the point: the system does not create a long-lived PHI store before the operator has confirmed custody |
 | A5 | **ClickHouse access:** the archiver users hold INSERT on the archive database only; the API user holds SELECT; no other runtime user exists in shipped configuration. **Schema migration is a separate step** (an init job or `tributary-archiver migrate`, run before the archivers start) **with its own migration credential** holding CREATE/ALTER on the archive database. The archiver processes never run DDL and never receive that credential; at startup they check that the expected schema version is present and exit non-zero if it is not. (Today the archiver runs CREATE/ALTER at startup; `archive-engineer` is moving it out.) Content is read only through the API, which emits an audit event for every content view (W3-6, exit criterion 4). Who may view content: ADR-009 D14. Row-level policies are not in v0 | Operators with ClickHouse admin bypass the audit, which is an operational control, not a technical one. One more job to order before the archivers in Compose and Helm |
 | A6 | **Backfill** (W3-2b) re-reads `raw` from a given offset or time and writes through the same idempotent path. A second run changes nothing (W3-2b verify) | Only within `raw` retention (7 d default) |
 
-## 4. Retention mechanics (proposal; the values are `TODO(human)`)
+## 4. Retention (rev 2, 2026-10-06: DECIDED, operator-configurable with documented defaults)
 
-| # | Mechanism | Value |
-|---|---|---|
-| R1 | ClickHouse table TTL on `ts` with month partitions; whole parts are dropped where possible (`ttl_only_drop_parts`), so expiry does not rewrite data | Events: **90 d placeholder** (ruled 2026-10-05). Content: **30 d placeholder**, shorter than events because it is the payload. **Both `TODO(human)` (H4)** |
-| R2 | Values are per environment in v0 (`TB_ARCHIVE_TTL_DAYS`, `TB_ARCHIVE_CONTENT_TTL_DAYS`). Per-channel retention is a later, additive channel-spec field | — |
-| R3 | Kafka retention stays per `topics/v0` 2 (`raw` 7 d, `dlq` 30 d, events 3 d, audit 30 d `TODO(human)`) | `TODO(human)` for audit, H4 |
-| R4 | **Erasure** of one message is mechanically available as a ClickHouse lightweight delete by `message_id` across both tables. Whether and when to use it, and whether crypto-shredding is wanted instead, is **`TODO(human)` (H6)** | — |
-| R5 | **Claim-check objects** expire by bucket lifecycle rule no earlier than the longest retention of anything that can reference them: `max(raw, dlq, archive content)` plus a replay margin. An object is never deleted while a record or row still points at it | Storage for the margin |
+**Human answer to H4, 2026-10-06 (relayed by the lead), verbatim:** *"Give the user a possibility to
+change it"*. So retention is an operator setting, not a number this project fixes. Defaults are
+documented, and the operator owns the duty that applies to their site. **No legal reading has been
+done by an agent, and none is implied by the defaults below.**
+
+**Options considered.** (a) One fixed value per store (rev 1 placeholders). Rejected: the human ruled
+it out. (b) Per-environment operator settings applied by the migrate step (**chosen**). (c) A
+retention write endpoint in the API. Rejected: the API process would need the ClickHouse DDL
+credential (A5 gives it SELECT only). An admin token, or a compromised one, could then shorten audit
+retention and erase the record of its own actions. (d) Per-channel retention. Deferred: a later,
+additive channel-spec field. Criteria: invariant 9 (nothing in message flow waits on retention), A5
+least privilege, irreversibility of deletion, and operator effort. **Give up:** changing retention
+needs a redeploy (`helm upgrade` or Compose `up`), not a UI click. Retention is per environment, not
+per channel. A UI can show the value but not change it.
+
+| # | Rule |
+|---|---|
+| R1 | **Mechanism:** ClickHouse table TTL on `ts`, month partitions, `ttl_only_drop_parts = 1`, so expiry drops whole parts without rewriting data. **Stated cost:** a part is dropped only when all of its rows have expired, so a row can outlive its TTL by up to one month partition. An operator who needs prompt deletion of one message uses R4, not a shorter TTL |
+| R2 | **Settings and defaults** (per environment, integer days, **1-36500**; anything else refuses to start, as `TB_ARCHIVE_TTL_DAYS` does today): **archived events** `TB_ARCHIVE_TTL_DAYS`, default **90** (name unchanged from W3-2a). **Archived content** `TB_ARCHIVE_CONTENT_TTL_DAYS`, default **30**, read only when `TB_ARCHIVE_CONTENT` is on (W3-2b). It is shorter because it holds payloads. **Audit records** `TB_ARCHIVE_AUDIT_TTL_DAYS`, default **2190** (six years). Why 2190: deleting an audit trail is irreversible, while over-keeping it costs little. Audit rows carry ids, actor and action, never payload (invariant 6). A six-year duty *may* apply (`topics/v0` 2.1). This is a conservative engineering default, **not a compliance determination**; the operator lowers or raises it. **Decrease guard:** `TB_ARCHIVE_ALLOW_TTL_DECREASE`, default `false`. It is read by the migrate step only (R6) |
+| R3 | **Surfaces.** *Helm:* `archiver.retention.eventsDays: 90`, `contentDays: 30`, `auditDays: 2190`, `allowDecrease: false`, rendered into the env of both the migrate Job and the archivers. The current `archiver.ttlDays: 365` is **drift** from the documented default and is removed. The chart `fail`s at render if it is still set, so it is never ignored silently. *Compose:* the same four env vars with the same defaults on the migrate service. *API (read-only):* `GET` of the effective retention per environment (W3-1b), readable by every role (metadata, no PHI). It reads the `archive_settings` table that the migrate step writes. *No write surface in the API* (option c, rejected). *Docs:* a chart README section, "Changing retention", with the R6 procedure and R1's cost |
+| R4 | **Erasure** of one message is mechanically available as a ClickHouse lightweight delete by `message_id` across the archive tables. Whether and when to use it, and whether crypto-shredding is wanted instead, is still **`TODO(human)` (H6)** |
+| R5 | **Claim-check objects** expire by bucket lifecycle rule no earlier than the longest retention of anything that can reference them: `max(raw, dlq, TB_ARCHIVE_CONTENT_TTL_DAYS)` plus a replay margin. An object is never deleted while a record or row still points at it. The rule is in the operator docs, because the bucket is operator-supplied |
+| R6 | **Applying a change to existing tables.** Only the migrate step (`tributary.archiver --migrate-only`, migration credential, A5) applies retention. It runs before the archivers on every `helm upgrade` and Compose `up`. Per table, it reads the current TTL from `system.tables` and, only when the value differs: **(1)** if the new value is *longer*, it runs `ALTER TABLE <t> MODIFY TTL toDateTime(ts) + INTERVAL <n> DAY` with `materialize_ttl_after_modify` left at its default `1`. Existing parts then get the new TTL, so a lengthened retention protects rows already stored (ClickHouse docs; **verified only by the R6 test**, not yet run). **(2)** If the new value is *shorter*, it **refuses**: exit non-zero, `startup_refused`, code `RETENTION_DECREASE_REFUSED` (L6a, not registered), table unchanged. It applies the change only with `TB_ARCHIVE_ALLOW_TTL_DECREASE=true`, because rows past the new TTL are deleted irreversibly at the next TTL merge. **(3)** It writes an `archive_settings` row (table, days, previous days, applied-at, release) and logs `retention_applied` with the same fields. Lengthening never restores rows already dropped. The archivers do not read or apply TTL values (INSERT only) |
+| R7 | **Audit system of record: ClickHouse `audit_log`** (architect decision under the same delegation; it was the open half of H4). The API produces each audit record to `_tb.<env>.audit` (`acks=all`). The `requested` phase fails closed, as `archiver/audit.py` already requires. The events archiver consumes that topic into `audit_log`, with the same idempotent `ReplacingMergeTree` pattern and month partitions, and TTL from R2. **Kafka is a buffer:** `_tb.<env>.audit` keeps 30 d (`topics/v0` 2), which bounds how long the archiver may be down before audit records are lost. Rejected: Kafka as the store (six years at RF=3 on brokers); object storage with object lock (the stronger tamper evidence, but a second store, and lite has none, since MinIO is never shipped). **Give up:** a ClickHouse admin can alter or delete `audit_log` rows. Tamper evidence is an operational control in v0 (risk row) |
+| R8 | **Kafka topic retention is not a records-retention control.** `raw` 7 d, `dlq` 30 d, `_tb.<env>.events` 3 d and `_tb.<env>.audit` 30 d stay as in `topics/v0` 2 and are not operator settings in v0 (`topic-defaults.json` is read, never restated). Per-topic overrides are a later, additive item if operators ask |
 
 ## 5. Kafka role model (proposal; human approval required)
 
@@ -75,8 +103,9 @@ Builds on `topics/v0` 3.4.1 (set 1.4, reconciled with code) and ADR-008 D6-D9.
 | receiver | one per `(env, channel)` | WRITE `raw`; READ `_tb.<env>.channels` + spec-reader group; sync only READ `reply` + LITERAL `replier` group; IDEMPOTENT_WRITE |
 | pipeline worker | one per `(env, channel)` | READ `raw`; WRITE `out.*`, `dlq`, `_tb.<env>.events`; sync only WRITE `reply`; groups as 3.4.1; transactional id prefix when transactional |
 | loader | one per `(env, channel, destination)` | READ `out.<dest>`; WRITE `dlq`, `_tb.<env>.events`; LITERAL `loader.<dest>` group |
-| events archiver | one per `env` | READ `_tb.<env>.events`; LITERAL group `tb.<env>.archiver` (set 1.8) |
+| events archiver | one per `env` | READ `_tb.<env>.events`; **rev 2: READ LITERAL `_tb.<env>.audit`** (R7; set 1.8 part 2); LITERAL group `tb.<env>.archiver` (set 1.8) |
 | **content archiver (new)** | one per `env` | READ `<env>.*.raw`, `<env>.*.out.*`, `<env>.*.dlq` (**PREFIXED on `<env>.`**, the only cross-channel data grant); LITERAL group `tb.<env>.archiver.content` |
+| reprocessor (W3-29, 2026-10-06) | one per `(env, channel)` | READ, WRITE and DESCRIBE on LITERAL `<env>.<ch>.raw`; IDEMPOTENT_WRITE. Assigns partitions and never commits. LITERAL group `tb.<env>.reprocessor` only if assign without `group.id` proves impossible. Replay targets its source channel only (`wave-3.md` 2.6 H8) |
 | control-plane publisher | one per `env` | WRITE `_tb.<env>.channels`, `_tb.<env>.audit`; DESCRIBE cluster |
 | topic bootstrap | one per cluster | super user (creates topics and ACLs) |
 | users-init | one per cluster | ALTER on CLUSTER **only during provisioning** (W3-16, rule K3) |
@@ -120,50 +149,116 @@ Rules:
 
 | Surface | Decided now (contract) | `TODO(human)` |
 |---|---|---|
-| Broker volumes, ClickHouse, PostgreSQL, backups | Encryption on, operator-provided (`topics/v0` 3.5) | **Key custody, H1** |
-| Claim-check bucket | Bucket-default encryption on; lifecycle per R5 | **Key custody, H1** |
-| Archived content column | Stored on an encrypted volume; content off by default in production (A4) | **Application-level encryption, H2** |
-| `attrs` `*_hmac` | Not emitted by producers, dropped by the archiver (`events/v0` 4.1 rule 3) | **Construction, key and de-identification status, H3** |
-| Audit trail | Event shape in W3-1b | **Retention and system of record, H4** |
+| Broker volumes, ClickHouse, PostgreSQL, backups | Encryption on, operator-provided (`topics/v0` 3.5) | Key custody: **H1 draft decision**, pending `security-reviewer` |
+| Claim-check bucket | Bucket-default encryption on; lifecycle per R5 | Key custody: **H1 draft decision**, pending `security-reviewer` |
+| Archived content column | Stored on an encrypted volume; content off by default in production (A4) | **H2 draft decision: none beyond volume encryption in v0**, pending `security-reviewer` |
+| `attrs` `*_hmac` | Not emitted by producers, dropped by the archiver (`events/v0` 4.1 rule 3) | **H3 deferred** (rev 2) |
+| Audit trail | Event shape in W3-1b; system of record ClickHouse `audit_log` (R7) | Retention **decided**: operator setting, default 2190 d (R2) |
 
-## 7. Questions for the human (`TODO(human)`, none designed here)
+## 7. Questions H1-H7 (rev 2, 2026-10-06)
 
-**H1. Key custody for encryption at rest** (`wave-3.md` 7.4). Covers broker volumes, ClickHouse,
-PostgreSQL, the claim-check bucket and backups.
-- `TODO(human)`: (a) provider-managed keys (cloud disk default encryption, SSE-S3); (b)
-  customer-managed KMS keys (SSE-KMS or CMEK, the customer controls rotation and revocation); (c)
-  customer-held keys outside the cloud (HSM, Vault) for on-premises sites. Who holds them, the
-  rotation cadence, and whether the answer differs for lite and production.
-- Default until answered: operator-provided volume encryption, no Tributary-managed keys. **Gates
-  production use of the archive, not the build.**
+Human answers, 2026-10-06, relayed by the lead, verbatim: on key custody *"Let the lead, architect
+and security engineer decide"*; on `_hmac` *"let the lead and architect decide"*; on retention
+*"Give the user a possibility to change it"*. H6 and H7 were not answered. "Security engineer" is read
+as the `security-reviewer` role.
 
-**H2. Application-level encryption of archived content.**
-- `TODO(human)`: (a) none beyond volume encryption; (b) envelope encryption of the payload column with
-  a KMS or Vault data key per channel or per period, which enables crypto-shredding but rules out
-  server-side content search; (c) encryption of claim-check objects only. Choosing (b) or (c) starts a
-  key-management design, which a human must own.
+**Boundary kept:** the drafts below choose among **documented** features of KMS services, cloud
+volume encryption, object-store server-side encryption and existing libraries. They design no
+cipher, key hierarchy, key-wrapping scheme or key derivation. Anything that would need that goes to
+the human (CLAUDE.md). Provider behaviour is cited from public documentation and **was not re-checked
+in this session** (marked *docs*).
 
-**H3. `_hmac` mechanism** (`wave-3.md` 7.3; `events/v0` 3.1). Due now: the archiver is built.
-- `TODO(human)`: decide now or extend the deferral. If now:
-  - **Construction:** HMAC-SHA-256, keyed BLAKE2b-256, or a per-channel pepper. All fit the 64-hex
-    shape.
-  - **Key scope:** deployment, environment or channel.
-  - **Rotation:** dual-key search window, re-hash on rotation, or accept the break.
-  - **Key location:** in the API process via KMS, or hashing as an authorised API operation.
-  - **Is a keyed hash of an MRN de-identified for your purposes?** Under Safe Harbor it is not.
-- Default: no identifier-derived attributes; per-patient search refused; archiver drops `*_hmac`.
+### H1. Key custody for encryption at rest: DRAFT DECISION, pending `security-reviewer` concurrence
 
-**H4. Retention values and the audit system of record** (`wave-3.md` 7.2; `topics/v0` 2.1).
-- `TODO(human)`: the retention duty for the access and control-plane audit trail (30 d versus a
-  possible six-year duty; no legal reading has been done by agents); whether it reaches archived
-  events (placeholder 90 d), archived content (placeholder 30 d), `raw` and `_tb.<env>.events`; and
-  whether the system of record is ClickHouse, object storage with object lock, or Kafka with tiered
-  storage. **Blocks exit criterion 4 (audit).**
+Covers broker volumes, ClickHouse, PostgreSQL, the claim-check bucket and backups.
 
-**H5. Credential rotation policy.**
-- `TODO(human)`: cadence for Kafka SCRAM and mTLS credentials and for ClickHouse and PostgreSQL users;
-  the secret store (Kubernetes Secrets with external-secrets, Vault, a cloud secrets manager); and who
-  may read the content archiver's credential (K2).
+| Option | For | Against |
+|---|---|---|
+| (a) Provider-managed keys (cloud disk default encryption, SSE-S3) | Zero setup; always on | The customer cannot revoke or audit key use separately from the provider. Protects a lost disk only |
+| **(b) Customer-managed KMS keys (AWS KMS customer managed key for EBS and SSE-KMS; GCP CMEK; Azure customer-managed keys), through an encrypted StorageClass and bucket default encryption (recommended for `production`)** | The customer controls rotation, revocation and key-use logs (*docs*: KMS audit logging such as CloudTrail). Disabling the key is a documented emergency stop for data at rest. Tributary writes no crypto code | KMS setup per site; small per-key and per-request cost to the customer |
+| (c) Customer-held keys outside the cloud (HSM, Vault; LUKS/dm-crypt on premises) | Required by some on-premises sites; the same properties as (b) | The site operates the key service; unlock-at-boot is the site's own mechanism |
+
+Criteria: who can revoke access to PHI at rest; key-use auditability; no Tributary-written
+cryptography; works on premises and in lite; operator effort.
+
+**Recommendation:**
+1. **Tributary manages no encryption keys** and implements no at-rest encryption. Encryption at rest
+   is the platform's documented feature. The requirement that it be on (`topics/v0` 3.5) is unchanged.
+2. **`production` profile: customer-managed keys, (b) or (c), on every PHI-at-rest surface**: broker
+   volumes, ClickHouse, PostgreSQL, the claim-check bucket and backups. Provider-managed keys (a) are
+   not sufficient for `production`.
+3. **`lite` profile:** (a), (b) or (c). Lite already carries the RF=1 warning (ADR-002 D14). The
+   docs state that (a) protects a lost disk only.
+4. **Claim-check bucket:** bucket default encryption SSE-KMS with the customer-managed key (S3 Bucket
+   Keys allowed, *docs*). Tributary writers send no per-object key parameters, so the bucket default
+   governs. The identities that write or read claim-checked objects need the KMS permissions the
+   provider documents for SSE-KMS (generate data key on write, decrypt on read), scoped to that key.
+   That grant is customer IAM, listed in the chart README. **Unbuilt:** no claim-check writer exists
+   yet.
+5. **Rotation:** the KMS's own automatic key rotation, enabled. Earlier key versions stay usable for
+   decryption, so stored data is not re-encrypted (*docs*). Cadence is the customer's policy;
+   recommended setting: automatic rotation on at the provider's default period.
+6. **Who holds keys:** the customer's KMS administrators. No Tributary process holds key material.
+   Volume encryption is transparent to them. Only claim-check access needs KMS permissions (item 4).
+7. **What Tributary can check:** not volume encryption, reliably, from inside a pod. The controls
+   are a chart README checklist and the production default of `TB_ARCHIVE_CONTENT=off` (A4). An
+   operator turns content on after meeting item 2.
+8. **The `_hmac` key:** not covered; follows H3.
+
+**Give up:** production needs a KMS or HSM before content is turned on. Tributary cannot prove from
+inside that encryption is on. The docs carry per-provider variance.
+
+### H2. Application-level encryption of archived content: DRAFT DECISION (a), pending concurrence
+
+- **(a) None beyond volume encryption with customer-managed keys (H1) in v0: chosen.** (b) Envelope
+  encryption of the payload column with per-channel or per-period data keys needs a key hierarchy,
+  data-key caching, rotation and re-wrapping. That is key-management design, so it is a human
+  escalation. It also rules out server-side content search. (c) Extra encryption of claim-check
+  objects is unnecessary: SSE-KMS with the customer's key (H1 item 4) is already the store's
+  documented envelope encryption.
+- **What (a) does not cover:** a compromised ClickHouse credential or admin reads content in clear.
+  Mitigations: A5 (API holds SELECT only, archivers INSERT only), content off by default in production
+  (A4), ADR-009 D14 (only `operator`/`admin` see content), audit of every view (R7).
+- **Revisit trigger:** H6 choosing crypto-shredding, or a customer requirement for column encryption.
+  Either one goes to the human as a design question.
+
+### H3. `_hmac` mechanism: DEFERRED (lead and architect, 2026-10-06, under the human's delegation)
+
+- **Decision: defer.** Reasons: (1) no wave 3 exit criterion needs per-patient search. Criterion 1
+  reads by message id. (2) The key's custody follows H1, which has no concurrence yet. (3) A keyed hash
+  over a bounded identifier space (MRNs) is only as strong as the key's secrecy, so building it before
+  custody is settled creates a reversible PHI index. (4) Deferral loses no data: producers SHOULD NOT
+  emit `*_hmac`, and the archiver drops and counts it (`events/v0` 4.1 rule 3).
+- **Position that removes the de-identification question from the design:** any `*_hmac` value is
+  treated as **PHI** whatever its construction (stored, access-controlled and audited like content).
+  The system never relies on a keyed hash being de-identified, so no agent needs a compliance reading.
+- **Revisit trigger:** H1 concurrence, **and** before W4-3 or any per-patient search task is
+  scheduled. When revisited: a documented construction from an existing library only. RFC 2104
+  HMAC-SHA-256 through Python's stdlib `hmac` is the candidate that fits the pinned 64-hex shape. The
+  key is held per H1/H5. Key scope and rotation go to `security-reviewer`, and anything beyond
+  documented features goes to the human.
+- **Give up:** no per-patient search in wave 3. Operators find a patient's messages through their own
+  systems, then by message id.
+
+### H4. Retention values and the audit system of record: DECIDED (section 4)
+
+Operator-configurable, defaults events 90 d, content 30 d, audit 2190 d (R2). Applied by the migrate
+step with a decrease guard (R6). Audit system of record is ClickHouse `audit_log` with Kafka as a
+buffer (R7). **Exit criterion 4 (audit) is no longer blocked on a human answer.**
+
+### H5. Credential rotation: DRAFT DECISION, pending `security-reviewer` concurrence
+
+- **Secret store:** Tributary reads secrets only from files (`secretRef` under `TB_SECRETS_DIR`,
+  `engine-kafka/v0`), unchanged. The operator's store fills those files: Kubernetes Secrets,
+  optionally synced from Vault or a cloud secret manager by an external-secrets operator. Tributary
+  calls no secret-manager API in v0. **Give up:** no dynamic, short-lived database credentials in v0.
+- **Cadence:** the customer's policy. Recommended default (judgement, not measured): 90 days for
+  Kafka SCRAM, ClickHouse and PostgreSQL passwords; mTLS client certificates with at most 90-day
+  validity; immediate rotation on suspected compromise or staff departure. The mechanics are K5, whose
+  SCRAM single-credential assumption is **still unverified**.
+- **Content archiver credential (K2):** its own Secret, mounted only into the content-archiver
+  StatefulSet, never shared with another role. Namespace Secret-read is the residual exposure, an
+  operational control, listed in the chart README.
 
 **H6. Erasure.**
 - `TODO(human)`: whether erasure requests are honoured by delete (R4), by crypto-shredding (requires
@@ -187,8 +282,18 @@ PostgreSQL, the claim-check bucket and backups.
     `consumerGroup` platform alternative gains `(\.content)?`);
   - `observability/v0`: content-archiver metrics;
   - `security.grants` structured list (K4).
+  - **Rev 2 (set 1.8 part 2, with W3-1b):** events-archiver READ LITERAL `_tb.<env>.audit` (R7);
+    `_tb.<env>.audit` record shape with the retention settings of R2 named; read-only retention `GET`
+    in `openapi/v0`; `topics/v0` 2.1 and `topic-defaults.json` `classes.audit` restated as decided
+    (done 2026-10-06, README and description only).
 - **Follow-ups:**
-  1. `security-reviewer`: read this draft (W3-10 verify).
-  2. `archive-engineer` (W3-2b): A2-A6 and R1-R2 against the placeholders, with no key handling.
+  1. `security-reviewer`: read this draft (W3-10 verify). **Rev 2: concur or object on H1, H2, H5**
+     (lead schedules next).
+  2. `archive-engineer` (W3-2b): A2-A6 against R1-R2, with no key handling.
   3. `devops-engineer` (W3-16): K3.
-  4. The architect sends H1-H7 to the human through the lead and mirrors them in STATUS.
+  4. ~~The architect sends H1-H7 to the human through the lead and mirrors them in STATUS.~~ Done
+     2026-10-05. Answers recorded 2026-10-06. H6 and H7 remain open with the human.
+  5. **Rev 2 tasks** (`phases/wave-3.md` 2.7): W3-30 `archive-engineer` (R2, R6, R7 in the archiver
+     and migrate step), W3-31 `devops-engineer` (R3 Helm, Compose, chart README; creates
+     `_tb.<env>.audit` in bootstrap), W3-32 `control-plane-engineer` (audit producer and retention
+     `GET`).

@@ -34,7 +34,7 @@ These are non-negotiable. Changing one needs a new ADR approved by a human.
 | Lint and format | `ruff check`, `ruff format` |
 | Kafka | Apache Kafka 4.x (KRaft), `confluent-kafka`; cooperative-sticky assignor and static membership |
 | Runtime | `asyncio` with `uvloop`, `orjson`, pydantic v2, multi-process workers |
-| Control plane | FastAPI, SQLAlchemy 2, psycopg 3, Alembic, PostgreSQL |
+| Control plane | FastAPI, SQLAlchemy 2, asyncpg (not psycopg: LGPL-3.0), Alembic, PostgreSQL |
 | Archive | ClickHouse (loader: HTTP interface via stdlib, no client library; archiver: `clickhouse-connect`, with `certifi` approved for its runtime use), optional S3/MinIO |
 | Tests | `pytest`, `hypothesis`, `testcontainers`; markers `integration`, `chaos`, `bench` |
 | UI | React, TypeScript, Vite, `pnpm`, API client generated from OpenAPI |

@@ -1,7 +1,7 @@
 # Contract: topic naming, defaults and required configuration — v0 (draft)
 
 **Contract id:** `tributary.topics/v0`
-**Status:** Draft. Partition defaults and `session.timeout.ms` are **measured** (S4, S5, 2026-09-20) and are lower bounds from a laptop-hosted cluster; `_tb.<env>.events` partitions and audit retention are still open. **Set 1.4 (2026-09-29):** ACL role table
+**Status:** Draft. Partition defaults and `session.timeout.ms` are **measured** (S4, S5, 2026-09-20) and are lower bounds from a laptop-hosted cluster; `_tb.<env>.events` partitions are still open. Audit retention was decided on 2026-10-06 as an operator setting (2.1). **Set 1.4 (2026-09-29):** ACL role table
 reconciled with the code (3.4.1), `super.users` restated, spec-reader group named (3.6). **Set 1.4.1
 (patch):** 3.4 `super.users` row: a user-provisioning identity is no longer a super user. **Set 1.7
 (2026-10-05):** 3.3.1: the reply consumer reads its own `clients.reply_consumer` values, and the unique
@@ -111,7 +111,7 @@ Helm read one source instead of hardcoding three.
 | `reply` | 3, or `spec.source.reply.partitions` (set 1.2); created only for a sync-reply channel | 10 min | delete |
 | `_tb.<env>.channels` | 6 | compacted | compact |
 | `_tb.<env>.events` | 24 (**still unmeasured**, section 2.2) | 3 d | delete |
-| `_tb.<env>.audit` | 6 | 30 d (**TODO(human)**, section 2.1) | delete |
+| `_tb.<env>.audit` | 6 | 30 d (transport buffer; the system of record is ClickHouse, section 2.1) | delete |
 
 `out.<dest>` MUST have the same partition count as its `raw` topic when the channel declares
 per-key ordering. Different counts change the hash-to-partition mapping, so two messages for one
@@ -128,7 +128,29 @@ It must be at least the number of receiver processes, because each process needs
 (3.3.1). Raising it on a live topic is harmless; lowering it means recreating the topic, which a
 10-minute retention makes cheap.
 
-### 2.1 Audit retention is a human decision, not an engineering default
+### 2.1 Audit retention: operator-configurable (decided 2026-10-06)
+
+**Decision (set 1.8, 2026-10-06; ADR-004 section 4).** The human answered on 2026-10-06 (relayed by
+the lead), verbatim: *"Give the user a possibility to change it"*. So:
+
+1. **Retention is an operator setting with documented defaults.** No agent has made, or implies, a
+   compliance determination.
+2. **The system of record for audit records is the ClickHouse `audit_log` table.** The events
+   archiver fills it from `_tb.<env>.audit` (ADR-004 R7). Its retention is
+   `TB_ARCHIVE_AUDIT_TTL_DAYS`, default **2190 days**, range 1-36500. The default is conservative
+   because deleting an audit trail is irreversible. It is not a reading of any rule.
+3. **`_tb.<env>.audit` is a transport buffer** and keeps 30 days (table above, `topic-defaults.json`),
+   which bounds how long the archiver may be down before audit records are lost. It is not an
+   operator setting in v0.
+4. **The same setting pattern covers archived events** (`TB_ARCHIVE_TTL_DAYS`, default 90) **and
+   archived content** (`TB_ARCHIVE_CONTENT_TTL_DAYS`, default 30). Kafka retention of `raw` (7 d) and
+   `_tb.<env>.events` (3 d) is unchanged and is not a records-retention control (ADR-004 R8).
+5. **Changes apply through the archiver's migrate step only:** `MODIFY TTL` on the existing table.
+   A decrease is refused unless `TB_ARCHIVE_ALLOW_TTL_DECREASE=true` (ADR-004 R6). Helm values,
+   Compose variables and the read-only API view are in ADR-004 R3.
+
+The rest of this section is the 2026-09-20 analysis that led to the question, kept because it
+explains the default.
 
 `_tb.<env>.audit` retains 30 days. That number was chosen to match the DLQ and keep a small cluster
 small. It is an engineering default and it may be wrong by two orders of magnitude.
@@ -156,9 +178,11 @@ Three questions for the human, carried in `docs/agent-team/STATUS.md`:
    places a "what happened to this message, and who touched it" question is answered, and `raw` is
    also the replay source. A retention duty that covers the audit trail may or may not cover them.
 
-Until that is answered, the 30-day value stands and is marked `TODO(human)` in
-[`topic-defaults.json`](topic-defaults.json). The `_tb.<env>.audit` event contract itself is unwritten
-(see the events contract, section 6), so nothing depends on this yet.
+~~Until that is answered, the 30-day value stands and is marked `TODO(human)`.~~ **Answered
+2026-10-06** (decision at the top of this section): question 1 is the operator's, through the
+setting. Question 2 is ClickHouse with Kafka as a buffer. Question 3: Kafka retention is unchanged,
+and archived events and content get settings of their own. The `_tb.<env>.audit` record shape is
+published with W3-1b (set 1.8 part 2).
 
 ### 2.2 Why 3 partitions, not 12 — and the partition budget
 
@@ -521,5 +545,6 @@ each invalid one breaks. Tests validate each string against `topic-name.schema.j
   versus customer-managed KMS keys) and application-level payload encryption, both ADR-004. The
   requirement itself is not deferred — a v0 deployment with unencrypted broker disks does not
   conform.
-- Audit retention (section 2.1) is an open human decision, and the `_tb.<env>.audit` event contract
-  is unwritten. Both must be settled together.
+- ~~Audit retention (section 2.1) is an open human decision, and the `_tb.<env>.audit` event contract
+  is unwritten.~~ Retention decided on 2026-10-06 (operator setting, 2.1). The record shape follows
+  in W3-1b.

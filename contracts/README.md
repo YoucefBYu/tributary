@@ -55,7 +55,7 @@ overrule it, and it is much cheaper to overrule now than after wave 1 references
 | Contract | Format | Target | Consumers |
 |---|---|---|---|
 | Control-plane API, part 2 (messages, reprocess, replay, stats, events) | OpenAPI 3.1 | Phase 1 wave 3 (W3-1b) | API, UI client generation, CLI, tests |
-| Audit events (`_tb.<env>.audit`) | JSON Schema | Phase 1, with RBAC — **blocked on the retention decision** (`topics/v0/README.md` 2.1): whether Kafka, ClickHouse or object storage is the system of record changes the contract, so settle that first | control plane, archive |
+| Audit events (`_tb.<env>.audit`) | JSON Schema | Phase 1 wave 3 (W3-1b). **Unblocked 2026-10-06:** retention is an operator setting (`TB_ARCHIVE_AUDIT_TTL_DAYS`, default 2190 d). The system of record is ClickHouse `audit_log`, and the topic is a 30 d buffer (`topics/v0/README.md` 2.1, ADR-004 R2/R7) | control plane, archive |
 
 ## Rules
 

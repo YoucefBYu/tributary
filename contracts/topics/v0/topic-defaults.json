@@ -141,7 +141,7 @@
     },
     "audit": {
       "partitions": 6,
-      "retention_open_question": "TODO(human): 30 days is an engineering default, not a compliance decision. A six-year retention duty may apply to an audit trail (HIPAA 164.316(b)(2)(i)); if it does, the system of record is probably ClickHouse or object storage with Kafka as a buffer, not a larger retention.ms. Unverified, no legal review. See README.md section 2.1.",
+      "retention_note": "Decided 2026-10-06 (set 1.8; README 2.1; ADR-004 R2, R6, R7): this topic is a 30-day transport buffer, not the system of record. Audit records are kept in the ClickHouse audit_log table, with retention set by the operator through TB_ARCHIVE_AUDIT_TTL_DAYS (default 2190 days, range 1-36500), applied by the archiver migrate step. The default is conservative, not a compliance determination. Bootstrap creates this topic.",
       "configs": {
         "cleanup.policy": "delete",
         "retention.ms": 2592000000,

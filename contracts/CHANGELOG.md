@@ -3,7 +3,29 @@
 Newest first. Each entry names the contract, the version, whether the change is additive or
 breaking, and the reason. Breaking changes reference an ADR.
 
-## 2026-10-06 (latest) — contract set 1.8, W3-3 rulings (README only)
+## 2026-10-06 (latest, later) — contract set 1.8: retention is an operator setting (README and description only)
+
+**Additive, documentation only. No schema, example or manifest change; `validate.py` counts and
+pinned pairs unchanged. No invariant changes.** The human's answer to wave-3 7.2 / ADR-004 H4, relayed
+by the lead, verbatim: *"Give the user a possibility to change it"*.
+
+- **`topics/v0` 2.1 rewritten as decided.** Audit records are kept in ClickHouse `audit_log`,
+  retention `TB_ARCHIVE_AUDIT_TTL_DAYS` (default 2190 d, range 1-36500). `_tb.<env>.audit` stays a
+  30 d transport buffer, and its `retention.ms` is unchanged. Status line, defaults table row and
+  open-items bullet updated.
+- **`topic-defaults.json` `classes.audit`:** the description key `retention_open_question` is
+  replaced by `retention_note` (no code reads it, by grep; only a docstring in
+  `deploy/compose/topic-bootstrap/bootstrap_topics.py` names it, and W3-31 updates that). No
+  config value changes.
+- **`events/v0` 4.1 rule 4:** archived-event retention is an operator setting (`TB_ARCHIVE_TTL_DAYS`,
+  default 90), applied by the migrate step with a decrease guard. Section 6 bullet updated.
+- **`contracts/README.md`:** the audit-events contract is no longer blocked. Its shape lands with
+  W3-1b (set 1.8 part 2), which also adds the events-archiver READ LITERAL `_tb.<env>.audit` grant
+  and a read-only retention `GET` (ADR-004 R3, R7).
+- Rejected: a retention write endpoint in the API, which would need the ClickHouse DDL credential
+  (ADR-004 A5). **Give up:** a retention change needs a redeploy.
+
+## 2026-10-06 — contract set 1.8, W3-3 rulings (README only)
 
 **Additive, documentation only. No schema, example or manifest change; `validate.py` counts and
 pinned pairs unchanged from set 1.8 part 1. No invariant changes.**

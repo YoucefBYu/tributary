@@ -230,11 +230,11 @@ tested against one.
    (`tb_archiver_attrs_dropped_total{reason}`), and the rest of the event is stored. `_hmac` is
    dropped even though its shape is schema-valid, because the mechanism is unresolved (3.1) and the
    human has not answered 7.3. This follows "lenient consumers": one bad entry does not lose the event.
-4. **Retention of archived events.** Default **90 days** (`TB_ARCHIVE_TTL_DAYS`), an engineering
-   placeholder matching ADR-001 6.6's illustrative content TTL. **TODO(human)**, decided together with
-   audit retention (`topics/v0` 2.1, question 3, and `phases/wave-3.md` 7.2): whether a retention duty
-   reaches event metadata is the same legal reading. The archiver keeps the value configurable. It is
-   not a blocker for the build.
+4. **Retention of archived events: an operator setting (decided 2026-10-06).** `TB_ARCHIVE_TTL_DAYS`,
+   default **90 days**, integer 1-36500. The human's answer, verbatim: *"Give the user a possibility
+   to change it"* (`topics/v0` 2.1, ADR-004 R2). The migrate step applies a change to the existing
+   table with `MODIFY TTL` and refuses a decrease unless `TB_ARCHIVE_ALLOW_TTL_DECREASE=true` (ADR-004
+   R6). With `ttl_only_drop_parts`, a row can outlive its TTL by up to one month partition (R1).
 
 ---
 
@@ -247,6 +247,7 @@ synthetic.
 
 - No aggregate or rollup events (per-channel per-minute counters). Metrics cover that today; the
   browser may want it once the archive is measured.
-- No control-plane events here: those go to `_tb.<env>.audit` with its own contract, unwritten.
+- No control-plane events here: those go to `_tb.<env>.audit` with its own contract (shape in W3-1b;
+  retention decided 2026-10-06 as an operator setting, `topics/v0` 2.1).
 - `duration_ms` versus deriving latency by joining stages: v0 allows both, which risks the two
   disagreeing. Pick one in v1 once the archiver exists.
