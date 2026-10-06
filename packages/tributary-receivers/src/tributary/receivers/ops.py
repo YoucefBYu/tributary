@@ -105,6 +105,11 @@ def _response(status: int, body: bytes = b"", *, allow: bool = False) -> bytes:
 #: A connection younger than this is never evicted: a client that connects and sends its request a few
 #: milliseconds later (every real probe) must not be dropped by a newer arrival.
 MIN_EVICT_AGE_S = 0.05
+#: A client that has sent some bytes but not finished its head after this long is a trickler, and may be evicted by a
+#: newcomer from a different address.
+TRICKLE_EVICT_AGE_S = 0.2
+#: Slots one peer address may hold, so one address cannot fill the 8 with tricklers.
+MAX_PER_PEER = 4
 BACKLOG = 128
 #: Resource exhaustion: back off, so the loop does not spin on an accept that cannot succeed.
 _BACKOFF_ERRNOS = frozenset({errno.EMFILE, errno.ENFILE, errno.ENOBUFS, errno.ENOMEM})
@@ -185,14 +190,25 @@ class OpsServer:
             writer.close()
         self._active.clear()
 
-    def _victim(self) -> asyncio.StreamWriter | None:
+    def _victim(self, peer: str | None) -> asyncio.StreamWriter | None:
+        """The connection a newcomer from `peer` (`None`: not yet known) may take the slot of, or `None`.
+
+        Evictable means still reading its head and either silent for `MIN_EVICT_AGE_S`, or a trickler (some bytes,
+        head unfinished) for `TRICKLE_EVICT_AGE_S`. A peer address holds at most `MAX_PER_PEER` slots: at that
+        count it may only replace one of its own. Otherwise the newcomer takes the oldest evictable connection of
+        the peer holding the most slots, and never a trickler of its own address (that is what the cap is for)."""
         now = time.monotonic()
-        candidates = [
-            (w, c) for w, c in self._active.items() if c.reading and not c.got_bytes and now - c.born >= MIN_EVICT_AGE_S
-        ]
+        held = Counter(c.peer for c in self._active.values())
+
+        def evictable(c: _Conn) -> bool:
+            age = now - c.born
+            return c.reading and age >= (TRICKLE_EVICT_AGE_S if c.got_bytes else MIN_EVICT_AGE_S)
+
+        if peer is not None and held[peer] >= MAX_PER_PEER:
+            return next((w for w, c in self._active.items() if c.peer == peer and evictable(c)), None)
+        candidates = [(w, c) for w, c in self._active.items() if evictable(c) and not (c.got_bytes and c.peer == peer)]
         if not candidates:
             return None
-        held = Counter(c.peer for c in self._active.values())
         heaviest = max(held[c.peer] for _w, c in candidates)
         return next(w for w, c in candidates if held[c.peer] == heaviest)  # dict order: the oldest of them
 
@@ -205,13 +221,15 @@ class OpsServer:
             await self._accept_forever(sock)
         except asyncio.CancelledError:
             raise
-        except Exception as exc:  # the listener is gone: liveness will now fail, which is the honest answer
+        except Exception as exc:
+            # Close the listener, so a probe is refused rather than left hanging on a socket nobody accepts from.
+            sock.close()
             self._log_death(exc)
 
     async def _accept_forever(self, sock: socket.socket) -> None:
         loop = asyncio.get_running_loop()
         while not self._closing:
-            if len(self._active) >= MAX_CONNECTIONS and self._victim() is None:
+            if len(self._active) >= MAX_CONNECTIONS and self._victim(None) is None:
                 await asyncio.sleep(0.01)  # every slot is protected: leave the rest in the backlog
                 continue
             try:
@@ -231,6 +249,9 @@ class OpsServer:
                 reader = asyncio.StreamReader(limit=MAX_HEAD_BYTES)
                 protocol = asyncio.StreamReaderProtocol(reader, self._handle)
                 await loop.connect_accepted_socket(partial(_same, protocol), conn)
+            except OSError:
+                conn.close()  # this connection is lost (reset while being set up); the listener is fine
+                continue
             except BaseException:
                 conn.close()  # never leak an accepted socket, whatever went wrong between accept and the transport
                 raise
@@ -254,8 +275,9 @@ class OpsServer:
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         peername = writer.get_extra_info("peername")
         conn = _Conn(peer=str(peername[0]) if peername else "", born=time.monotonic())
-        if len(self._active) >= MAX_CONNECTIONS:
-            victim = self._victim()
+        over_peer_cap = sum(1 for c in self._active.values() if c.peer == conn.peer) >= MAX_PER_PEER
+        if over_peer_cap or len(self._active) >= MAX_CONNECTIONS:
+            victim = self._victim(conn.peer)
             if victim is None:  # every slot is protected: refuse this one rather than exceed the cap
                 writer.close()
                 return

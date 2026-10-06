@@ -17,6 +17,7 @@ from tributary.receivers.ops import (
     DEFAULT_BIND,
     DEFAULT_PORT,
     MAX_CONNECTIONS,
+    MAX_PER_PEER,
     MIN_EVICT_AGE_S,
     OpsConfigError,
     OpsServer,
@@ -174,12 +175,20 @@ def test_a_slow_sender_is_dropped_after_the_read_timeout() -> None:
     serve(scenario)
 
 
+async def open_from(source: str, port: int) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    sock = socket.socket()
+    sock.setblocking(False)
+    sock.bind((source, 0))
+    await asyncio.get_running_loop().sock_connect(sock, ("127.0.0.1", port))
+    return await asyncio.open_connection(sock=sock)
+
+
 def test_eight_idle_connections_do_not_block_a_probe_the_oldest_is_evicted() -> None:
     async def go() -> None:
         server = OpsServer(OpsSettings("127.0.0.1", 0), report)
         port = await server.start()
         try:
-            held = [await asyncio.open_connection("127.0.0.1", port) for _ in range(MAX_CONNECTIONS)]
+            held = [await open_from("127.0.0.1" if i % 2 == 0 else "127.0.0.2", port) for i in range(MAX_CONNECTIONS)]
             for _ in range(100):
                 if server.open_connections == MAX_CONNECTIONS:
                     break
@@ -187,13 +196,12 @@ def test_eight_idle_connections_do_not_block_a_probe_the_oldest_is_evicted() -> 
             assert server.open_connections == MAX_CONNECTIONS  # the fault fired: every slot is taken by an idle peer
             await asyncio.sleep(MIN_EVICT_AGE_S + 0.05)  # old enough to be evictable
             started = asyncio.get_running_loop().time()
-            assert (await get(port, "/readyz"))[0] == 200, "a probe is served at once"
+            assert await probe_from("127.0.0.3", port, 0.0) == 200, "a probe is served at once"
             assert asyncio.get_running_loop().time() - started < 0.5
             assert server.open_connections <= MAX_CONNECTIONS
             # The oldest idle connection was the one closed; the newest is still open.
-            first = held[0][0]
             with contextlib.suppress(ConnectionResetError):
-                assert await asyncio.wait_for(first.read(10), 2) == b""
+                assert await asyncio.wait_for(held[0][0].read(10), 2) == b""
             held[-1][1].write(b"GET /livez HTTP/1.1\r\n\r\n")
             await held[-1][1].drain()
             assert b"200 OK" in await asyncio.wait_for(held[-1][0].read(200), 2)
@@ -211,9 +219,10 @@ def test_a_flood_of_idle_connections_never_locks_out_a_probe() -> None:
         port = await server.start()
         try:
             flood = [await asyncio.open_connection("127.0.0.1", port) for _ in range(40)]
-            for _ in range(5):
+            await asyncio.sleep(MIN_EVICT_AGE_S + 0.1)
+            for _ in range(5):  # even from the flooder's own address: its idle connections are replaced
                 assert (await get(port, "/livez"))[0] == 200
-            assert server.open_connections <= MAX_CONNECTIONS
+            assert server.open_connections <= MAX_PER_PEER
             for _r, w in flood:
                 w.close()
         finally:
@@ -226,16 +235,16 @@ def conn_state(peer: str, age: float, *, reading: bool = True, got_bytes: bool =
     return _Conn(peer=peer, born=time.monotonic() - age, reading=reading, got_bytes=got_bytes)
 
 
-def test_victim_rules_age_bytes_and_the_heaviest_peer() -> None:
+def test_victim_rules_age_bytes_peer_cap_and_the_heaviest_peer() -> None:
     server = OpsServer(OpsSettings("127.0.0.1", 0), report)
-    w: Any = [object() for _ in range(8)]
-    # Everything young, or sent bytes, or past its head: nothing is evictable.
+    w: Any = [object() for _ in range(12)]
+    # Young, mid-trickle (under 200 ms) and past-head connections are protected.
     server._active = {
         w[0]: conn_state("a", 0.001),
-        w[1]: conn_state("a", 5.0, got_bytes=True),
+        w[1]: conn_state("a", 0.1, got_bytes=True),
         w[2]: conn_state("b", 5.0, reading=False),
     }
-    assert server._victim() is None
+    assert server._victim("c") is None
     # Old and silent: evictable; the peer holding the most slots is taken from first, oldest of its connections.
     server._active = {
         w[0]: conn_state("probe", 5.0),
@@ -243,35 +252,32 @@ def test_victim_rules_age_bytes_and_the_heaviest_peer() -> None:
         w[2]: conn_state("flood", 3.0),
         w[3]: conn_state("flood", 0.001),  # young: protected, but still counts as a slot the flooder holds
     }
-    assert server._victim() is w[1]
+    assert server._victim("other") is w[1]
     del server._active[w[1]]
-    assert server._victim() is w[2]
+    assert server._victim("other") is w[2]
+    # A trickler (bytes sent, head unfinished) older than 200 ms is evictable by a different address only.
+    server._active = {w[0]: conn_state("slow", 1.0, got_bytes=True), w[1]: conn_state("x", 1.0, reading=False)}
+    assert server._victim("probe") is w[0]
+    assert server._victim("slow") is None, "below the peer cap, an address never evicts its own trickler"
+    # At the per-peer cap a peer may replace only its own connections, even if another peer's are older.
+    server._active = {w[i]: conn_state("flood", 1.0 + i, got_bytes=True) for i in range(MAX_PER_PEER)}
+    server._active[w[10]] = conn_state("other", 9.0)
+    assert server._victim("flood") is w[0]
+    server._active = {w[i]: conn_state("flood", 0.001) for i in range(MAX_PER_PEER)}
+    server._active[w[10]] = conn_state("other", 9.0)
+    assert server._victim("flood") is None, "every one of its own is young: the newcomer is refused, not another peer"
 
 
-def test_a_connection_that_has_sent_bytes_is_never_evicted() -> None:
+def test_one_address_holds_at_most_four_slots() -> None:
     async def go() -> None:
         server = OpsServer(OpsSettings("127.0.0.1", 0), report)
         port = await server.start()
         try:
-            partial = []
-            for _ in range(MAX_CONNECTIONS):
-                r, w = await asyncio.open_connection("127.0.0.1", port)
-                w.write(b"GET /livez HTT")  # the head is not finished
-                await w.drain()
-                partial.append((r, w))
-            await asyncio.sleep(MIN_EVICT_AGE_S + 0.1)
-            r, w = await asyncio.open_connection("127.0.0.1", port)
-            w.write(b"GET /livez HTTP/1.1\r\n\r\n")
-            await w.drain()
-            # Held back while every slot is protected: the partial senders are still open.
-            with pytest.raises(TimeoutError):
-                await asyncio.wait_for(r.read(10), 0.3)
-            assert server.open_connections == MAX_CONNECTIONS
-            # Their own read deadline frees the slots; then the waiting probe is served.
-            assert b"200 OK" in await asyncio.wait_for(r.read(200), 5)
-            w.close()
-            for _r, pw in partial:
-                pw.close()
+            conns = [await asyncio.open_connection("127.0.0.1", port) for _ in range(12)]
+            await asyncio.sleep(0.3)
+            assert server.open_connections == MAX_PER_PEER
+            for _r, w in conns:
+                w.close()
         finally:
             await server.close()
 
@@ -333,6 +339,47 @@ def test_a_flooder_from_one_address_does_not_stop_probes_from_another() -> None:
 
     results = asyncio.run(go())
     assert results == [200] * 8, results
+
+
+def test_forty_tricklers_from_one_address_do_not_starve_probes_from_another() -> None:
+    """Each sends a byte and stalls (the head never finishes), reconnecting when dropped."""
+
+    async def go() -> list[int]:
+        server = OpsServer(OpsSettings("127.0.0.1", 0), report)
+        port = await server.start()
+        stop = False
+
+        async def trickler() -> None:
+            while not stop:
+                try:
+                    r, w = await asyncio.open_connection("127.0.0.1", port)
+                except OSError:
+                    await asyncio.sleep(0.01)
+                    continue
+                with contextlib.suppress(OSError):
+                    w.write(b"G")
+                    await w.drain()
+                with contextlib.suppress(OSError, asyncio.CancelledError):
+                    await r.read(1)  # stalls until the server drops it, then reconnects at once
+                w.close()
+
+        tasks = [asyncio.create_task(trickler()) for _ in range(40)]
+        try:
+            await asyncio.sleep(0.5)
+            results = []
+            for _ in range(20):
+                results.append(await probe_from("127.0.0.2", port, 0.01))
+                await asyncio.sleep(0.05)
+            return results
+        finally:
+            stop = True
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await server.close()
+
+    results = asyncio.run(asyncio.wait_for(go(), 60))
+    assert results == [200] * 20, results
 
 
 class FlakyLoop:
@@ -492,3 +539,54 @@ def test_the_ops_module_has_no_kafka_client() -> None:
 
     source = Path(ops.__file__).read_text(encoding="utf-8")
     assert "confluent_kafka" not in source and "list_topics" not in source
+
+
+def test_a_socket_lost_while_being_set_up_is_closed_and_the_loop_carries_on() -> None:
+    async def go() -> None:
+        loop = asyncio.get_running_loop()
+        real = loop.connect_accepted_socket
+        failures = [OSError(errno.ECONNRESET, "x"), OSError(errno.EPIPE, "x")]
+
+        async def flaky(factory: Any, sock: Any) -> Any:
+            if failures:
+                raise failures.pop(0)
+            return await real(factory, sock)
+
+        loop.connect_accepted_socket = flaky  # type: ignore[method-assign]
+        log = Log()
+        server = OpsServer(OpsSettings("127.0.0.1", 0), report, log=log)
+        port = await server.start()
+        try:
+            for _ in range(2):  # the two lost connections are closed
+                r, w = await asyncio.open_connection("127.0.0.1", port)
+                with contextlib.suppress(ConnectionResetError):
+                    assert await asyncio.wait_for(r.read(10), 3) == b""
+                w.close()
+            assert (await get(port, "/livez"))[0] == 200, "the loop survived"
+            assert log.events == []
+        finally:
+            await server.close()
+
+    asyncio.run(go())
+
+
+def test_a_dead_accept_loop_closes_the_listener_so_probes_are_refused() -> None:
+    async def go() -> None:
+        loop = asyncio.get_running_loop()
+        flaky = FlakyLoop(loop, [OSError(errno.EBADF, "x")])
+        loop.sock_accept = flaky.sock_accept  # type: ignore[method-assign]
+        log = Log()
+        server = OpsServer(OpsSettings("127.0.0.1", 0), report, log=log)
+        port = await server.start()
+        try:
+            for _ in range(100):
+                if log.events:
+                    break
+                await asyncio.sleep(0.01)
+            assert log.events
+            with pytest.raises(OSError):
+                await asyncio.open_connection("127.0.0.1", port)
+        finally:
+            await server.close()
+
+    asyncio.run(go())
