@@ -12,6 +12,7 @@ import pytest
 from api_kit import public_jwk
 from cryptography.hazmat.primitives.asymmetric import rsa
 from tributary.api.auth.jwks import (
+    BACKOFF_BASE_S,
     BACKOFF_CAP_S,
     MAX_BODY_BYTES,
     FileJwksFetcher,
@@ -96,25 +97,43 @@ def test_failure_keeps_the_old_snapshot_and_backs_off_with_full_jitter() -> None
 
 
 def test_a_failing_fetcher_is_retried_on_the_schedule_not_per_request() -> None:
-    """The loop sleeps until `next_attempt_at`; looking keys up in between never fetches."""
+    """Driven by fake time, not by event-loop ticks (a fetch runs on an executor thread, so a tick count
+    depends on scheduling). `run()` awaits every fetch to completion, and the fake sleep advances the clock by
+    exactly the slice it is asked for, so the fetch times are a pure function of the seeded jitter. The test
+    computes that schedule independently and requires the fetch count to equal it, while the request path
+    reads keys 50 times per slice."""
+    total = 600.0
+
+    def expected_fetches() -> int:
+        rng, due, failures, n = _rng(1), 0.0, 0, 0
+        while due < total:  # a fetch is due at `due`; the failure schedules the next one
+            n += 1
+            failures += 1
+            due += rng.uniform(0.0, min(BACKOFF_CAP_S, BACKOFF_BASE_S * 2 ** (failures - 1)))
+        return n
 
     async def go() -> None:
         clock, fetch = Clock(), Fetcher(JwksError("down"))
+        start = clock.now
         slept: list[float] = []
+        reached = asyncio.Event()
 
         async def fake_sleep(seconds: float) -> None:
             slept.append(seconds)
             clock.now += seconds
+            for _ in range(50):
+                ks.get("k1")  # request-path reads: they must never fetch
+            if clock.now - start >= total:
+                reached.set()
+                await asyncio.Event().wait()  # park: no fetch may happen past the window
             await asyncio.sleep(0)
 
         ks = KeySet(fetch, refresh_s=300, max_stale_s=3600, timeout_s=5, clock=clock, rng=_rng(1), sleep=fake_sleep)
         task = asyncio.get_running_loop().create_task(ks.run())
-        for _ in range(200):
-            await asyncio.sleep(0)
-            ks.get("k1")  # request-path reads
+        await asyncio.wait_for(reached.wait(), timeout=30)
         task.cancel()
-        calls_in_200_ticks = fetch.calls
-        assert 1 <= calls_in_200_ticks <= 8, calls_in_200_ticks  # bounded by backoff, not by the 200 lookups
+        assert fetch.calls == ks.failures == expected_fetches()  # exactly the backoff schedule
+        assert fetch.calls >= 2 and len(slept) > fetch.calls * 5  # many lookups and sleeps, few fetches
         assert all(s <= 5.0 for s in slept)  # slices
 
     asyncio.run(go())
