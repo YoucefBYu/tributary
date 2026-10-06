@@ -299,7 +299,7 @@ class ReceiverLifecycle[S](ABC):
         settings = self._opts.ops
         if settings is None:
             return True
-        ops = OpsServer(settings, self.readiness_report)
+        ops = OpsServer(settings, self.readiness_report, log=self._log)
         try:
             self.ops_port = await ops.start()
         except OSError as exc:

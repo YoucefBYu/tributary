@@ -18,12 +18,18 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import ipaddress
 import os
 import socket
+import time
+from collections import Counter
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from functools import partial
+
+from tributary.runtime.errors import safe_token
+from tributary.sdk.context import Logger
 
 from .net import is_loopback
 from .readiness import LIVE_BODY, Report
@@ -96,27 +102,47 @@ def _response(status: int, body: bytes = b"", *, allow: bool = False) -> bytes:
     return ("\r\n".join(head) + "\r\n\r\n").encode("ascii") + body
 
 
+#: A connection younger than this is never evicted: a client that connects and sends its request a few
+#: milliseconds later (every real probe) must not be dropped by a newer arrival.
+MIN_EVICT_AGE_S = 0.05
+BACKLOG = 128
+#: Resource exhaustion: back off, so the loop does not spin on an accept that cannot succeed.
+_BACKOFF_ERRNOS = frozenset({errno.EMFILE, errno.ENFILE, errno.ENOBUFS, errno.ENOMEM})
+#: A connection that died between the kernel's accept queue and ours: not an error of the listener, retry at once.
+_RETRY_ERRNOS = frozenset({errno.ECONNABORTED, errno.EPROTO})
+
+
+@dataclass(slots=True)
+class _Conn:
+    peer: str
+    born: float
+    reading: bool = True  # still waiting for the end of its head
+    got_bytes: bool = False  # has sent at least one byte of it
+    oversize: bool = False
+
+
 def _same(protocol: asyncio.StreamReaderProtocol) -> asyncio.StreamReaderProtocol:
     return protocol
 
 
 class OpsServer:
-    """Capacity rule (O5, at most 8 connections): a newcomer is always served by evicting the **oldest connection
-    still reading its head** (an idle or slow client must not lock a probe out). When all 8 are past their head
-    (writing a response, which takes microseconds) nothing is evictable, so accepting pauses until one finishes:
-    the connections wait in the kernel backlog instead of costing the loop an accept each.
+    """Capacity rule (O5, at most 8 connections). A newcomer evicts one connection only if that one is *evictable*:
+    still reading its head, has sent no byte, and is at least `MIN_EVICT_AGE_S` old. Among those, it takes the
+    oldest from the peer address that holds the most slots, so a single flooder pays for its own flood and a probe
+    from another address is not the one dropped. A connection that has sent bytes is never evicted.
+
+    When all 8 are protected (young, or past their head), accepting pauses until one is evictable or done: the
+    waiting connections sit in the kernel backlog (128) instead of costing the loop an accept each.
 
     The accept loop is ours (`loop.sock_accept`), because `asyncio.Server` cannot pause its listening socket."""
 
-    def __init__(self, settings: OpsSettings, readiness: Callable[[], Report]) -> None:
+    def __init__(self, settings: OpsSettings, readiness: Callable[[], Report], *, log: Logger | None = None) -> None:
         self._settings = settings
         self._readiness = readiness
+        self._log = log
         self._sock: socket.socket | None = None
         self._accept_task: asyncio.Task[None] | None = None
-        #: Open connections, oldest first; the value is True while the head is still being read.
-        self._active: dict[asyncio.StreamWriter, bool] = {}
-        self._room = asyncio.Event()
-        self._room.set()
+        self._active: dict[asyncio.StreamWriter, _Conn] = {}
         self._closing = False
 
     @property
@@ -137,7 +163,7 @@ class OpsServer:
         try:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind((bind, self._settings.port))
-            sock.listen(16)
+            sock.listen(BACKLOG)
             sock.setblocking(False)
         except OSError:
             sock.close()
@@ -159,33 +185,56 @@ class OpsServer:
             writer.close()
         self._active.clear()
 
-    def _update_room(self) -> None:
-        if len(self._active) < MAX_CONNECTIONS or any(self._active.values()):
-            self._room.set()
-        else:
-            self._room.clear()
+    def _victim(self) -> asyncio.StreamWriter | None:
+        now = time.monotonic()
+        candidates = [
+            (w, c) for w, c in self._active.items() if c.reading and not c.got_bytes and now - c.born >= MIN_EVICT_AGE_S
+        ]
+        if not candidates:
+            return None
+        held = Counter(c.peer for c in self._active.values())
+        heaviest = max(held[c.peer] for _w, c in candidates)
+        return next(w for w, c in candidates if held[c.peer] == heaviest)  # dict order: the oldest of them
+
+    def _log_death(self, exc: BaseException) -> None:
+        if self._log is not None:
+            self._log.error("ops_accept_loop_died", error=safe_token(type(exc).__name__))
 
     async def _accept_loop(self, sock: socket.socket) -> None:
+        try:
+            await self._accept_forever(sock)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # the listener is gone: liveness will now fail, which is the honest answer
+            self._log_death(exc)
+
+    async def _accept_forever(self, sock: socket.socket) -> None:
         loop = asyncio.get_running_loop()
         while not self._closing:
-            await self._room.wait()  # paused at capacity with nothing evictable
+            if len(self._active) >= MAX_CONNECTIONS and self._victim() is None:
+                await asyncio.sleep(0.01)  # every slot is protected: leave the rest in the backlog
+                continue
             try:
-                conn, _addr = await loop.sock_accept(sock)
-            except asyncio.CancelledError:
-                raise
-            except OSError:
+                conn, addr = await loop.sock_accept(sock)
+            except OSError as exc:
                 if self._closing:
                     return
-                await asyncio.sleep(0.05)  # EMFILE and the like: back off, never spin
-                continue
-            conn.setblocking(False)
-            reader = asyncio.StreamReader(limit=MAX_HEAD_BYTES)
-            protocol = asyncio.StreamReaderProtocol(reader, self._handle)
+                if exc.errno in _RETRY_ERRNOS:
+                    await asyncio.sleep(0)
+                    continue
+                if exc.errno in _BACKOFF_ERRNOS:
+                    await asyncio.sleep(0.05)
+                    continue
+                raise
             try:
+                conn.setblocking(False)
+                reader = asyncio.StreamReader(limit=MAX_HEAD_BYTES)
+                protocol = asyncio.StreamReaderProtocol(reader, self._handle)
                 await loop.connect_accepted_socket(partial(_same, protocol), conn)
-            except OSError:
-                conn.close()
-                continue
+            except BaseException:
+                conn.close()  # never leak an accepted socket, whatever went wrong between accept and the transport
+                raise
+            del addr
             await asyncio.sleep(0)  # let the handler register before the next capacity check
             await asyncio.sleep(0)
 
@@ -203,26 +252,21 @@ class OpsServer:
         return _response(404)
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        peername = writer.get_extra_info("peername")
+        conn = _Conn(peer=str(peername[0]) if peername else "", born=time.monotonic())
         if len(self._active) >= MAX_CONNECTIONS:
-            oldest = next((w for w, reading in self._active.items() if reading), None)
-            if oldest is None:  # unreachable while the accept loop pauses; refuse rather than exceed the cap
+            victim = self._victim()
+            if victim is None:  # every slot is protected: refuse this one rather than exceed the cap
                 writer.close()
                 return
-            del self._active[oldest]
-            oldest.close()  # its handler sees the closed stream and ends
-        self._active[writer] = True
-        self._update_room()
+            del self._active[victim]
+            victim.close()  # its handler sees the closed stream and ends
+        self._active[writer] = conn
         try:
-            try:
-                head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), READ_TIMEOUT_S)
-            except (TimeoutError, ConnectionError, OSError, asyncio.IncompleteReadError):
+            head = await self._read_head(reader, conn)
+            if head is None:
                 return
-            except asyncio.LimitOverrunError:
-                self._reading_done(writer)
-                await self._send(writer, _response(431))
-                return
-            self._reading_done(writer)
-            if len(head) > MAX_HEAD_BYTES:
+            if conn.oversize:
                 await self._send(writer, _response(431))
                 return
             line = head.split(b"\r\n", 1)[0].split(b" ")
@@ -234,13 +278,31 @@ class OpsServer:
             await self._send(writer, self._route(method, path))
         finally:
             self._active.pop(writer, None)
-            self._update_room()
             writer.close()
 
-    def _reading_done(self, writer: asyncio.StreamWriter) -> None:
-        if writer in self._active:
-            self._active[writer] = False
-            self._update_room()
+    @staticmethod
+    async def _read_head(reader: asyncio.StreamReader, conn: _Conn) -> bytes | None:
+        """The request head (to the blank line), an empty head with `conn.oversize` set past 8 KiB, `None` on a timeout or a closed peer. The 1 s
+        deadline covers the whole head, so a trickle does not extend it. `conn` records the first byte."""
+        deadline = time.monotonic() + READ_TIMEOUT_S
+        buffer = b""
+        try:
+            while b"\r\n\r\n" not in buffer:
+                if len(buffer) > MAX_HEAD_BYTES:
+                    conn.reading = False
+                    conn.oversize = True
+                    return b""
+                chunk = await asyncio.wait_for(reader.read(4096), max(0.0, deadline - time.monotonic()))
+                if not chunk:
+                    return None
+                conn.got_bytes = True
+                buffer += chunk
+        except (TimeoutError, ConnectionError, OSError):
+            return None
+        conn.reading = False
+        end = buffer.index(b"\r\n\r\n") + 4
+        conn.oversize = end > MAX_HEAD_BYTES
+        return buffer[:end]
 
     @staticmethod
     async def _send(writer: asyncio.StreamWriter, data: bytes) -> None:
