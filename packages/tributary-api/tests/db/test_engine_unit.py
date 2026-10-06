@@ -35,7 +35,7 @@ def test_spec_digest_is_key_order_independent() -> None:
 
 def test_single_migration_head() -> None:
     script = ScriptDirectory.from_config(make_config("postgresql://x/y"))
-    assert script.get_heads() == ["0001"]
+    assert script.get_heads() == ["0002"]
 
 
 class _FakeOrig(Exception):

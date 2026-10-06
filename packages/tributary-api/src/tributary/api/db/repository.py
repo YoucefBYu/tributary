@@ -8,10 +8,11 @@ import hashlib
 import json
 import re
 import uuid
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
+from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 from tributary.api.db.errors import (
@@ -19,7 +20,6 @@ from tributary.api.db.errors import (
     InUseError,
     InvalidValueError,
     NotFoundError,
-    NothingToRollBackError,
     RepositoryError,
     TransientError,
 )
@@ -49,10 +49,24 @@ def _classify(exc: DBAPIError, what: str) -> RepositoryError:
     return RepositoryError(f"{what} rejected by the database")
 
 
+def published_bytes(spec: dict[str, Any]) -> bytes:
+    """The exact bytes written to `_tb.<env>.channels` for a stored document: canonical JSON (sorted keys, no
+    whitespace, UTF-8). `spec_sha256` is the SHA-256 of these bytes (`openapi/v0` README 3.2). NaN and
+    Infinity are refused (ValueError)."""
+    return json.dumps(spec, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
+
+
 def spec_digest(spec: dict[str, Any]) -> str:
-    """SHA-256 of the canonical JSON form (sorted keys, no whitespace). NaN and Infinity are refused (ValueError)."""
-    canonical = json.dumps(spec, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return hashlib.sha256(published_bytes(spec)).hexdigest()
+
+
+def image_digest_of(spec: dict[str, Any]) -> str | None:
+    """`sha256:<hex>` from `spec.pipeline.bundle` (`name@sha256:<hex>`, pinned by the channel schema)."""
+    bundle = (spec.get("spec") or {}).get("pipeline", {}).get("bundle")
+    if not isinstance(bundle, str) or "@" not in bundle:
+        return None
+    digest = bundle.rsplit("@", 1)[1]
+    return digest if _DIGEST_RE.fullmatch(digest) else None
 
 
 async def _write_guarded(session: AsyncSession, *, add: object | None = None, delete: object | None = None) -> None:
@@ -127,9 +141,13 @@ class ChannelRepository:
                 raise InUseError(f"channel {_n(name)} still has deployments") from None
             raise _classify(exc, f"channel {_n(name)} delete") from None
 
-    async def add_version(self, name: str, spec: dict[str, Any], created_by: str) -> ChannelVersion:
+    async def add_version(
+        self, name: str, spec: dict[str, Any], created_by: str, origin: dict[str, Any] | None = None
+    ) -> ChannelVersion:
         """Append the next version. Serialised per channel by a row lock, so concurrent writers get
-        distinct consecutive numbers rather than a unique-violation."""
+        distinct consecutive numbers rather than a unique-violation. The stored document is a copy of `spec`
+        with `metadata.version` set to the new number, and `spec_sha256` hashes the stored document's
+        published bytes (`openapi/v0` README 3.2)."""
         ch = await self.get_by_name(name, for_update=True)
         current = (
             await self._s.execute(
@@ -139,11 +157,14 @@ class ChannelRepository:
                 .limit(1)
             )
         ).scalar_one_or_none()
+        number = (current or 0) + 1
+        stored = {**spec, "metadata": {**spec.get("metadata", {}), "version": number}}
         ver = ChannelVersion(
             channel_id=ch.id,
-            version=(current or 0) + 1,
-            spec=spec,
-            spec_sha256=spec_digest(spec),
+            version=number,
+            spec=stored,
+            spec_sha256=spec_digest(stored),
+            origin=origin if origin is not None else {"kind": "api"},
             created_by=created_by,
         )
         try:
@@ -163,121 +184,217 @@ class ChannelRepository:
             raise NotFoundError(f"channel {_n(name)} version {version} not found")
         return ver
 
-    async def list_versions(self, name: str) -> Sequence[ChannelVersion]:
+    async def list_versions(
+        self, name: str, *, limit: int | None = None, before_version: int | None = None
+    ) -> Sequence[ChannelVersion]:
+        """Newest first. `before_version` is the keyset cursor: only versions below it."""
         ch = await self.get_by_name(name)
         stmt = select(ChannelVersion).where(ChannelVersion.channel_id == ch.id).order_by(ChannelVersion.version.desc())
+        if before_version is not None:
+            stmt = stmt.where(ChannelVersion.version < before_version)
+        if limit is not None:
+            stmt = stmt.limit(limit)
         return (await self._s.execute(stmt)).scalars().all()
+
+    async def latest_versions(self, channel_ids: Sequence[uuid.UUID]) -> dict[uuid.UUID, ChannelVersion]:
+        """The newest version row of each channel (one query)."""
+        if not channel_ids:
+            return {}
+        newest = (
+            select(ChannelVersion.channel_id, func.max(ChannelVersion.version).label("v"))
+            .where(ChannelVersion.channel_id.in_(channel_ids))
+            .group_by(ChannelVersion.channel_id)
+            .subquery()
+        )
+        stmt = select(ChannelVersion).join(
+            newest, (ChannelVersion.channel_id == newest.c.channel_id) & (ChannelVersion.version == newest.c.v)
+        )
+        return {row.channel_id: row for row in (await self._s.execute(stmt)).scalars().all()}
+
+    async def version_by_id(self, version_id: uuid.UUID) -> ChannelVersion:
+        return await self._s.get_one(ChannelVersion, version_id)
+
+
+_LIVE = ("pending", "published")
 
 
 class DeploymentRepository:
+    """Deployment request records. The caller holds the channel row lock (`lock_channel`) across the
+    read-check-insert so two operators on one channel are serialised, which is what makes
+    `expected_current_version` an honest guard."""
+
     def __init__(self, session: AsyncSession) -> None:
         self._s = session
 
-    async def _lock_channel(self, name: str) -> Channel:
+    async def lock_channel(self, name: str) -> Channel:
         return await ChannelRepository(self._s).get_by_name(name, for_update=True)
 
-    async def active(self, channel_id: uuid.UUID, environment_id: uuid.UUID) -> Deployment | None:
-        stmt = select(Deployment).where(
-            Deployment.channel_id == channel_id,
-            Deployment.environment_id == environment_id,
-            Deployment.status == "active",
-        )
-        return (await self._s.execute(stmt)).scalar_one_or_none()
-
-    async def deploy(
-        self, channel_name: str, version: int, environment_name: str, image_digest: str, created_by: str
-    ) -> Deployment:
-        """Make `version` active in the environment; the previous active deployment becomes `superseded`.
-        `image_digest` must be `sha256:<64 hex>` (a tag is refused by the CHECK constraint)."""
-        ch = await self._lock_channel(channel_name)
-        env = await EnvironmentRepository(self._s).get_by_name(environment_name)
-        ver = await ChannelRepository(self._s).get_version(channel_name, version)
-        previous = await self.active(ch.id, env.id)
-        return await self._insert(ch, env, ver.id, image_digest, created_by, flip=(previous, "superseded"))
-
-    async def rollback(self, channel_name: str, environment_name: str, created_by: str) -> Deployment:
-        """Re-activate the most recent earlier deployment whose version or image differs from the current
-        one (a new `active` row with `restored_from` = that deployment). The current deployment becomes
-        `rolled_back`; history is append-only."""
-        ch = await self._lock_channel(channel_name)
-        env = await EnvironmentRepository(self._s).get_by_name(environment_name)
-        current = await self.active(ch.id, env.id)
-        if current is None:
-            raise NothingToRollBackError(
-                f"channel {_n(channel_name)} has no active deployment in {_n(environment_name)}"
-            )
-        # A rollback copy sits at a new seq, but the next rollback must keep walking back from the
-        # deployment it restored, not bounce between the two most recent ones.
-        limit = current.seq
-        if current.restored_from is not None:
-            limit = (await self._s.get_one(Deployment, current.restored_from)).seq
+    async def current(self, channel_id: uuid.UUID, environment_id: uuid.UUID) -> Deployment | None:
+        """The effective record: the newest `pending` or `published` one (what was asked for, and what the
+        channels topic holds or is about to). A newest record of kind `undeploy` means "not deployed"."""
         stmt = (
             select(Deployment)
             .where(
-                Deployment.channel_id == ch.id,
-                Deployment.environment_id == env.id,
-                Deployment.seq < limit,
-                Deployment.status == "superseded",
-                (Deployment.version_id != current.version_id) | (Deployment.image_digest != current.image_digest),
+                Deployment.channel_id == channel_id,
+                Deployment.environment_id == environment_id,
+                Deployment.status.in_(_LIVE),
             )
             .order_by(Deployment.seq.desc())
             .limit(1)
         )
-        target = (await self._s.execute(stmt)).scalar_one_or_none()
-        if target is None:
-            raise NothingToRollBackError(
-                f"channel {_n(channel_name)} has no earlier deployment in {_n(environment_name)}"
+        return (await self._s.execute(stmt)).scalar_one_or_none()
+
+    async def previous_published_version(self, current: Deployment) -> ChannelVersion | None:
+        """The most recent version published before `current` that differs from it: the default rollback
+        target (`openapi/v0` RollbackRequest.to_version)."""
+        if current.version_id is None:
+            return None
+        stmt = (
+            select(ChannelVersion)
+            .join(Deployment, Deployment.version_id == ChannelVersion.id)
+            .where(
+                Deployment.channel_id == current.channel_id,
+                Deployment.environment_id == current.environment_id,
+                Deployment.status == "published",
+                Deployment.seq < current.seq,
+                Deployment.version_id != current.version_id,
             )
-        return await self._insert(
-            ch,
-            env,
-            target.version_id,
-            target.image_digest,
-            created_by,
-            flip=(current, "rolled_back"),
-            restored_from=target.id,
+            .order_by(Deployment.seq.desc())
+            .limit(1)
         )
+        return (await self._s.execute(stmt)).scalar_one_or_none()
 
-    async def history(self, channel_name: str, environment_name: str | None = None) -> Sequence[Deployment]:
-        ch = await ChannelRepository(self._s).get_by_name(channel_name)
-        stmt = select(Deployment).where(Deployment.channel_id == ch.id).order_by(Deployment.seq.desc())
-        if environment_name is not None:
-            env = await EnvironmentRepository(self._s).get_by_name(environment_name)
-            stmt = stmt.where(Deployment.environment_id == env.id)
-        return (await self._s.execute(stmt)).scalars().all()
-
-    async def _insert(
+    async def request(
         self,
         ch: Channel,
         env: Environment,
-        version_id: uuid.UUID,
-        image_digest: str,
+        kind: str,
+        version: ChannelVersion | None,
+        previous_version: int | None,
         created_by: str,
         *,
-        flip: tuple[Deployment | None, str],
         restored_from: uuid.UUID | None = None,
     ) -> Deployment:
-        """Retire the old active row and insert the new one in ONE savepoint: a rejected insert must not
-        leave the environment with no active deployment."""
-        if not _DIGEST_RE.fullmatch(image_digest):
-            raise InvalidValueError("image_digest must be sha256:<64 lowercase hex>")
+        """Insert a `pending` record and supersede any older pending one, in one savepoint. `image_digest` is
+        copied from the version's `pipeline.bundle`; a deploy whose document has none is refused."""
+        image: str | None = None
+        if kind != "undeploy" and (version is None or (image := image_digest_of(version.spec)) is None):
+            raise InvalidValueError("the document has no digest-pinned pipeline.bundle")
         dep = Deployment(
             channel_id=ch.id,
             environment_id=env.id,
-            version_id=version_id,
-            image_digest=image_digest,
-            status="active",
+            kind=kind,
+            version_id=None if version is None else version.id,
+            image_digest=image,
+            previous_version=previous_version,
+            status="pending",
             restored_from=restored_from,
             created_by=created_by,
         )
-        old, new_status = flip
         try:
             async with self._s.begin_nested():
-                if old is not None:
-                    old.status = new_status
-                    await self._s.flush()  # free the partial unique index before the insert
+                await self._s.execute(
+                    update(Deployment)
+                    .where(
+                        Deployment.channel_id == ch.id,
+                        Deployment.environment_id == env.id,
+                        Deployment.status == "pending",
+                    )
+                    .values(status="superseded")
+                )
                 self._s.add(dep)
                 await self._s.flush()
         except DBAPIError as exc:
             raise _classify(exc, "deployment") from None
         return dep
+
+    async def get(self, deployment_id: uuid.UUID, *, for_update: bool = False) -> Deployment:
+        stmt = select(Deployment).where(Deployment.id == deployment_id)
+        if for_update:
+            stmt = stmt.with_for_update().execution_options(populate_existing=True)
+        dep = (await self._s.execute(stmt)).scalar_one_or_none()
+        if dep is None:
+            raise NotFoundError("deployment not found")
+        return dep
+
+    async def mark_published(self, dep: Deployment) -> None:
+        """`pending` -> `published`. Anything else raises InvalidValueError (a superseded record never publishes)."""
+        if dep.status != "pending":
+            raise InvalidValueError(f"deployment is {dep.status}, not pending")
+        dep.status = "published"
+        dep.published_at = datetime.now(UTC)
+        await self._s.flush()
+
+    async def mark_failed(self, dep: Deployment, failure_code: str) -> None:
+        if dep.status != "pending":
+            raise InvalidValueError(f"deployment is {dep.status}, not pending")
+        dep.status = "failed"
+        dep.failure_code = failure_code
+        await self._s.flush()
+
+    async def history(
+        self,
+        ch: Channel,
+        env: Environment,
+        *,
+        limit: int,
+        before_seq: int | None = None,
+    ) -> Sequence[Deployment]:
+        """Newest first; `before_seq` is the keyset cursor."""
+        stmt = (
+            select(Deployment)
+            .where(Deployment.channel_id == ch.id, Deployment.environment_id == env.id)
+            .order_by(Deployment.seq.desc())
+            .limit(limit)
+        )
+        if before_seq is not None:
+            stmt = stmt.where(Deployment.seq < before_seq)
+        return (await self._s.execute(stmt)).scalars().all()
+
+    async def current_in_environment(
+        self, env: Environment, *, limit: int, after_channel: str | None = None
+    ) -> Sequence[tuple[str, Deployment]]:
+        """The effective record of every channel currently deployed in `env`, by channel name (undeployed
+        channels are left out)."""
+        newest = (
+            select(func.max(Deployment.seq).label("s"))
+            .where(Deployment.environment_id == env.id, Deployment.status.in_(_LIVE))
+            .group_by(Deployment.channel_id)
+            .subquery()
+        )
+        stmt = (
+            select(Channel.name, Deployment)
+            .join(Deployment, Deployment.channel_id == Channel.id)
+            .where(Deployment.seq.in_(select(newest.c.s)), Deployment.kind != "undeploy")
+            .order_by(Channel.name)
+            .limit(limit)
+        )
+        if after_channel is not None:
+            stmt = stmt.where(Channel.name > after_channel)
+        return [(name, dep) for name, dep in (await self._s.execute(stmt)).all()]
+
+    async def states_for_channel(self, ch: Channel) -> Sequence[tuple[str, Deployment]]:
+        """Per environment, the newest record that is not `superseded` (so a failed publish stays visible)."""
+        newest = (
+            select(func.max(Deployment.seq).label("s"))
+            .where(Deployment.channel_id == ch.id, Deployment.status != "superseded")
+            .group_by(Deployment.environment_id)
+            .subquery()
+        )
+        stmt = (
+            select(Environment.name, Deployment)
+            .join(Deployment, Deployment.environment_id == Environment.id)
+            .where(Deployment.seq.in_(select(newest.c.s)))
+            .order_by(Environment.name)
+        )
+        return [(name, dep) for name, dep in (await self._s.execute(stmt)).all()]
+
+    async def version_numbers(self, deployments: Iterable[Deployment]) -> dict[uuid.UUID, int]:
+        """`version_id` -> version number, for rendering records."""
+        ids = {d.version_id for d in deployments if d.version_id is not None}
+        if not ids:
+            return {}
+        rows = await self._s.execute(
+            select(ChannelVersion.id, ChannelVersion.version).where(ChannelVersion.id.in_(ids))
+        )
+        return {row[0]: row[1] for row in rows.all()}
