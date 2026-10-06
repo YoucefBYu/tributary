@@ -305,6 +305,14 @@ def _get(url: str, *, deadline: float, ssl_context: ssl.SSLContext | None) -> by
             headers={"Accept": "application/json"},
         )
         sock = conn.sock
+        if sock is None:
+            raise JwksError("fetch failed")
+        # Re-arm to the time LEFT: sending and connecting used part of the budget, and reading the headers
+        # must count toward the same total deadline.
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise JwksError("deadline exceeded")
+        sock.settimeout(left)
         response = conn.getresponse()
         if response.status != 200:
             raise JwksError("unexpected status")

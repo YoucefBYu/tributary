@@ -184,8 +184,7 @@ def parse_role_map(raw: str | None) -> dict[str, str]:
     return parsed
 
 
-def from_env(env: Mapping[str, str]) -> Settings:
-    """Build and validate the settings. Raises `ConfigurationError`; never returns a weak configuration."""
+def database_from_env(env: Mapping[str, str]) -> DatabaseSettings:
     if "TB_DATABASE_URL" in env:
         # A URL carries the password in the environment. Refuse it instead of ignoring it, so a stale
         # manifest cannot look configured (ADR-004 C1/C2).
@@ -204,6 +203,12 @@ def from_env(env: Mapping[str, str]) -> Settings:
         port=db_port,
         ca_secret_ref=env.get("TB_DATABASE_CA_SECRET_REF") or None,
     )
+    return database
+
+
+def from_env(env: Mapping[str, str]) -> Settings:
+    """Build and validate the settings. Raises `ConfigurationError`; never returns a weak configuration."""
+    database = database_from_env(env)
     claim = tuple(env.get("TB_OIDC_ROLES_CLAIM", "roles").split("."))
     oidc = OidcSettings(
         issuer=env.get("TB_OIDC_ISSUER", ""),

@@ -16,14 +16,13 @@ from fastapi import FastAPI
 from tributary.runtime.clients import producer_config
 from tributary.runtime.config import load_topic_defaults
 from tributary.runtime.engine_kafka import load_engine_kafka_or_exit
-from tributary.runtime.errors import RuntimeConfigurationError
 from tributary.runtime.logs import JsonLogger
-from tributary.runtime.secrets import DirSecretResolver
 
 from . import config
 from .app import assert_access_log_off, create_app
 from .auth.jwks import Fetch, FileJwksFetcher, HttpsJwksFetcher, KeySet
-from .db.engine import make_session_factory, make_tls_engine
+from .db.connect import engine_from_settings
+from .db.engine import make_session_factory
 from .errors import ConfigurationError
 from .operations import check_routes
 from .publisher import KafkaChannelsPublisher
@@ -55,16 +54,7 @@ def build_app(environ: dict[str, str] | None = None) -> FastAPI:
     else:
         fetch = HttpsJwksFetcher(oidc.issuer, jwks_uri=oidc.jwks_uri, timeout_s=oidc.http_timeout_s)
     keys = KeySet(fetch, refresh_s=oidc.refresh_s, max_stale_s=oidc.max_stale_s, timeout_s=oidc.http_timeout_s)
-    # ADR-004 C1/C2: the credential and the optional trust bundle come from secretRef files; a missing or
-    # unreadable one raises `SecretResolutionError` (fixed message, no path, no value), mapped below.
-    resolver = DirSecretResolver.from_environ(env)
-    db = settings.database
-    try:
-        password = resolver.resolve_text(db.secret_ref, "password")
-        ca_file = str(resolver.resolve_file(db.ca_secret_ref, "ca.crt")) if db.ca_secret_ref else None
-    except RuntimeConfigurationError:
-        raise ConfigurationError("DATABASE_SECRET_UNRESOLVED", "the database secretRef did not resolve") from None
-    engine = make_tls_engine(host=db.host, port=db.port, name=db.name, user=db.user, password=password, ca_file=ca_file)
+    engine = engine_from_settings(settings.database, env)  # ADR-004 C1/C2
 
     async def close_publisher() -> None:
         publisher.close()

@@ -321,3 +321,40 @@ def test_a_dripping_server_cannot_stretch_the_fetch_past_the_total_deadline(idp)
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_slow_response_headers_count_toward_the_total_deadline(idp) -> None:  # type: ignore[no-untyped-def]
+    import ssl
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class SlowHeaders(BaseHTTPRequestHandler):
+        def log_message(self, *a: object) -> None:
+            pass
+
+        def do_GET(self) -> None:
+            time.sleep(4)  # nothing sent for 4 s
+            try:
+                self.send_response(200)
+                self.end_headers()
+            except OSError:
+                pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), SlowHeaders)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(idp.cert_file, idp.key_file)
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        fetcher = HttpsJwksFetcher(
+            "https://x.example",
+            jwks_uri=f"https://127.0.0.1:{server.server_address[1]}/jwks",
+            timeout_s=1.0,
+            ssl_context=idp.client_context(),
+        )
+        started = time.monotonic()
+        with pytest.raises(JwksError):
+            fetcher()
+        assert time.monotonic() - started < 2.5
+    finally:
+        server.shutdown()
+        server.server_close()
