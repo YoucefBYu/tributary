@@ -1,7 +1,7 @@
 {
   "marker": "integration",
   "command": "uv run pytest -m integration",
-  "count": 212,
+  "count": 215,
   "modules": {
     "packages/tributary-api/tests/api/test_db_tls_integration.py": 2,
     "packages/tributary-api/tests/api/test_deploy_kafka_integration.py": 2,
@@ -34,6 +34,7 @@
     "packages/tributary-runtime/tests/test_integration_channels_outage.py": 1,
     "packages/tributary-runtime/tests/test_integration_engine_kafka.py": 7,
     "packages/tributary-runtime/tests/test_integration_kafka.py": 4,
+    "packages/tributary-runtime/tests/test_integration_ops.py": 3,
     "packages/tributary-runtime/tests/test_integration_reply.py": 4,
     "packages/tributary-runtime/tests/test_integration_tree.py": 1,
     "tests/chaos/test_cooperative_rebalance_commit_refused_mid_join.py": 1,
