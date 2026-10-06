@@ -3,6 +3,7 @@
     "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
   },
   "teammateMode": "auto",
+  "subagentPromptCacheTtl": "1h",
   "permissions": {
     "defaultMode": "acceptEdits",
     "allow": [
@@ -40,7 +41,36 @@
       "Bash(find *)",
       "Bash(grep *)",
       "Bash(git push -u origin wave/*)",
-      "Bash(git push origin wave/*)"
+      "Bash(git push origin wave/*)",
+      "Bash(git -C * status*)",
+      "Bash(git -C * diff*)",
+      "Bash(git -C * log*)",
+      "Bash(git -C * show*)",
+      "Bash(git -C * rev-parse*)",
+      "Bash(git -C * ls-files*)",
+      "Bash(git -C * worktree list*)",
+      "Bash(git -C * branch --show-current)",
+      "Bash(git fetch *)",
+      "Bash(git push origin *:refs/heads/wave/*)",
+      "Bash(gh api *)",
+      "Bash(helm *)",
+      "Bash(python3 *)"
+    ],
+    "ask": [
+      "Bash(uv sync)",
+      "Bash(gh api *-X*)",
+      "Bash(gh api *--method*)",
+      "Bash(gh api *-f *)",
+      "Bash(gh api *-F *)",
+      "Bash(gh api *--field*)",
+      "Bash(gh api *--raw-field*)",
+      "Bash(gh api *--input*)",
+      "Bash(helm install *)",
+      "Bash(helm upgrade *)",
+      "Bash(helm uninstall *)",
+      "Bash(helm delete *)",
+      "Bash(helm rollback *)",
+      "Bash(helm push *)"
     ],
     "deny": [
       "Bash(git push --force*)",
@@ -64,7 +94,25 @@
       "Read(./secrets/**)",
       "Bash(git checkout *)",
       "Bash(git switch *)",
-      "Bash(git stash*)"
+      "Bash(git stash*)",
+      "Bash(git -C * push --force*)",
+      "Bash(git -C * push -f*)",
+      "Bash(git -C * push * --force*)",
+      "Bash(git -C * push * -f*)",
+      "Bash(git -C * push *+*)",
+      "Bash(git -C * push * --delete*)",
+      "Bash(git -C * push * --mirror*)",
+      "Bash(git -C * reset --hard*)",
+      "Bash(git -C * clean *)",
+      "Bash(git -C * rebase*)",
+      "Bash(git -C * checkout *)",
+      "Bash(git -C * switch *)",
+      "Bash(git -C * stash*)",
+      "Read(.mypy_cache/**)",
+      "Read(.pytest_cache/**)",
+      "Read(.venv/**)",
+      "Read(node_modules/**)",
+      "Read(sbom.cdx.json)"
     ]
   },
   "hooks": {
