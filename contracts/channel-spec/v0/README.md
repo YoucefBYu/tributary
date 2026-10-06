@@ -1222,8 +1222,9 @@ table row, and wave 2's exit criterion 1 needs both from one channel.
 - **Reprocess must be destination-scoped** for any `dlq` record carrying `tb-destination`. This
   covers destination-step failures and loader exhaustion alike, and the latter already exists in
   wave 1. Re-injecting such a record into `raw` would re-deliver it to *every* destination under a
-  new `tb-msg-id`, which no loader's idempotency can absorb. Until W3-3 implements destination-scoped
-  re-entry, the reprocess tooling must refuse these records. Recorded in ADR-003 D5.
+  new `tb-msg-id`, which no loader's idempotency can absorb. Until destination-scoped re-entry is
+  built (deferred from W3-3 to wave 4 on 2026-10-06, ADR-003 follow-up 10), the reprocess tooling must
+  refuse these records. Recorded in ADR-003 D5.
 - The `raw` offset is committed once every destination has either been produced to or dead-lettered;
   a redelivery re-runs all of them, which invariant 4's loader idempotency absorbs. With
   `pipeline.transactional: true`, all the `out` records for one message commit atomically.

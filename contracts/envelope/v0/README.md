@@ -636,6 +636,17 @@ the minted id ([events contract](../../events/v0/README.md)). It deliberately ha
 5. Reprocess and replay mint a **new** `tb-msg-id` and set `tb-parent-id` to the original. This
    keeps the browser's parent/child tree honest and keeps loader idempotency keys distinct, so a
    deliberate reprocess is not silently deduplicated away by the destination.
+   **`tb-received-at` is copied unchanged from the original** (set 1.8 part 2, ruled 2026-10-06 on
+   `archive-engineer`'s W3-3 question). Rule 1 holds: a reprocess or replay is a re-injection, not a
+   receive, and the original receive time is known, unlike a quarantine (5.2). Steps that read
+   `received_at` therefore produce what the original should have produced. The reprocess time is
+   recorded in the lifecycle event's `ts` and in the audit event (W3-1b), not in the header.
+   **Consequence:** `now - tb-received-at` is not a latency for a reprocessed or replayed record and
+   must not be computed as one. Until W3-3's origin discriminator exists (channel-spec section 9), a
+   latency consumer cannot tell such a record from a split child, so it excludes every record that
+   carries `tb-parent-id`. The new `tb-msg-id` may be derived deterministically from the original id
+   and the operator's request id, so a retried action with an unknown outcome is absorbed by loader
+   idempotency (`tributary-archiver` `republish.py`). The layout is pinned with W3-1b.
 6. A step MUST NOT delete a registered header it does not understand.
 7. **Set 1.2:** `tb-reply-partition` and `tb-reply-deadline` are **not** propagated. The worker strips
    them from every `out`, `retry` and `dlq` record it produces, and reprocess never copies them, so a

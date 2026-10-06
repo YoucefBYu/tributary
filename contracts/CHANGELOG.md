@@ -3,7 +3,25 @@
 Newest first. Each entry names the contract, the version, whether the change is additive or
 breaking, and the reason. Breaking changes reference an ADR.
 
-## 2026-10-05 (latest) — contract set 1.8, part 1: `observability/v0` (W3-12), `openapi/v0` part 1 (W3-1a), archive rulings, `--check-expectations` (W3-11)
+## 2026-10-06 (latest) — contract set 1.8, W3-3 rulings (README only)
+
+**Additive, documentation only. No schema, example or manifest change; `validate.py` counts and
+pinned pairs unchanged from set 1.8 part 1. No invariant changes.**
+
+- **`events/v0` 4.1 rule 2 corrected.** Background merges do not cross month partitions, so storage
+  keeps a straddling duplicate. `FINAL` does collapse across partitions at read time while
+  `do_not_merge_across_partitions_select_final = 0` (default). The earlier text was wrong.
+  `archive-engineer` measured 6 rows plain and 5 under `FINAL`. The query library keeps `LIMIT 1 BY` the
+  key (setting-independent). A straddling `FINAL` test pins the setting in the query.
+- **`envelope/v0` 6 rule 5 clarified: reprocess and replay copy `tb-received-at` unchanged** (rule 1).
+  Rejected: the reprocess time, which would change what time-reading steps produce and rewrite a known
+  fact. **Give up:** `now - tb-received-at` is not a latency for re-injected records. Latency consumers
+  exclude records with `tb-parent-id` until W3-3's origin discriminator exists. The deterministic
+  reprocess id (original id + request id) is noted, and its layout is pinned with W3-1b.
+- **Destination-scoped reprocess: not in wave 3; the refusal stays** (channel-spec 3.5 and ADR-003
+  follow-up 10, unchanged). Ruled in `docs/agent-team/phases/wave-3.md` 2.5 (H5). No contract change.
+
+## 2026-10-05 — contract set 1.8, part 1: `observability/v0` (W3-12), `openapi/v0` part 1 (W3-1a), archive rulings, `--check-expectations` (W3-11)
 
 **Additive. Two new contract directories. No existing schema, example or manifest changes validity,
 and no existing pinned pair moves. No invariant changes.** Part 2 of set 1.8 (W3-1b: messages,

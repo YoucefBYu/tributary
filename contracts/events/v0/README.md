@@ -209,11 +209,19 @@ tested against one.
    its `ts` differs. Partition events are a low-volume operator timeline, and alerting reads
    `tb_partitions_halted`, not the archive. Producers SHOULD set `offset` on partition events (the
    blocked record's offset); the schema keeps it optional, because requiring it would be breaking.
-2. **Month partitions are accepted.** With `PARTITION BY toYYYYMM(ts)`, `ReplacingMergeTree` collapses
-   duplicates only inside one partition. A redelivery that crosses a month boundary is kept twice.
-   The replay window is `commit_every` records (seconds of traffic), so this affects a tail at month
-   end only. **Rule:** the W3-3 query library deduplicates on the key at read time (`LIMIT 1 BY` the
-   key), so the browser never shows the duplicate. A `FINAL` count test must not straddle a month.
+2. **Month partitions are accepted.** With `PARTITION BY toYYYYMM(ts)`, `ReplacingMergeTree`'s
+   **background merges** never cross a partition, so a redelivery that crosses a month boundary is
+   **stored** twice, and a plain `count()` counts both. **`SELECT ... FINAL` does collapse across
+   partitions at read time** while the ClickHouse setting `do_not_merge_across_partitions_select_final`
+   is `0`, its default (corrected in set 1.8 part 2, 2026-10-06: the earlier text said `FINAL` does not
+   collapse across months. `archive-engineer` measured 6 rows plain and 5 under `FINAL` on a
+   straddling duplicate in W3-3). An operator profile that sets it to `1`, or any server-side automatic
+   partition-local `FINAL`, brings the duplicate back under `FINAL`. The replay window is
+   `commit_every` records (seconds of traffic), so this affects a tail at month end only. **Rule:** the
+   W3-3 query library deduplicates on the key at read time (`LIMIT 1 BY` the key), which is correct
+   whatever that setting is, so the browser never shows the duplicate. Do not rely on `FINAL` for
+   dedup in product code. A `FINAL` count test that straddles a month is valid only if it pins the
+   setting to `0` in the query (`SETTINGS do_not_merge_across_partitions_select_final = 0`).
    **Rejected:** partitioning on the UUIDv7 time of `message_id`, which puts every nil-id partition
    event in one epoch partition and breaks partition-level TTL for them. **Give up:** storage for a
    rare duplicate, and unqualified `count()` over a month boundary can overcount by that tail.

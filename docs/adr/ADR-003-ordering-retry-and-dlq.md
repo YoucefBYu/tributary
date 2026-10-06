@@ -362,8 +362,11 @@ partition pause means; Kafka share groups for unordered destinations.
     (2026-09-24, found by `platform-engineer` while designing per-destination steps). D5 re-injects
     into `raw` with a new `tb-msg-id`. For a record that failed at one destination, that re-delivers
     to every destination under an id no loader has seen, and loader idempotency cannot absorb it. The
-    gap already exists for wave 1 loader-exhaustion records. W3-3 implements destination-scoped
-    re-entry. Until then, reprocess refuses these records. `contracts/channel-spec/v0/README.md` 3.5.
+    gap already exists for wave 1 loader-exhaustion records. ~~W3-3 implements destination-scoped
+    re-entry.~~ **Amended 2026-10-06: deferred to wave 4** (`phases/wave-3.md` 2.6 H5). The direction:
+    `out.<dest>` re-entry for loader exhaustion, a destination-only step re-run through an additive
+    `raw` header for destination-step failures, and both need an amendment here plus ADR-004 H7 for the
+    grants. Until then, reprocess refuses these records. `contracts/channel-spec/v0/README.md` 3.5.
     **Extended 2026-09-25 (W2-5, `platform-engineer`): the same applies to any `dlq` record carrying
     `tb-parent-id`.** A dead-lettered split child's payload is the child as the splitter produced it.
     Re-injecting that into `raw` re-runs the splitter on one child: a JSON element is refused as
