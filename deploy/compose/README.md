@@ -175,3 +175,14 @@ variable defaulting to a warning is not.
   its output. `channel-spec-volume-init` exists only because Docker creates a new named volume owned
   by `root:root`, and every long-running container here is non-root (Phase 1 requirement 7) — it
   chowns the volume once, as root, and is the only thing in this file that runs as root.
+
+## RF=3 test cluster (W3-33a)
+
+`docker-compose.rf3.yml` adds `kafka-2` and `kafka-3` to make three KRaft nodes with RF=3 and
+`min.insync.replicas=2` (the `production` profile of `topic-defaults.json`), within about 3 GiB of broker memory:
+
+    docker compose -f deploy/compose/docker-compose.yml -f deploy/compose/docker-compose.rf3.yml \
+      up -d kafka kafka-2 kafka-3 kafka-users-init topic-bootstrap
+
+Host ports 19092 to 19094 (loopback). It proves RF=3 correctness, not absolute latency. CI runs it weekly and on
+demand (`.github/workflows/chaos-rf3.yml`).

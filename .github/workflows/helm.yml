@@ -68,3 +68,6 @@ jobs:
           helm template tb "$CHART" $v --set networkPolicy.kubeletCIDR=10.0.0.0/8 2>&1 | grep -q "is too short"
           helm template tb "$CHART" $v --set networkPolicy.enabled=false 2>&1 | grep -q "allowUnprotectedOpsPort"
           helm template tb "$CHART" $v --set ingress.tlsSecretName= 2>&1 | grep -q "tlsSecretName is required"
+          helm template tb "$CHART" $v --set archiver.ttlDays=365 2>&1 | grep -q "archiver.ttlDays was removed"
+          helm template tb "$CHART" $v --set archiver.retention.eventsDays=0 2>&1 | grep -q "must be an integer from 1 to 36500"
+          helm template tb "$CHART" $v --set archiver.retention.auditDays=36501 2>&1 | grep -q "must be an integer from 1 to 36500"

@@ -1,7 +1,20 @@
 {
+  "topics": {
+    "audit": {
+      "partitions": 6,
+      "replicas": 3,
+      "config": {
+        "cleanup.policy": "delete",
+        "retention.ms": "2592000000",
+        "compression.type": "producer",
+        "min.insync.replicas": "2",
+        "unclean.leader.election.enable": "false"
+      }
+    }
+  },
   "generatedFrom": "contracts/topics/v0/topic-defaults.json",
-  "sourceSha256": "5cf22532d422c86820fc955ae2cff73a9b82d5430a28eaf5519610e9b5b7f13d",
-  "lagReaderIsPlaceholder": true,
+  "sourceSha256": "dc6fcf1bff6698e601bf44d9be4f99e96ea22bb7f7ff7a64b2dfc88d75bb507b",
+  "lagReaderIsPlaceholder": false,
   "placeholders": {
     "env": "@ENV@",
     "channel": "@CHANNEL@",

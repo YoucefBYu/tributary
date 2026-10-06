@@ -1,0 +1,105 @@
+# RF=3 test cluster (W3-33a): three KRaft nodes (each broker and controller), replication factor 3 and
+# min.insync.replicas=2, for QA's chaos tests (W3-33b) on a developer host or the free CI runner. It proves
+# correctness under RF=3 (no ACK without two replicas; no ACKed loss across a leader kill), not absolute
+# latency or sizing: all three brokers share one kernel and one disk (phases/wave-3.md 2.7).
+#
+#   docker compose -f deploy/compose/docker-compose.yml -f deploy/compose/docker-compose.rf3.yml \
+#     up -d kafka kafka-2 kafka-3 kafka-users-init topic-bootstrap
+#
+# Start only those services: the ClickHouse, PostgreSQL and data-plane containers of the lite file are not
+# needed here and would exceed the budget. Budget: 3 brokers x 1 GiB (512 MiB heap) = 3 GiB, about 2 vCPU.
+# Security is the lite stack's: SASL_SSL on client listeners, SSL with required client certificates between
+# nodes and on the loopback admin listener, deny by default ACLs from topic-defaults.json. Host ports are
+# loopback-bound: 19092, 19093, 19094 (nodes 1 to 3). Never put real data here.
+#
+# The topic profile is `production` (RF=3, min.insync.replicas=2 from topic-defaults.json), not `lite`.
+name: tributary-rf3
+
+x-broker: &broker
+  image: apache/kafka:4.0.0@sha256:3f7b939115cd4872e9cee9369d80bd69712fde55f9902f46d793f64848dedc75
+  restart: "no"          # a restart policy would resurrect a killed broker inside a fault window
+  mem_limit: 1g
+  memswap_limit: 1g
+  cpus: 0.7
+  entrypoint: ["/bin/bash", "/opt/tb/start-broker.sh"]
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  depends_on:
+    kafka-tls-init:
+      condition: service_completed_successfully
+  tmpfs:
+    - /var/lib/kafka/data:size=1g,uid=1000,gid=1000,mode=0700
+    - /etc/kafka/secrets:size=1m
+    - /mnt/shared/config:size=1m
+  environment:
+    KAFKA_JMX_OPTS: "-XX:+DisableAttachMechanism"
+    KAFKA_HEAP_OPTS: ${TB_KAFKA_HEAP:--Xmx512M -Xms512M}
+  healthcheck:
+    test: ["CMD-SHELL", "test -f /tmp/tb-ready && /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server 127.0.0.1:9096 --command-config /etc/tributary/broker/healthcheck.properties >/dev/null 2>&1 || exit 1"]
+    interval: 10s
+    timeout: 30s       # a JVM admin client under a 0.7 cpu cap takes longer than the lite 5 s
+    retries: 30
+    start_period: 20s
+
+services:
+  kafka-tls-init:
+    environment:
+      TB_KAFKA_NODES: "3"
+
+  kafka:
+    mem_limit: 1g
+    memswap_limit: 1g
+    cpus: 0.7
+    depends_on:
+      kafka-tls-init:
+        condition: service_completed_successfully
+    healthcheck:
+      interval: 10s
+      timeout: 30s
+      retries: 30
+
+  kafka-2:
+    <<: *broker
+    container_name: tb-kafka-2
+    hostname: kafka-2
+    ports:
+      - "127.0.0.1:19093:19093"
+    volumes:
+      - ./kafka/start-broker.sh:/opt/tb/start-broker.sh:ro
+      - type: volume
+        source: kafka-secrets
+        target: /etc/tributary/broker
+        read_only: true
+        volume:
+          subpath: broker-2
+
+  kafka-3:
+    <<: *broker
+    container_name: tb-kafka-3
+    hostname: kafka-3
+    ports:
+      - "127.0.0.1:19094:19094"
+    volumes:
+      - ./kafka/start-broker.sh:/opt/tb/start-broker.sh:ro
+      - type: volume
+        source: kafka-secrets
+        target: /etc/tributary/broker
+        read_only: true
+        volume:
+          subpath: broker-3
+
+  kafka-users-init:
+    depends_on:
+      kafka-2:
+        condition: service_healthy
+      kafka-3:
+        condition: service_healthy
+
+  topic-bootstrap:
+    depends_on:
+      kafka-2:
+        condition: service_healthy
+      kafka-3:
+        condition: service_healthy
+    environment:
+      TB_PROFILE: production

@@ -10,9 +10,7 @@ There is no `tributary-runtime` topic-creation tool yet (W1-4 is not that far al
 compose-only stand-in for the lite stack, not a contract. Once the runtime has one, this file should
 call it instead of re-deriving the same configs.
 
-Two things deliberately not created here, both documented in the contract itself:
-  * `_tb.<env>.audit` -- its retention is an open legal question (topic-defaults.json `classes.audit`
-    `retention_open_question`; architect, "no number is written").
+One thing deliberately not created here, documented in the contract itself:
   * `<channel>.reply` -- the demo channel (`adt-passthrough`) is not a sync-reply channel.
 """
 
@@ -266,7 +264,7 @@ def derive_topics(
                 _class_configs(defaults, "out", profile),
             )
         )
-    for platform_kind in ("channels", "events"):  # audit deliberately excluded, see module docstring
+    for platform_kind in ("channels", "events", "audit"):  # audit: a 30 d buffer (ADR-004 R7, set 1.8)
         topics.append(
             TopicSpec(
                 platform_topic_name(env, platform_kind),

@@ -104,6 +104,19 @@ def check(docs: list[dict[str, Any]]) -> list[str]:
     if receivers and not cidr_ok:
         bad.append("no NetworkPolicy limiting ingress on 9180 to the kubelet CIDR")
 
+    for n, spec in pods(docs):
+        if not n.endswith("-worker"):
+            continue
+        c = spec["containers"][0]
+        if "--ops-bind=$(POD_IP)" not in c["args"]:
+            bad.append(f"{n}: worker --ops-bind is not the pod IP")
+        if c.get("livenessProbe", {}).get("httpGet", {}).get("path") != "/livez":
+            bad.append(f"{n}: worker has no /livez liveness probe")
+        if not any(
+            x["metadata"]["name"] == n and any(9180 in [p["port"] for p in r["ports"]] for r in x["spec"]["ingress"])
+            for x in by_kind.get("NetworkPolicy", [])
+        ):
+            bad.append(f"{n}: no NetworkPolicy limiting ops port 9180 for the worker")
     arch = [s for n, s in pods(docs) if n.endswith("-archiver")]
     job = [s for n, s in pods(docs) if n.endswith("-archiver-migrate")]
     if not arch or "--skip-ddl" not in arch[0]["containers"][0]["args"]:
@@ -134,6 +147,7 @@ def check(docs: list[dict[str, Any]]) -> list[str]:
                 bad.append("runtime and migration secretRef are the same")
 
     bad += check_workloads(docs, by_kind)
+    bad += check_retention(docs, by_kind)
     bad += check_acls(by_kind)
     bad += check_network(docs, by_kind, receivers)
     for name, spec in pods(docs):
@@ -205,6 +219,36 @@ def check_workloads(docs: list[dict[str, Any]], by_kind: dict[str, list[dict[str
     ]
     if CA_EXPECTED and not ca:
         bad.append("archiver CA cert env not rendered although caCertSecretRef is set in the CI values")
+    return bad
+
+
+def check_retention(docs: list[dict[str, Any]], by_kind: dict[str, list[dict[str, Any]]]) -> list[str]:
+    """ADR-004 R2/R3: the three TTL vars on archiver and migrate Job with the R2 defaults; the decrease guard
+    on the Job only; the audit topic buffer read from the contract."""
+    bad: list[str] = []
+    want = {"TB_ARCHIVE_TTL_DAYS": "90", "TB_ARCHIVE_CONTENT_TTL_DAYS": "30", "TB_ARCHIVE_AUDIT_TTL_DAYS": "2190"}
+    for name, spec in pods(docs):
+        if not name.endswith(("-archiver", "-archiver-migrate")):
+            continue
+        env = {e["name"]: e.get("value") for c in spec["containers"] for e in c.get("env", [])}
+        for k, v in want.items():
+            if env.get(k) != v:
+                bad.append(f"{name}: {k} is {env.get(k)!r}, expected the R2 default {v!r}")
+        guard = env.get("TB_ARCHIVE_ALLOW_TTL_DECREASE")
+        if name.endswith("-archiver") and guard is not None:
+            bad.append(f"{name}: the decrease guard must reach the migrate Job only")
+        if name.endswith("-archiver-migrate") and guard != "false":
+            bad.append(f"{name}: TB_ARCHIVE_ALLOW_TTL_DECREASE is not 'false' by default")
+    topics = by_kind.get("KafkaTopic", [])
+    if by_kind.get("KafkaUser"):
+        audit = [t for t in topics if t["spec"]["topicName"].endswith(".audit")]
+        contract = json.loads((ROOT / "contracts/topics/v0/topic-defaults.json").read_text())["classes"]["audit"]
+        if len(audit) != 1:
+            bad.append("no _tb.<env>.audit KafkaTopic")
+        elif audit[0]["spec"]["config"].get("retention.ms") != str(contract["configs"]["retention.ms"]):
+            bad.append("audit topic retention.ms differs from topic-defaults.json")
+        elif audit[0]["spec"]["partitions"] != contract["partitions"]:
+            bad.append("audit topic partitions differ from topic-defaults.json")
     return bad
 
 

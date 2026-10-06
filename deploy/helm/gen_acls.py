@@ -69,7 +69,17 @@ def build() -> dict[str, object]:
                     for g in bt.parse_grants(body, env=ENV, channel=CH, destinations=(DEST,))
                 ]
         roles[role] = sorted(rows, key=lambda g: tuple(str(v) for v in g.values()))
+    defaults = json.loads(raw)
+    audit = defaults["classes"]["audit"]
+    topics = {  # `_tb.<env>.audit`: a 30 d transport buffer (ADR-004 R7); every value comes from the contract
+        "audit": {
+            "partitions": audit["partitions"],
+            "replicas": defaults["profiles"]["production"]["replication_factor"],
+            "config": {k: str(v) for k, v in audit["configs"].items()},
+        }
+    }
     return {
+        "topics": topics,
         "generatedFrom": "contracts/topics/v0/topic-defaults.json",
         "sourceSha256": hashlib.sha256(raw).hexdigest(),
         "lagReaderIsPlaceholder": placeholder,

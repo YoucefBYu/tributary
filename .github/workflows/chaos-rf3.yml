@@ -1,0 +1,80 @@
+name: chaos-rf3
+
+# W3-33a. The free RF=3 cluster for QA's chaos tests (W3-33b): three KRaft brokers, RF=3 and
+# min.insync.replicas=2 from topic-defaults.json. Weekly plus manual: the repository is private (unverified;
+# if it is public this may become nightly), where Linux minutes are included and then billed, and a 45 minute
+# run nightly would exceed the allowance. Exceeding included minutes is cloud spend and goes to the human.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 1"   # Mondays 03:17 UTC
+
+permissions:
+  contents: read
+
+concurrency:
+  group: chaos-rf3
+  cancel-in-progress: false
+
+env:
+  UV_FROZEN: "1"
+  COMPOSE: docker compose -f deploy/compose/docker-compose.yml -f deploy/compose/docker-compose.rf3.yml
+
+jobs:
+  chaos-rf3:
+    name: chaos on a 3-broker RF=3 cluster
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync
+      - name: bring up three brokers, users and topics
+        run: $COMPOSE up -d --build kafka kafka-2 kafka-3 kafka-users-init topic-bootstrap
+      - name: wait for three healthy brokers
+        run: |
+          for _ in $(seq 1 60); do
+            n=$($COMPOSE ps --format '{{.Name}} {{.Health}}' | grep -c '^tb-kafka.* healthy' || true)
+            [ "$n" -ge 3 ] && exit 0
+            sleep 5
+          done
+          $COMPOSE ps; exit 1
+      - name: sample container memory in the background
+        run: |
+          mkdir -p rf3-report
+          nohup bash -c 'while true; do date -u +%FT%TZ; docker stats --no-stream --format "{{.Name}} {{.MemUsage}} {{.CPUPerc}}"; sleep 15; done' > rf3-report/docker-stats.txt 2>&1 &
+      - name: chaos and rf3 tests
+        run: uv run pytest -m "chaos and rf3" tests/chaos -ra --junitxml=rf3-report/junit.xml
+      - name: peak memory under 5 GiB
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import re
+          peak = {}
+          unit = {"KiB": 1 / 1024**2, "MiB": 1 / 1024, "GiB": 1.0}
+          snap = {}
+          for line in open("rf3-report/docker-stats.txt"):
+              m = re.match(r"(\S+) ([\d.]+)(KiB|MiB|GiB) /", line)
+              if m:
+                  snap[m[1]] = float(m[2]) * unit[m[3]]
+              elif line[:2] == "20":
+                  peak["total"] = max(peak.get("total", 0), sum(snap.values())); snap = {}
+          print("peak total GiB:", round(peak.get("total", 0), 2))
+          assert peak.get("total", 0) < 5, "peak memory over 5 GiB"
+          PY
+      - name: logs on failure
+        if: failure()
+        run: $COMPOSE logs --no-color --tail 200 kafka kafka-2 kafka-3
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        if: always()
+        with:
+          name: rf3-report
+          path: rf3-report/
+      - name: tear down
+        if: always()
+        run: $COMPOSE down -v

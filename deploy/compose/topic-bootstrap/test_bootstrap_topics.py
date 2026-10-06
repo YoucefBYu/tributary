@@ -37,13 +37,21 @@ def test_topic_names_match_the_naming_grammar(defaults: dict) -> None:  # type: 
         "dev.adt-passthrough.out.http-stub",
         "_tb.dev.channels",
         "_tb.dev.events",
+        "_tb.dev.audit",
     }
 
 
-def test_audit_topic_is_never_created(defaults: dict) -> None:  # type: ignore[type-arg]
-    # The contract flags audit retention as an open legal question; no topic until it is answered.
-    topics = derive_topics(defaults, env="dev", profile="lite", channel="adt-passthrough", destinations=("http-stub",))
-    assert platform_topic_name("dev", "audit") not in {t.name for t in topics}
+def test_audit_topic_is_created_with_the_contract_buffer_config(defaults: dict) -> None:  # type: ignore[type-arg]
+    # ADR-004 R7 / set 1.8: `_tb.<env>.audit` is a 30 d transport buffer; every value comes from the contract.
+    topics = {
+        t.name: t
+        for t in derive_topics(
+            defaults, env="dev", profile="lite", channel="adt-passthrough", destinations=("http-stub",)
+        )
+    }
+    audit = topics[platform_topic_name("dev", "audit")]
+    assert audit.partitions == defaults["classes"]["audit"]["partitions"]
+    assert audit.configs["retention.ms"] == str(defaults["classes"]["audit"]["configs"]["retention.ms"])
 
 
 def test_reply_topic_is_never_created_for_a_non_sync_reply_channel(defaults: dict) -> None:  # type: ignore[type-arg]

@@ -43,9 +43,13 @@ RENEW_SECONDS=$((7 * 24 * 3600))
 APP_UID=10001
 BROKER_UID=1000
 COMPONENTS=(receiver worker loader channel-publish topic-bootstrap admin)
+# TB_KAFKA_NODES=3 (docker-compose.rf3.yml, W3-33a): three KRaft nodes (broker and controller each), RF=3 and
+# min.insync.replicas=2 (topic-defaults.json profiles.production). 1 (the default) is the lite stack, unchanged.
+NODES="${TB_KAFKA_NODES:-1}"
+case "$NODES" in 1|3) ;; *) echo "TB_KAFKA_NODES must be 1 or 3" >&2; exit 2 ;; esac
 
 # A changed script (new listeners, new users, new cipher pin) must not be masked by stale output.
-SCRIPT_SUM=$(sha256sum "${BASH_SOURCE[0]}" | cut -d' ' -f1)
+SCRIPT_SUM=$(printf '%s' "$NODES" | cat - "${BASH_SOURCE[0]}" | sha256sum | cut -d' ' -f1)
 
 if [[ -f "$SECRETS/generation" && "$(cat "$SECRETS/script.sha256" 2>/dev/null || true)" == "$SCRIPT_SUM" && -f "$SECRETS/tb-lite-kafka-ca/ca.crt" ]] \
    && openssl x509 -checkend "$RENEW_SECONDS" -noout -in "$SECRETS/tb-lite-kafka-ca/ca.crt" >/dev/null 2>&1 \
@@ -78,7 +82,9 @@ issue() {
 }
 # The broker certificate's SANs match every name a client (or the broker itself) dials: `kafka` is the
 # Compose service name; 127.0.0.1 and localhost are the host-published and loopback listeners.
-issue broker kafka "DNS:kafka,DNS:localhost,IP:127.0.0.1"
+BROKER_SAN="DNS:kafka,DNS:localhost,IP:127.0.0.1"
+[[ "$NODES" -gt 1 ]] && BROKER_SAN="$BROKER_SAN,DNS:kafka-2,DNS:kafka-3"   # one certificate shared by the three nodes
+issue broker kafka "$BROKER_SAN"
 issue healthcheck tb-lite-healthcheck "DNS:tb-lite-healthcheck"
 issue users-init tb-lite-users-init "DNS:tb-lite-users-init"
 rm -f "$tmp/ca.key"   # signed; nothing may issue certificates from this CA any more
@@ -101,34 +107,51 @@ install -m 0400 -o "$APP_UID" -g "$APP_UID" "$tmp/users-init.crt" "$SECRETS/user
 install -m 0400 -o "$APP_UID" -g "$APP_UID" "$tmp/users-init.key" "$SECRETS/users-init/client.key"
 
 # --- broker material ---------------------------------------------------------------------------
-B="$SECRETS/broker"
-install -d -m 0500 -o "$BROKER_UID" -g "$BROKER_UID" "$B"
-install -m 0400 "$tmp/ca.crt" "$B/ca.crt"
-cat "$tmp/broker.key" "$tmp/broker.crt" >"$B/broker.pem"
-cat "$tmp/healthcheck.key" "$tmp/healthcheck.crt" >"$B/healthcheck.pem"
-openssl rand -hex 8 >"$B/generation"
-
 # AEAD-only suites, TLS 1.2+ (Java names). Same intent as the clients' ECDHE+AESGCM:ECDHE+CHACHA20.
 SUITES="TLS_AES_256_GCM_SHA384,TLS_AES_128_GCM_SHA256,TLS_CHACHA20_POLY1305_SHA256,\
 TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,\
 TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,\
 TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256"
 SCRAM=org.apache.kafka.common.security.scram.ScramLoginModule
+GEN=$(openssl rand -hex 8)
+cat "$tmp/broker.key" "$tmp/broker.crt" >"$tmp/broker.pem"
+cat "$tmp/healthcheck.key" "$tmp/healthcheck.crt" >"$tmp/healthcheck.pem"
 
-cat >"$B/server.properties" <<PROPS
+# write_broker <n>: node 1 is `broker/` (the lite layout), nodes 2 and 3 are `broker-<n>/`.
+write_broker() {
+  local n=$1 B="$SECRETS/broker" host=kafka
+  [[ "$n" -gt 1 ]] && B="$SECRETS/broker-$n" && host="kafka-$n"
+  install -d -m 0500 -o "$BROKER_UID" -g "$BROKER_UID" "$B"
+  install -m 0400 "$tmp/ca.crt" "$B/ca.crt"
+  install -m 0400 "$tmp/broker.pem" "$B/broker.pem"
+  install -m 0400 "$tmp/healthcheck.pem" "$B/healthcheck.pem"
+  printf '%s' "$GEN" >"$B/generation"
+  local voters listeners advertised dflt_rf=1 isr=1 txisr=1
+  if [[ "$NODES" -eq 1 ]]; then
+    voters="1@127.0.0.1:9093"
+    listeners="CONTROLLER://127.0.0.1:9093,BROKER://127.0.0.1:9095,ADMIN://127.0.0.1:9096,CLIENT://0.0.0.0:9094,EXTERNAL://0.0.0.0:19092"
+    advertised="BROKER://127.0.0.1:9095,ADMIN://127.0.0.1:9096,CLIENT://kafka:9094,EXTERNAL://127.0.0.1:19092"
+  else
+    # RF=3 profile: controller and inter-broker links cross containers, so they bind all interfaces and are
+    # advertised by service name (the certificate carries those SANs). Still SSL with required client certs.
+    voters="1@kafka:9093,2@kafka-2:9093,3@kafka-3:9093"
+    listeners="CONTROLLER://0.0.0.0:9093,BROKER://0.0.0.0:9095,ADMIN://127.0.0.1:9096,CLIENT://0.0.0.0:9094,EXTERNAL://0.0.0.0:1909$((n + 1))"
+    advertised="BROKER://$host:9095,ADMIN://127.0.0.1:9096,CLIENT://$host:9094,EXTERNAL://127.0.0.1:1909$((n + 1))"
+    dflt_rf=3 isr=2 txisr=2
+  fi
+  cat >"$B/server.properties" <<PROPS
 process.roles=broker,controller
-node.id=1
-controller.quorum.voters=1@127.0.0.1:9093
+node.id=$n
+controller.quorum.voters=$voters
 controller.listener.names=CONTROLLER
 inter.broker.listener.name=BROKER
 # No listener is PLAINTEXT. CONTROLLER, BROKER (inter-broker) and ADMIN are SSL with REQUIRED client
-# certificates, each bound to 127.0.0.1 inside this container: the certificate is the identity, so no
-# password exists to leak. CLIENT is what containers dial and EXTERNAL is the host-published,
-# loopback-mapped one: both SASL_SSL. (engine-kafka/v0 README section 6 rule 1 would allow a loopback
-# PLAINTEXT controller, but then the controller's own requests arrive as User:ANONYMOUS, and
-# super.users must never contain ANONYMOUS, rule 3.)
-listeners=CONTROLLER://127.0.0.1:9093,BROKER://127.0.0.1:9095,ADMIN://127.0.0.1:9096,CLIENT://0.0.0.0:9094,EXTERNAL://0.0.0.0:19092
-advertised.listeners=BROKER://127.0.0.1:9095,ADMIN://127.0.0.1:9096,CLIENT://kafka:9094,EXTERNAL://127.0.0.1:19092
+# certificates: the certificate is the identity, so no password exists to leak. CLIENT is what containers
+# dial and EXTERNAL is the host-published, loopback-mapped one: both SASL_SSL. (engine-kafka/v0 README
+# section 6 rule 1 would allow a loopback PLAINTEXT controller, but then the controller's own requests
+# arrive as User:ANONYMOUS, and super.users must never contain ANONYMOUS, rule 3.)
+listeners=$listeners
+advertised.listeners=$advertised
 listener.security.protocol.map=CONTROLLER:SSL,BROKER:SSL,ADMIN:SSL,CLIENT:SASL_SSL,EXTERNAL:SASL_SSL
 sasl.enabled.mechanisms=SCRAM-SHA-512
 listener.name.controller.ssl.client.auth=required
@@ -156,27 +179,25 @@ super.users=User:CN=kafka;User:tb-lite-topic-bootstrap;User:tb-lite-admin
 
 log.dirs=/var/lib/kafka/data
 
-# Lite profile (topic-defaults.json profiles.lite, ADR-002 D14, human-approved 2026-09-21): ONE broker,
-# so RF=1 and min.insync.replicas=1. An explicit, documented exception to invariant 1's durability
-# promise, not a relaxation of it. Not in must_not_hardcode: these are fixed by "one broker", not
-# measured. Topic-level min.insync.replicas and unclean election are still set per topic by
-# topic-bootstrap from the contract file.
+# One node (lite profile, topic-defaults.json profiles.lite, ADR-002 D14, human-approved 2026-09-21): RF=1 and
+# min.insync.replicas=1, an explicit documented exception to invariant 1's durability promise. Three nodes
+# (docker-compose.rf3.yml): RF=3 and min.insync.replicas=2, topic-defaults.json profiles.production. Topic-level
+# min.insync.replicas and unclean election are still set per topic by topic-bootstrap from the contract file.
 # auto.create.topics stays off so nothing but topic-bootstrap creates a topic. The internal-topic
 # factors default to 3 and can never be satisfied on one broker: without them __consumer_offsets is
 # never created and every consumer group hangs at FIND_COORDINATOR (found by qa-engineer-2, W1-8).
-default.replication.factor=1
-min.insync.replicas=1
+default.replication.factor=$dflt_rf
+min.insync.replicas=$isr
 unclean.leader.election.enable=false
 auto.create.topics.enable=false
-offsets.topic.replication.factor=1
-transaction.state.log.replication.factor=1
-transaction.state.log.min.isr=1
+offsets.topic.replication.factor=$dflt_rf
+transaction.state.log.replication.factor=$dflt_rf
+transaction.state.log.min.isr=$txisr
 PROPS
-chmod 0400 "$B/server.properties"
-
-# Healthcheck client: the ACL-less certificate principal over the real (loopback) admin listener, so
-# "healthy" proves TLS and mutual authentication work, not just that a port is open.
-cat >"$B/healthcheck.properties" <<PROPS
+  chmod 0400 "$B/server.properties"
+  # Healthcheck client: the ACL-less certificate principal over the real (loopback) admin listener, so
+  # "healthy" proves TLS and mutual authentication work, not just that a port is open.
+  cat >"$B/healthcheck.properties" <<PROPS
 security.protocol=SSL
 ssl.keystore.type=PEM
 ssl.keystore.location=/etc/tributary/broker/healthcheck.pem
@@ -184,11 +205,9 @@ ssl.truststore.type=PEM
 ssl.truststore.location=/etc/tributary/broker/ca.crt
 ssl.endpoint.identification.algorithm=https
 PROPS
-chmod 0400 "$B/healthcheck.properties"
-
-# The broker's own admin client (its certificate, the super user): used once by start-broker.sh to grant
-# kafka-users-init its single ACL.
-cat >"$B/broker-client.properties" <<PROPS
+  chmod 0400 "$B/healthcheck.properties"
+  # The broker's own admin client (its certificate, the super user): used once by start-broker.sh.
+  cat >"$B/broker-client.properties" <<PROPS
 security.protocol=SSL
 ssl.keystore.type=PEM
 ssl.keystore.location=/etc/tributary/broker/broker.pem
@@ -196,8 +215,11 @@ ssl.truststore.type=PEM
 ssl.truststore.location=/etc/tributary/broker/ca.crt
 ssl.endpoint.identification.algorithm=https
 PROPS
-chmod 0400 "$B/broker-client.properties"
-chown -R "$BROKER_UID:$BROKER_UID" "$B"
+  chmod 0400 "$B/broker-client.properties"
+  chown -R "$BROKER_UID:$BROKER_UID" "$B"
+}
+for n in $(seq 1 "$NODES"); do write_broker "$n"; done
+B="$SECRETS/broker"
 
 # The generation marker is written last: a half-finished run is never taken for a valid one.
 printf '%s' "$SCRIPT_SUM" >"$SECRETS/script.sha256"

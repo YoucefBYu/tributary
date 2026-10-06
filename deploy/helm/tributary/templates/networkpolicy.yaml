@@ -102,6 +102,33 @@ spec:
         - {protocol: TCP, port: {{ $ch.receiver.port }}}
     {{- end }}
 {{- end }}
+{{- range $ch := .Values.channels }}
+---
+# Worker ops listener (/livez, /metrics) binds the pod IP: same restriction as the receiver's.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "tb.name" $ }}-{{ $ch.name }}-worker
+  labels: {{- include "tb.labels" $ | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ $.Release.Name }}
+      app.kubernetes.io/component: worker
+      tributary.dev/channel: {{ $ch.name }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - ipBlock: {cidr: {{ $kubelet | quote }}}
+        {{- if $.Values.otel.enabled }}
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ $.Release.Name }}
+              app.kubernetes.io/component: otel-collector
+        {{- end }}
+      ports:
+        - {protocol: TCP, port: {{ $.Values.receiver.opsPort }}}
+{{- end }}
 {{- if .Values.otel.enabled }}
 {{- $prom := required "monitoring.prometheusFrom is required while otel and networkPolicy are enabled: it names who may scrape :8889" .Values.monitoring.prometheusFrom }}
 ---

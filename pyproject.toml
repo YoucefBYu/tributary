@@ -57,6 +57,7 @@ markers = [
     "integration: needs Kafka, ClickHouse or PostgreSQL (testcontainers or the compose stack)",
     "chaos: injects broker, consumer or dependency faults",
     "bench: measurement run, not a pass/fail test",
+    "rf3: needs the 3-broker RF=3 cluster (deploy/compose/docker-compose.rf3.yml)",
 ]
 
 [tool.ruff]

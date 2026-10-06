@@ -51,7 +51,13 @@ loader:
 archiver:
   enabled: true
   replicas: 1
-  ttlDays: 365
+  # Retention (ADR-004 R1-R8): integer days, 1-36500, validated at render. Applied ONLY by the migrate Job
+  # (MODIFY TTL); archivers never apply it. See README "Changing retention" before lowering a value.
+  retention:
+    eventsDays: 90         # TB_ARCHIVE_TTL_DAYS
+    contentDays: 30        # TB_ARCHIVE_CONTENT_TTL_DAYS (read when content archiving is on)
+    auditDays: 2190        # TB_ARCHIVE_AUDIT_TTL_DAYS: six years, an engineering default, not a compliance determination
+    allowDecrease: false   # TB_ARCHIVE_ALLOW_TTL_DECREASE, the migrate Job only: a decrease deletes rows irreversibly
   # Runtime credential is INSERT-only (ADR-004 A5); DDL runs in the migrate Job with its own secret.
   clickhouse:
     host: clickhouse
