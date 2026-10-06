@@ -210,8 +210,8 @@ carried items.
   `archiver.retention.*`; the API view is read-only. Full spec: ADR-004 section 4 (R1-R8); contract
   text: `topics/v0` 2.1, `events/v0` 4.1 rule 4. **Drift found:** the chart sets `archiver.ttlDays: 365`
   against the documented 90 (W3-31 removes it). **Give up:** a retention change needs a redeploy.
-- **D4. Key custody: DRAFT in ADR-004 H1 (with H2 and H5), pending `security-reviewer`
-  concurrence.** Recommendation: Tributary manages no keys. `production` requires customer-managed keys
+- **D4. Key custody: DECIDED in ADR-004 H1 (with H2 and H5); `security-reviewer` CONCUR WITH
+  CONDITIONS C1-C8 (ADR-004 7.1, lead-relayed 2026-10-06), tasks W3-34..W3-36.** Recommendation: Tributary manages no keys. `production` requires customer-managed keys
   (KMS CMK or CMEK, or HSM or Vault on premises) on every PHI-at-rest surface, and lite may use
   provider-managed keys. H2 is none beyond volume encryption in v0. H5: file-based secrets filled by
   the operator's store, with 90-day recommended cadence (judgement). The lead obtains the review next.
@@ -238,6 +238,10 @@ carried items.
 | W3-32 | `control-plane-engineer` | Production `AuditHook`: each audit record produced to `_tb.<env>.audit` (`acks=all`, idempotent) in the W3-1b shape. `requested` fails closed, so a content view or re-publish that cannot be recorded does not happen. Read-only effective-retention `GET` from `archive_settings`. W3-6 uses the hook | W3-1b, W3-30 (1) | Integration: with Kafka stopped, a content view returns the W3-1b problem code and reads no content. With Kafka up, exactly one record per view lands on the topic with no payload bytes (invariant 6). The `GET` returns what the migrate step wrote; contract tests pass against `openapi/v0` |
 | W3-33a | `devops-engineer` | Free RF=3 cluster, infrastructure: `deploy/compose/docker-compose.rf3.yml` override for developer hosts (3 KRaft nodes, SASL_SSL and deny-by-default ACLs as lite, loopback-bound, heap 512 MiB, `mem_limit` 1 GiB each). A CI job `chaos-rf3` on `ubuntu-latest`, triggered by `workflow_dispatch` plus a schedule (nightly on a public repo; weekly if private, see budget), 45 min timeout, running `pytest -m "chaos and rf3"`, uploading the report rows and a `docker stats` sample | none | `workflow_dispatch` run green on `wave/1-3`; job log shows peak container memory under 5 GiB; on a developer host, metadata lists 3 brokers and `raw` has `min.insync.replicas=2` read from `topic-defaults.json` |
 | W3-33b | `qa-engineer` | Free RF=3 cluster, tests: `tests/support/kafka_cluster.py`, promoted from `test_kafka_broker_kill.py`, with broker and topic values read from `topic-defaults.json`, not literals. Topologies: `combined` (3 nodes) and `split` (3 brokers + 1 controller), with marker `rf3`. **C1** two of three brokers stopped (`split`, so the quorum survives): every message sent during the outage is NACKed or refused, and 0 ACKed are lost after recovery. Fault fired: ISR = 1 in metadata and a not-enough-replicas or timeout error seen by the receiver's producer. Mutation control: a `min.insync.replicas=1` topic ACKs during the same outage and the test goes red. **C2** rolling restart of all three under keyed MLLP load: 0 ACKed lost, 0 per-key order violations, duplicates counted. **C3** leader SIGKILL mid-batch: distinct `tb-msg-id` count on `raw` equals the record count. **B1** (`bench`) S2 ACK p50/p99 at about 1k msg/s, RF=1 vs RF=3, 3+3 interleaved runs on one runner, reported as a ratio | W3-33a for the CI job (tests run locally first) | `uv run pytest -m "chaos and rf3" tests/chaos`, 3 runs: fault fired 3/3 per scenario, 0 ACKed lost, 0 order violations; C1 control red. Report `docs/spikes/wave-3-rf3-free-cluster.md` with runner type, vCPU, RAM, peak memory and raw rows, and the "cannot prove" list from 2.7 |
+
+| W3-34 | `control-plane-engineer` | ADR-004 C1/C2 for the API: PostgreSQL over TLS with `sslmode=verify-full` semantics on asyncpg (CA file, hostname checked); plaintext refused unless the host is loopback; DB credential from a `secretRef` file under `TB_SECRETS_DIR`, retiring `TB_DATABASE_URL` (refuse to start if it is set, so it is never read silently). The C2 exception closes when this lands | W3-4a | Integration against PostgreSQL with a test CA: verify-full connects; a certificate for the wrong hostname is refused; plaintext to a non-loopback host refused at start; `TB_DATABASE_URL` set → exit non-zero; the credential is read from the file |
+| W3-35 | `devops-engineer` | ADR-004 C1, C3, C4, C8 in Helm, Compose and Strimzi: broker `connections.max.reauth.ms` ≤ 3600000; ClickHouse and PostgreSQL plaintext ports unexposed except on loopback (NetworkPolicy and Service ports); no `subPath` Secret mounts (helm_check); chart README checklist: customer-managed keys incl. tiered-storage, S3 disks and `BACKUP` targets (C5); claim-check bucket deny-non-TLS policy (C1); revocation order (remove ACLs or `KafkaUser` first, then rotate; restart pods, C4); ClickHouse `default` user disabled and admin queries logged outside ClickHouse before content is turned on (C8) | none | `helm template` shows the reauth setting on brokers and Strimzi `Kafka`; `helm_check.py` fails a fixture with a `subPath` Secret mount and one exposing ClickHouse 8123 or PostgreSQL plaintext off loopback; checklist present in the chart README |
+| W3-36 | `devops-engineer` | ADR-004 C7 docs: Compose and chart READMEs state that lite without a customer-managed key, or on a host without full-disk encryption, holds synthetic data only (`topics/v0` 3.8 rule 4, done) | none | Both READMEs carry the rule, citing `topics/v0` 3.8 rule 4 |
 
 **W3-33 resource budget (estimate, unverified until W3-33a measures it):** brokers 3 x 1 GiB (512 MiB
 heap); `split` controller 512 MiB (256 MiB heap); receiver, worker and pytest about 1.5 GiB. Peak
@@ -295,8 +299,9 @@ W3-28a-d at any time (small); W3-26 and W3-27 follow W3-25 in their owners' queu
 
 **Added 2026-10-06 (2.8):** W3-30 part (1) now (`archive-engineer`, no dependency); W3-31 after it
 (`devops-engineer`); W3-32 after W3-1b (`control-plane-engineer`); W3-33b starts locally now
-(`qa-engineer`), W3-33a in parallel (`devops-engineer`). `security-reviewer` on ADR-004 H1/H2/H5
-(lead schedules).
+(`qa-engineer`), W3-33a in parallel (`devops-engineer`). ~~`security-reviewer` on ADR-004 H1/H2/H5~~
+done: concurred with conditions. W3-34 (`control-plane-engineer`, after W3-4a), W3-35 and W3-36
+(`devops-engineer`) at any time.
 
 W3-3 (`archive-engineer`); W3-5, then W3-7 (`control-plane-engineer`); W3-8 continued, then W3-16
 (`devops-engineer`); W3-9a API case (`qa-engineer`); W3-19 build after the ruling
@@ -357,7 +362,7 @@ changes need an ADR.
 | 7.1 | ~~`psycopg` 3 or `asyncpg`~~ **ANSWERED 2026-10-06:** *"let the lead and architect decide"*, so **`asyncpg`** (2.7 D1). CLAUDE.md line proposed to the lead | — | — |
 | 7.2 | ~~Audit retention~~ **ANSWERED 2026-10-06:** *"Give the user a possibility to change it"*, so operator settings with defaults events 90 / content 30 / audit 2190 d (2.7 D3, ADR-004 section 4) | — | — |
 | 7.3 | ~~`_hmac` mechanism~~ **ANSWERED 2026-10-06:** *"let the lead and architect decide"*, so **deferred** until H1 concurrence and before per-patient search; `_hmac` treated as PHI (2.7 D2, ADR-004 H3) | Per-patient search (W4-3) | Archiver drops `*_hmac`; per-patient search refused |
-| 7.4 | ~~Key custody~~ **ANSWERED 2026-10-06:** *"Let the lead, architect and security engineer decide"*, so draft in ADR-004 H1/H2/H5, **pending `security-reviewer` concurrence** (2.7 D4) | Production use of the archive, until concurrence | Content off by default in production (A4) |
+| 7.4 | ~~Key custody~~ **ANSWERED 2026-10-06:** *"Let the lead, architect and security engineer decide"*, so **decided** in ADR-004 H1/H2/H5, with `security-reviewer` concurring under conditions C1-C8 (2.7 D4) | Production content storage, until W3-34/W3-35 land | Content off by default in production (A4) |
 | 7.5 | Add `hl7.org` or `build.fhir.org` to the network allow-list. **Still open** | W2-2 item 4 | Golden files stay unchecked against R4 |
 | 7.6 | ~~Paid RF=3 capacity~~ **ANSWERED 2026-10-06:** *"find alternative free solution"*, so W3-33a/b (2.7 D5). Paid capacity is needed only for absolute latency or sizing claims and stays human | — | Absolute numbers stay single-host, labelled |
 | 7.7 | ~~Merge~~ **ANSWERED 2026-10-06:** merge `wave/1-1` and `wave/1-2` into `main`; PR for `wave/1-3`. The lead executes | — | Further wave 3 work is on `wave/1-3` |

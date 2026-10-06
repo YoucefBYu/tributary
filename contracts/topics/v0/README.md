@@ -520,6 +520,9 @@ itself is unchanged. Three rules follow, and none of them is advisory:
 3. `lite` is the only place the durability floor may be lowered, and it is lowered explicitly in
    `profiles.lite.class_config_overrides` rather than inherited. A tool that applies the class
    configs and forgets the profile overrides fails **safe**, at the production floor.
+4. **(2026-10-06, ADR-004 C7.)** A `lite` deployment without a customer-managed key, or on a host
+   without full-disk encryption, holds **synthetic data only**. Real PHI requires ADR-004 H1's
+   production custody rules. Documentation rule; the warning string is unchanged.
 
 Acceptance: a test asserts the warning is emitted when the profile is `lite` and not emitted
 otherwise. A warning nobody can prove fires is the same as no warning — the lesson Phase 0 recorded

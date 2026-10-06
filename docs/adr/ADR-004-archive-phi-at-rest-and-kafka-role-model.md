@@ -2,22 +2,22 @@
 
 - **Status:** **Proposed** (draft 2026-10-05, W3-10; **rev 2 2026-10-06** after the human's answers).
   **No invariant changes.** Section 7 state per question:
-  - **H1 key custody, H2 application-level encryption, H5 rotation:** **DRAFT DECISION, pending
-    `security-reviewer` concurrence.** The human delegated H1 to *"the lead, architect and security
-    engineer"*. H2 and H5 follow from H1. Only documented KMS, cloud-volume and library features are
-    used. **No cryptography or key hierarchy is designed here** (CLAUDE.md escalation stays in force).
+  - **H1 key custody, H2 application-level encryption, H5 rotation:** **DECIDED 2026-10-06,
+    concurred with conditions C1-C8** (section 7.1) by the lead, the architect and
+    `security-reviewer`, under the human's delegation (*"the lead, architect and security
+    engineer"*). Only documented KMS, cloud-volume and library features are used. **No cryptography
+    or key hierarchy is designed here** (CLAUDE.md escalation stays in force).
   - **H3 `_hmac`:** **DEFERRED** by the lead and architect under the human's delegation, until H1 has
     concurrence and before any per-patient search task starts.
   - **H4 retention:** **DECIDED.** Operator-configurable with documented defaults (section 4).
   - **H6 erasure and H7 role-model sign-off:** still **`TODO(human)`**. The human did not answer
     them on 2026-10-06.
 
-  This ADR stays Proposed until `security-reviewer` concurs on H1/H2/H5 and a human approves section 5
-  (H7).
-- **Date:** 2026-10-05 (rev 2: 2026-10-06)
+  This ADR stays Proposed until a human approves section 5 (H7) and answers H6.
+- **Date:** 2026-10-05 (rev 2: 2026-10-06; rev 3, conditions C1-C8: 2026-10-06)
 - **Deciders:** `architect` (draft). H3 and H4 rev 2: lead and architect, under the human's 2026-10-06
-  delegation. H1/H2/H5 rev 2: lead, architect and `security-reviewer`; **concurrence pending**. Owed
-  from the human: H6, H7.
+  delegation. H1/H2/H5: lead, architect and `security-reviewer` (**CONCUR WITH CONDITIONS**,
+  lead-relayed 2026-10-06; the architect has not read the review itself). Owed from the human: H6, H7.
 - **Contracts:** `events/v0` 4 and 4.1; `topics/v0` 2.1, 3.4, 3.4.1, 3.5, 3.6; `envelope/v0` (claim
   check); `observability/v0` (archiver metrics). Contract changes named here land with the task that
   needs them (section 8).
@@ -168,14 +168,15 @@ cipher, key hierarchy, key-wrapping scheme or key derivation. Anything that woul
 the human (CLAUDE.md). Provider behaviour is cited from public documentation and **was not re-checked
 in this session** (marked *docs*).
 
-### H1. Key custody for encryption at rest: DRAFT DECISION, pending `security-reviewer` concurrence
+### H1. Key custody for encryption at rest: DECIDED, concurred with conditions (7.1)
 
-Covers broker volumes, ClickHouse, PostgreSQL, the claim-check bucket and backups.
+Covers broker volumes, ClickHouse, PostgreSQL, the claim-check bucket and backups. **C5** adds the Kafka
+tiered-storage remote tier, ClickHouse S3 disks and ClickHouse `BACKUP` targets.
 
 | Option | For | Against |
 |---|---|---|
 | (a) Provider-managed keys (cloud disk default encryption, SSE-S3) | Zero setup; always on | The customer cannot revoke or audit key use separately from the provider. Protects a lost disk only |
-| **(b) Customer-managed KMS keys (AWS KMS customer managed key for EBS and SSE-KMS; GCP CMEK; Azure customer-managed keys), through an encrypted StorageClass and bucket default encryption (recommended for `production`)** | The customer controls rotation, revocation and key-use logs (*docs*: KMS audit logging such as CloudTrail). Disabling the key is a documented emergency stop for data at rest. Tributary writes no crypto code | KMS setup per site; small per-key and per-request cost to the customer |
+| **(b) Customer-managed KMS keys (AWS KMS customer managed key for EBS and SSE-KMS; GCP CMEK; Azure customer-managed keys), through an encrypted StorageClass and bucket default encryption (recommended for `production`)** | The customer controls rotation, revocation and key-use logs (*docs*: KMS audit logging such as CloudTrail). Disabling the key blocks new attach and decrypt. Volumes already attached may stay readable until detached (provider docs) (**C6**, replacing the rev 2 "emergency stop" wording). Tributary writes no crypto code | KMS setup per site; small per-key and per-request cost to the customer |
 | (c) Customer-held keys outside the cloud (HSM, Vault; LUKS/dm-crypt on premises) | Required by some on-premises sites; the same properties as (b) | The site operates the key service; unlock-at-boot is the site's own mechanism |
 
 Criteria: who can revoke access to PHI at rest; key-use auditability; no Tributary-written
@@ -185,10 +186,13 @@ cryptography; works on premises and in lite; operator effort.
 1. **Tributary manages no encryption keys** and implements no at-rest encryption. Encryption at rest
    is the platform's documented feature. The requirement that it be on (`topics/v0` 3.5) is unchanged.
 2. **`production` profile: customer-managed keys, (b) or (c), on every PHI-at-rest surface**: broker
-   volumes, ClickHouse, PostgreSQL, the claim-check bucket and backups. Provider-managed keys (a) are
-   not sufficient for `production`.
+   volumes, ClickHouse, PostgreSQL, the claim-check bucket and backups, plus the Kafka tiered-storage
+   remote tier, ClickHouse S3 disks and `BACKUP` targets (C5). Provider-managed keys (a) are not
+   sufficient for `production`.
 3. **`lite` profile:** (a), (b) or (c). Lite already carries the RF=1 warning (ADR-002 D14). The
-   docs state that (a) protects a lost disk only.
+   docs state that (a) protects a lost disk only. **C7:** lite without a customer-managed key, or on a
+   host without full-disk encryption, holds **synthetic data only**. Real PHI requires the production
+   custody rules.
 4. **Claim-check bucket:** bucket default encryption SSE-KMS with the customer-managed key (S3 Bucket
    Keys allowed, *docs*). Tributary writers send no per-object key parameters, so the bucket default
    governs. The identities that write or read claim-checked objects need the KMS permissions the
@@ -208,7 +212,7 @@ cryptography; works on premises and in lite; operator effort.
 **Give up:** production needs a KMS or HSM before content is turned on. Tributary cannot prove from
 inside that encryption is on. The docs carry per-provider variance.
 
-### H2. Application-level encryption of archived content: DRAFT DECISION (a), pending concurrence
+### H2. Application-level encryption of archived content: DECIDED (a), concurred with conditions (7.1)
 
 - **(a) None beyond volume encryption with customer-managed keys (H1) in v0: chosen.** (b) Envelope
   encryption of the payload column with per-channel or per-period data keys needs a key hierarchy,
@@ -246,10 +250,11 @@ Operator-configurable, defaults events 90 d, content 30 d, audit 2190 d (R2). Ap
 step with a decrease guard (R6). Audit system of record is ClickHouse `audit_log` with Kafka as a
 buffer (R7). **Exit criterion 4 (audit) is no longer blocked on a human answer.**
 
-### H5. Credential rotation: DRAFT DECISION, pending `security-reviewer` concurrence
+### H5. Credential rotation: DECIDED, concurred with conditions (7.1)
 
 - **Secret store:** Tributary reads secrets only from files (`secretRef` under `TB_SECRETS_DIR`,
-  `engine-kafka/v0`), unchanged. The operator's store fills those files: Kubernetes Secrets,
+  `engine-kafka/v0`), unchanged. **Exception (C2):** the API reads its database credential from the
+  env var `TB_DATABASE_URL`, until W3-34 moves it to a `secretRef` file. The operator's store fills those files: Kubernetes Secrets,
   optionally synced from Vault or a cloud secret manager by an external-secrets operator. Tributary
   calls no secret-manager API in v0. **Give up:** no dynamic, short-lived database credentials in v0.
 - **Cadence:** the customer's policy. Recommended default (judgement, not measured): 90 days for
@@ -259,6 +264,22 @@ buffer (R7). **Exit criterion 4 (audit) is no longer blocked on a human answer.*
 - **Content archiver credential (K2):** its own Secret, mounted only into the content-archiver
   StatefulSet, never shared with another role. Namespace Secret-read is the residual exposure, an
   operational control, listed in the chart README.
+
+### 7.1 Conditions of concurrence on H1, H2 and H5 (`security-reviewer`, 2026-10-06, lead-relayed)
+
+Verdict: **CONCUR WITH CONDITIONS**. H1, H2 and H5 are decided by the lead, the architect and
+`security-reviewer` under the human's 2026-10-06 delegation. Conditions as relayed by the lead:
+
+| # | Condition | Task |
+|---|---|---|
+| C1 | **TLS in transit.** Production requires TLS with certificate and hostname verification on every PHI hop: Kafka (`topics/v0` 3.4); archivers and the API to ClickHouse; the API to PostgreSQL (`sslmode=verify-full`); HTTPS-only access to the claim-check bucket, with a bucket policy that denies non-TLS requests. ClickHouse and PostgreSQL plaintext ports must not be reachable from anywhere but loopback | W3-34 (API to PostgreSQL), W3-35 (chart: ports, bucket policy in the checklist) |
+| C2 | The API reads its DB credential from the env var `TB_DATABASE_URL`. **Recorded as an exception to H5**, closed by moving it to a `secretRef` file | W3-34 |
+| C3 | **Revocation.** Brokers set `connections.max.reauth.ms` (KIP-368; suggested at most 3600000). Revocation means removing the principal's ACLs or `KafkaUser` first, then rotating | W3-35 |
+| C4 | Secret files are read once at startup, so rotation and revocation take effect only after a pod restart. Do not use `subPath` mounts for Secrets | W3-35 (chart check); documented here |
+| C5 | Add the Kafka tiered-storage remote tier, ClickHouse S3 disks and `BACKUP` targets to the surfaces that need a customer-managed key | Applied in H1 items 2 and the scope line |
+| C6 | Replaces the H1 option (b) wording: "Disabling the key blocks new attach and decrypt. Volumes already attached may stay readable until detached (provider docs)." | Applied in the H1 table |
+| C7 | Lite without a customer-managed key, or on a host without full-disk encryption, holds **synthetic data only**. Real PHI requires the production custody rules | Applied in H1 item 3 and `topics/v0` 3.8 rule 4; W3-36 (Compose and chart READMEs) |
+| C8 | Turning on content storage in production also requires the ClickHouse `default` user to be disabled and admin queries to be logged outside ClickHouse. Both go into the chart README checklist | W3-35 |
 
 **H6. Erasure.**
 - `TODO(human)`: whether erasure requests are honoured by delete (R4), by crypto-shredding (requires
@@ -287,8 +308,10 @@ buffer (R7). **Exit criterion 4 (audit) is no longer blocked on a human answer.*
     in `openapi/v0`; `topics/v0` 2.1 and `topic-defaults.json` `classes.audit` restated as decided
     (done 2026-10-06, README and description only).
 - **Follow-ups:**
-  1. `security-reviewer`: read this draft (W3-10 verify). **Rev 2: concur or object on H1, H2, H5**
-     (lead schedules next).
+  1. `security-reviewer`: read this draft (W3-10 verify). **Rev 2: concurred with conditions on H1,
+     H2, H5 (2026-10-06, section 7.1).**
+  6. **Rev 3 tasks** (`phases/wave-3.md` 2.8): W3-34 `control-plane-engineer` (C1, C2), W3-35
+     `devops-engineer` (C1 ports, C3, C4, C8), W3-36 `devops-engineer` (C7 docs).
   2. `archive-engineer` (W3-2b): A2-A6 against R1-R2, with no key handling.
   3. `devops-engineer` (W3-16): K3.
   4. ~~The architect sends H1-H7 to the human through the lead and mirrors them in STATUS.~~ Done

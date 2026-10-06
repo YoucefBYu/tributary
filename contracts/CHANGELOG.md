@@ -24,6 +24,8 @@ by the lead, verbatim: *"Give the user a possibility to change it"*.
   and a read-only retention `GET` (ADR-004 R3, R7).
 - Rejected: a retention write endpoint in the API, which would need the ClickHouse DDL credential
   (ADR-004 A5). **Give up:** a retention change needs a redeploy.
+- **`topics/v0` 3.8 rule 4 (ADR-004 C7):** `lite` without a customer-managed key or full-disk
+  encryption holds synthetic data only. Documentation rule; `profiles.lite.warning` is unchanged.
 
 ## 2026-10-06 — contract set 1.8, W3-3 rulings (README only)
 
