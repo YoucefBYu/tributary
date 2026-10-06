@@ -2,10 +2,10 @@ name: helm
 
 on:
   pull_request:
-    paths: ["deploy/helm/**", ".github/workflows/helm.yml", ".github/scripts/helm_check.py", "contracts/observability/**"]
+    paths: ["deploy/helm/**", ".github/workflows/helm.yml", ".github/scripts/helm_check.py", "contracts/observability/**", "contracts/topics/**", "deploy/compose/topic-bootstrap/bootstrap_topics.py"]
   push:
     branches: [main, "wave/**"]
-    paths: ["deploy/helm/**", ".github/workflows/helm.yml", ".github/scripts/helm_check.py", "contracts/observability/**"]
+    paths: ["deploy/helm/**", ".github/workflows/helm.yml", ".github/scripts/helm_check.py", "contracts/observability/**", "contracts/topics/**", "deploy/compose/topic-bootstrap/bootstrap_topics.py"]
 
 permissions:
   contents: read
@@ -44,6 +44,8 @@ jobs:
           tar xzf kubeconform-linux-amd64.tar.gz kubeconform
           echo "$PWD/linux-amd64" >> "$GITHUB_PATH"
           echo "$PWD" >> "$GITHUB_PATH"
+      - name: KafkaUser ACLs match topic-defaults.json (drift check)
+        run: python3 deploy/helm/gen_acls.py --check
       - name: helm lint
         run: helm lint "$CHART" -f "$CHART/ci/values-ci.yaml" --strict
       - name: helm template (all optional parts on)

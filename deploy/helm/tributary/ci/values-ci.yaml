@@ -8,6 +8,7 @@ monitoring:
       podSelector: {matchLabels: {app.kubernetes.io/name: prometheus}}
 channels:
   - name: adt-passthrough
+    syncReply: true
     receiver:
       module: tributary.receivers.mllp
       port: 6661
@@ -18,6 +19,13 @@ channels:
       - name: http-stub
         module: tributary.loaders.http
         replicas: 2
+  - name: lab-results
+    receiver:
+      module: tributary.receivers.http
+      port: 8080
+    destinations:
+      - name: fhir-stub
+        module: tributary.loaders.fhir
 ingress:
   enabled: true
   className: nginx
@@ -26,3 +34,6 @@ ingress:
   channel: adt-passthrough
   logFormat:
     enabled: true
+archiver:
+  clickhouse:
+    caCertSecretRef: chca

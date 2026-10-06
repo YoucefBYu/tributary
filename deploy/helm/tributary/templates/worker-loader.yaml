@@ -2,7 +2,7 @@
 {{- $wname := printf "%s-%s-worker" (include "tb.name" $) $ch.name }}
 ---
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: {{ $wname }}
   labels:
@@ -10,6 +10,9 @@ metadata:
     app.kubernetes.io/component: worker
     tributary.dev/channel: {{ $ch.name }}
 spec:
+  serviceName: {{ include "tb.name" $ }}-headless
+  podManagementPolicy: Parallel
+  updateStrategy: {type: RollingUpdate}
   {{- if not $.Values.keda.enabled }}
   replicas: {{ ($ch.worker | default dict).replicas | default 1 }}
   {{- end }}
@@ -62,7 +65,7 @@ spec:
 {{- $lname := printf "%s-%s-loader-%s" (include "tb.name" $) $ch.name $d.name }}
 ---
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: {{ $lname }}
   labels:
@@ -71,6 +74,9 @@ metadata:
     tributary.dev/channel: {{ $ch.name }}
     tributary.dev/destination: {{ $d.name }}
 spec:
+  serviceName: {{ include "tb.name" $ }}-headless
+  podManagementPolicy: Parallel
+  updateStrategy: {type: RollingUpdate}
   {{- if not $.Values.keda.enabled }}
   replicas: {{ $d.replicas | default 1 }}
   {{- end }}

@@ -30,6 +30,7 @@ kafka:
 # (invariant 3), not from this chart.
 channels: []
 #  - name: adt-passthrough
+#    syncReply: true     # sync-reply channel: adds the receiver reply READ and replier group, worker reply WRITE
 #    receiver: {module: tributary.receivers.mllp, port: 6661, replicas: 2}
 #    worker:   {replicas: 2}
 #    destinations:
@@ -101,11 +102,6 @@ securityContext:               # pod level; containers are non-root, read-only, 
   runAsGroup: 10001
   fsGroup: 10001
 
-# Contracts mounted from a ConfigMap you create from contracts/ (worker, loader and receiver read
-# topic-defaults.json via TB_CONTRACTS_DIR). Create it with:
-#   kubectl create configmap tributary-contracts --from-file=topic-defaults.json=contracts/topics/v0/topic-defaults.json
-contractsConfigMap: tributary-contracts
-
 keda:
   enabled: true
   lagThreshold: "1000"
@@ -115,6 +111,10 @@ keda:
   cooldownPeriod: 300
   # TriggerAuthentication reads SCRAM credentials from this Secret (keys: sasl, username, password, ca).
   authSecretRef: tb-keda-kafka
+  # KafkaUser rendered with strimzi.enabled: the lag_reader role (DESCRIBE only; placeholder grants until
+  # W3-29 adds it to topic-defaults.json). Its Strimzi secret holds only `password`; keda.authSecretRef is
+  # still composed by the operator (sasl, username, password, ca, tls) from it.
+  lagReaderUser: tb-lag-reader
 
 # Strimzi Kafka (KRaft). Needs the Strimzi operator installed; the chart renders the CR only.
 strimzi:

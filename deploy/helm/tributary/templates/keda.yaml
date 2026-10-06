@@ -23,7 +23,7 @@ metadata:
   name: {{ include "tb.name" $ }}-{{ $ch.name }}-worker
   labels: {{- include "tb.labels" $ | nindent 4 }}
 spec:
-  scaleTargetRef: {name: {{ include "tb.name" $ }}-{{ $ch.name }}-worker}
+  scaleTargetRef: {apiVersion: apps/v1, kind: StatefulSet, name: {{ include "tb.name" $ }}-{{ $ch.name }}-worker}
   minReplicaCount: {{ $.Values.keda.minReplicaCount }}
   maxReplicaCount: {{ $.Values.keda.maxReplicaCount }}
   pollingInterval: {{ $.Values.keda.pollingInterval }}
@@ -45,7 +45,7 @@ metadata:
   name: {{ include "tb.name" $ }}-{{ $ch.name }}-loader-{{ $d.name }}
   labels: {{- include "tb.labels" $ | nindent 4 }}
 spec:
-  scaleTargetRef: {name: {{ include "tb.name" $ }}-{{ $ch.name }}-loader-{{ $d.name }}}
+  scaleTargetRef: {apiVersion: apps/v1, kind: StatefulSet, name: {{ include "tb.name" $ }}-{{ $ch.name }}-loader-{{ $d.name }}}
   minReplicaCount: {{ $.Values.keda.minReplicaCount }}
   maxReplicaCount: {{ $.Values.keda.maxReplicaCount }}
   pollingInterval: {{ $.Values.keda.pollingInterval }}

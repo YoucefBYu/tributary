@@ -46,7 +46,6 @@ capabilities:
 - {name: engine-kafka, mountPath: /etc/tributary, readOnly: true}
 - {name: kafka-role, mountPath: /var/run/secrets/tributary/{{ index .root.Values.kafka.roleSecretRefs .role }}, readOnly: true}
 - {name: kafka-ca, mountPath: /var/run/secrets/tributary/{{ .root.Values.kafka.caSecretRef }}, readOnly: true}
-- {name: contracts, mountPath: /contracts, readOnly: true}
 - {name: tmp, mountPath: /tmp}
 {{- end -}}
 
@@ -57,21 +56,17 @@ capabilities:
   secret: {secretName: {{ index .root.Values.kafka.roleSecretRefs .role }}}
 - name: kafka-ca
   secret: {secretName: {{ .root.Values.kafka.caSecretRef }}}
-- name: contracts
-  configMap: {name: {{ .root.Values.contractsConfigMap }}}
 - name: tmp
   emptyDir: {sizeLimit: 64Mi}
 {{- end -}}
 
 {{- define "tb.commonEnv" -}}
 - {name: TB_ENGINE_KAFKA_FILE, value: /etc/tributary/engine-kafka.json}
-- {name: TB_CONTRACTS_DIR, value: /contracts}
 - {name: TB_PROFILE, value: production}
 {{- end -}}
 
 {{- define "tb.archiverEnv" -}}
 - {name: TB_ENGINE_KAFKA_FILE, value: /etc/tributary/engine-kafka.json}
-- {name: TB_CONTRACTS_DIR, value: /contracts}
 - {name: TB_PROFILE, value: production}
 - {name: TB_ARCHIVE_CLICKHOUSE_HOST, value: {{ .Values.archiver.clickhouse.host | quote }}}
 - {name: TB_ARCHIVE_CLICKHOUSE_PORT, value: {{ .Values.archiver.clickhouse.port | quote }}}

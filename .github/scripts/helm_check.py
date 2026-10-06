@@ -18,6 +18,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[2]
 CHART = ROOT / "deploy" / "helm" / "tributary"
 FORBIDDEN_LOG_VAR = re.compile(r"\$(request|request_uri|args|query_string|http_authorization|http_cookie)\b")
+CA_EXPECTED = True  # ci/values-ci.yaml sets archiver.clickhouse.caCertSecretRef
 METRIC = re.compile(r"\btb_[a-z][a-z0-9_]*")
 
 
@@ -33,7 +34,7 @@ def registry() -> set[str]:
 def pods(docs: list[dict[str, Any]]) -> list[tuple[str, dict[str, Any]]]:
     out = []
     for d in docs:
-        if d["kind"] in ("Deployment", "Job"):
+        if d["kind"] in ("Deployment", "StatefulSet", "Job"):
             out.append((d["metadata"]["name"], d["spec"]["template"]["spec"]))
     return out
 
@@ -132,6 +133,8 @@ def check(docs: list[dict[str, Any]]) -> list[str]:
             if runtime_ref == job_ref:
                 bad.append("runtime and migration secretRef are the same")
 
+    bad += check_workloads(docs, by_kind)
+    bad += check_acls(by_kind)
     bad += check_network(docs, by_kind, receivers)
     for name, spec in pods(docs):
         if spec.get("securityContext", {}).get("seccompProfile", {}).get("type") != "RuntimeDefault":
@@ -140,7 +143,7 @@ def check(docs: list[dict[str, Any]]) -> list[str]:
         if spec.get("automountServiceAccountToken") is not want:
             bad.append(f"{name}: automountServiceAccountToken must be {str(want).lower()}")
     for svc in by_kind.get("Service", []):
-        for p in svc["spec"]["ports"]:
+        for p in svc["spec"].get("ports", []):
             if p["port"] == 9180 or p.get("targetPort") in (9180, "ops"):
                 bad.append(f"Service {svc['metadata']['name']} exposes the ops port")
 
@@ -160,6 +163,113 @@ def check(docs: list[dict[str, Any]]) -> list[str]:
     return bad
 
 
+def check_workloads(docs: list[dict[str, Any]], by_kind: dict[str, list[dict[str, Any]]]) -> list[str]:
+    """StatefulSets (ruling H3), no PVCs, no contracts volume (ruling H4), archiver CA path (W3-8 follow-up)."""
+    bad: list[str] = []
+    for d in by_kind.get("Deployment", []):
+        if "otel-collector" not in d["metadata"]["name"]:
+            bad.append(f"{d['metadata']['name']}: data-plane workload is a Deployment, must be a StatefulSet")
+    sets = by_kind.get("StatefulSet", [])
+    if not sets:
+        bad.append("no StatefulSet rendered")
+    names = {d["metadata"]["name"] for d in by_kind.get("Service", []) if d["spec"].get("clusterIP") == "None"}
+    for d in sets:
+        n = d["metadata"]["name"]
+        if d["spec"].get("podManagementPolicy") != "Parallel":
+            bad.append(f"{n}: podManagementPolicy is not Parallel")
+        if d["spec"].get("volumeClaimTemplates"):
+            bad.append(f"{n}: has volumeClaimTemplates")
+        if d["spec"].get("serviceName") not in names:
+            bad.append(f"{n}: serviceName is not a rendered headless Service")
+    for so in by_kind.get("ScaledObject", []):
+        if so["spec"]["scaleTargetRef"].get("kind") != "StatefulSet":
+            bad.append("ScaledObject scaleTargetRef.kind is not StatefulSet")
+    for name, spec in pods(docs):
+        for v in spec.get("volumes", []):
+            if v["name"] == "contracts" or v.get("configMap", {}).get("name", "").endswith("contracts"):
+                bad.append(f"{name}: has a contracts volume (contracts/ ships in the image)")
+        for c in spec["containers"]:
+            for e in c.get("env", []):
+                if e["name"] == "TB_CONTRACTS_DIR":
+                    bad.append(f"{name}: sets TB_CONTRACTS_DIR (the image sets it)")
+                if e["name"] == "TB_ARCHIVE_CLICKHOUSE_CA_CERT" and not re.fullmatch(
+                    r"/var/run/secrets/tributary-ca/[^/]+", e["value"]
+                ):
+                    bad.append(f"{name}: TB_ARCHIVE_CLICKHOUSE_CA_CERT is not a mounted file path (empty key?)")
+    ca = [
+        e
+        for _, s2 in pods(docs)
+        for c in s2["containers"]
+        for e in c.get("env", [])
+        if e["name"] == "TB_ARCHIVE_CLICKHOUSE_CA_CERT"
+    ]
+    if CA_EXPECTED and not ca:
+        bad.append("archiver CA cert env not rendered although caCertSecretRef is set in the CI values")
+    return bad
+
+
+def check_acls(by_kind: dict[str, list[dict[str, Any]]]) -> list[str]:
+    """Rendered KafkaUser ACLs against the contract (re-parsed independently of the template)."""
+    users = {u["metadata"]["labels"]["tributary.dev/role"]: u for u in by_kind.get("KafkaUser", [])}
+    if not users:
+        return []  # strimzi.enabled=false: nothing rendered
+    bad: list[str] = []
+    for role in ("receiver", "worker", "loader", "archiver", "lag-reader"):
+        if role not in users:
+            bad.append(f"no KafkaUser for role {role}")
+    rendered = {
+        role: {
+            (a["resource"]["type"], a["resource"].get("name", ""), a["resource"].get("patternType", ""), op)
+            for a in u["spec"]["authorization"]["acls"]
+            for op in a["operations"]
+        }
+        for role, u in users.items()
+    }
+    for role, acls in rendered.items():
+        for t, name, _pat, op in acls:
+            if name in ("*", "") and t != "cluster":
+                bad.append(f"KafkaUser {role}: wildcard or empty resource name")
+            if op in ("Alter", "Delete", "All") or (t == "cluster" and op not in ("IdempotentWrite", "Describe")):
+                bad.append(f"KafkaUser {role}: forbidden operation {op} on {t}")
+            if op == "Write" and name.endswith(".channels"):
+                bad.append(f"KafkaUser {role}: WRITE on the channels topic")
+    # Sync-reply grants (set 1.2): present for the syncReply channel, absent for the other one.
+    rcv, wrk = rendered.get("receiver", set()), rendered.get("worker", set())
+    if ("topic", "prod.adt-passthrough.reply", "literal", "Read") not in rcv or (
+        "group",
+        "tb.prod.adt-passthrough.replier",
+        "literal",
+        "Read",
+    ) not in rcv:
+        bad.append("receiver lacks the sync-reply READ on reply or the replier group (every sync request would AR)")
+    if ("topic", "prod.adt-passthrough.reply", "literal", "Write") not in wrk:
+        bad.append("worker lacks WRITE on the sync-reply topic")
+    if any(".reply" in n or ".replier" in n for _t, n, _p, op in rcv | wrk if "lab-results" in n):
+        bad.append("sync-reply grants rendered for a channel without syncReply")
+    if any(op == "Write" and n.endswith(".reply") for _t, n, _p, op in rcv):
+        bad.append("receiver can WRITE reply (it could forge an answer)")
+    lag = rendered.get("lag-reader", set())
+    if any(op != "Describe" for *_, op in lag):
+        bad.append("lag_reader holds more than DESCRIBE")
+    if not any(op == "Write" for *_, op in rendered.get("receiver", set())):
+        bad.append("receiver has no WRITE (raw)")
+    if any(t == "topic" and ".out." in n and op == "Write" for t, n, _p, op in rendered.get("receiver", set())):
+        bad.append("receiver can WRITE out topics")
+    # Two-way against the generated file: every contract grant for the cluster-independent roles appears.
+    gen = json.loads((CHART / "files" / "acls.json").read_text())["roles"]
+    for role, key in (("archiver", "archiver"), ("worker", "worker")):
+        want = {
+            (g["resourceType"].lower(), g["name"].replace("@ENV@", "prod"))
+            for g in gen[key]
+            if "@CHANNEL@" not in g["name"]
+        }
+        have = {(t, n) for t, n, _p, _o in rendered.get(role, set())}
+        for t, n in want:
+            if t != "cluster" and (t, n) not in have:
+                bad.append(f"KafkaUser {role}: contract grant on {n} missing from the render")
+    return bad
+
+
 def check_network(
     docs: list[dict[str, Any]], by_kind: dict[str, list[dict[str, Any]]], receivers: list[Any]
 ) -> list[str]:
@@ -168,7 +278,9 @@ def check_network(
     if not any(n["spec"]["podSelector"] == {} and "ingress" not in n["spec"] for n in nps):
         bad.append("no namespace default-deny NetworkPolicy")
     labels = {
-        d["metadata"]["name"]: d["spec"]["template"]["metadata"]["labels"] for d in docs if d["kind"] == "Deployment"
+        d["metadata"]["name"]: d["spec"]["template"]["metadata"]["labels"]
+        for d in docs
+        if d["kind"] in ("Deployment", "StatefulSet")
     }
     for name, _ in receivers:
         sel = [n["spec"]["podSelector"].get("matchLabels", {}) for n in nps if n["metadata"]["name"] == name]
@@ -189,7 +301,7 @@ def check_network(
                     spec_ports = {
                         p["containerPort"]
                         for d in docs
-                        if d["metadata"]["name"] == name and d["kind"] == "Deployment"
+                        if d["metadata"]["name"] == name and d["kind"] in ("Deployment", "StatefulSet")
                         for c in d["spec"]["template"]["spec"]["containers"]
                         for p in c["ports"]
                         if p["name"] == "ingest"

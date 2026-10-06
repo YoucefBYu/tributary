@@ -435,6 +435,7 @@ services:
       TB_ENV: dev
       TB_CHANNEL: adt-passthrough
       TB_ENGINE_KAFKA_FILE: /etc/tributary/engine-kafka.json
+      # Explicit and unique per replica (W3-28d); the pid default is going away.
       TB_INSTANCE_ID: worker-0
       # The worker refuses to start without contracts/topics/v0/topic-defaults.json
       # (tributary.runtime.config: "must ship contracts/ or set TB_CONTRACTS_DIR"); mounted, not
@@ -483,6 +484,8 @@ services:
       - --channel=adt-passthrough
       - --destination=http-stub
       - --env=dev
+      # Explicit and unique per replica (W3-28d): the pid default is going away, and every container's pid is 1.
+      - --instance-id=loader-http-stub-0
     environment:
       TB_ENGINE_KAFKA_FILE: /etc/tributary/engine-kafka.json
       # Consumer defaults (session.timeout.ms, commit_every, ...) come from topic-defaults.json, same

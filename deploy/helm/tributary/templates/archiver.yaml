@@ -2,13 +2,16 @@
 {{- $ch := .Values.archiver.clickhouse }}
 ---
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: {{ include "tb.name" . }}-archiver
   labels:
     {{- include "tb.labels" . | nindent 4 }}
     app.kubernetes.io/component: archiver
 spec:
+  serviceName: {{ include "tb.name" . }}-headless
+  podManagementPolicy: Parallel
+  updateStrategy: {type: RollingUpdate}
   replicas: {{ .Values.archiver.replicas }}
   selector:
     matchLabels:

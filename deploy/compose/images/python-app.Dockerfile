@@ -51,7 +51,12 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     && useradd --uid 10001 --gid tributary --no-create-home --shell /usr/sbin/nologin tributary
 
 COPY --from=build /opt/venv /opt/venv
-ENV PATH=/opt/venv/bin:$PATH \
+# contracts/ ships in every image (W3 ruling H4): topic-defaults.json carries invariant-1 producer values
+# pinned to this code version, so it must travel with the code, not come from an operator-built ConfigMap.
+# Compose still bind-mounts ../../contracts over this path for development.
+COPY contracts/ /contracts/
+ENV TB_CONTRACTS_DIR=/contracts \
+    PATH=/opt/venv/bin:$PATH \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
