@@ -1,0 +1,34 @@
+[project]
+name = "tributary-fhir"
+version = "0.0.0"
+description = "FHIR helpers over pydantic models; ctx.fhir and ctx.terminology interfaces."
+license = "Apache-2.0"
+requires-python = ">=3.12"
+dependencies = [
+    "tributary-sdk",
+    "fhir.resources>=8.0",   # BSD. Pydantic v2 FHIR models. Confirm with .github/scripts/licence_check.py
+                              # before relying on this comment -- see that file's own warning about
+                              # trusting a one-line annotation over the automated check.
+]
+
+# Neither dependency above talks to a socket: no HTTP client anywhere in this package's own code or its
+# dependency closure. That is what lets `tributary-runtime` depend on this package (to call `attach()`)
+# without acquiring network capability transitively -- see `context.py`'s attachment docstring.
+
+[project.entry-points.pytest11]
+# Gives a bundle the `fhir_ctx` fixture with no conftest, the same mechanism as tributary-sdk's.
+tributary_fhir = "tributary.fhir.pytest_plugin"
+
+[project.entry-points."tributary.context"]
+# The worker loads this factory at start-up and wraps each branch's ctx (tributary.runtime.extensions).
+fhir = "tributary.fhir.runtime:context_extension"
+
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tributary"]
+
+[tool.uv.sources]
+tributary-sdk = { workspace = true }

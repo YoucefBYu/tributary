@@ -1,0 +1,129 @@
+{{- if .Values.archiver.enabled }}
+{{- $ch := .Values.archiver.clickhouse }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "tb.name" . }}-archiver
+  labels:
+    {{- include "tb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: archiver
+spec:
+  replicas: {{ .Values.archiver.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: archiver
+  template:
+    metadata:
+      labels:
+        {{- include "tb.labels" . | nindent 8 }}
+        app.kubernetes.io/component: archiver
+    spec:
+      automountServiceAccountToken: false
+      securityContext: {{- include "tb.podSecurityContext" . | nindent 8 }}
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: archiver
+          image: {{ include "tb.image" (dict "root" . "pkg" "archiver") | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - tributary.archiver
+            - --env={{ .Values.env }}
+            - --instance-id=$(POD_NAME)
+            # ADR-004 A5: the runtime credential is INSERT-only; DDL is the migrate Job's.
+            - --skip-ddl
+          env:
+            {{- include "tb.downwardEnv" . | nindent 12 }}
+            {{- include "tb.archiverEnv" . | nindent 12 }}
+            - {name: TB_ARCHIVE_CLICKHOUSE_SECRET_REF, value: {{ $ch.secretRef | quote }}}
+            {{- if $ch.caCertSecretRef }}
+            - {name: TB_ARCHIVE_CLICKHOUSE_CA_CERT, value: {{ printf "/var/run/secrets/tributary-ca/%s" $ch.caCertSecretKey | quote }}}
+            {{- end }}
+          resources: {{- toYaml .Values.archiver.resources | nindent 12 }}
+          securityContext: {{- include "tb.containerSecurityContext" . | nindent 12 }}
+          volumeMounts:
+            {{- include "tb.kafkaMounts" (dict "root" . "role" "archiver") | nindent 12 }}
+            - {name: clickhouse, mountPath: /var/run/secrets/tributary/{{ $ch.secretRef }}, readOnly: true}
+            {{- if $ch.caCertSecretRef }}
+            - {name: clickhouse-ca, mountPath: /var/run/secrets/tributary-ca, readOnly: true}
+            {{- end }}
+      volumes:
+        {{- include "tb.kafkaVolumes" (dict "root" . "role" "archiver") | nindent 8 }}
+        - name: clickhouse
+          secret: {secretName: {{ $ch.secretRef }}}
+        {{- if $ch.caCertSecretRef }}
+        - name: clickhouse-ca
+          secret: {secretName: {{ $ch.caCertSecretRef }}}
+        {{- end }}
+{{- if .Values.podDisruptionBudget.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "tb.name" . }}-archiver
+  labels: {{- include "tb.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: archiver
+{{- end }}
+{{- if .Values.archiver.migrate.enabled }}
+---
+# Schema migration: pre-install and pre-upgrade, with the MIGRATION credential only (ADR-004 A5).
+# --migrate-only needs no Kafka link. The runtime pods never see this secret.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "tb.name" . }}-archiver-migrate
+  labels:
+    {{- include "tb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: archiver-migrate
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: {{ .Values.archiver.migrate.backoffLimit }}
+  activeDeadlineSeconds: {{ .Values.archiver.migrate.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        {{- include "tb.labels" . | nindent 8 }}
+        app.kubernetes.io/component: archiver-migrate
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext: {{- include "tb.podSecurityContext" . | nindent 8 }}
+      containers:
+        - name: migrate
+          image: {{ include "tb.image" (dict "root" . "pkg" "archiver") | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: [tributary.archiver, "--env={{ .Values.env }}", --migrate-only]
+          env:
+            {{- include "tb.archiverEnv" . | nindent 12 }}
+            - {name: TB_ARCHIVE_CLICKHOUSE_MIGRATE_SECRET_REF, value: {{ $ch.migrateSecretRef | quote }}}
+            {{- if $ch.caCertSecretRef }}
+            - {name: TB_ARCHIVE_CLICKHOUSE_CA_CERT, value: {{ printf "/var/run/secrets/tributary-ca/%s" $ch.caCertSecretKey | quote }}}
+            {{- end }}
+          resources: {{- toYaml .Values.archiver.resources | nindent 12 }}
+          securityContext: {{- include "tb.containerSecurityContext" . | nindent 12 }}
+          volumeMounts:
+            - {name: clickhouse-migrate, mountPath: /var/run/secrets/tributary/{{ $ch.migrateSecretRef }}, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+            {{- if $ch.caCertSecretRef }}
+            - {name: clickhouse-ca, mountPath: /var/run/secrets/tributary-ca, readOnly: true}
+            {{- end }}
+      volumes:
+        {{- if $ch.caCertSecretRef }}
+        - name: clickhouse-ca
+          secret: {secretName: {{ $ch.caCertSecretRef }}}
+        {{- end }}
+        - name: clickhouse-migrate
+          secret: {secretName: {{ $ch.migrateSecretRef }}}
+        - name: tmp
+          emptyDir: {sizeLimit: 64Mi}
+{{- end }}
+{{- end }}

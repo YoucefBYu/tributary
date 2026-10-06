@@ -110,6 +110,79 @@ Sources to re-check: openintegrationengine.org and the OIE GitHub repository (li
   **Why a separate approval rather than adding a fourth name to the list above:** that approval was
   recorded as covering *those three packages*, and a transitive arrival is exactly the case the scope
   note was written for. Extending it silently would have made the scope note decorative.
+- **Checker defect, fixed 2026-09-24 (`f083c49`).** `licence_check.py`'s MPL branch (and the LGPL
+  branch modelled on it) approved any expression containing "mpl" without checking the other terms,
+  so `MPL-2.0 AND Proprietary` passed. The wave 1 "0 failed" result therefore never checked the
+  non-MPL terms of `orjson`'s `MPL-2.0 AND (Apache-2.0 OR MIT)`. Those terms are permissive, so the
+  approvals above are unaffected, but the CI evidence was weaker than it read. Regression tests were
+  shown red against the old code. See `docs/agent-team/STATUS.md`. **Third instance of the pattern:**
+  a licence claim is only as good as the mechanism that produced it, and a checker needs a failing
+  case too.
+- **`paramiko` (LGPL-2.1), HUMAN-APPROVED 2026-09-24** as its own decision. It is **not** an
+  extension of the MPL approvals above, nor of `certifi`'s. This is the first LGPL dependency and the
+  first non-permissive one in the **shipped runtime** other than `orjson`. The human chose it, when
+  asked directly by the lead, over two alternatives: shelling out to OpenSSH, or descoping SFTP
+  (`contracts/channel-spec/v0/README.md` 10.2).
+  **Scope:** unmodified `paramiko`, as a dependency of `tributary-loaders` (the SFTP loader) and
+  `tributary-receivers` (the SFTP poller), for SFTP only. Any other package depending on it, or a
+  modified or vendored copy, needs a fresh decision.
+  **Its dependency closure is not approved.** The option the human chose stated that paramiko's own
+  dependencies are permissive; it approved paramiko alone. The wider "dependency closure" wording was
+  the lead's relay, not the human's (confirmed by the lead, 2026-09-24). So each package paramiko pulls
+  in must pass `licence_check.py` on its own licence, and any non-permissive one is a different
+  dependency needing a fresh decision.
+  **Obligations:** what distributing an LGPL-2.1 library inside a container image requires
+  (notices, availability of the library's source) belongs to the W4-7 release pipeline and its SBOM,
+  and to the legal review in 10.3. It is not settled here, and this is not legal advice.
+- **`clickhouse-connect` NOT adopted for the `clickhouse` loader, HUMAN DECISION 2026-09-25.** It is
+  Apache-2.0, but it unconditionally requires `certifi`, whose approval above is non-runtime only, so
+  `licence_check.py` failed when it entered `tributary-loaders`' runtime closure (found by
+  `connector-engineer`, W2-6, and reverted). Its defaults (`query_retries=2`, internal HTTP retries)
+  also re-send silently on connection failure. The loader instead uses ClickHouse's HTTP interface via
+  the standard library, on the HTTP loader's rules: redirects refused, no pooling, no hidden retries,
+  auth headers from `secretRef`, stdlib TLS. **No new dependency; `certifi`'s scope is unchanged.**
+  Rejected: approving `certifi` for the runtime; deferring the loader. This departs from the CLAUDE.md
+  stack table (Archive: `clickhouse-connect`) **for the loader only**. The wave 3 archiver's client was
+  left open here and was decided by the human on 2026-09-28 (next entry).
+- **`certifi` (MPL-2.0) in the runtime, HUMAN-APPROVED 2026-09-28** as its own decision. It is **not**
+  an extension of the 2026-09-23 dev-only `certifi` approval, nor of the 2026-09-25 loader decision.
+  The human chose `clickhouse-connect` (Apache-2.0) as the wave 3 archiver's ClickHouse client when
+  asked directly by the lead, over building the archiver on the loader's stdlib HTTP client.
+  **Scope:** unmodified `certifi`, in the runtime, only as a dependency of `clickhouse-connect` in the
+  archiver package. Any other package or path pulling it into the runtime, or a modified or vendored
+  copy, needs a fresh decision. **The `clickhouse` loader is unchanged:** it keeps its stdlib HTTP
+  client, and `tributary-loaders` must not gain `certifi` in its runtime closure.
+  **Conditions:** (1) `clickhouse-connect`'s silent retries are turned off, both `query_retries` and
+  its internal HTTP retries, so the runtime's retry policy is the only retry; (2) the archiver passes
+  the same `code-reviewer` and `security-reviewer` review as the loaders, including the library-default
+  checks of `wave-2.md` 6.3. **Follow-up (wave 3, when the archiver package is created):**
+  `devops-engineer` extends `MPL_APPROVED` in `.github/scripts/licence_check.py` to cover `certifi`'s
+  runtime scope. Until then the checker still treats `certifi` as non-runtime only, which is correct.
+  The CLAUDE.md stack-table line was updated by the lead on `wave/1-2`.
+- **`botocore` in the runtime, HUMAN-APPROVED 2026-09-29** (asked directly by the lead), as **its own
+  decision**. It is **not** an extension of the archiver's 2026-09-28 runtime `certifi` approval, or of
+  any other entry above. **Scope:** unmodified `botocore`, as a runtime dependency of the `s3` loader in
+  `tributary-loaders` only. The approval includes its **bundled, unmodified `cacert.pem`**, which is
+  Mozilla CA data under MPL-2.0 shipped inside a package whose metadata declares Apache-2.0. Any other
+  package or path bringing `botocore` into the runtime, or a modified or vendored copy, needs a fresh
+  decision. **Condition:** the loader keeps preferring the OS CA file, and the bundled file is only
+  botocore's own fallback. **How it was found:** `security-reviewer`, not `licence_check.py`. The
+  checker reads package metadata, not bundled files, so a package declaring Apache-2.0 that carries
+  MPL data passes it. That is another instance of the pattern above: a licence claim is only as good
+  as the mechanism that produced it. **Follow-up, `devops-engineer`:** extend `MPL_APPROVED` in
+  `.github/scripts/licence_check.py` to record this runtime scope. Note that an entry keyed on
+  `botocore`'s metadata is never consulted, because the MPL branch runs only on an MPL expression. The
+  record has to be a bundled-file check, scoped like `LGPL_APPROVED`'s `importers_of`, that fails if
+  `botocore` enters the runtime closure through any other workspace member. The owner chooses the
+  mechanism.
+- **MinIO (AGPL-3.0) as a test-only container image, HUMAN DECISION 2026-09-29** (asked directly by
+  the lead). It is **allowed** as the S3-compatible server that the `s3` loader's integration and
+  redelivery tests start through testcontainers. It is an image the tests run, not a Python dependency,
+  and it is never linked or distributed. **It must never appear in Compose, Helm or any shipped
+  artefact.** Where this ADR and the contracts say "S3/MinIO" or "the MinIO equivalent", they mean an
+  S3-compatible store that an operator supplies and the `endpoint` field points at, not something
+  Tributary ships. A lite-profile object store, if one is ever needed, requires a permissively licensed
+  image and a fresh decision.
 - **How this one nearly passed unnoticed, which is the reusable part.** The root manifest annotates
   `"testcontainers[kafka]>=4.8",  # Apache-2.0`. That comment is *correct about testcontainers itself*
   and says nothing about its transitive closure, so it reads as a clearance while clearing nothing —
@@ -418,6 +491,8 @@ Some integrations need the sender to wait for a downstream result (query/respons
 
 This costs latency and adds a failure mode, so it is opt-in per channel. Default is asynchronous ACK-after-commit.
 
+**Refined 2026-09-28 (W2-8, ADR-003 D10):** step 1's "subscribes for that id" is implemented as **targeted** routing, not broadcast. Each receiver process holds reply partitions through the `replier` consumer group and names one in `tb-reply-partition`; the worker produces the reply to that partition. The answer semantics (`AA` / `AE` / `AR`) and the spec shape are in `contracts/channel-spec/v0` 3.2.6.
+
 ### 6.6 Storage and data model
 
 **PostgreSQL (control plane):** tenants, users, roles, role bindings, channels, channel versions (spec plus bundle digest), deployments (environment, version, status), alert rules, code/KV entries, API tokens, secret references. Migrations with Alembic.
@@ -459,7 +534,9 @@ TTL toDateTime(ts) + INTERVAL 90 DAY;
 
 **Searching without storing PHI in clear text:** searchable identifiers (for example MRN) are stored as keyed hashes (HMAC) in `attrs`; the message browser hashes the search term with the same key. Content can be envelope-encrypted with a key from Vault Transit or a cloud KMS.
 
-**Object storage (S3/MinIO):** claim-check payloads and optional long-term content archive.
+**Object storage (S3/MinIO):** claim-check payloads and optional long-term content archive. The
+object store is operator-supplied: MinIO (AGPL-3.0) is never shipped in Compose or Helm (section 2.3,
+2026-09-29).
 
 ### 6.7 API design
 
@@ -477,6 +554,8 @@ REST with OpenAPI (FastAPI) as the primary API, gRPC optional later for the data
 | `GET /v1/events` (SSE) | Live event stream for the UI |
 
 Later: an optional Mirth-REST-compatible shim so that existing CI and tooling that talks to Mirth's API can be pointed at the new engine.
+
+**Superseded in detail 2026-10-05 (set 1.8):** the table above is illustrative. The contract is `contracts/openapi/v0`, which models deploy, rollback and undeploy per environment (`/v1/environments/{env}/channels/{channel}/deploy`) rather than as `:verb` methods on a channel, and puts validation at `POST /v1/validate`. Authentication is ADR-009 (OIDC bearer, resource server).
 
 ### 6.8 Web UI
 
@@ -546,7 +625,7 @@ Rows marked **measured** were exercised in Phase 0; the rest remain design inten
 | Poison message | Retry in place, then DLQ with context; ordered channels can be configured to halt instead | **measured (S5):** exactly 8 of 8 dead-lettered, partition kept moving; `halt-partition` verified as the ordered alternative |
 | Transactional stage killed with a transaction open | Successor fences the dead producer, aborts the transaction, input offsets roll back | **measured (S5):** 50 records proven inside an open transaction at the kill; after restart, 2,000 records with 0 duplicates and 0 losses |
 | Destination outage | Backoff or circuit breaker; lag grows and alerts fire; other destinations unaffected | **partly measured (S5):** 598 blocking pause/seek/resume cycles, 0 loss, 0 skips. Outages of seconds only; a multi-minute outage against `max.poll.interval.ms` is untested |
-| Synchronous reply worker crash | Requests in flight time out; the receiver returns a NACK | **measured (S3, stand-in worker):** 5 to 6 s stall, 0 lost, no reply delivered to the wrong request. **The timed-out requests were already committed**, so a sender retry duplicates them downstream — sync mode requires loader idempotency on `tb-msg-id` and the timeout NACK means "committed, outcome unknown" |
+| Synchronous reply worker crash | Requests in flight time out; the receiver returns a NACK | **measured (S3, stand-in worker):** 5 to 6 s stall, 0 lost, no reply delivered to the wrong request. **The timed-out requests were already committed**, so a sender retry duplicates them downstream, and the timeout NACK means "committed, outcome unknown". The retry carries a **new** `tb-msg-id`, so loader idempotency on `tb-msg-id` does not absorb it; only a business-identifier sink or edge dedupe does (ADR-003 D9, amended 2026-09-28) |
 | ClickHouse or archiver down | Processing unaffected; archiver catches up from Kafka within retention | not measured |
 | PostgreSQL or API down | Data plane keeps running from compacted channel specs; deploys and UI edits unavailable | not measured |
 | Bad deploy | Roll back to previous digest; replay affected range from `raw` | not measured |
@@ -563,7 +642,7 @@ Rows marked **measured** were exercised in Phase 0; the rest remain design inten
 
 ## 8. Security and Compliance
 
-- **Transport:** TLS for all listeners (MLLP over TLS), mTLS or SASL/SCRAM plus ACLs on Kafka, per-channel topic ACLs.
+- **Transport:** TLS for all listeners (MLLP over TLS), mTLS or SASL/SCRAM plus ACLs on Kafka, per-channel topic ACLs. Every data-plane process reads its engine Kafka connection and credentials from one `engine-kafka/v0` document and refuses PLAINTEXT to any non-loopback broker, the lite Compose stack included (ADR-008, 2026-09-29). An mTLS listener can restrict which client certificates it accepts by SAN (ADR-007 D18).
 - **AuthN/Z:** OIDC (Keycloak or similar); roles `admin`, `developer`, `operator`, `auditor`, `viewer`; channel-level scopes; API tokens with scopes and expiry.
 - **Secrets:** Vault or Kubernetes external secrets; never in specs; only `secretRef`.
 - **PHI protection:** field-level or payload envelope encryption in the archive; keyed-hash search index; log scrubbing; configurable masking in the message browser.
@@ -696,7 +775,7 @@ bold; the full version with ratings is `docs/spikes/PHASE-0-DECISION.md` section
 | Contributor fragmentation with OIE | Medium | Medium | none | Open dialogue, interoperability, importer targeting OIE |
 | Security incident from arbitrary Python steps | Low to medium | High | none | Trust model, container isolation, signed bundles, review gates |
 | **Receiver-wide stall on a single broker loss** | **Medium** | **Medium** | **S2: 7.5 to 12.7 s across all connections, 20/20 trials; cause inferred** | **Per-connection head-of-line isolation; broker session and election tuning** |
-| **Sync-reply duplicates after a timeout NACK** | **High** | **Medium** | **S3: 1,026 of 9,000 requests timed out, all already committed** | **Loader idempotency on `tb-msg-id`; document `AE` as "committed, outcome unknown"** |
+| **Sync-reply duplicates after a timeout NACK** | **High** | **Medium** | **S3: 1,026 of 9,000 requests timed out, all already committed** | **Document `AE` as "committed, a resend duplicates" (channel-spec 3.2.6); business-identifier idempotency at the sink; edge dedupe (ADR-003 D8, deferred). `tb-msg-id` idempotency covers worker replays only: a resend has a new id (ADR-003 D9 as amended 2026-09-28)** |
 | **ACK latency target unverified on production-like hardware** | **High** | **Medium** | **S2: p99 33 to 125 ms at 1k msg/s against a 50 ms threshold; a bare producer with no MLLP had p99 131 ms on the same cluster** | **Linux re-run with a dedicated cluster before any sizing or marketing claim** |
 | **Untested mechanisms carried forward** (`retry-topic` delay tiers, claim-check) | **Medium** | **Medium** | **none — neither was exercised in Phase 0** | **Spike both before implementing; claim-check is the largest single PHI store in the design** |
 

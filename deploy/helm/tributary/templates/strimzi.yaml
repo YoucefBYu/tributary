@@ -1,0 +1,49 @@
+{{- if .Values.strimzi.enabled }}
+{{- $s := .Values.strimzi }}
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaNodePool
+metadata:
+  name: {{ $s.name }}
+  labels:
+    strimzi.io/cluster: {{ $s.name }}
+    {{- include "tb.labels" . | nindent 4 }}
+spec:
+  replicas: {{ $s.replicas }}
+  roles: [controller, broker]
+  storage:
+    type: jbod
+    volumes:
+      - id: 0
+        type: persistent-claim
+        size: {{ $s.storage.size }}
+        {{- if $s.storage.className }}
+        class: {{ $s.storage.className }}
+        {{- end }}
+        deleteClaim: false
+  resources: {{- toYaml $s.resources | nindent 4 }}
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: Kafka
+metadata:
+  name: {{ $s.name }}
+  labels: {{- include "tb.labels" . | nindent 4 }}
+  annotations:
+    strimzi.io/node-pools: enabled
+    strimzi.io/kraft: enabled
+spec:
+  kafka:
+    version: {{ $s.kafkaVersion | quote }}
+    listeners:
+      - name: tls
+        port: 9093
+        type: internal
+        tls: true
+        authentication: {type: scram-sha-512}
+    authorization: {type: simple}
+    config: {{- toYaml $s.config | nindent 6 }}
+    rack: {topologyKey: topology.kubernetes.io/zone}
+  entityOperator:
+    topicOperator: {}
+    userOperator: {}
+{{- end }}

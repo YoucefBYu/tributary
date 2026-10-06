@@ -1,0 +1,169 @@
+# Tributary chart values. No image is published yet (W3-13 gates that): override image.registry/tag
+# (and prefer image.digests) for your own build. Secrets are never values: every credential is a
+# secretRef, mounted as a directory under /var/run/secrets/tributary (TB_SECRETS_DIR layout).
+env: prod                      # the topic-name env segment
+
+image:
+  registry: tributary          # e.g. registry.example.com/tributary
+  tag: 0.0.0-unpublished
+  pullPolicy: IfNotPresent
+  # Optional per-component digest (sha256:...); wins over the tag when set.
+  digests:
+    receivers: ""
+    runtime: ""
+    loaders: ""
+    archiver: ""
+
+# Engine-to-Kafka connection (engine-kafka/v0), rendered to a ConfigMap per role. SCRAM secrets are
+# Strimzi KafkaUser secrets (or your own) named in secretRef; they hold no value in this chart.
+kafka:
+  bootstrapServers: ["tributary-kafka-bootstrap:9093"]
+  saslMechanism: SCRAM-SHA-512
+  caSecretRef: tributary-kafka-ca
+  roleSecretRefs:              # one secretRef per role (kafka role model, ADR-004)
+    receiver: tb-receiver
+    worker: tb-worker
+    loader: tb-loader
+    archiver: tb-archiver
+
+# One entry per channel. The channel spec itself is read from the compacted _tb.<env>.channels topic
+# (invariant 3), not from this chart.
+channels: []
+#  - name: adt-passthrough
+#    receiver: {module: tributary.receivers.mllp, port: 6661, replicas: 2}
+#    worker:   {replicas: 2}
+#    destinations:
+#      - {name: http-stub, module: tributary.loaders.http, replicas: 2}
+
+receiver:
+  opsPort: 9180
+  resources: {requests: {cpu: 100m, memory: 128Mi}, limits: {memory: 512Mi}}
+  probes:
+    readiness: {periodSeconds: 5, failureThreshold: 3, timeoutSeconds: 2}
+    liveness: {initialDelaySeconds: 10, periodSeconds: 10, failureThreshold: 3, timeoutSeconds: 2}
+    startup: {periodSeconds: 5, failureThreshold: 60}   # warm-producer-before-ready can take a while
+worker:
+  resources: {requests: {cpu: 200m, memory: 256Mi}, limits: {memory: 1Gi}}
+loader:
+  resources: {requests: {cpu: 100m, memory: 128Mi}, limits: {memory: 512Mi}}
+
+archiver:
+  enabled: true
+  replicas: 1
+  ttlDays: 365
+  # Runtime credential is INSERT-only (ADR-004 A5); DDL runs in the migrate Job with its own secret.
+  clickhouse:
+    host: clickhouse
+    port: 8443
+    database: tributary
+    secure: true
+    secretRef: tb-archive-clickhouse           # INSERT-only runtime credential
+    migrateSecretRef: tb-archive-clickhouse-migrate   # CREATE/ALTER, used only by the migrate Job
+    caCertSecretRef: ""                          # optional Secret holding the CA bundle
+    caCertSecretKey: ca.crt                      # key in that Secret; mounted, path passed as TB_ARCHIVE_CLICKHOUSE_CA_CERT
+  resources: {requests: {cpu: 200m, memory: 256Mi}, limits: {memory: 1Gi}}
+  migrate:
+    enabled: true
+    backoffLimit: 2
+    activeDeadlineSeconds: 300
+
+networkPolicy:
+  enabled: true
+  # Node or kubelet source CIDR allowed to reach the receiver ops port (9180). REQUIRED: the ops
+  # listener binds the pod IP so kubelet can probe it, which makes it reachable by anything that can
+  # route to the pod; this CIDR is the only non-collector ingress on that port.
+  kubeletCIDR: ""        # must be node-sized: IPv4 /16 or longer, IPv6 /48 or longer; /0 is rejected
+  # Explicit opt-out. With networkPolicy.enabled=false and receivers present the render FAILS unless this
+  # is true, because the ops listener binds the pod IP. Only set it when your CNI policy does the same job.
+  allowUnprotectedOpsPort: false
+  # Namespace default-deny (ingress and egress) plus per-component egress allow-lists. Kafka, ClickHouse
+  # and destination peers are deployment-specific, so the defaults allow DNS only: set these.
+  defaultDeny: true
+  egress:
+    common: []           # rules for every data-plane component, typically the Kafka brokers
+    receiver: []
+    worker: []
+    loader: []           # destinations (HTTP, FHIR, SFTP, ...)
+    archiver: []         # ClickHouse
+    otel: []             # an OTLP trace backend, if otel.otlpEndpointExporter is set
+    # Each entry is a raw NetworkPolicy egress rule, e.g.
+    #   - {to: [{podSelector: {matchLabels: {strimzi.io/cluster: tributary}}}], ports: [{protocol: TCP, port: 9093}]}  # Peers allowed to reach each receiver's ingest port. Empty means ingest is denied (default-deny).
+  ingestFrom: []
+  #  - ipBlock: {cidr: 10.20.0.0/16}
+  #  - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: ingress-nginx}}
+
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+
+securityContext:               # pod level; containers are non-root, read-only, no capabilities
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+
+# Contracts mounted from a ConfigMap you create from contracts/ (worker, loader and receiver read
+# topic-defaults.json via TB_CONTRACTS_DIR). Create it with:
+#   kubectl create configmap tributary-contracts --from-file=topic-defaults.json=contracts/topics/v0/topic-defaults.json
+contractsConfigMap: tributary-contracts
+
+keda:
+  enabled: true
+  lagThreshold: "1000"
+  minReplicaCount: 1
+  maxReplicaCount: 10
+  pollingInterval: 15
+  cooldownPeriod: 300
+  # TriggerAuthentication reads SCRAM credentials from this Secret (keys: sasl, username, password, ca).
+  authSecretRef: tb-keda-kafka
+
+# Strimzi Kafka (KRaft). Needs the Strimzi operator installed; the chart renders the CR only.
+strimzi:
+  enabled: false
+  name: tributary
+  kafkaVersion: "4.0.0"
+  replicas: 3
+  storage: {size: 100Gi, className: ""}
+  config:
+    default.replication.factor: 3
+    min.insync.replicas: 2
+    offsets.topic.replication.factor: 3
+    transaction.state.log.replication.factor: 3
+    transaction.state.log.min.isr: 2
+    auto.create.topics.enable: false
+  resources: {requests: {cpu: "1", memory: 4Gi}, limits: {memory: 4Gi}}
+
+otel:
+  enabled: true
+  # TODO(devops): pin by digest (repo@sha256:...) once resolved from the registry; the tag is not immutable.
+  image: otel/opentelemetry-collector-contrib:0.111.0
+  replicas: 1
+  otlpEndpointExporter: ""     # optional OTLP exporter target for traces; empty disables
+  resources: {requests: {cpu: 100m, memory: 128Mi}, limits: {memory: 512Mi}}
+
+monitoring:
+  # Peers allowed to scrape the collector on :8889 (NetworkPolicy peers). Required while
+  # networkPolicy.enabled and otel.enabled.
+  prometheusFrom: []
+  #  - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: monitoring}}
+  #    podSelector: {matchLabels: {app.kubernetes.io/name: prometheus}}
+  prometheusRule: {enabled: true, labels: {}}
+  dashboards: {enabled: true, labelKey: grafana_dashboard, labelValue: "1"}
+  # Consumer lag comes from a Kafka exporter, not from Tributary (metrics.json note). Metric name
+  # of the lag gauge your exporter exposes:
+  lagMetric: kafka_consumergroup_lag
+
+# Optional ingress for HTTP receivers. ADR-009 D1: access logs carry no query string and no
+# Authorization header. The log-format ConfigMap this renders is a SEPARATE object, not applied to the
+# controller. The controller is not owned by this chart: merge its data keys into the controller's own
+# config (ingress-nginx Helm value `controller.config`): log-format-upstream (uses $uri, never $request,
+# $request_uri, $args, $query_string or $http_authorization), log-format-escape-json, and
+# error-log-path /dev/null with error-log-level crit, because nginx's error log prints the request line
+# including the query string. TLS is required: a bearer token must not cross the network in clear.
+ingress:
+  enabled: false
+  className: nginx
+  host: ""
+  channel: ""                  # the channel whose receiver the Ingress routes to
+  tlsSecretName: ""            # required when enabled
+  logFormat:
+    enabled: false

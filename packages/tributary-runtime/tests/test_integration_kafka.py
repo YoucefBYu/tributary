@@ -24,6 +24,7 @@ import os
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from collections.abc import Iterator
@@ -375,8 +376,8 @@ def test_an_undecodable_record_is_quarantined_to_the_dlq_with_a_record_event(
 
 WORKER_PROGRAM = """
 import os
-from tributary.runtime.clients import KafkaSettings
 from tributary.runtime.config import load_topic_defaults
+from tributary.runtime.engine_kafka import load_engine_kafka
 from tributary.runtime.worker import PipelineWorker, WorkerSettings
 from tributary.sdk import step
 
@@ -388,7 +389,7 @@ worker = PipelineWorker(
     settings=WorkerSettings(
         env=os.environ["TB_ENV"],
         channel=os.environ["TB_CHANNEL"],
-        kafka=KafkaSettings(bootstrap_servers=os.environ["TB_BOOTSTRAP_SERVERS"]),
+        kafka=load_engine_kafka(),
         instance_id=os.environ["TB_INSTANCE_ID"],
         poll_timeout_s=0.1,
     ),
@@ -401,12 +402,28 @@ worker.run()
 
 
 def spawn_worker(bootstrap: str, instance_id: str) -> subprocess.Popen[bytes]:
-    """A worker in its own process, so it can be killed rather than asked politely to stop."""
+    """A worker in its own process, so it can be killed rather than asked politely to stop.
+
+    Its link comes from an `engine-kafka/v0` document, as a deployed worker's does (ADR-008): PLAINTEXT is
+    valid here only because the testcontainers broker is advertised on 127.0.0.1.
+    """
+    document = Path(tempfile.mkdtemp(prefix="tb-engine-kafka-")) / "engine-kafka.json"
+    document.write_text(
+        json.dumps(
+            {
+                "apiVersion": "tributary.dev/v1",
+                "kind": "EngineKafkaConnection",
+                "bootstrapServers": [bootstrap],
+                "security": {"protocol": "PLAINTEXT"},
+            }
+        ),
+        encoding="utf-8",
+    )
     environment = {
-        **os.environ,
+        **{name: value for name, value in os.environ.items() if name != "TB_BOOTSTRAP_SERVERS"},
         "TB_ENV": ENV,
         "TB_CHANNEL": CHANNEL,
-        "TB_BOOTSTRAP_SERVERS": bootstrap,
+        "TB_ENGINE_KAFKA_FILE": str(document),
         "TB_INSTANCE_ID": instance_id,
         "TB_LOG_LEVEL": "warning",
     }

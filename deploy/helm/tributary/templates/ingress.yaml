@@ -1,0 +1,51 @@
+{{- if .Values.ingress.enabled }}
+{{- $host := required "ingress.host is required when ingress.enabled" .Values.ingress.host }}
+{{- $chn := required "ingress.channel is required when ingress.enabled" .Values.ingress.channel }}
+{{- $_ := required "ingress.tlsSecretName is required when ingress.enabled (bearer tokens must not cross the network in clear)" .Values.ingress.tlsSecretName }}
+{{- $port := 0 }}
+{{- range .Values.channels }}{{ if eq .name $chn }}{{ $port = .receiver.port }}{{ end }}{{ end }}
+{{- if eq (int $port) 0 }}{{ fail "ingress.channel names no entry in channels" }}{{ end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "tb.name" . }}-{{ $chn }}
+  labels: {{- include "tb.labels" . | nindent 4 }}
+  annotations:
+    # ADR-009 D1: this Ingress's access log is off; the controller-wide format (ingress-log-format
+    # ConfigMap below) carries no query string and no Authorization header either way.
+    nginx.ingress.kubernetes.io/enable-access-log: "false"
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  tls:
+    - hosts: [{{ $host | quote }}]
+      secretName: {{ .Values.ingress.tlsSecretName }}
+  rules:
+    - host: {{ $host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "tb.name" . }}-{{ $chn }}-receiver
+                port: {number: {{ $port }}}
+{{- if .Values.ingress.logFormat.enabled }}
+---
+# A separate object: NOT applied to the controller. Merge `data` into the ingress-nginx controller config
+# (controller.config in its Helm chart); the controller is controller-wide and not owned by this chart. $uri is the normalised path WITHOUT the query string; $request, $request_uri,
+# $args, $query_string and $http_authorization must never appear in a Tributary proxy log format.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "tb.name" . }}-ingress-log-format
+  labels: {{- include "tb.labels" . | nindent 4 }}
+data:
+  log-format-escape-json: "true"
+  # nginx's error log prints the request line, query string included.
+  error-log-path: /dev/null
+  error-log-level: crit
+  log-format-upstream: >-
+    {"time":"$time_iso8601","remote_addr":"$remote_addr","method":"$request_method","path":"$uri","status":$status,"bytes":$body_bytes_sent,"request_time":$request_time,"request_id":"$req_id"}
+{{- end }}
+{{- end }}

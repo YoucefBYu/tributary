@@ -1,0 +1,6 @@
+{
+  "type": "about:blank",
+  "title": "Kafka error",
+  "status": 503,
+  "code": "KafkaException"
+}

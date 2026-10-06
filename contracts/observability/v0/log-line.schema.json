@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tributary.dev/contracts/observability/v0/log-line.schema.json",
+  "title": "Tributary structured log line, v0",
+  "description": "One JSON object per line on stderr, as written by tributary.runtime.logs.JsonLogger. See README.md section 4. Field names are snake_case codes; values are scalars, bounded, single-line. A field name that denotes a direct identifier or carries content is refused (invariant 6). This RAISES THE COST of logging PHI; it does not make it impossible, so code review and security-reviewer remain the control.",
+  "type": "object",
+  "required": ["ts", "level", "event", "component"],
+  "maxProperties": 32,
+  "propertyNames": {
+    "allOf": [
+      { "pattern": "^[a-z][a-z0-9_]{0,31}$" },
+      {
+        "$comment": "Direct identifiers: byte-for-byte the events/v0 attrs deny-list and tributary.sdk.guards.IDENTIFIER_NAMES.",
+        "not": {
+          "enum": [
+            "mrn", "pid", "patient", "patient_id", "patientid", "patient_name", "name", "family_name", "given_name",
+            "surname", "first_name", "last_name", "dob", "birth_date", "birthdate", "ssn", "nhs_number",
+            "insurance_number", "account", "account_number", "visit_number", "encounter_id", "accession",
+            "accession_number", "address", "street", "postcode", "zip", "phone", "telephone", "email", "identifier",
+            "key", "message_key", "partition_key"
+          ]
+        }
+      },
+      {
+        "$comment": "Content and free-text carriers (new in observability/v0). Exception text quotes the offending field value; a payload or body is PHI by default.",
+        "not": {
+          "enum": [
+            "payload", "body", "content", "raw", "message", "msg", "text", "segment", "headers",
+            "traceback", "stack", "stack_trace", "exc_info", "exception", "exc_text",
+            "query", "query_string", "sql"
+          ]
+        }
+      }
+    ]
+  },
+  "properties": {
+    "ts": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$"
+    },
+    "level": { "enum": ["debug", "info", "warning", "error"] },
+    "event": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$" },
+    "component": { "type": "string", "pattern": "^[a-z][a-z0-9_-]{0,31}$" },
+    "channel": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,63}$" },
+    "channel_version": { "type": "integer", "minimum": 0 },
+    "destination": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,63}$" },
+    "message_id": { "$ref": "#/$defs/uuid" },
+    "parent_id": { "$ref": "#/$defs/uuid" },
+    "correlation_id": { "$ref": "#/$defs/uuid" },
+    "tb_msg_id": { "$ref": "#/$defs/uuid", "$comment": "DEPRECATED alias of message_id (receivers, wave 2). Accepted in v0; new code writes message_id." },
+    "msg_id": { "$ref": "#/$defs/uuid", "$comment": "DEPRECATED alias of message_id (receivers/reply, wave 2). Accepted in v0; new code writes message_id." },
+    "error_code": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]{0,63}$" },
+    "error": {
+      "type": "string",
+      "pattern": "^[A-Za-z_][A-Za-z0-9_.]{0,127}$",
+      "$comment": "An exception CLASS name (safe_token(type(exc).__name__)), never str(exc)."
+    },
+    "ready": { "type": "boolean" },
+    "instance": { "type": "string", "minLength": 1, "maxLength": 253, "pattern": "^[^\\r\\n]*$" },
+    "trace_id": { "type": "string", "pattern": "^(?![0]{32})[0-9a-f]{32}$" },
+    "span_id": { "type": "string", "pattern": "^(?![0]{16})[0-9a-f]{16}$" }
+  },
+  "additionalProperties": {
+    "type": ["string", "integer", "number", "boolean", "null"],
+    "maxLength": 256,
+    "pattern": "^[^\\r\\n]*$",
+    "$comment": "Scalars only, at most 256 characters, no CR or LF (a newline forges a second log line). Same rules as tributary.sdk.guards.validate_log_field."
+  },
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    }
+  }
+}

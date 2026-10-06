@@ -38,10 +38,18 @@
       "Bash(python *)",
       "Bash(echo *)",
       "Bash(find *)",
-      "Bash(grep *)"
+      "Bash(grep *)",
+      "Bash(git push -u origin wave/*)",
+      "Bash(git push origin wave/*)"
     ],
     "deny": [
-      "Bash(git push*)",
+      "Bash(git push --force*)",
+      "Bash(git push -f*)",
+      "Bash(git push * --force*)",
+      "Bash(git push * -f*)",
+      "Bash(git push *+*)",
+      "Bash(git push * --delete*)",
+      "Bash(git push * --mirror*)",
       "Bash(git reset --hard*)",
       "Bash(git clean *)",
       "Bash(git rebase*)",

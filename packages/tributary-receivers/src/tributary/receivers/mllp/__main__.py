@@ -1,4 +1,4 @@
-"""`python -m tributary.receivers.mllp --channel-spec <path> --env <env> --bootstrap <hosts>`."""
+"""`python -m tributary.receivers.mllp --channel-spec <path> --env <env>`."""
 
 from .server import main
 

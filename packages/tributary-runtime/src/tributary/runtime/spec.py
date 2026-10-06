@@ -19,12 +19,22 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Literal
 
+from .capabilities import CAPABILITIES, NAME_PATTERN
 from .errors import ChannelSpecError, safe_token
+from .step_namespaces import (
+    DISTRIBUTION_MAX_LENGTH,
+    DISTRIBUTION_PATTERN,
+    NAMESPACE_MAX_LENGTH,
+    NAMESPACE_PATTERN,
+    is_reserved,
+)
 from .topics import CHANNEL, DESTINATION
 
 Ordering = Literal["per-key", "none"]
+ReplyBodyMode = Literal["ack", "step"]
 OnExhaust = Literal["halt-partition", "dlq-and-continue"]
 
 #: ADR-003 D4: a step exception is retried in place a small number of times, then dead-lettered.
@@ -59,15 +69,6 @@ class Idempotency:
 
 
 @dataclass(frozen=True, slots=True)
-class Destination:
-    name: str
-    type: str
-    params: Mapping[str, Any]
-    idempotency: Idempotency
-    retry: RetryPolicy
-
-
-@dataclass(frozen=True, slots=True)
 class StepRef:
     """A step to load: exactly one of `uses` (entry point) or `ref` (dotted path in the bundle)."""
 
@@ -78,11 +79,29 @@ class StepRef:
 
 
 @dataclass(frozen=True, slots=True)
+class Destination:
+    name: str
+    type: str
+    params: Mapping[str, Any]
+    idempotency: Idempotency
+    retry: RetryPolicy
+    #: Set 1.1 (README 3.5): steps run for this destination only, in the pipeline worker, before the
+    #: record is produced to `out.<dest>`. Empty means the destination gets the pipeline output as is.
+    steps: tuple[StepRef, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class Pipeline:
     bundle: str
     steps: tuple[StepRef, ...]
     step_retries: int = DEFAULT_STEP_RETRIES
     transactional: bool = False
+    #: `pipeline.context` (set 1.5, README 3.3.4): registered capability names, sorted, no duplicates.
+    #: Empty when absent. Only these `tributary.context` extensions are loaded (`extensions.py`).
+    context: tuple[str, ...] = ()
+    #: `pipeline.stepNamespaces` (set 1.6, README 3.3.5 N3): non-engine namespace -> the one distribution
+    #: (PEP 503 normalised) that may supply its `uses` steps. Empty when absent: engine namespaces only.
+    step_namespaces: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,6 +126,30 @@ class ChannelSpec:
     @property
     def ordered(self) -> bool:
         return self.ordering == "per-key"
+
+    @property
+    def source_type(self) -> str | None:
+        kind = self.source.get("type")
+        return kind if isinstance(kind, str) else None
+
+    @property
+    def sync_reply(self) -> bool:
+        """True when `source.reply` is present: its presence alone switches sync mode on (README 3.2.6).
+
+        The worker does not use this to decide **whether** to reply — the consumed record decides, by
+        carrying `tb-reply-partition` — only to refuse a spec that cannot reply at load.
+        """
+        return isinstance(self.source.get("reply"), dict)
+
+    @property
+    def reply_body(self) -> ReplyBodyMode:
+        """`source.reply.body`: `step` only when the applied spec says so; anything else is `ack`.
+
+        Lenient (section 1.1): an unknown value from a newer control plane means the receiver builds the
+        answer, which is the reading that never needs a body this worker cannot supply.
+        """
+        block = self.source.get("reply")
+        return "step" if isinstance(block, dict) and block.get("body") == "step" else "ack"
 
     @classmethod
     def from_document(cls, document: Any) -> ChannelSpec:
@@ -193,7 +236,64 @@ def _pipeline(channel: str, block: Mapping[str, Any]) -> Pipeline:
         if isinstance(step_retries, int) and not isinstance(step_retries, bool)
         else DEFAULT_STEP_RETRIES,
         transactional=bool(block.get("transactional", False)),
+        context=_context(channel, block),
+        step_namespaces=_step_namespaces(channel, block),
     )
+
+
+def _context(channel: str, block: Mapping[str, Any]) -> tuple[str, ...]:
+    """`pipeline.context`. Not lenient: a capability the runtime cannot satisfy refuses the spec, since
+    dropping it would dead-letter every message on `AttributeError` (context-extension/v0 section 2)."""
+    if "context" not in block:
+        return ()
+    value = block["context"]
+    where = f"channel {safe_token(channel)}: spec.pipeline.context"
+    if not isinstance(value, list) or not value:
+        raise ChannelSpecError(f"{where} must be a non-empty array (omit it for no capabilities)")
+    names: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not NAME_PATTERN.fullmatch(item):
+            raise ChannelSpecError(f"{where} items must be capability names")
+        if item not in CAPABILITIES:
+            raise ChannelSpecError(f"{where} names {safe_token(item)}, which is not a registered capability")
+        if item in names:
+            raise ChannelSpecError(f"{where} names {safe_token(item)} twice")
+        names.append(item)
+    return tuple(sorted(names))  # L4: a set; wrapping order is by name
+
+
+def _step_namespaces(channel: str, block: Mapping[str, Any]) -> Mapping[str, str]:
+    """`pipeline.stepNamespaces`. Not lenient, like `context`: dropping a malformed binding would refuse
+    every customer step later with a less useful error, and a `tributary.*` key is a spec trying to
+    rebind an engine step (README 3.3.5 N2), which is refused however the CLI was bypassed."""
+    if "stepNamespaces" not in block:
+        return MappingProxyType({})
+    value = block["stepNamespaces"]
+    where = f"channel {safe_token(channel)}: spec.pipeline.stepNamespaces"
+    if not isinstance(value, dict) or not value:
+        raise ChannelSpecError(f"{where} must be a non-empty object (omit it for engine namespaces only)")
+    bindings: dict[str, str] = {}
+    for namespace, distribution in value.items():
+        if (
+            not isinstance(namespace, str)
+            or len(namespace) > NAMESPACE_MAX_LENGTH
+            or not NAMESPACE_PATTERN.fullmatch(namespace)
+        ):
+            raise ChannelSpecError(f"{where} keys must be two-segment namespaces such as acme.lab")
+        if is_reserved(namespace):
+            raise ChannelSpecError(
+                f"{where} binds {safe_token(namespace)}: tributary.* namespaces are bound only by the engine registry"
+            )
+        if (
+            not isinstance(distribution, str)
+            or len(distribution) > DISTRIBUTION_MAX_LENGTH
+            or not DISTRIBUTION_PATTERN.fullmatch(distribution)
+        ):
+            raise ChannelSpecError(
+                f"{where} binds {safe_token(namespace)} to a value that is not a PEP 503 normalised distribution name"
+            )
+        bindings[namespace] = distribution
+    return MappingProxyType(bindings)
 
 
 def _step(channel: str, block: Mapping[str, Any]) -> StepRef:
@@ -219,12 +319,21 @@ def _destination(channel: str, block: Any) -> Destination:
     if not DESTINATION.match(name):
         raise ChannelSpecError(f"channel {safe_token(channel)}: destination name {safe_token(name)} is not topic-safe")
     params = block.get("with")
+    steps_block = block.get("steps")
+    if steps_block is not None and not isinstance(steps_block, list):
+        raise ChannelSpecError(f"{safe_token(channel)}/{safe_token(name)}: destination steps must be an array")
+    steps = tuple(_step(channel, item) for item in steps_block or [] if isinstance(item, dict))
+    if steps_block is not None and len(steps) != len(steps_block):
+        # A non-object entry would otherwise vanish, and the destination would run fewer steps than the
+        # author wrote. Lenient means ignoring unknown *fields*, not dropping known ones.
+        raise ChannelSpecError(f"{safe_token(channel)}/{safe_token(name)}: every destination step must be an object")
     return Destination(
         name=name,
         type=_text(block, "type", "destination"),
         params=params if isinstance(params, dict) else {},
         idempotency=_idempotency(channel, name, _object(block, "idempotency")),
         retry=_retry(channel, name, _object(block, "retry")),
+        steps=steps,
     )
 
 

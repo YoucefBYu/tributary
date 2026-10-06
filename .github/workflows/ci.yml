@@ -28,7 +28,12 @@ jobs:
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
         with:
           python-version: "3.12"
-      - run: uv run --no-project --python 3.12 --with jsonschema python contracts/validate.py
+      # Without openapi-spec-validator the default run fails by design (209 passed, 1 failed).
+      - name: contracts validate
+        run: uv run --no-project --python 3.12 --with jsonschema --with openapi-spec-validator python contracts/validate.py
+      # Exits non-zero if any pinned (json_path, validator) pair has drifted from what the schema measures.
+      - name: pinned failure pairs have not drifted
+        run: uv run --no-project --python 3.12 --with jsonschema --with openapi-spec-validator python contracts/validate.py --check-expectations
 
   python:
     name: lint, types, unit tests, conformance
@@ -46,6 +51,13 @@ jobs:
       # Explicit so a contracts/** change can never skip it, even if testpaths change.
       - name: contract conformance
         run: uv run pytest tests/conformance -q
+      # Named so a marker, testpaths or collection change cannot silently drop the sync-reply
+      # property tests.
+      - name: sync-reply property tests
+        run: >
+          uv run pytest -q
+          packages/tributary-receivers/tests/reply/test_properties.py
+          packages/tributary-runtime/tests/test_reply_properties.py
 
   integration:
     name: integration (testcontainers)
@@ -58,8 +70,16 @@ jobs:
           python-version: "3.12"
           enable-cache: true
       - run: uv sync
-      # Exit code 5 means "no tests collected": allowed until the first integration test lands.
-      - run: uv run pytest -m integration || [ $? -eq 5 ]
+      # Collection check first (no Docker needed): the -m integration selection must equal
+      # tests/support/integration_expected.json. Then the run itself: passed == expected count and
+      # skipped == 0, so Docker missing or a skip/deselect cannot pass. The same -m integration selector is
+      # used for both, so chaos tests also marked integration are counted on both sides.
+      - name: integration collection matches expected
+        run: uv run python -m tests.support.integration_expected --check
+      - name: integration tests
+        run: uv run pytest -m integration -ra --junitxml=integration-junit.xml
+      - name: integration passed count equals expected, none skipped
+        run: uv run python .github/scripts/check_integration_counts.py integration-junit.xml
 
   supply-chain:
     name: licence and SBOM, secret scan, gitignore guard
@@ -81,6 +101,19 @@ jobs:
         with:
           name: sbom
           path: sbom.cdx.json
+
+  image-check:
+    # ADR-007 follow-up 18 / D24, W3-13: builds each package image from the repo Dockerfile and runs
+    # .github/scripts/image_env_check.py inside it (no duplicate distribution names, tributary.context and
+    # tributary.* step entry points match the registries), plus a negative control per image. No image is
+    # published until this is green.
+    name: image environment check (duplicates, entry-point registries)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - run: .github/scripts/image_check.sh
 
   ui:
     name: ui lint, typecheck, test

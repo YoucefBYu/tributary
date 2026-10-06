@@ -1,0 +1,36 @@
+[project]
+name = "tributary-content-hl7-fhir"
+version = "0.0.0"
+description = "Reference HL7 v2 to FHIR R4 mapping steps (ADT A01/A03/A08, ORU R01)."
+license = "Apache-2.0"
+requires-python = ">=3.12"
+dependencies = [
+    "tributary-sdk",
+    "tributary-hl7v2",
+    "tributary-fhir",
+    # Declared explicitly (security review, LOW), not left as a transitive pull-in through
+    # tributary-fhir: this package's own source imports fhir.resources.R4B.* directly (adt.py, oru.py,
+    # patient.py, datatypes.py). BSD; version pin matches tributary-fhir's own pyproject.toml.
+    "fhir.resources>=8.0",
+]
+
+# Clean-room: built from the public HL7 v2-to-FHIR Implementation Guide's published mapping pages and
+# concept maps (https://build.fhir.org/ig/HL7/v2-to-fhir/), read for interoperability only (CLAUDE.md
+# invariant 10). No Mirth, OIE or other MPL/GPL-licensed mapping code was read or copied. See
+# `docs/MAPPING.md` for the rule-by-rule citations each golden test references.
+
+[project.entry-points."tributary.steps"]
+"tributary.content_hl7_fhir.adt" = "tributary.content_hl7_fhir.adt:adt_to_fhir"
+"tributary.content_hl7_fhir.oru_r01" = "tributary.content_hl7_fhir.oru:oru_r01_to_fhir"
+
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tributary"]
+
+[tool.uv.sources]
+tributary-sdk = { workspace = true }
+tributary-hl7v2 = { workspace = true }
+tributary-fhir = { workspace = true }

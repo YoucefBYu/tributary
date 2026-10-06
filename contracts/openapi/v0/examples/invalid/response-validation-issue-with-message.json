@@ -1,0 +1,11 @@
+{
+  "valid": false,
+  "errors": [
+    {
+      "json_path": "$.spec.destinations[0].with.url",
+      "validator": "pattern",
+      "message": "'https://primary.example.org/ingest?token=SYNTH' does not match '^https://[^?#]+$'"
+    }
+  ],
+  "warnings": []
+}

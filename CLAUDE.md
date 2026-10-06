@@ -35,7 +35,7 @@ These are non-negotiable. Changing one needs a new ADR approved by a human.
 | Kafka | Apache Kafka 4.x (KRaft), `confluent-kafka`; cooperative-sticky assignor and static membership |
 | Runtime | `asyncio` with `uvloop`, `orjson`, pydantic v2, multi-process workers |
 | Control plane | FastAPI, SQLAlchemy 2, psycopg 3, Alembic, PostgreSQL |
-| Archive | ClickHouse (`clickhouse-connect`), optional S3/MinIO |
+| Archive | ClickHouse (loader: HTTP interface via stdlib, no client library; archiver: `clickhouse-connect`, with `certifi` approved for its runtime use), optional S3/MinIO |
 | Tests | `pytest`, `hypothesis`, `testcontainers`; markers `integration`, `chaos`, `bench` |
 | UI | React, TypeScript, Vite, `pnpm`, API client generated from OpenAPI |
 | Ops | Docker Compose (lite), Helm, Strimzi, KEDA, OpenTelemetry, Prometheus, Grafana |
@@ -46,7 +46,7 @@ Conventions:
 - Every change ships with tests. Bug fixes ship with a regression test.
 - Conventional commits. Commit early and often, and only files you own.
 - In the shared checkout, stay on the current `wave/*` branch and never switch branches. Only in your own git worktree use `agent/<role>/<task-id>`.
-- Never `git push`, force-push or rewrite shared history. A human pushes.
+- The lead pushes the current `wave/*` branch to GitHub (`git push -u origin <branch>`) once lint, format, type check and fast tests pass. Teammates commit but do not push. Never force-push or rewrite shared history.
 
 ## Commands
 

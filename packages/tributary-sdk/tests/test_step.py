@@ -93,17 +93,25 @@ def test_wrong_signatures_are_refused_at_decoration_time(func: object) -> None:
         Step(func)  # type: ignore[arg-type]
 
 
-def test_keyword_only_parameters_need_defaults() -> None:
+def test_a_keyword_only_parameter_without_a_default_is_required_from_with() -> None:
+    """Channel-spec README 3.3 (2026-09-24): no default means "required from `with`", not a bad signature.
+
+    The step still decorates; calling it unbound says what is missing and how to bind it."""
+
     def with_required_kwarg(msg: Message, *, threshold: int) -> None:
         return None
 
-    with pytest.raises(StepDefinitionError):
-        Step(with_required_kwarg)
+    node = Step(with_required_kwarg)
+    assert node.options["threshold"].required is True
+    with pytest.raises(StepDefinitionError, match="threshold"):
+        node(make_message())
+    assert node.bind({"threshold": 2})(make_message()) is not None
 
     def with_defaulted_kwarg(msg: Message, *, threshold: int = 1) -> None:
         return None
 
     assert Step(with_defaulted_kwarg).takes_ctx is False
+    assert Step(with_defaulted_kwarg).options["threshold"].required is False
 
 
 def test_first_argument_must_be_a_message() -> None:

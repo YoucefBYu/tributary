@@ -132,6 +132,22 @@ def test_deliver_transport_error_is_retryable() -> None:
     assert outcome.reason == "transport-error"
 
 
+def test_deliver_tls_verification_error_is_not_retryable() -> None:
+    """Security review, Low: a certificate/hostname verification failure must not retry forever the
+    way a transient transport error does. `tests/http/test_tls_failures.py` proves this classification
+    is actually reachable against a real TLS handshake, not just this injected fake."""
+    from tributary.loaders.http.client import TlsVerificationError
+
+    def raiser(req: Request) -> Response:
+        raise TlsVerificationError("certificate verify failed")
+
+    loader = HttpLoader(make_config(), send=raiser)
+    outcome = asyncio.run(loader.deliver(make_message()))
+    assert outcome.success is False
+    assert outcome.reason == "tls-verify-failed"
+    assert outcome.retryable is False
+
+
 def test_basic_auth_header() -> None:
     seen: list[Request] = []
 

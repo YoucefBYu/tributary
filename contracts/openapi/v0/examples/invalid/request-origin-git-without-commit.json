@@ -1,0 +1,9 @@
+{
+  "document": {
+    "apiVersion": "tributary.dev/v1",
+    "kind": "Channel",
+    "metadata": { "name": "adt-fanout" },
+    "spec": {}
+  },
+  "origin": { "kind": "git", "path": "channels/adt-fanout.yaml" }
+}

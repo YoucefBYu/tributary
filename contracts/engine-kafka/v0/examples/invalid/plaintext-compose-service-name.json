@@ -1,0 +1,6 @@
+{
+  "apiVersion": "tributary.dev/v1",
+  "kind": "EngineKafkaConnection",
+  "bootstrapServers": ["kafka:9092"],
+  "security": { "protocol": "PLAINTEXT" }
+}

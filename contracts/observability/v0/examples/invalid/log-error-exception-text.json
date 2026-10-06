@@ -1,0 +1,9 @@
+{
+  "ts": "2026-10-05T09:14:03.217Z",
+  "level": "error",
+  "event": "step_failed",
+  "component": "worker",
+  "channel": "adt-synth-in",
+  "message_id": "0192f3a4-5b6c-7d8e-9f01-23456789abcd",
+  "error": "ValueError: invalid literal for int() with base 10: 'TRIBUTARY-SYNTH-000123'"
+}

@@ -1,0 +1,73 @@
+{
+  "apiVersion": "tributary.dev/v1",
+  "kind": "Channel",
+  "metadata": {
+    "name": "lab-file-relay",
+    "labels": { "domain": "oru" },
+    "description": "Polls a partner's SFTP drop, archives each file to S3 and relays it to a second SFTP server. Synthetic only."
+  },
+  "spec": {
+    "ordering": "none",
+    "source": {
+      "type": "sftp",
+      "contentType": "application/hl7-v2+er7",
+      "ack": { "mode": "after-commit", "nackOn": ["parse-error"] },
+      "maxMessageBytes": 1000000,
+      "sftp": {
+        "host": "sftp.partner.example.org",
+        "port": 22,
+        "hostKeys": ["SHA256:TRIBUTARYSYNTHfakeHostKeyFingerprint0000000"],
+        "auth": { "type": "private-key", "secretRef": "partner-sftp" },
+        "directory": "/outbound/lab",
+        "filePattern": "*.hl7",
+        "pollIntervalSeconds": 30,
+        "minFileAgeSeconds": 10,
+        "maxFilesPerPoll": 500,
+        "afterCommit": "move",
+        "archiveDirectory": "/outbound/lab/done",
+        "rejectDirectory": "/outbound/lab/rejected"
+      }
+    },
+    "pipeline": {
+      "bundle": "ghcr.io/tributary-synth/lab-integration@sha256:a1b2c3d4e5f60718293a4b5c6d7e8f900a1b2c3d4e5f60718293a4b5c6d7e8f9",
+      "steps": [{ "name": "check", "ref": "lab_flow.checks.reject_non_oru" }]
+    },
+    "destinations": [
+      {
+        "name": "document-archive",
+        "type": "s3",
+        "with": {
+          "bucket": "tributary-synth-lab-archive",
+          "prefix": "lab/results",
+          "region": "us-east-1",
+          "serverSideEncryption": "aws:kms",
+          "kmsKeyId": "alias/tributary-synth-lab",
+          "expectedBucketOwner": "111122223333",
+          "auth": { "type": "ambient" },
+          "fileExtension": ".hl7",
+          "timeoutMs": 10000
+        },
+        "idempotency": { "technique": "deterministic-name" },
+        "retry": { "policy": "blocking", "maxAttempts": 10, "onExhaust": "dlq-and-continue" }
+      },
+      {
+        "name": "partner-relay",
+        "type": "sftp",
+        "with": {
+          "host": "sftp.receiver.example.org",
+          "hostKeys": [
+            "SHA256:TRIBUTARYSYNTHfakeHostKeyFingerprint1111111",
+            "SHA256:TRIBUTARYSYNTHfakeHostKeyFingerprint2222222"
+          ],
+          "auth": { "type": "password", "secretRef": "receiver-sftp" },
+          "directory": "/inbound",
+          "fileNamePrefix": "lab-",
+          "fileExtension": ".hl7",
+          "timeoutMs": 15000
+        },
+        "idempotency": { "technique": "deterministic-name" },
+        "retry": { "policy": "blocking", "maxAttempts": 10, "onExhaust": "halt-partition" }
+      }
+    ]
+  }
+}

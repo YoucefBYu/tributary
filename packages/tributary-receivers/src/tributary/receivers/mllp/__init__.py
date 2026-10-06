@@ -1,6 +1,10 @@
 """MLLP receiver (W1-5): framing, ACK-after-commit publish to `<env>.<channel>.raw`, TLS/mTLS.
 
-    from tributary.receivers.mllp import serve_from_channel_spec
+    python -m tributary.receivers.mllp --channel <name> --env <env>   # spec from _tb.<env>.channels
+
+The channel spec is read from the compacted `_tb.<env>.channels` topic (invariant 3), never from a file:
+`runner.py` is the lifecycle (not ready until a spec is read; live update; tombstone) and `reload.py`
+is the table of which settings apply live and which exit 0 for a supervisor restart.
 
 v0 scope, and what is deliberately not here yet:
 
@@ -26,6 +30,7 @@ v0 scope, and what is deliberately not here yet:
 
 from __future__ import annotations
 
-from .server import MllpServer, MllpSettings, serve_from_channel_spec
+from .runner import MllpRunner
+from .server import MllpServer, MllpSettings
 
-__all__ = ["MllpServer", "MllpSettings", "serve_from_channel_spec"]
+__all__ = ["MllpRunner", "MllpServer", "MllpSettings"]

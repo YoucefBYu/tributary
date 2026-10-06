@@ -1,0 +1,9 @@
+{
+  "document": {
+    "apiVersion": "tributary.dev/v1",
+    "kind": "Channel",
+    "metadata": { "name": "ADT_Fanout" },
+    "spec": {}
+  },
+  "origin": { "kind": "ui" }
+}

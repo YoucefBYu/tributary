@@ -62,14 +62,22 @@ from typing import Literal
 from tributary.sdk import Message
 from tributary.sdk.context import Logger
 
-from ..secrets import SecretResolver
+from ..secrets import SecretResolver, reject_control_characters
 from .circuit_breaker import CircuitBreaker, State
-from .client import Request, Response, TransportError, stdlib_send
+from .client import Request, Response, TlsVerificationError, TransportError, stdlib_send
 from .config import AuthSpec, HttpDestinationConfig
 from .metrics import LoaderMetrics
 
 Reason = Literal[
-    "success", "circuit-open", "timeout", "transport-error", "http-5xx", "http-429", "http-4xx", "http-3xx"
+    "success",
+    "circuit-open",
+    "timeout",
+    "transport-error",
+    "tls-verify-failed",
+    "http-5xx",
+    "http-429",
+    "http-4xx",
+    "http-3xx",
 ]
 
 DEFAULT_MAX_CONCURRENT_REQUESTS = 8
@@ -100,7 +108,7 @@ class DeliveryOutcome:
 
     @property
     def retryable(self) -> bool:
-        return not self.success and self.reason not in ("http-4xx", "http-3xx")
+        return not self.success and self.reason not in ("http-4xx", "http-3xx", "tls-verify-failed")
 
 
 def classify_status(status_code: int) -> Reason:
@@ -123,10 +131,10 @@ def _auth_header(auth: AuthSpec, resolver: SecretResolver) -> tuple[str, str]:
     if auth.type == "basic":
         import base64
 
-        creds = resolver.resolve_text(auth.secret_ref, "credentials")  # "user:pass"
+        creds = reject_control_characters(resolver.resolve_text(auth.secret_ref, "credentials"))  # "user:pass"
         return "Authorization", "Basic " + base64.b64encode(creds.encode("utf-8")).decode("ascii")
     if auth.type == "bearer":
-        token = resolver.resolve_text(auth.secret_ref, "token")
+        token = reject_control_characters(resolver.resolve_text(auth.secret_ref, "token"))
         return "Authorization", f"Bearer {token}"
     raise ValueError(f"unsupported auth type {auth.type!r}")  # config.py already refuses this at load time
 
@@ -218,6 +226,8 @@ class HttpLoader:
             # not "late" and not worth a log line.
             inner.add_done_callback(self._log_late_completion)
             return self._record_failure(msg_id, "timeout")
+        except TlsVerificationError:
+            return self._record_failure(msg_id, "tls-verify-failed")
         except TransportError:
             return self._record_failure(msg_id, "transport-error")
         reason = classify_status(response.status_code)
@@ -240,6 +250,12 @@ class HttpLoader:
             return
         exc = future.exception()
         if exc is not None:
-            self._log.warning("delayed_request_failed", destination=self.config.destination, error=repr(exc))
+            # A fixed reason code only (invariant 6, matching every other failure log in this module):
+            # `repr(exc)` could quote a driver's exception message, which can embed the destination's
+            # URL, a header value or the response body -- exactly the free text this loader's own
+            # error-code family (`ERROR_CODES`) exists to avoid ever logging.
+            self._log.warning(
+                "delayed_request_failed", destination=self.config.destination, error_type=type(exc).__name__
+            )
         else:
             self._log.info("delayed_request_completed", destination=self.config.destination)

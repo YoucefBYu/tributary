@@ -1,0 +1,62 @@
+{
+  "apiVersion": "tributary.dev/v1",
+  "kind": "Channel",
+  "metadata": {
+    "name": "fhir-observation-ingest",
+    "labels": { "domain": "oru", "owner": "integration-team" }
+  },
+  "spec": {
+    "ordering": "per-key",
+    "partitionKey": "json:/subject/reference",
+    "source": {
+      "type": "http",
+      "bind": "0.0.0.0",
+      "port": 8443,
+      "path": "/fhir/ingest",
+      "accept": ["application/fhir+json"],
+      "auth": { "type": "bearer", "secretRef": "fhir-ingest-token" },
+      "tls": { "secretRef": "fhir-ingest-tls", "clientAuth": "none", "minVersion": "1.3" },
+      "ack": { "mode": "after-commit", "nackOn": ["parse-error", "queue-full"], "timeoutMs": 10000 },
+      "maxMessageBytes": 1000000,
+      "queue": { "maxBytes": 67108864 }
+    },
+    "pipeline": {
+      "bundle": "ghcr.io/tributary-synth/fhir-integration@sha256:a1b2c3d4e5f60718293a4b5c6d7e8f900a1b2c3d4e5f60718293a4b5c6d7e8f9",
+      "steps": [{ "name": "validate", "ref": "fhir_flow.checks.validate_observation" }]
+    },
+    "destinations": [
+      {
+        "name": "fhir-server",
+        "type": "fhir",
+        "steps": [{ "name": "to-bundle", "ref": "fhir_flow.mapping.to_transaction_bundle" }],
+        "with": {
+          "url": "https://fhir.example.org/fhir",
+          "fhirVersion": "4.0.1",
+          "interaction": "transaction",
+          "timeoutMs": 8000,
+          "headers": { "Accept": "application/fhir+json" },
+          "auth": { "type": "bearer", "secretRef": "fhir-token" }
+        },
+        "idempotency": { "technique": "conditional-update" },
+        "retry": { "policy": "blocking", "maxAttempts": 10, "onExhaust": "halt-partition" }
+      },
+      {
+        "name": "results-db",
+        "type": "postgresql",
+        "steps": [{ "name": "to-row", "ref": "fhir_flow.mapping.to_observation_row" }],
+        "with": {
+          "host": "db.example.org",
+          "port": 5432,
+          "database": "clinical",
+          "table": "staging.observations",
+          "idColumn": "tb_msg_id",
+          "auth": { "type": "password", "secretRef": "results-db" },
+          "tls": { "mode": "verify-full", "secretRef": "results-db-ca" },
+          "timeoutMs": 5000
+        },
+        "idempotency": { "technique": "sink-native", "note": "INSERT ... ON CONFLICT (tb_msg_id) DO NOTHING" },
+        "retry": { "policy": "blocking", "maxAttempts": 20, "onExhaust": "halt-partition" }
+      }
+    ]
+  }
+}

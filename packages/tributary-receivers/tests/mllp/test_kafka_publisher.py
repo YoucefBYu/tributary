@@ -76,3 +76,52 @@ def test_topic_name_rejects_bad_env(env: str) -> None:
 def test_topic_name_rejects_bad_channel() -> None:
     with pytest.raises(ValueError, match="channel"):
         topic_name("dev", "ADT")
+
+
+def _no_producer(*_a: object, **_k: object) -> object:
+    raise AssertionError("a Producer was built for a refused SSL configuration")
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [{}, {"ssl.certificate.location": "/run/secrets/tls.crt"}, {"ssl.key.location": "/run/secrets/tls.key"}],
+)
+def test_raw_publisher_refuses_server_auth_only_ssl(extra: dict[str, str], monkeypatch: pytest.MonkeyPatch) -> None:
+    from tributary.receivers.mllp.kafka_publisher import RawPublisher
+    from tributary.runtime.clients import KafkaSettings
+    from tributary.runtime.errors import KafkaSecurityError
+    from tributary.runtime.kafka_security import PINNED_CIPHER_SUITES
+
+    monkeypatch.setattr("confluent_kafka.Producer", _no_producer)
+    security = {
+        "security.protocol": "SSL",
+        "enable.ssl.certificate.verification": True,
+        "ssl.endpoint.identification.algorithm": "https",
+        "ssl.cipher.suites": PINNED_CIPHER_SUITES,
+        **extra,
+    }
+    with pytest.raises(KafkaSecurityError) as exc:
+        RawPublisher(KafkaSettings("broker.example:9093", security=security), "dev.c.raw")
+    assert "ssl.certificate.location" in str(exc.value)
+
+
+def test_a_closed_publisher_refuses_later_publishes_and_never_reports_a_commit() -> None:
+    import asyncio
+
+    from tributary.receivers.mllp.kafka_publisher import RawPublisher
+    from tributary.runtime.clients import KafkaSettings
+
+    publisher = RawPublisher(
+        KafkaSettings(bootstrap_servers="127.0.0.1:19"),
+        "dev.c.raw",
+        topic_defaults=None,
+    )
+
+    async def go() -> list[bool]:
+        publisher.start(asyncio.get_running_loop())
+        publisher.close(timeout_s=0.1)
+        publisher.close(timeout_s=0.1)  # idempotent
+        message = build_raw_envelope(channel="c", channel_version=0, source="mllp:i@p", payload=b"x", key=None)
+        return [await publisher.publish(message, timeout_s=0.5)]
+
+    assert asyncio.run(go()) == [False]

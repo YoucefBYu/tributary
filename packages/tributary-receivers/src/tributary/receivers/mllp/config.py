@@ -10,11 +10,10 @@ this wave's receiver cannot yet honour, and it refuses to start rather than sile
 same "specified and quietly not applied" mistake the gate report flagged twice in Phase 0 spike code
 (gate report 6, findings 1 and 2).
 
-There is no `tributary-runtime` yet (W1-4) to consume `_tb.<env>.channels` and hand this receiver its
-spec, so v0's entry point is a JSON file: the published (or, for `ordering: none` walking-skeleton
-channels, the authored) form, loaded with the standard library's `json`. This is a wave-1 stand-in,
-not a contract: once the runtime exists, whatever feeds it a parsed spec `dict` replaces the file read
-in `mllp/server.py`'s `main`, and everything below this line is unchanged.
+The spec arrives as a parsed `tributary.runtime.spec.ChannelSpec` from the live `_tb.<env>.channels`
+reader (`mllp_settings_from_spec`), not from a file: invariant 3 and `mllp/reload.py` (which settings
+apply live and which need a restart). `mllp_settings_from_channel_spec` keeps the published-document
+shape for tests and tools; both share `_settings`.
 """
 
 from __future__ import annotations
@@ -23,8 +22,13 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from tributary.runtime.spec import ChannelSpec
+from tributary.sdk.keys import KeyExpression
+
 from ..backpressure import DEFAULT_MAX_BYTES
 from ..errors import ConfigError
+from ..keys import key_expression_from_spec
+from ..reply.settings import ReplySettings, reply_settings
 from ..tls import TlsSpec
 
 #: `ack.nackOn` conditions this v0 receiver can actually produce. `spec-invalid` is in the contract's
@@ -54,19 +58,40 @@ class MllpSettings:
     queue_max_bytes: int
     queue_max_messages: int | None
     env: str
-    bootstrap_servers: str
     instance: str = "mllp-0"
     idle_timeout_s: float = 60.0
     write_timeout_s: float = 10.0
     max_conns: int = 512
+    tls_handshake_timeout_s: float = 10.0
     conn_pipeline: int = 256
     max_inflight: int = 5000
+    #: `spec.ordering` and, for `per-key`, the parsed `spec.partitionKey` (`tributary.sdk.keys`, the one shared
+    #: evaluator, README 4.3). Fixed for the life of the process: `mllp/reload.py`.
+    ordering: str = "none"
+    partition_key: str | None = None
+    key_expression: KeyExpression | None = None
     linger_ms: int = 5  # matches contracts/topics/v0 clients.receiver_producer.linger.ms
+    #: `source.reply` (README 3.2.6): present means synchronous reply mode. `None` is the async after-commit path.
+    #: Its presence needs a restart (`reload.py`); `timeoutMs`, `maxPending` and `body` apply to the next request.
+    reply: ReplySettings | None = None
     # No delivery_timeout_ms field: that value is `acks`/`enable.idempotence`'s sibling in the
     # topics contract's must_not_hardcode list, and RawPublisher reads it from the contract
     # unconditionally (kafka_publisher.py) rather than accepting it as a parameter here.
 
     def __post_init__(self) -> None:
+        # Every numeric value is checked here, once, so a spec that reaches a *serving* receiver is
+        # refused as a `ConfigError` before anything is applied (a zero `queue.maxBytes` used to reach
+        # `ByteBudget.set_limits` and raise mid-update).
+        if (self.ordering == "per-key") != (self.key_expression is not None):
+            raise ConfigError(f"channel {self.channel!r}: ordering per-key needs a key expression, none forbids one")
+        for name in ("queue_max_bytes", "max_message_bytes"):
+            _positive_int(getattr(self, name), name, self.channel)
+        if self.queue_max_messages is not None:
+            _positive_int(self.queue_max_messages, "queue_max_messages", self.channel)
+        if isinstance(self.port, bool) or not isinstance(self.port, int) or not 0 <= self.port <= 65535:
+            raise ConfigError(f"channel {self.channel!r}: source.port must be an integer in 0..65535")
+        if not isinstance(self.ack_timeout_s, int | float) or self.ack_timeout_s <= 0:
+            raise ConfigError(f"channel {self.channel!r}: source.ack.timeoutMs must be a positive number")
         # A frame under max_message_bytes must always be able to fit the (empty) byte budget on
         # its own, or the first max-size message to arrive would be a ByteBudget.BudgetExceeded
         # crash mid-connection instead of a config error caught at startup. The channel-spec schema
@@ -81,6 +106,11 @@ class MllpSettings:
             )
 
 
+def _positive_int(value: object, field: str, channel: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ConfigError(f"channel {channel!r}: {field} must be a positive integer")
+
+
 def _require(mapping: Mapping[str, Any], key: str, where: str) -> Any:
     try:
         return mapping[key]
@@ -88,24 +118,69 @@ def _require(mapping: Mapping[str, Any], key: str, where: str) -> Any:
         raise ConfigError(f"{where}: missing required field {key!r}") from None
 
 
-def mllp_settings_from_channel_spec(
-    spec: Mapping[str, Any], *, env: str, bootstrap_servers: str, instance: str = "mllp-0"
-) -> MllpSettings:
+def mllp_settings_from_channel_spec(spec: Mapping[str, Any], *, env: str, instance: str = "mllp-0") -> MllpSettings:
     """Build `MllpSettings` from a parsed channel-spec document. Raises `ConfigError` for anything
     this receiver cannot honour; never silently ignores a field the schema allows."""
     metadata = _require(spec, "metadata", "channel spec")
     channel = _require(metadata, "name", "metadata")
-    channel_version = metadata.get("version", 0)
-
     body = _require(spec, "spec", "channel spec")
-    ordering = _require(body, "ordering", "spec")
-    if ordering != "none":
-        raise ConfigError(
-            f"channel {channel!r}: ordering {ordering!r} is not supported by this receiver yet — "
-            "per-key ordering needs the keyExpression evaluator (W2-4); ordering: none only in v0"
-        )
+    pipeline = body.get("pipeline") or {}
+    return _settings(
+        channel,
+        int(metadata.get("version", 0)),
+        _require(body, "ordering", "spec"),
+        _require(body, "source", "spec"),
+        partition_key=body.get("partitionKey"),
+        env=env,
+        instance=instance,
+        transactional=bool(pipeline.get("transactional", False)),
+        step_uses=tuple(
+            step.get("uses")
+            for steps in (
+                [pipeline.get("steps") or []] + [d.get("steps") or [] for d in body.get("destinations") or []]
+            )
+            for step in steps
+        ),
+    )
 
-    source = _require(body, "source", "spec")
+
+def mllp_settings_from_spec(spec: ChannelSpec, *, env: str, instance: str = "mllp-0") -> MllpSettings:
+    """Build `MllpSettings` from the runtime's parsed spec (the `_tb.<env>.channels` record)."""
+    if not spec.source:
+        raise ConfigError(f"channel {spec.name!r}: spec.source is absent")
+    return _settings(
+        spec.name,
+        spec.version,
+        spec.ordering,
+        spec.source,
+        partition_key=spec.partition_key,
+        env=env,
+        instance=instance,
+        transactional=spec.pipeline.transactional,
+        step_uses=tuple(
+            step.uses for steps in [spec.pipeline.steps, *(d.steps for d in spec.destinations)] for step in steps
+        ),
+    )
+
+
+def _settings(
+    channel: str,
+    channel_version: int,
+    ordering: str,
+    source: Mapping[str, Any],
+    *,
+    partition_key: str | None,
+    env: str,
+    instance: str,
+    transactional: bool,
+    step_uses: tuple[str | None, ...],
+) -> MllpSettings:
+    # `per-key` (invariant 5): the key expression is parsed and source-checked here, so a malformed or
+    # inapplicable locator is a `ConfigError`, never a per-message surprise (`receivers/keys.py`).
+    key_expression = key_expression_from_spec(
+        {"ordering": ordering, "partitionKey": partition_key}, channel=channel, source_type="mllp"
+    )
+
     if source.get("type") != "mllp":
         raise ConfigError(f"channel {channel!r}: source.type is {source.get('type')!r}, not 'mllp'")
 
@@ -122,14 +197,33 @@ def mllp_settings_from_channel_spec(
         )
 
     tls_obj = source.get("tls")
-    tls = TlsSpec(tls_obj["secretRef"], tls_obj["clientAuth"], tls_obj.get("minVersion", "1.2")) if tls_obj else None
+    # `tls_obj is not None`, never a truthiness check (security review; the same class of bug as the
+    # mllp LOADER's `with.tls: {}` finding, `tributary.loaders.mllp.config`): a present-but-empty
+    # `source.tls: {}` must not be silently read as `tls` being absent. `net.require_safe_bind`
+    # (`server.py`) already refuses to start a non-loopback listener whose `cfg.tls is None`, so this
+    # specific shape could not previously reach a running plaintext listener off-box -- but it produced
+    # a confusing `BindError` there instead of the clear `ConfigError` a malformed `tls` object should
+    # raise right here, and a *loopback* bind with `tls: {}` would have silently accepted a listener
+    # with no TLS at all, papering over an operator's clearly-intended (if malformed) request for one.
+    tls = (
+        TlsSpec(
+            _require(tls_obj, "secretRef", "source.tls"),
+            _require(tls_obj, "clientAuth", "source.tls"),
+            tls_obj.get("minVersion", "1.2"),
+            tuple(tls_obj.get("allowedClientSans", ())),
+        )
+        if tls_obj is not None
+        else None
+    )
+
+    reply = reply_settings(source, channel=channel, transactional=transactional, step_uses=step_uses)
 
     queue = source.get("queue") or {}
     queue_max_bytes = queue.get("maxBytes", DEFAULT_MAX_BYTES)
 
     return MllpSettings(
         channel=channel,
-        channel_version=int(channel_version),
+        channel_version=channel_version,
         bind=_require(source, "bind", "source"),
         port=_require(source, "port", "source"),
         tls=tls,
@@ -139,6 +233,9 @@ def mllp_settings_from_channel_spec(
         queue_max_bytes=queue_max_bytes,
         queue_max_messages=queue.get("maxMessages"),
         env=env,
-        bootstrap_servers=bootstrap_servers,
         instance=instance,
+        ordering=ordering,
+        partition_key=partition_key,
+        key_expression=key_expression,
+        reply=reply,
     )

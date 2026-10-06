@@ -1,0 +1,405 @@
+"""The SFTP poller: claim a file by renaming it, publish its bytes to `<env>.<channel>.raw`, and delete
+or move it only after the record is committed (invariant 1; README 3.2.2's `afterCommit` row).
+
+**Crash safety.** A file is only ever deleted or moved to the archive after the delivery report for
+its record says success. Until then it exists under a claim name, `.tb-claim.<instance>.<name>`, in
+the source directory:
+
+* crash before commit: the claim is still there. On its next cycle this instance finds its own claims
+  (by its instance id, stable across restarts like a static-membership id) and re-processes them
+  first, so no file is ever lost. If the record *was* committed before the crash, this ingests the
+  file again under a new `tb-msg-id`: the inherent at-least-once duplicate of README 3.2.2, bounded by
+  one file per instance.
+* Kafka unavailable: the claim is renamed back and the cycle stops (README: "leave the file; retry
+  next poll"). If the rename back fails, the claim is recovered next cycle as above.
+* claim atomicity: SFTP `rename` fails rather than overwrites, and each claim name is unique to this
+  instance, so of two pollers racing for one file exactly one rename succeeds; the loser skips it.
+  Pollers on the same directory must have distinct instance ids. Claims left by an instance that
+  never comes back are not touched (they are reported as `foreign_claims`): stealing a live poller's
+  claim would risk two ingests, so that stays an operator decision.
+
+**Refusals** (oversize, empty, key unresolved, malformed JSON when `parse-error` is declared) move the
+claimed file to `rejectDirectory`, never delete it (the NACK column of README 3.2.2), and never publish.
+
+**Bounds.** One file at a time, so at most `maxMessageBytes + 1` bytes are buffered; the remote listing
+is capped; every network read has a timeout (`session.connect`); a poll cycle publishes at most
+`maxFilesPerPoll` files.
+
+**Live spec (invariant 3).** `apply_settings` replaces the settings; a cycle reads them once for its listing and
+its claim paths (`directory`, the pattern), and every file reads them again for what it does to that file
+(limits, `nackOn`, key, where it goes afterwards), so one file is never handled under half of an update.
+`pause` (a tombstone) stops the loop after the file in flight: nothing new is claimed or published, and a file
+claimed but not yet published is handed back. `sftp/reload.py` is the live-versus-restart table.
+
+**PHI.** Remote file names are PHI (README 3.2.4). They are used only as opaque strings passed to the
+server and never reach a log line, metric, header, exception message or event; logs carry the channel,
+`tb-msg-id`, byte counts and outcome codes.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import fnmatch
+import logging
+import os
+import posixpath
+import sys
+import time
+import uuid
+from collections.abc import Callable
+from typing import Protocol
+
+from tributary.runtime import load_engine_kafka_or_exit
+from tributary.runtime.logs import JsonLogger
+from tributary.sdk import Message
+from tributary.sdk import headers as h
+
+from ..envelope import build_raw_envelope
+from ..errors import ConfigError, PermanentPublishError
+from ..events import event_logger
+from ..keys import resolve_key
+from ..metrics import Metrics
+from ..mllp.kafka_publisher import RawPublisher, topic_name
+from ..payload import well_formed
+from ..secrets import DirSecretResolver
+from .config import SftpSettings
+from .session import (
+    NotRegularFileError,
+    RemoteEntry,
+    RemoteExistsError,
+    RemoteNotFoundError,
+    SessionError,
+    SftpSession,
+    connect,
+)
+
+__all__ = ["SftpPoller"]
+
+CLAIM_PREFIX = ".tb-claim."
+_MAX_NAME = 200  # leaves room for the claim prefix inside a 255-byte file name limit
+
+
+class _Publisher(Protocol):  # the slice of RawPublisher this module uses
+    async def publish(self, message: Message, *, timeout_s: float) -> bool: ...
+
+
+def _safe_name(name: str) -> bool:
+    """A listing entry is untrusted input: refuse anything that could escape the directory."""
+    return bool(name) and len(name) <= _MAX_NAME and "/" not in name and "\x00" not in name and name not in (".", "..")
+
+
+def _event(event: str, **fields: object) -> None:
+    event_logger("receiver-sftp").info(event, **fields)
+
+
+class SftpPoller:
+    def __init__(
+        self,
+        cfg: SftpSettings,
+        publisher: _Publisher,
+        session_factory: Callable[[], SftpSession],
+        *,
+        metrics: Metrics | None = None,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        self.cfg = cfg
+        self.publisher = publisher
+        self._connect = session_factory
+        self.metrics = metrics if metrics is not None else Metrics()
+        self._clock = clock
+        self.foreign_claims = 0
+        self._claim_prefix = f"{CLAIM_PREFIX}{cfg.instance}."
+        self._paused = False
+
+    def apply_settings(self, new: SftpSettings) -> None:
+        """Replace the settings (a live spec update; `sftp/reload.py`). One assignment: a cycle or a file that
+        already took its snapshot finishes under the old one. The caller has refused restart-only changes."""
+        self.cfg = new
+
+    def pause(self) -> None:
+        """Stop after the file in flight (a tombstone). Idempotent; a paused poller is not resumed, a redeploy
+        builds a new one."""
+        self._paused = True
+
+    @property
+    def paused(self) -> bool:
+        return self._paused
+
+    # ------------------------------------------------------------------ one cycle
+
+    async def poll_once(self) -> int:
+        """One connect-list-process cycle. Returns the number of files committed. Never raises for a
+        remote or Kafka failure (those end the cycle and are counted); a programming error propagates."""
+        if self._paused:
+            return 0
+        self.metrics.connections_total += 1
+        try:
+            session = await asyncio.to_thread(self._connect)
+        except SessionError as exc:
+            self.metrics.connections_refused += 1  # a failed connect, whatever the reason
+            self.metrics.poll_errors += 1
+            _event("sftp_connect_failed", channel=self.cfg.channel, error=type(exc).__name__)
+            return 0
+        self.metrics.connections_open += 1
+        try:
+            return await self._cycle(session)
+        except SessionError as exc:
+            self.metrics.poll_errors += 1
+            _event("sftp_poll_failed", channel=self.cfg.channel, error=type(exc).__name__)
+            return 0
+        finally:
+            self.metrics.connections_open -= 1
+            await asyncio.to_thread(session.close)
+
+    async def _cycle(self, session: SftpSession) -> int:
+        cfg = self.cfg  # this cycle's listing and claim paths; each file takes its own snapshot for the rest
+        skipped_before = session.undecodable_names
+        entries = await asyncio.to_thread(session.list_dir, cfg.directory, cfg.max_listing)
+        skipped = session.undecodable_names - skipped_before
+        if skipped:  # names that are not valid UTF-8 are skipped, never fatal (and never logged)
+            self.metrics.files_skipped += skipped
+            _event("sftp_names_skipped", channel=self.cfg.channel, count=skipped)
+        own_claims: list[str] = []
+        candidates: list[RemoteEntry] = []
+        now = self._clock()
+        for entry in entries:
+            if not entry.is_regular or not _safe_name(entry.name):
+                continue
+            if entry.name.startswith(self._claim_prefix):
+                own_claims.append(entry.name)
+            elif entry.name.startswith(CLAIM_PREFIX):
+                self.foreign_claims += 1
+            elif fnmatch.fnmatchcase(entry.name, cfg.file_pattern) and now - entry.mtime >= cfg.min_file_age_s:
+                candidates.append(entry)
+        candidates.sort(key=lambda e: (e.mtime, e.name))  # oldest first: the order senders wrote them
+
+        committed = 0
+        # Our own leftover claims first: they are files a previous run took and never finished.
+        for claim_name in own_claims[: cfg.max_files_per_poll]:
+            if self._paused:
+                return committed
+            outcome = await self._process(session, claim_name[len(self._claim_prefix) :], claim_name, cfg.directory)
+            if outcome is None:
+                return committed
+            committed += outcome
+        budget = cfg.max_files_per_poll - len(own_claims)
+        for entry in candidates[: max(budget, 0)]:
+            if self._paused:
+                return committed
+            claim_name = f"{self._claim_prefix}{entry.name}"
+            src = posixpath.join(cfg.directory, entry.name)
+            try:
+                await asyncio.to_thread(session.rename, src, posixpath.join(cfg.directory, claim_name))
+            except (RemoteNotFoundError, RemoteExistsError):
+                continue  # another poller claimed it first (or the sender removed it)
+            outcome = await self._process(session, entry.name, claim_name, cfg.directory)
+            if outcome is None:
+                return committed  # Kafka refused: stop hammering, retry next poll
+            committed += outcome
+        return committed
+
+    # ------------------------------------------------------------------ one file
+
+    async def _process(self, session: SftpSession, original: str, claim_name: str, directory: str) -> int | None:
+        """`1` committed, `0` refused (rejected), `None` Kafka unavailable or paused (file left for next poll).
+        `directory` is the cycle's: the claim lives there whatever the settings say by now."""
+        cfg = self.cfg  # one snapshot for this whole file
+        claim = posixpath.join(directory, claim_name)
+        self.metrics.messages_received += 1
+        try:
+            # `read_bounded` opens, fstats the handle and re-checks the name before reading a byte, so there is
+            # no lstat-then-open-by-name gap; a link or other non-regular object is refused like any bad input.
+            payload = await asyncio.to_thread(session.read_bounded, claim, cfg.max_message_bytes)
+            regular = True
+        except NotRegularFileError:
+            regular = False
+            payload = b""
+        except RemoteNotFoundError:
+            return 0  # vanished under us: nothing to commit and nothing to lose
+        if not regular:
+            self.metrics.nacked_parse_error += 1
+            await self._reject(session, cfg, claim, original, "not-regular-file")
+            return 0
+        if payload is None:
+            self.metrics.nacked_oversize += 1
+            await self._reject(session, cfg, claim, original, "oversize")
+            return 0
+        if not payload:
+            self.metrics.nacked_parse_error += 1
+            await self._reject(session, cfg, claim, original, "empty")
+            return 0
+        if "parse-error" in cfg.nack_on and not well_formed(cfg.content_type, payload):
+            self.metrics.nacked_parse_error += 1
+            await self._reject(session, cfg, claim, original, "parse-error")
+            return 0
+        outcome = resolve_key(
+            cfg.key_expression, payload=payload, content_type=cfg.content_type, headers=None, header_source="kafka"
+        )
+        if outcome.reason is not None:
+            self.metrics.nacked_parse_error += 1
+            await self._reject(session, cfg, claim, original, "key-unresolved")
+            return 0
+
+        message = build_raw_envelope(
+            channel=cfg.channel,
+            channel_version=cfg.channel_version,
+            source=f"sftp:{cfg.instance}@{cfg.host}",
+            payload=payload,
+            key=outcome.key,
+            content_type=cfg.content_type,
+        )
+        msg_id = message.require(h.TB_MSG_ID)
+        if self._paused:  # tombstoned while this file was read: not published, handed back for a redeploy
+            await self._unclaim(session, claim, posixpath.join(directory, original))
+            return None
+        t0 = time.monotonic()
+        try:
+            ok = await self.publisher.publish(message, timeout_s=cfg.ack_timeout_s)
+        except PermanentPublishError:
+            self.metrics.rejected_envelope += 1
+            await self._reject(session, cfg, claim, original, "envelope-invalid")
+            return 0
+        except Exception:  # any failure is "not committed"; its text is never surfaced
+            ok = False
+        self.metrics.record_ack_latency_ms((time.monotonic() - t0) * 1000)
+        if not ok:
+            self.metrics.publish_failures += 1
+            self.metrics.nacked_unavailable += 1
+            await self._unclaim(session, claim, posixpath.join(directory, original))
+            _event("sftp_publish_refused", channel=cfg.channel, tb_msg_id=msg_id, bytes=len(payload))
+            return None
+
+        # Committed. Only now does the file leave the source directory.
+        self.metrics.acked += 1
+        try:
+            await self._finish(session, cfg, claim, original)
+        except SessionError as exc:
+            # The record is committed but the file is still under our claim: it is re-ingested (a
+            # duplicate, never a loss) when the claim is recovered next cycle.
+            self.metrics.poll_errors += 1
+            _event("sftp_after_commit_failed", channel=cfg.channel, tb_msg_id=msg_id, error=type(exc).__name__)
+            return 1
+        _event("sftp_committed", channel=cfg.channel, tb_msg_id=msg_id, bytes=len(payload), after=cfg.after_commit)
+        return 1
+
+    async def _finish(self, session: SftpSession, cfg: SftpSettings, claim: str, original: str) -> None:
+        if cfg.after_commit == "delete":
+            await asyncio.to_thread(session.remove, claim)
+        else:
+            archive = cfg.archive_directory
+            if archive is None:  # unreachable: SftpSettings refuses `move` without one
+                raise ConfigError("afterCommit 'move' requires archiveDirectory")
+            await self._move(session, claim, archive, original)
+
+    async def _reject(self, session: SftpSession, cfg: SftpSettings, claim: str, original: str, reason: str) -> None:
+        try:
+            await self._move(session, claim, cfg.reject_directory, original)
+        except SessionError as exc:
+            # Never delete a refused file. If it cannot be moved it stays under our claim and is retried.
+            self.metrics.poll_errors += 1
+            _event("sftp_reject_failed", channel=self.cfg.channel, reason=reason, error=type(exc).__name__)
+            return
+        _event("sftp_rejected", channel=self.cfg.channel, reason=reason)
+
+    async def _move(self, session: SftpSession, claim: str, directory: str, original: str) -> None:
+        """Move under the original name (kept: it is on the sender's server, README 3.2.4), or under a
+        collision-free variant if that name is taken. Never overwrites."""
+        target = posixpath.join(directory, original)
+        if await asyncio.to_thread(session.exists, target):
+            target = f"{target}.{uuid.uuid4().hex[:12]}"
+        await asyncio.to_thread(session.rename, claim, target)
+
+    async def _unclaim(self, session: SftpSession, claim: str, original_path: str) -> None:
+        with contextlib.suppress(SessionError):  # still ours under the claim name: recovered next cycle
+            await asyncio.to_thread(session.rename, claim, original_path)
+
+    # ------------------------------------------------------------------ loop
+
+    async def run(self, stop: asyncio.Event) -> None:
+        while not stop.is_set() and not self._paused:
+            await self.poll_once()
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(stop.wait(), self.cfg.poll_interval_s)
+
+
+def main() -> None:
+    """`python -m tributary.receivers.sftp --channel <name> --env <env>`.
+
+    The channel spec is read from the compacted `_tb.<env>.channels` topic over the engine Kafka link
+    (invariant 3); there is no file input. Polling starts only after a valid spec for `--channel` has been read.
+    Exit codes: 0 after SIGTERM/SIGINT or after a spec change that needs a restart (the supervisor restarts on
+    0), 2 for a refused startup configuration."""
+    from tributary.runtime.config import load_topic_defaults
+    from tributary.runtime.errors import RuntimeConfigurationError
+
+    from ..cli import QuietArgumentParser, add_ops_arguments, ops_settings_or_exit, run_until_stopped, spec_feed_opener
+    from ..startup import refuse, refuse_retired_channel_spec_flag, spec_reader_group_or_exit
+    from .runner import RunnerOptions, SftpRunner
+    from .service import SftpService
+
+    argv = sys.argv[1:]
+    log = JsonLogger("receiver-sftp")
+    # Before parse_args: argparse echoes an unknown flag's value to stderr, so a retired
+    # --bootstrap / --engine-security / --channel-spec must reach its refusal first.
+    kafka = load_engine_kafka_or_exit(argv=argv, log=log)
+    refuse_retired_channel_spec_flag(argv, log)
+    p = QuietArgumentParser(log, description=__doc__)
+    p.add_argument("--channel", required=True, help="the deployed channel name (spec.metadata.name)")
+    p.add_argument("--env", required=True, help="the topic-name env segment, e.g. 'dev' or 'prod'")
+    p.add_argument("--instance", default="sftp-0", help="this process's identity: claim names and tb-source")
+    p.add_argument("--secrets-dir", help="overrides TB_SECRETS_DIR / the default secrets mount")
+    p.add_argument("--contracts-dir", help="overrides TB_CONTRACTS_DIR / the default contracts/ search")
+    p.add_argument("--metrics-file")
+    add_ops_arguments(p)
+    a = p.parse_args(argv)
+    logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(message)s")
+    # Operator input is validated (and refused without being echoed) before it becomes a log field.
+    spec_group = spec_reader_group_or_exit(a.env, a.channel, a.instance, log)
+    log = JsonLogger("receiver-sftp", base={"channel": a.channel, "instance": a.instance})
+    try:
+        defaults = load_topic_defaults(a.contracts_dir)
+    except RuntimeConfigurationError as exc:
+        refuse(log, error=type(exc).__name__, code=exc.code)
+    try:
+        topic = topic_name(a.env, a.channel)
+    except ValueError:
+        refuse(log, error="UsageError", code="ARGUMENTS_INVALID", reason="invalid --env or --channel")
+    resolver = DirSecretResolver(a.secrets_dir) if a.secrets_dir else DirSecretResolver()
+
+    def make_publisher(cfg: SftpSettings) -> RawPublisher:
+        publisher = RawPublisher(
+            kafka,
+            topic,
+            topic_defaults=defaults,
+            ordering="per-key" if cfg.key_expression is not None else "none",
+            client_id_prefix="sftp-receiver",
+        )
+        publisher.start(asyncio.get_running_loop())
+        return publisher
+
+    def make_service(cfg: SftpSettings, publisher: RawPublisher, metrics: Metrics) -> SftpService:
+        # Host, host keys and credentials are restart-only, so the startup settings dial for the life of the process.
+        return SftpService(cfg, publisher, lambda: connect(cfg, resolver), metrics=metrics)
+
+    runner = SftpRunner(
+        open_feed=spec_feed_opener(
+            kafka=kafka, defaults=defaults, env=a.env, channel=a.channel, group=spec_group, log=log
+        ),
+        make_publisher=make_publisher,
+        make_service=make_service,
+        options=RunnerOptions(
+            env=a.env,
+            instance=a.instance,
+            topic=topic,
+            ops=ops_settings_or_exit(a, log),
+            lite_profile=os.environ.get("TB_PROFILE", "lite") == "lite",
+        ),
+        log=log,
+        metrics_file=a.metrics_file,
+    )
+    run_until_stopped(runner)
+
+
+if __name__ == "__main__":
+    main()

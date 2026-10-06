@@ -191,12 +191,25 @@ produced 1,026 late replies, which the receiver correctly dropped as unknown cor
 across the restart was zero.
 
 The consequence is unavoidable rather than a defect: **a sender that retries after a timeout NACK
-creates a duplicate downstream.** Therefore:
+creates a duplicate downstream.**
+
+**Amended 2026-09-28 (W2-8, `platform-engineer`'s finding, verified by the architect).** The original
+text drew the wrong conclusion from that sentence: it said loader idempotency on `tb-msg-id` is the
+mitigation. It is not. **A resent message is a new message with a new `tb-msg-id`**
+(`channel-spec/v0` 3.2.2, "Duplicates at ingest": the receiver mints the id per received message), so
+a loader that is idempotent on `tb-msg-id` delivers it again. `tb-msg-id` idempotency absorbs the
+*other* duplicate source in sync mode — worker replays after a crash, which keep their id. The only
+mitigations for a sender resend are sink-native idempotency on a **business identifier** (for example
+the W2-3 conditional FHIR update on a visit or order identifier) and edge dedupe (D8, deferred). No
+invariant changes: invariant 4 promises at-least-once with `tb-msg-id` idempotency, and it never
+covered a sender resubmitting. Therefore:
 
 1. Every loader on a synchronous channel MUST be idempotent on `tb-msg-id` — invariant 4 already
-   requires this, and sync mode is where it stops being theoretical.
+   requires this, and it absorbs worker-replay duplicates, **not** sender resends after `AE`.
 2. The timeout NACK's meaning MUST be documented for integrators, who will otherwise read `AE` as
-   "resend it, nothing happened".
+   "resend it, nothing happened": `AE` means committed, a resend is a duplicate that `tb-msg-id`
+   idempotency does not absorb, and only a business-identifier sink or D8 would. The control plane
+   warns on every sync channel (`contracts/channel-spec/v0` 3.2.6).
 3. The reply worker uses **fail-fast plus DLQ, not `blocking` retry**: pausing a partition to retry
    one reply would stall every other sender's request on that partition, and the receiver's own
    timeout is the correct control (S5's note to S3).
@@ -204,10 +217,89 @@ creates a duplicate downstream.** Therefore:
    and S3's latency was already dominated by two Kafka commits per request.
 
 **Give up:** exactly-once semantics at the edge. No sender protocol offers it, and edge dedupe (D8)
-is the only mitigation — deferred, and a state store either way.
+is the only general mitigation — deferred, and a state store either way.
 
 **Caveat:** S3's numbers come from a **stand-in echo worker**, not a real pipeline worker. The
 mechanism and its failure semantics are established; the latency figures are not a product number.
+
+### D10. Synchronous reply: routing and what each answer means (decided 2026-09-28, W2-8)
+
+From `platform-engineer`'s proposal (`docs/agent-team/proposals/W2-8-sync-reply.md`), ruled by the
+architect. Contract: `contracts/channel-spec/v0` 3.2.6, `envelope/v0` 3 and 2.3.3, `topics/v0` 3.3.1,
+set 1.2.
+
+**Routing.** Criteria: no coordinator (invariant 3), each reply reaches the process holding the socket,
+cost that does not grow with process count, least PHI exposure.
+
+| Option | Verdict |
+|---|---|
+| Plain consumer group, replies hashed by correlation id | **Rejected.** The reply lands on whichever member owns the hash, not the one holding the socket |
+| Broadcast (ADR-001 6.5 as written): every process reads every partition and filters | **Rejected as the default.** Reads scale as replies × processes, and with `body: step` every process reads every other sender's PHI-bearing answer |
+| **Targeted:** each process holds reply partitions through the `replier` group and advertises one in `tb-reply-partition`; the worker produces to it | **Chosen.** Kafka's assignment is the lease. S3: no slower (p50 43 vs 49 ms at 100 msg/s, 85 vs 136 ms at 1k; single run, one instance, inconclusive) |
+
+**Give up:** a reply partition count that must track the receiver process count (a deploy warning and
+a readiness failure rather than a silent degradation), and a rebalance turns in-flight requests on the
+moved partition into `AE` / `REPLY_ROUTE_LOST`. Planned restarts avoid that with static membership
+(S5: 3.21 s).
+
+**Answers.** One rule across both MLLP modes: **`AR` = commit not confirmed (resend is safe), `AE` =
+committed (resend duplicates), `AA` = committed and routed.** Neither `AA` nor `AE` is ever sent before
+the receiver's own `raw` delivery callback succeeds. A pipeline `Reject` answers `AE`, not `AR`,
+because it was committed; a whole-message `Drop` answers `AA`, because it was committed and filtered on
+purpose. **Rejected:** `AR` for a `Reject`, the proposal's own alternative, which would tell the sender
+a resend is safe when it is not. HL7 original mode reads `AE` as a content error anyway. **Give up:** a
+sender configured to expect `AR` for a refused message sees `AE`, and any sender that treats `AE` as
+"resend" duplicates — hence the D9 amendment and the integrator note.
+
+**Refused in set 1.2:** sync reply on transactional channels (a reply inside the transaction is late
+by up to a batch; one outside could `AA` aborted work) and on channels with any splitter (N outcomes,
+no aggregator). `after: delivered` is reserved. The HTTP status mapping is decided with W2-7 under
+the constraint that no committed outcome uses a status clients retry automatically.
+
+**Invariants.** 1: holds, and the proposal was amended so that a revoke before the commit callback
+cannot produce an `AE`. 5: order is fixed at the `raw` commit and sync mode changes neither
+partitioning nor retry; a resend after `AE` that lands after later messages is **sender-induced**, not
+an engine reordering, and cannot be detected without D8, so it is documented rather than prevented. 6:
+the sender's MSH-10 lives only in the receiver's in-memory map, and the three new headers carry an
+integer, a timestamp and an enum.
+
+**`ctx.reply` shape (ruled 2026-09-29, set 1.3.1).** `reply` stays on the additive
+`ReplyContext(Context)` protocol, as `platform-engineer` built it, not on `Context`. Adding a member to
+the `Context` protocol breaks every structural implementer. The in-tree case is `tributary-fhir`'s
+`_Attached`, and out-of-tree wrappers would break the same way. So `Context` is frozen for set 1.x,
+and new `ctx` capabilities arrive as sub-protocols. **Rejected:** `reply` on `Context` plus a
+one-line forward in `_Attached`, which fixes only the in-tree wrapper. **Give up:** wrappers do not
+gain `reply` by themselves, so `healthcare-standards-engineer` makes `attach()` of a `ReplyContext`
+a `ReplyContext` before `body: step` is lifted. Detail in `contracts/channel-spec/v0` 3.2.6.
+
+**Expired replies get a code (ruled 2026-09-29, set 1.4).** A reply skipped past its deadline was
+emitted as `replied` / `dropped` with a sentence and no code. **Options:** (a) keep that; (b) register
+`REPLY_EXPIRED` and carry it on the `dropped` event; (c) `status: error` with the code. **Criteria:**
+queryable by a stable key in the archive; no page for a backlog the engine handled correctly; `Drop`
+reasons remain a channel concept. **Chosen: (b).** (a) leaves operators grepping static text, and (c)
+turns a post-outage backlog into an error-rate alert. **Give up:** `dropped` is no longer always
+code-free. The rule is that it may carry only a registered engine skip code. Envelope README 2.3.2.
+
+**Receiver rules from the built MLLP receiver (ruled 2026-10-05, set 1.7).** Evidence: commits
+`8bfe205`, `33b2207`, `f420634`, `4134ab3`, `c051002` (`connector-engineer`), read, not run.
+(1) **A `body: step` body the receiver cannot write** (an MLLP framing byte, or no room in
+`queue.maxBytes`) makes the reply `failed` and answers `AE`, as built. **Options:** reuse `REPLY_BUSY`
+/ `REPLY_BODY_MISSING` (as built); new codes; answer the built `AA` and drop the body. **Chosen: new
+codes `REPLY_BODY_INVALID` and `REPLY_BODY_OVER_BUDGET`.** Reusing `REPLY_BUSY` gives an `AR` code an
+`AE` meaning, so "resend is safe" and "resend duplicates" share a key. A built `AA` would hide that a
+query sender never got its response. Waiting for budget would hold the body outside the budget.
+**Give up:** two more codes in the registry and the SDK. (2) **Per-connection fairness** at
+`max(1, maxPending // 4)` is **ratified as a bound inside the per-process cap, not a spec field.**
+**Give up:** a single-connection channel uses a quarter of `maxPending`; original-mode MLLP senders
+(depth 1) are unaffected. A field stays possible later, additively. (3) **`--instance` is required
+with `source.reply`**, unique per replica, templated by Helm from the pod name; `group.instance.id` is
+`<instance>-p<pid>`. Rejected: keeping a default, which fenced replicas. **Give up:** one more required
+deployment parameter. Contract: channel-spec README 3.2.6, `topics/v0` 3.3.1.
+
+**Retry groups (ruled 2026-09-29, set 1.4; applies to D2 when `retry-topic` lifts).** The shared
+per-channel `retry` topic is consumed by each destination in its own group
+`tb.<env>.<ch>.loader.<dest>`, filtering on `tb-destination`. A shared group would let one
+destination's commits skip another's retries (invariant 4). ADR-008 D9, `topics/v0` 3.4.1.
 
 ---
 
@@ -247,10 +339,15 @@ partition pause means; Kafka share groups for unordered destinations.
 3. Alert rules for `partition_halted` and DLQ arrival rate ship with the MVP, not after. D3's default
    of `halt-partition` requires an operator, so the alert *is* the mitigation.
 4. Document the ordering and retry model for integrators in `docs/` — this is a migration blocker for
-   Mirth users, who expect per-destination queues with automatic retry. Include D9's `AE` semantics.
+   Mirth users, who expect per-destination queues with automatic retry. Include D9's `AE` semantics
+   as amended (a resend after `AE` is a new `tb-msg-id`), D10's answer table, and the sender-induced
+   reordering of a late resend (2026-09-28).
 5. **Spike `retry-topic` with delay tiers** (D2) before any destination may select it: choose between
    one topic plus `tb-retry-not-before` and one topic per tier, and measure the head-of-line cost that
-   separates them. It is the only policy in ADR-001 6.4 with no evidence behind it.
+   separates them. It is the only policy in ADR-001 6.4 with no evidence behind it. **The criteria for
+   lifting the refusal are fixed in advance** in `contracts/channel-spec/v0/README.md` 4.1.1 (ADR-007
+   D15), 2026-09-24 — including that the spike characterises how retried messages reorder rather than
+   claiming they do not. Owner: `platform-engineer`, inside W2-4.
 6. **Decouple resume from the poll timeout** in `tributary-runtime`: about 155 ms of each 169 ms retry
    cycle was `poll_timeout_s`, not backoff (S5 follow-up 1).
 7. **Test a multi-minute destination outage** against `max.poll.interval.ms`. S5's pauses lasted
@@ -261,3 +358,22 @@ partition pause means; Kafka share groups for unordered destinations.
 9. Port `test_librdkafka_semantics.py` into the runtime's test suite. It is four small tests that pin
    the client behaviours the whole design assumes — including the one that proves pause-then-resume
    without seeking back **silently loses the failed message**.
+10. **Reprocess must be destination-scoped for any `dlq` record carrying `tb-destination`**
+    (2026-09-24, found by `platform-engineer` while designing per-destination steps). D5 re-injects
+    into `raw` with a new `tb-msg-id`. For a record that failed at one destination, that re-delivers
+    to every destination under an id no loader has seen, and loader idempotency cannot absorb it. The
+    gap already exists for wave 1 loader-exhaustion records. ~~W3-3 implements destination-scoped
+    re-entry.~~ **Amended 2026-10-06: deferred to wave 4** (`phases/wave-3.md` 2.6 H5). The direction:
+    `out.<dest>` re-entry for loader exhaustion, a destination-only step re-run through an additive
+    `raw` header for destination-step failures, and both need an amendment here plus ADR-004 H7 for the
+    grants. Until then, reprocess refuses these records. `contracts/channel-spec/v0/README.md` 3.5.
+    **Extended 2026-09-25 (W2-5, `platform-engineer`): the same applies to any `dlq` record carrying
+    `tb-parent-id`.** A dead-lettered split child's payload is the child as the splitter produced it.
+    Re-injecting that into `raw` re-runs the splitter on one child: a JSON element is refused as
+    `SPLIT_INPUT_INVALID`, and an HL7 message becomes a new identity that no loader has seen. So until
+    W3-3 builds a post-split re-entry point that keeps the child's derived `tb-msg-id`, reprocess
+    refuses these records too. **This over-refuses on purpose.** D5 also sets `tb-parent-id` on
+    reprocessed records, so a reprocessed message that fails again is refused as well, and the header
+    alone cannot tell the two cases apart. W3-3 picks the discriminator: a derivation check (no
+    contract change, but it fails once a child is itself reprocessed) or an additive origin header.
+    `contracts/channel-spec/v0/README.md` 3.3.2 split rules 5-6 and section 9.

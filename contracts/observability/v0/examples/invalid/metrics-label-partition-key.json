@@ -1,0 +1,15 @@
+{
+  "contract": "tributary.observability/v0",
+  "labels": {
+    "channel": { "description": "Channel name.", "pattern": "^[a-z][a-z0-9-]{0,63}$" }
+  },
+  "metrics": [
+    {
+      "name": "tb_messages_by_key_total",
+      "type": "counter",
+      "help": "Messages per partition key, to find hot keys.",
+      "labels": ["channel", "partition_key"],
+      "emitters": ["worker"]
+    }
+  ]
+}

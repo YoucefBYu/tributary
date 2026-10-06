@@ -2,6 +2,17 @@
 real MLLP receiver ACKed is ever lost, even though the broker that goes down was actually leading part
 of the traffic at the moment it died.
 
+**W3-22: the scenario is keyed.** The channel spec sets `ordering: per-key` and a receiver-side
+`partitionKey` (`hl7:PID.3.1`), so the record keys under chaos are the ones the real receiver derived from
+each message, not keys a test harness invented (this closed "receiver-originated keys are not under chaos").
+The sender interleaves 8 synthetic patients; every message carries its per-patient sequence number in
+MSH-10. The test additionally asserts invariant 5 across the leader change: per key, the first delivery of
+each sequence number is increasing (counted, not only asserted: `order_violations` in the report row); the
+record key is the patient id the message carries; each key lives on exactly one partition; and the fault
+touched keyed traffic: at least one key sits on a partition the killed broker led and has ACKed messages
+both before and after the kill. The helpers that make those checks have mutation controls in
+`test_chaos_assertion_mutation_controls.py`.
+
 Marked `chaos` and `integration`: it needs Docker and injects a real `docker kill` against one of three
 broker containers. Follows PHASE-0-DECISION section 4's rule for fault-injection tests: **assert the
 fault happened rather than assume it, and keep a mutation control for the headline claim.** Two checks
@@ -38,14 +49,21 @@ from pathlib import Path
 from typing import NamedTuple
 
 import pytest
-from confluent_kafka import Consumer
 from confluent_kafka.admin import AdminClient, NewTopic
 from testcontainers.core.container import DockerContainer
 from testcontainers.core.network import Network
 from tributary.runtime.topics import raw_topic
 
-from benchmarks.gen import generate
-from tests.support.channel_spec import walking_skeleton_document, write_channel_spec_file
+from tests.support.channel_spec import ordered_document, write_channel_spec_file
+from tests.support.chaos_assertions import (
+    assert_each_key_on_one_partition,
+    assert_fault_fired,
+    assert_per_key_order_preserved,
+    count_order_violations,
+    keys_hit_by_fault,
+    record_chaos_row,
+)
+from tests.support.kafka_helpers import create_topics_with_retry, drain_topic
 from tests.support.mllp_client import is_application_accept, send_mllp
 from tests.support.processes import ManagedProcess, spawn_mllp_receiver
 
@@ -57,6 +75,8 @@ DESTINATION = "http-stub"  # unused here (no loader in this test) but required b
 PARTITIONS = 3
 MESSAGE_COUNT = 120
 KILL_AFTER = MESSAGE_COUNT // 2
+KEYS = 8  # synthetic patients, interleaved: message i belongs to patient i % KEYS, sequence i // KEYS
+PARTITION_KEY = "hl7:PID.3.1"
 
 
 def _free_port() -> int:
@@ -148,15 +168,13 @@ def kafka_cluster() -> Iterator[tuple[str, dict[int, Broker]]]:
 
 @pytest.fixture(scope="module")
 def topics(kafka_cluster: tuple[str, dict[int, Broker]]) -> tuple[str, dict[int, Broker]]:
+    """Create `raw` with a bounded retry: `_await_cluster` proves metadata lists all 3 brokers, not that
+    the controller quorum has finished settling enough to serve `CreateTopics` -- a single attempt right
+    after that gate can race a controller-quorum leader election and see a broker connection reset
+    (`_DESTROY_BROKER`) instead of an answer. See `create_topics_with_retry`."""
     bootstrap, brokers = kafka_cluster
-    admin = AdminClient({"bootstrap.servers": bootstrap})
     wanted = [NewTopic(raw_topic(ENV, CHANNEL), PARTITIONS, 3)]
-    for _topic, future in admin.create_topics(wanted).items():
-        try:
-            future.result(timeout=30)
-        except Exception as exc:  # pragma: no cover - already exists on a re-run
-            if "TOPIC_ALREADY_EXISTS" not in str(exc):
-                raise
+    create_topics_with_retry(bootstrap, wanted)
     return bootstrap, brokers
 
 
@@ -167,7 +185,8 @@ def mllp_port() -> int:
 
 @pytest.fixture(scope="module")
 def channel_spec_file(tmp_path_factory: pytest.TempPathFactory, mllp_port: int) -> Path:
-    document = walking_skeleton_document(
+    document = ordered_document(
+        partition_key=PARTITION_KEY,
         mllp_port=mllp_port,
         http_url="http://127.0.0.1:1/ingest",  # never dialled: this test has no loader
         channel=CHANNEL,
@@ -205,7 +224,7 @@ def _kill_and_confirm(broker: Broker, *, timeout_s: float = 30.0) -> int:
     raise AssertionError(f"broker {broker.node_id} did not reach Docker's 'exited' state within {timeout_s}s of kill()")
 
 
-def _kill_a_leader(bootstrap: str, brokers: dict[int, Broker], *, topic: str) -> tuple[Broker, int]:
+def _kill_a_leader(bootstrap: str, brokers: dict[int, Broker], *, topic: str) -> tuple[Broker, int, frozenset[int]]:
     """Pick the broker to kill from live metadata rather than a fixed node id: it must actually be
     leading at least one partition of `topic` right now, or killing it would prove nothing (module
     docstring, point 1)."""
@@ -217,75 +236,68 @@ def _kill_a_leader(bootstrap: str, brokers: dict[int, Broker], *, topic: str) ->
     target_id = next(iter(leaders))
     assert target_id in brokers, f"leader {target_id} is not one of the brokers this test started: {sorted(brokers)}"
     target = brokers[target_id]
+    led = frozenset(p.id for p in raw_meta.partitions.values() if p.leader == target_id)
     exit_code = _kill_and_confirm(target)
-    return target, exit_code
+    return target, exit_code, led
 
 
 def _control_id(message: str) -> str:
     return message.split("\r", 1)[0].split("|")[9]
 
 
-def _drain_raw(bootstrap: str, *, expected: int, timeout_s: float = 60.0) -> list[bytes]:
-    """Read `raw` from the beginning, stopping once every partition has hit EOF and at least
-    `expected` records have been collected (EOF rather than the high watermark: the watermark counts
-    transaction control records that are never handed to the application)."""
-    consumer = Consumer(
-        {
-            "bootstrap.servers": bootstrap,
-            "group.id": f"chaos-verify-{time.time_ns()}",
-            "auto.offset.reset": "earliest",
-            "enable.auto.commit": False,
-            "enable.partition.eof": True,
-        }
+def _patient(index: int) -> str:
+    return f"SYNTH{index % KEYS:03d}"
+
+
+def _sequence(index: int) -> int:
+    return index // KEYS
+
+
+def _keyed_message(index: int) -> str:
+    """ADT with MSH-3 TRIBUTARY-SYNTH. PID-3.1 is the partition key; MSH-10 is `P<patient>-<sequence>`."""
+    control = f"{_patient(index)}-{_sequence(index):04d}"
+    return (
+        f"MSH|^~\\&|TRIBUTARY-SYNTH|SYNTH-FAC|TRIBUTARY-DST|DST-FAC|20260101000000||ADT^A08|{control}|P|2.5.1\r"
+        f"PID|1||{_patient(index)}^^^SYNTH||TESTPATIENT^SYNTHETIC||19700101|U\r"
     )
-    consumer.subscribe([raw_topic(ENV, CHANNEL)])
-    collected: list[bytes] = []
-    eofs: set[int] = set()
-    deadline = time.monotonic() + timeout_s
-    try:
-        while time.monotonic() < deadline:
-            record = consumer.poll(1.0)
-            if record is None:
-                if collected and len(collected) >= expected:
-                    break
-                continue
-            if record.error() is not None:
-                eofs.add(record.partition())
-                if len(eofs) >= PARTITIONS and len(collected) >= expected:
-                    break
-                continue
-            value = record.value()
-            if value is not None:
-                collected.append(value)
-    finally:
-        consumer.close()
-    return collected
 
 
-def test_broker_kill_mid_stream_loses_no_acknowledged_message(
+def _sequence_of(control_id: str) -> int:
+    return int(control_id.rsplit("-", 1)[1])
+
+
+def test_broker_kill_mid_stream_loses_no_acknowledged_message_and_keeps_per_key_order(
     mllp_port: int, topics: tuple[str, dict[int, Broker]], receiver: ManagedProcess
 ) -> None:
     bootstrap, brokers = topics
     acked: dict[str, bool] = {}
+    index_of: dict[str, int] = {}
     killed: Broker | None = None
     exit_code: int | None = None
+    led: frozenset[int] = frozenset()
 
-    for index, message in enumerate(generate(MESSAGE_COUNT, seed=4242), start=1):
+    for index in range(MESSAGE_COUNT):
+        message = _keyed_message(index)
         control_id = _control_id(message)
-        assert control_id and control_id not in acked, "the generator must produce unique control ids"
+        assert control_id and control_id not in acked, "control ids must be unique"
         ack = send_mllp("127.0.0.1", mllp_port, message.encode("ascii"), timeout_s=20.0)
         acked[control_id] = is_application_accept(ack)
-        if index == KILL_AFTER:
-            killed, exit_code = _kill_a_leader(bootstrap, brokers, topic=raw_topic(ENV, CHANNEL))
+        index_of[control_id] = index
+        if index + 1 == KILL_AFTER:
+            killed, exit_code, led = _kill_a_leader(bootstrap, brokers, topic=raw_topic(ENV, CHANNEL))
 
     assert killed is not None, "the kill never ran -- MESSAGE_COUNT is too small for KILL_AFTER to fire"
     assert exit_code is not None and exit_code != 0, (
         f"broker {killed.node_id} exited with code {exit_code}: a graceful stop exits 0, "
         "so this would mean the fault never really fired"
     )
+    assert led, "the killed broker led no raw partition: the kill would prove nothing"
 
     acked_ids = {control_id for control_id, ok in acked.items() if ok}
-    print(f"acked: {len(acked_ids)}/{MESSAGE_COUNT}; broker {killed.node_id} killed after send #{KILL_AFTER}")
+    print(
+        f"acked: {len(acked_ids)}/{MESSAGE_COUNT}; broker {killed.node_id} (led partitions {sorted(led)}) "
+        f"killed after send #{KILL_AFTER}"
+    )
     assert acked_ids, "nothing was acknowledged at all -- this run tested nothing"
     # A meaningful run must have kept the cluster available across the kill: RF=3/min-insync=2
     # surviving on 2 brokers is the entire point of this topology (module docstring). If most sends
@@ -295,7 +307,56 @@ def test_broker_kill_mid_stream_loses_no_acknowledged_message(
         "one broker down without this much disruption"
     )
 
-    delivered = _drain_raw(bootstrap, expected=len(acked_ids))
-    found_ids = {_control_id(value.decode("ascii")) for value in delivered}
+    records = drain_topic(
+        bootstrap, raw_topic(ENV, CHANNEL), partitions=PARTITIONS, expected=len(acked_ids), timeout_s=60
+    )
+    found_ids = {_control_id(r.value().decode("ascii")) for r in records}
     missing = acked_ids - found_ids
+
+    # Invariant 5, from the receiver-derived keys: first deliveries per key, in `raw` order per partition.
+    first: dict[bytes, list[int]] = {}
+    partitions_of: dict[bytes, set[int]] = {}
+    wrong_key = 0
+    for record in sorted(records, key=lambda r: (r.partition(), r.offset())):
+        control_id = _control_id(record.value().decode("ascii"))
+        key = record.key()
+        assert key is not None, "a per-key channel produced a record with no key (invariant 5)"
+        if key != control_id.rsplit("-", 1)[0].encode("ascii"):
+            wrong_key += 1
+        partitions_of.setdefault(key, set()).add(record.partition())
+        seen = first.setdefault(key, [])
+        sequence = _sequence_of(control_id)
+        if sequence not in seen:
+            seen.append(sequence)
+    violations = count_order_violations(first)
+    duplicates = len(records) - len(found_ids)
+
+    # The fault touched keyed traffic: a key on a partition the killed broker led, ACKed on both sides of it.
+    def acked_indexes(key: bytes) -> list[int]:
+        return [index_of[c] for c in acked_ids if c.rsplit("-", 1)[0].encode("ascii") == key]
+
+    hit = keys_hit_by_fault(
+        partitions_of, led, {key: acked_indexes(key) for key in partitions_of}, kill_index=KILL_AFTER
+    )
+    record_chaos_row(
+        scenario="broker-kill-mid-stream-keyed",
+        sent=MESSAGE_COUNT,
+        delivered_total=len(records),
+        delivered_distinct=len(found_ids),
+        order_violations=violations,
+        fault_fired=exit_code != 0 and bool(hit),
+    )
+    print(
+        f"keys={len(first)} partitions_by_key={ {k.decode(): sorted(v) for k, v in partitions_of.items()} } "
+        f"keys_hit_by_fault={sorted(k.decode() for k in hit)} order_violations={violations} duplicates={duplicates}"
+    )
     assert not missing, f"invariant 1 violated: {len(missing)} acknowledged message(s) missing from raw: {missing}"
+    assert wrong_key == 0, f"{wrong_key} record(s) whose key is not the PID-3.1 the message carries"
+    assert len(first) == KEYS, f"expected {KEYS} distinct keys on raw, saw {len(first)}"
+    assert_each_key_on_one_partition(partitions_of)
+    assert_fault_fired(
+        bool(hit),
+        description="no key with ACKed traffic on both sides of the kill sat on a partition the killed broker led",
+    )
+    assert_per_key_order_preserved(first)
+    assert violations == 0

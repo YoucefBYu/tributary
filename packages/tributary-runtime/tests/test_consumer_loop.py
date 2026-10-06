@@ -13,6 +13,7 @@ import io
 from typing import Any
 
 import pytest
+from confluent_kafka import KafkaError, KafkaException, TopicPartition
 from tributary.runtime.consumer import PARTITION_EOF, ConsumerLoop, LoopSettings, backoff_seconds
 from tributary.runtime.errors import DeliveryError
 from tributary.runtime.events import RecordingEmitter
@@ -24,6 +25,7 @@ from tributary.sdk.ids import uuid7
 from tributary.sdk.testing import make_message
 
 from .fakes import FakeConsumer, FakeError, FakeRecord
+from .log_line_schema import assert_lines_conform
 
 TOPIC = "dev.adt-passthrough.raw"
 BLOCKING = RetryPolicy(
@@ -106,6 +108,7 @@ def build(
     dlq: Any = None,
     clock: Clock | None = None,
     emitter: RecordingEmitter | None = None,
+    stream: io.StringIO | None = None,
 ) -> tuple[ConsumerLoop, RecordingEmitter]:
     events = emitter or RecordingEmitter()
     loop = ConsumerLoop(
@@ -115,7 +118,7 @@ def build(
         retry=retry,
         settings=LoopSettings(commit_every=commit_every, poll_timeout_s=0.0),
         emitter=events,
-        log=JsonLogger("test", stream=io.StringIO()),
+        log=JsonLogger("test", stream=stream if stream is not None else io.StringIO()),
         channel="adt-passthrough",
         channel_version=1,
         instance="worker:test@localhost",
@@ -384,7 +387,24 @@ def test_a_step_failure_is_dead_lettered_without_retrying_the_partition() -> Non
     loop, _ = build(consumer, Failing(), dlq=dlq)
     loop.run(max_iterations=2)
 
-    assert dlq.dead == [("STEP_ERROR", "transformed")]
+    assert dlq.dead == [("TRANSFORM_ERROR", "transformed")]
+    assert consumer.pause_calls == []
+
+
+def test_a_rejected_record_is_dead_lettered_with_the_step_s_own_code_and_no_pause() -> None:
+    """README 3.3.2: `Reject(code)` reaches `tb-error-code` as the step's code, not `TRANSFORM_ERROR`."""
+    consumer = FakeConsumer()
+    consumer.append(record(0))
+    dlq = RecordingDlq()
+
+    class Rejecting:
+        def handle(self, record: ConsumedRecord) -> None:
+            raise StepFailure("check", 1, "Reject", error_code="ORDER_WITHOUT_VISIT", rejected=True)
+
+    loop, _ = build(consumer, Rejecting(), dlq=dlq)
+    loop.run(max_iterations=2)
+
+    assert dlq.dead == [("ORDER_WITHOUT_VISIT", "transformed")]
     assert consumer.pause_calls == []
 
 
@@ -483,9 +503,12 @@ def test_partition_eof_is_not_an_error() -> None:
 def test_a_fatal_consumer_error_stops_the_loop() -> None:
     consumer = FakeConsumer()
     consumer.append(FakeRecord(TOPIC, 0, 0, None, None, None, FakeError(-1, True)))  # type: ignore[arg-type]
-    loop, _ = build(consumer, ScriptedHandler())
+    stream = io.StringIO()
+    loop, _ = build(consumer, ScriptedHandler(), stream=stream)
     with pytest.raises(RuntimeError):
         loop.run(max_iterations=2)
+    [logged] = [line for line in assert_lines_conform(stream.getvalue()) if line["event"] == "consumer_error"]
+    assert logged["kafka_error"] == "-1" and "error_code" not in logged  # L6: error_code is registered codes only
 
 
 def test_a_cooperative_revoke_commits_before_handing_the_partition_over() -> None:
@@ -579,3 +602,98 @@ def test_stop_ends_the_loop_and_still_drains() -> None:
     assert handler.seen == [0, 1]
     assert consumer.committed[-1] == [(TOPIC, 0, 2)]
     assert consumer.closed is True
+
+
+def test_poll_timeout_is_clamped_to_the_next_due_resume() -> None:
+    """ADR-003 follow-up 6: a paused partition must not wait out the poll timeout after its backoff.
+
+    Mutation-verified: returning `self._settings.poll_timeout_s` unconditionally turns this red.
+    """
+    consumer = FakeConsumer()
+    consumer.append(record(0))
+    clock = Clock()
+    handler = ScriptedHandler(failures=1)
+    loop = ConsumerLoop(
+        consumer,
+        handler,
+        topics=[TOPIC],
+        retry=RetryPolicy(
+            policy="blocking",
+            max_attempts=5,
+            on_exhaust="halt-partition",
+            backoff="fixed",
+            initial_delay_ms=40,
+            max_delay_ms=40,
+        ),
+        settings=LoopSettings(commit_every=1, poll_timeout_s=0.2),
+        emitter=RecordingEmitter(),
+        log=JsonLogger("test", stream=io.StringIO()),
+        channel="adt-passthrough",
+        channel_version=1,
+        instance="worker:test@host",
+        clock=clock,
+    )
+    loop.start()
+    assert loop.poll_timeout() == 0.2  # nothing paused: the configured timeout
+    loop.run(max_iterations=1)  # the record fails: the partition pauses for 20-40 ms (equal jitter)
+    timeout = loop.poll_timeout()
+    assert 0.0 < timeout <= 0.040
+    clock.advance(1.0)
+    assert loop.poll_timeout() == 0.0  # overdue: poll must not block at all
+
+
+class RefusingConsumer(FakeConsumer):
+    """Refuses the next `refusals` commits the way a broker does mid-rebalance."""
+
+    def __init__(self, refusals: int, code: int = KafkaError.ILLEGAL_GENERATION) -> None:
+        super().__init__()
+        self.refusals = refusals
+        self.code = code
+
+    def commit(self, offsets: Any = None, asynchronous: bool = True) -> Any:
+        if self.refusals > 0:
+            self.refusals -= 1
+            raise KafkaException(KafkaError(self.code))
+        return super().commit(offsets=offsets, asynchronous=asynchronous)
+
+
+@pytest.mark.parametrize(
+    "code", [KafkaError.ILLEGAL_GENERATION, KafkaError.REBALANCE_IN_PROGRESS, KafkaError.UNKNOWN_MEMBER_ID]
+)
+def test_a_commit_refused_by_a_rebalance_keeps_the_offsets_pending_and_does_not_crash(code: int) -> None:
+    """S7 regression: a loader crashed on ILLEGAL_GENERATION during a cooperative handover."""
+    consumer = RefusingConsumer(refusals=1, code=code)
+    consumer.append(record(0))
+    consumer.append(record(1))
+    stream = io.StringIO()
+    loop, _ = build(consumer, ScriptedHandler(), commit_every=1, stream=stream)
+    loop.run(max_iterations=2)
+    assert loop.stats.commits_refused == 1
+    [refused] = [line for line in assert_lines_conform(stream.getvalue()) if line["event"] == "commit_refused"]
+    assert refused["kafka_error"] == KafkaError(code).name() and "error_code" not in refused
+    # The refused offset rode along with the next commit: nothing was skipped or lost.
+    assert consumer.committed[-1] == [(TOPIC, 0, 2)]
+
+
+def test_any_other_commit_error_still_raises() -> None:
+    consumer = RefusingConsumer(refusals=1, code=KafkaError._TIMED_OUT)
+    consumer.append(record(0))
+    loop, _ = build(consumer, ScriptedHandler(), commit_every=1)
+    with pytest.raises(KafkaException):
+        loop.run(max_iterations=1)
+    assert (loop.stats.commits_failed, loop.stats.commits_refused) == (1, 0)  # tb_commits_total{outcome="failed"}
+
+
+def test_a_revoke_whose_commit_is_refused_forgets_the_revoked_partitions() -> None:
+    """Otherwise a later commit would name a partition another member now owns."""
+    consumer = RefusingConsumer(refusals=0)
+    consumer.append(record(0, partition=0))
+    consumer.append(record(0, partition=1))
+    loop, _ = build(consumer, ScriptedHandler(), commit_every=100)
+    loop.start()
+    for _ in range(2):
+        loop._consume_one(consumer.poll(0))  # no drain: the offsets must still be pending
+    consumer.refusals = 1
+    loop._on_revoke(consumer, [TopicPartition(TOPIC, 0)])
+    assert (TOPIC, 0) not in loop.stats.pending
+    assert (TOPIC, 1) in loop.stats.pending

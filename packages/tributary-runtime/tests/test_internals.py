@@ -36,7 +36,7 @@ def logger(stream: io.StringIO) -> JsonLogger:
 
 def test_log_lines_are_single_line_json_with_the_base_fields() -> None:
     stream = io.StringIO()
-    logger(stream).info("delivered", message_id="0192", attempt=1, duration_ms=3.5)
+    logger(stream).info("delivered", message_id="0192f3a4-5b6c-7d8e-9f01-23456789abcd", attempt=1, duration_ms=3.5)
     lines = stream.getvalue().splitlines()
     assert len(lines) == 1
     record = orjson.loads(lines[0])
@@ -229,7 +229,7 @@ def test_a_raising_step_is_retried_in_place_then_becomes_a_typed_failure() -> No
         executor.run(make_message(), context())
 
     assert counter.calls == 3, "step_retries=2 means three attempts in total (ADR-003 D4)"
-    assert caught.value.error_code == "STEP_ERROR"
+    assert caught.value.error_code == "TRANSFORM_ERROR"
     assert caught.value.exception_type == "ValueError"
     # The exception text is dropped on purpose: parser and validator messages quote the field value.
     assert "SYNTH" not in str(caught.value)

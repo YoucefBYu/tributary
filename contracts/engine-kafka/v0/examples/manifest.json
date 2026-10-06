@@ -1,0 +1,74 @@
+{
+  "contract": "tributary.engine-kafka/v0",
+  "schema": "../engine-kafka.schema.json",
+  "note": "Contract set 1.3 (2026-09-29, ADR-008). Every host, secretRef name and value is synthetic; no example carries a credential value (inline-password.json holds a labelled placeholder to prove the field is refused). Expected-failure pairs are PREDICTED by the architect, who has no shell, and UNMEASURED until `contracts/validate.py --emit-expectations` is run: see contracts/CHANGELOG.md 2026-09-29.",
+  "valid": [
+    {
+      "file": "valid/sasl-ssl-scram-production.json",
+      "note": "Production shape: three brokers, SASL_SSL with SCRAM-SHA-512, the receiver principal's credentials and a private CA, both by secretRef"
+    },
+    {
+      "file": "valid/ssl-mtls.json",
+      "note": "SSL with a client certificate: the principal is the certificate named by security.secretRef (tls.crt, tls.key); tls.secretRef is the CA only"
+    },
+    {
+      "file": "valid/plaintext-loopback.json",
+      "note": "PLAINTEXT to a loopback broker only: a testcontainers Kafka mapped to 127.0.0.1, or a developer's local broker. Never carries real data"
+    },
+    {
+      "file": "valid/compose-lite-worker.json",
+      "note": "The Compose lite stack after ADR-008 D5: SASL_SSL to the broker's internal listener on the Compose network, with a per-component SCRAM user and a dev CA generated at `up`"
+    }
+  ],
+  "invalid": [
+    {
+      "file": "invalid/plaintext-compose-service-name.json",
+      "violates": "PLAINTEXT only when every bootstrap server is loopback; a Compose service name is a network hop, not loopback. This is exactly the lite stack's pre-ADR-008 configuration, which e3ddee1 refuses at runtime",
+      "expected_json_path": "$.bootstrapServers[0]",
+      "expected_validator": "pattern",
+      "expectation_note": "PREDICTED (set 1.3), UNMEASURED. Same mechanism as channel-spec source-kafka-plaintext-remote.json, which measured at the item with pattern"
+    },
+    {
+      "file": "invalid/ssl-without-client-certificate.json",
+      "violates": "an SSL engine connection must present a client certificate (security.secretRef): without one the broker sees no principal, and the per-component ACLs of topics/v0 3.4 cannot apply",
+      "expected_json_path": "$.security",
+      "expected_validator": "required",
+      "expectation_note": "PREDICTED (set 1.3), UNMEASURED"
+    },
+    {
+      "file": "invalid/sasl-plain-mechanism.json",
+      "violates": "saslMechanism is SCRAM-SHA-512 in v0; PLAIN sends the password itself to the broker and is refused (topics/v0 3.4)",
+      "expected_json_path": "$.security.saslMechanism",
+      "expected_validator": "enum",
+      "expectation_note": "PREDICTED (set 1.3), UNMEASURED"
+    },
+    {
+      "file": "invalid/inline-password.json",
+      "violates": "no field can carry a credential value; credentials come only through security.secretRef. The value is a labelled synthetic placeholder",
+      "expected_json_path": "$.security",
+      "expected_validator": "additionalProperties",
+      "expectation_note": "PREDICTED (set 1.3), UNMEASURED"
+    },
+    {
+      "file": "invalid/tls-verification-disabled.json",
+      "violates": "broker certificate and hostname verification cannot be turned off; there is no field for it, so an 'insecure' switch is an unknown property",
+      "expected_json_path": "$.security.tls",
+      "expected_validator": "additionalProperties",
+      "expectation_note": "PREDICTED (set 1.3), UNMEASURED"
+    },
+    {
+      "file": "invalid/librdkafka-passthrough.json",
+      "violates": "no librdkafka property passthrough: a free-form map merged into the client config can override acks=all and enable.idempotence (invariant 1). Contract-owned client settings come from topics/v0 topic-defaults.json only",
+      "expected_json_path": "$",
+      "expected_validator": "additionalProperties",
+      "expectation_note": "PREDICTED (set 1.3), UNMEASURED. First root-level pair in these contracts; if jsonschema reports the root path differently, correct the path, not the rule"
+    },
+    {
+      "file": "invalid/plaintext-with-credentials.json",
+      "violates": "PLAINTEXT carries no secretRef or tls: a SCRAM password or certificate sent to a plaintext listener is a configuration mistake, never a feature",
+      "expected_json_path": "$.security",
+      "expected_validator": "not",
+      "expectation_note": "PREDICTED (set 1.3), UNMEASURED"
+    }
+  ]
+}

@@ -67,6 +67,20 @@ def _require(mapping: Mapping[str, Any], key: str, where: str) -> Any:
         raise ConfigError(f"{where}: missing required field {key!r}") from None
 
 
+def check_static_headers(destination: str, headers: Mapping[str, Any]) -> dict[str, str]:
+    """A static header name or value with a control character (a line break above all) would make
+    `http.client` refuse every request, and is how a header gets injected. Refused at load time, without
+    echoing the value (it may be a token someone pasted into the wrong field)."""
+    out: dict[str, str] = {}
+    for name, value in headers.items():
+        if not isinstance(name, str) or not isinstance(value, str) or not name or ":" in name:
+            raise ConfigError(f"destination {destination!r}: with.headers must map header names to strings")
+        if any(ord(c) < 0x20 or ord(c) == 0x7F for c in name + value):
+            raise ConfigError(f"destination {destination!r}: with.headers carries a control character")
+        out[name] = value
+    return out
+
+
 def http_destination_config_from_destination(channel: str, destination: Destination) -> HttpDestinationConfig:
     """Build `HttpDestinationConfig` from an already-parsed `tributary.runtime.spec.Destination`.
     Raises `ConfigError` for anything this wave's loader cannot honour."""
@@ -96,7 +110,7 @@ def http_destination_config_from_destination(channel: str, destination: Destinat
         url=_require(params, "url", "with"),
         method=_require(params, "method", "with"),
         timeout_s=_require(params, "timeoutMs", "with") / 1000,
-        headers=dict(params.get("headers", {})),
+        headers=check_static_headers(destination.name, params.get("headers") or {}),
         auth=auth,
         circuit_breaker=breaker,
         idempotency_technique=destination.idempotency.technique,

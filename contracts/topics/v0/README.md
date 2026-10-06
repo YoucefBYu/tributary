@@ -1,7 +1,11 @@
 # Contract: topic naming, defaults and required configuration — v0 (draft)
 
 **Contract id:** `tributary.topics/v0`
-**Status:** Draft. Partition defaults and `session.timeout.ms` are **measured** (S4, S5, 2026-09-20) and are lower bounds from a laptop-hosted cluster; `_tb.<env>.events` partitions and audit retention are still open.
+**Status:** Draft. Partition defaults and `session.timeout.ms` are **measured** (S4, S5, 2026-09-20) and are lower bounds from a laptop-hosted cluster; `_tb.<env>.events` partitions and audit retention are still open. **Set 1.4 (2026-09-29):** ACL role table
+reconciled with the code (3.4.1), `super.users` restated, spec-reader group named (3.6). **Set 1.4.1
+(patch):** 3.4 `super.users` row: a user-provisioning identity is no longer a super user. **Set 1.7
+(2026-10-05):** 3.3.1: the reply consumer reads its own `clients.reply_consumer` values, and the unique
+`--instance` deployment rule; `isolation.level` joins `must_not_hardcode`.
 **Owner:** `architect`.
 **Source:** ADR-001 sections 5.3 and 6.4, refined by ADR-002.
 **Schema:** [`topic-name.schema.json`](topic-name.schema.json) · **Defaults:** [`topic-defaults.json`](topic-defaults.json) · **Examples:** [`examples/topic-names.json`](examples/topic-names.json)
@@ -29,7 +33,7 @@ Total length ≤ 249 (Kafka's limit). The grammar's worst case is 150, so there 
 |---|---|---|
 | `<env>.<ch>.raw` | Messages as received. Source of truth for replay. | ordering key |
 | `<env>.<ch>.out.<dest>` | Transformed message for one destination. | ordering key |
-| `<env>.<ch>.retry` | Non-blocking retries, shared across destinations. | ordering key |
+| `<env>.<ch>.retry` | Non-blocking retries, shared across destinations. **Unused in v0**: `retry-topic` is refused, so no role holds a grant on it (3.4.1). | ordering key |
 | `<env>.<ch>.dlq` | Exhausted retries and step failures. | `tb-msg-id` |
 | `<env>.<ch>.reply` | Short-lived synchronous replies. | `tb-correlation-id` |
 | `_tb.<env>.channels` | Compacted deployed channel specs. | channel id |
@@ -104,7 +108,7 @@ Helm read one source instead of hardcoding three.
 | `out.<dest>` | 3, matching `raw` | 7 d | delete |
 | `retry` | 3, matching `raw` | 3 d | delete |
 | `dlq` | 3 | 30 d | delete |
-| `reply` | 3 | 10 min | delete |
+| `reply` | 3, or `spec.source.reply.partitions` (set 1.2); created only for a sync-reply channel | 10 min | delete |
 | `_tb.<env>.channels` | 6 | compacted | compact |
 | `_tb.<env>.events` | 24 (**still unmeasured**, section 2.2) | 3 d | delete |
 | `_tb.<env>.audit` | 6 | 30 d (**TODO(human)**, section 2.1) | delete |
@@ -116,6 +120,13 @@ a silent violation of invariant 5. The runtime MUST refuse to start a channel wh
 disagree.
 
 `dlq` gets fewer partitions because it is keyed by message id, low volume, and read by humans.
+
+**`reply` is sized by receiver processes, not by throughput (set 1.2).** Its count comes only from
+`spec.source.reply.partitions` (channel-spec 3.2.6), never from `spec.partitions`, and it need not
+match `raw`: a reply goes to the explicit partition named in `tb-reply-partition`, not by key hash.
+It must be at least the number of receiver processes, because each process needs one to advertise
+(3.3.1). Raising it on a live topic is harmless; lowering it means recreating the topic, which a
+10-minute retention makes cheap.
 
 ### 2.1 Audit retention is a human decision, not an engineering default
 
@@ -157,8 +168,8 @@ channels** (roughly 21,000 partitions: JVM OOM, then loss of the raft quorum). A
 — 12,009 partitions — were healthy**, with `list_topics` at 0.17 s and 1.4 GiB per broker container.
 
 Budget for deciding when a cluster needs more brokers or topic sharing, in **projected total
-partitions** (`channels x 4 x partitions`; a sync-reply channel has five topics, so it counts for
-more):
+partitions** (`channels x 4 x partitions`, plus `reply.partitions` for each sync-reply channel,
+whose fifth topic is sized separately):
 
 | Trigger | Partitions | Basis |
 |---|---|---|
@@ -192,7 +203,7 @@ These are not tuning knobs. Invariant 1 (never ACK and drop) is false without th
 | `replication.factor` | 3 (production), 1 (lite) | Survive one broker loss. |
 | `min.insync.replicas` | 2 (production), 1 (lite) | With `acks=all`, a write is durable on two brokers before the receiver ACKs. |
 | `unclean.leader.election.enable` | `false` | A leader elected from a stale replica silently loses acknowledged records. |
-| `max.message.bytes` | 1048576 | Matches the envelope's 1 MB inline limit plus header headroom. |
+| `max.message.bytes` | 1048576 | The envelope's 1 MB inline limit plus header headroom. **Not an envelope control:** Kafka checks it against the compressed batch, so a compressible oversize payload passes. See `max.message.bytes_source` in `topic-defaults.json`. |
 | `compression.type` | `producer` | Do not recompress on the broker. |
 
 **`min.insync.replicas` and `unclean.leader.election.enable` are set per topic, in every class in
@@ -234,6 +245,44 @@ available, it NACKs or refuses the connection. It never ACKs optimistically.
 | `isolation.level` | `read_committed` on topics written by a transactional stage | Otherwise a consumer sees aborted records. |
 | `max.poll.interval.ms` | ≥ the slowest destination timeout plus backoff | Otherwise a slow sink looks like a dead consumer and causes a rebalance loop. |
 
+#### 3.3.1 Receiver reply consumer (set 1.2, synchronous reply mode)
+
+Machine-readable in `topic-defaults.json` `clients.reply_consumer`. One per receiver process of a
+sync-reply channel, in group `tb.<env>.<channel>.replier`. **Kafka's partition assignment is the lease
+on a reply partition**, so no coordinator is involved and invariant 3 holds.
+
+| Setting | Value | Why |
+|---|---|---|
+| Offsets | never committed; `enable.auto.commit=false` | A reply older than the process's pending map is useless |
+| `auto.offset.reset` | `latest` | Same reason |
+| `isolation.level` | `read_uncommitted` | The reply producer is not transactional (sync reply is refused on transactional channels) |
+| `partition.assignment.strategy` | `cooperative-sticky` | A joining process takes partitions without revoking everyone's |
+| `group.instance.id` | unique **per process**: `<instance>-p<pid>` | A duplicate id fences a live process out of the group. **Set 1.7:** `--instance` is required with `source.reply` (below) |
+| `session.timeout.ms` / `heartbeat.interval.ms` | 15000 / 5000 | As 3.3. Bounds how long a killed process's partition stays unusable; stalls no other process |
+
+**Set 1.7: read these from `clients.reply_consumer`, not from `worker_consumer`.** The values are typed
+there since set 1.2 (`session.timeout.ms`, `heartbeat.interval.ms`, `auto.offset.reset`, and now
+`isolation.level` in `must_not_hardcode`). The first receiver build borrowed the worker's session and
+heartbeat values and wrote `latest` and `read_uncommitted` as literals. The numbers are equal today, so
+nothing is wrong at run time, but it is the 3.7 failure: a re-measurement of one profile would silently
+move, or fail to move, the other. The effective-configuration test (3.7) covers the replier.
+
+**Set 1.7: deployment rule for `--instance`.** With `source.reply` present, a receiver refuses to start
+without an explicit `--instance`. A built-in default is the same in every replica, and the pid is 1 in
+every container, so replicas fenced one another (found in the first multi-replica run). Every receiver
+replica of a channel in one environment gets a unique value: Helm templates it from the pod name
+(downward API `metadata.name`, or a StatefulSet ordinal), Compose sets it per service. A process that
+is fenced anyway (librdkafka `_FATAL`) reports not ready and exits non-zero for its supervisor.
+
+Two rules that are not client settings:
+
+1. **Advertise only an established partition.** A process puts p in `tb-reply-partition` only after it
+   holds p and its consumer has a fetch position on p. Otherwise a reply written between assignment
+   and the `latest` offset reset is skipped. That ends as `AE` (safe) but is a race, and the tests
+   must close it.
+2. **No partition, not ready.** A process holding none, or whose reply consumer is disconnected,
+   answers sync requests `AR` / `REPLY_UNAVAILABLE` **before publishing** and fails readiness.
+
 ### 3.4 Transport security and authorization (required)
 
 A cluster built from sections 3.1 to 3.3 alone is plaintext, unauthenticated and unauthorized, and it
@@ -247,7 +296,7 @@ in `topic-defaults.json` under `security`.
 | Authentication | `SCRAM-SHA-512` or `OAUTHBEARER`. Never `PLAIN` on a listener without TLS. |
 | Hostname verification | `ssl.endpoint.identification.algorithm=https`. Leaving this off is the most common way a TLS Kafka deployment silently accepts a man-in-the-middle. |
 | Authorization | `StandardAuthorizer` enabled and **`allow.everyone.if.no.acl.found=false`** — deny by default. |
-| `super.users` | The topic-creation job and the control plane only. Never a data-plane component. |
+| `super.users` | **Set 1.4.1:** the broker's own identity, the topic-creation job and an operator admin principal. A user-provisioning identity, where one exists, is **not** a super user: it gets only ALTER on CLUSTER, which is what `AlterUserScramCredentials` needs. That grant also authorises `CreateAcls`, so treat its key as super-user-grade. **Never** a data-plane component, the control plane's channel publisher (it holds only its `control_plane` grants), or `User:ANONYMOUS`. Lite stack names: `engine-kafka/v0` 6 rule 3. |
 | Credentials | From a `secretRef` or a secrets manager. Never in a channel spec, a Compose file or an image. |
 
 ACLs are least privilege on the topic prefix `<env>.<channel>.`, so compromising one channel's
@@ -257,9 +306,92 @@ cluster-wide `WRITE`, `DELETE` or `ALTER`; and no worker or loader gets `WRITE` 
 `_tb.<env>.channels`, because that topic is what invariant 3 makes workers trust completely — write
 access to it is remote code execution across the whole data plane.
 
+**Where a data-plane process gets its engine credentials (set 1.3, ADR-008).** From one
+[`engine-kafka/v0`](../../engine-kafka/v0/README.md) document per process, named by
+`TB_ENGINE_KAFKA_FILE`, holding the bootstrap servers, the protocol and `secretRef` names resolved from
+local files. It is the same for receivers, workers, loaders and the archiver, and every one of them
+enforces its section 4: **PLAINTEXT only to loopback brokers, with no opt-out**, verified TLS with the
+AEAD cipher pin, credentials present, and no property that can override the client settings in 3.2 and
+3.3. "Loopback" means the client connects to `127.0.0.0/8`, `[::1]` or `localhost`. A Docker Compose
+network, a Kubernetes pod network and a host-only bridge are **not** loopback, so the "loopback-bound
+lite listener" in the table above means a listener bound to `127.0.0.1` that only same-host (or
+same-container) processes reach. The Compose lite stack runs `SASL_SSL` (ADR-008 D5, `engine-kafka/v0`
+section 6); the lite profile lowers durability only (3.8), never transport security.
+
 **Escalated, not decided here:** the complete role model, credential rotation and key management are
 ADR-004 plus a human decision. This section fixes the minimum shape the configuration contract must
 state; it does not design the authorization model or any cryptography.
+
+#### 3.4.1 Role grants, reconciled with the code (set 1.4)
+
+**Why this exists.** The first deny-by-default run (Compose lite, ADR-008 D5) showed that the table was
+written from intent, not from the code. Every loader exited with `ChannelSpecError: channels topic
+_tb.dev.channels is not available`, which is how `open_spec_source` reports `TOPIC_AUTHORIZATION_FAILED`:
+the `loader` role had no READ on `_tb.<env>.channels`, although every loader reads its spec there
+(invariant 3). The worker logged `GROUP_AUTHORIZATION_FAILED` (error code 30) on its spec reader,
+because no role had a grant for that reader's group. With a temporary READ grant, the MLLP → worker →
+loader path ran end to end. Set 1.4 rebuilds the table from what each role's code touches.
+
+| Role | Topics | Consumer groups | Cluster / other |
+|---|---|---|---|
+| receiver | WRITE `raw`; READ `_tb.<env>.channels` (below) | `tb.<env>.<ch>.channels.` (prefixed); sync-reply only: `tb.<env>.<ch>.replier` (literal) | IDEMPOTENT_WRITE; sync-reply only: READ `reply`, never WRITE |
+| pipeline worker | READ `raw`; WRITE `out.*`, `dlq`, `_tb.<env>.events`; READ `_tb.<env>.channels`; sync-reply only: WRITE `reply` | `tb.<env>.<ch>.pipeline` (literal), `tb.<env>.<ch>.pipeline.shadow-` (prefixed), `tb.<env>.<ch>.channels.` (prefixed) | transactional channels only: WRITE on transactional id prefix `tb.<env>.<ch>.pipeline.` |
+| loader | READ `out.<dest>`; WRITE `dlq`, `_tb.<env>.events`; READ `_tb.<env>.channels` | `tb.<env>.<ch>.loader.<dest>` (literal), `tb.<env>.<ch>.channels.` (prefixed) | none |
+| control plane (channel publisher) | WRITE `_tb.<env>.channels`, `_tb.<env>.audit` | none | DESCRIBE |
+| archiver (set 1.8) | READ `_tb.<env>.events` | `tb.<env>.archiver` (literal) | none |
+
+**Rules the table follows.**
+
+1. **Every data-plane role reads `_tb.<env>.channels`** and holds READ on its spec reader's group
+   prefix `tb.<env>.<ch>.channels.` (`consumer_groups.spec_reader`). The reader uses `assign()` and
+   never commits, but librdkafka still looks up the coordinator for a configured `group.id`, and that
+   lookup needs the group grant. **The receiver gets the same grant before it needs it:** receivers
+   still read a spec file (a wave-1 stand-in, `receivers/mllp/config.py`), which is an invariant-3
+   gap, and the migration should not wait on a second ACL round. **WRITE on `_tb.<env>.channels` stays
+   control-plane only** (`forbidden`).
+2. **Every group grant is delimited.** A PREFIXED grant ends at `.` or `-` (`...channels.`,
+   `...pipeline.shadow-`), so `tb.dev.adt.loader.fhir` cannot reach `...loader.fhir-server`. Loaders
+   get a LITERAL group: no loader builds a shadow group. The set 1.2 `replier*` becomes LITERAL
+   `replier` for the same reason.
+3. **No grant without a code path.** The worker loses WRITE on `.retry`: under the set 1.1 design
+   (channel-spec 4.1.1 item 5) the loader writes `retry`, never the worker. The loader loses READ and
+   WRITE on `.retry`, because `retry-topic` is refused and nothing touches the topic
+   (`loader_retry_topic` says what it gains on lift). `topic-bootstrap` still creates the topic.
+4. **IDEMPOTENT_WRITE on the cluster is not granted to the worker or the loader.** Since Kafka 3.0
+   (KIP-679), WRITE on any topic authorizes an idempotent producer. Evidence: on the lite run, both
+   roles' `acks=all` idempotent producers worked without it. The receiver keeps its grant; it is
+   redundant and harmless. The KIP-679 reading was not re-checked against the 4.0 source.
+5. **The transactional-id grant lives outside the parsed worker string** (`pipeline_worker_transactional`).
+   If it is missing, `init_transactions` fails before the worker consumes anything, so the channel fails
+   closed.
+
+**Accepted exposure: every data-plane principal can read every channel spec in its environment.**
+`_tb.<env>.channels` is one compacted topic keyed by channel, and a reader needs all partitions
+(`channels.py`), so the grant cannot be per channel. A spec carries no secret value (only `secretRef`
+names) and no PHI, but it does reveal topology: hosts, ports, bucket names and partner endpoints.
+**What we give up:** a compromised loader learns the shape of other channels. Per-channel spec topics
+would fix that, at one more topic per channel against the 2.2 budget; ADR-004 may revisit it.
+
+**Retry groups (ruling, applies when `retry-topic` lifts).** One `retry` topic per channel, shared
+across destinations (4.1.1 item 1), is safe **only if no two destinations share a consumer group on
+it.** Kafka keeps committed offsets per `(group, topic, partition)`. If loaders A and B used a common
+group such as `tb.<env>.<ch>.retry`, A committing past B's record would make B skip its retry. That is
+silent loss, an invariant-4 violation. Therefore:
+
+- each destination's loader consumes `retry` in **its own group**, `tb.<env>.<ch>.loader.<dest>`,
+  whether through the same consumer as `out.<dest>` or a second member of that group, and skips
+  records whose `tb-destination` is not its own. A skipped record still advances **that group's**
+  offset, which is correct;
+- a channel-wide retry group is **forbidden**. The ACL enforces this: a loader holds only its LITERAL
+  destination group, so a shared group name fails authorization at start instead of losing data;
+- lift adds one conformance test: two destinations on one channel both fail, and each gets its own
+  retries, with a broken control that shares a group and goes red.
+
+**Rejected:** a per-destination retry topic `<env>.<ch>.retry.<dest>`. It isolates by construction, but
+it adds D−1 topics per channel against the S4 partition budget, and it is a grammar change. **What we
+give up:** each loader reads every destination's retry records (read amplification × destinations on a
+low-volume topic), and a loader's principal can read retry records for sibling destinations of the same
+channel. Same channel and same PHI class, so this is accepted.
 
 ### 3.5 Encryption at rest (required)
 
@@ -288,11 +420,34 @@ likewise an ADR-004 question; the requirement that encryption be on is not.
 ### 3.6 Consumer group naming
 
 ```
-tb.<env>.<channel>.<role>[.<destination>]     role = pipeline | loader | replier | archiver
+tb.<env>.<channel>.<role>[.<destination>]     role = pipeline | loader | replier | receiver
+tb.<env>.archiver                             environment-wide platform group (set 1.8)
 ```
+
+**Set 1.8: the archiver's group has no channel segment.** It consumes `_tb.<env>.events` for every
+channel, so a per-channel `archiver` role described a group nothing builds. Its ACL is **LITERAL**
+`tb.<env>.archiver`. The set 1.4 grant was PREFIXED `tb.<env>.archiver*`, which broke rule 2 of 3.4.1
+and would also have matched the groups of a channel named `archiver` (`tb.<env>.archiver.pipeline`).
 
 For example `tb.prod.adt-to-fhir.loader.fhir-server`. A shadow deployment appends
 `.shadow-<label>`, which is what makes shadow deploys free: a second group on the same `raw` topic.
+
+**`replier` (defined in set 1.2)** is the receivers' reply-consumer group in synchronous reply mode
+(3.3.1), on this engine's cluster. Receivers of a sync-reply channel gain READ on
+`<env>.<channel>.reply` and on group `tb.<env>.<channel>.replier*`; the pipeline worker gains WRITE on
+`<env>.<channel>.reply` (`security.acls`). The receiver gets no WRITE on `reply`, so it cannot forge an
+answer. Set 1.4 tightens the group grant to LITERAL `tb.<env>.<channel>.replier` (3.4.1 rule 2). Every receiver process of a channel shares one principal, so targeted routing limits what a
+process reads **by design, not by ACL**.
+
+**`receiver` (set 1.1, additive)** is the group of a `kafka` source (`channel-spec/v0` 3.2.5). That
+group lives on the **external** cluster the source reads, under the source's own credentials — never
+the engine's receiver principal — so section 3.4's ACL shape and `security.acls` gain nothing and lose
+nothing. The name is fixed here only so two deployments of one channel cannot collide on a foreign
+cluster.
+
+**Spec reader (set 1.4)** is `tb.<env>.<channel>.channels.<instance>`, one group per process, used by
+the `_tb.<env>.channels` reader (`consumer_groups.spec_reader`, 3.4.1 rule 1). It is not a `<role>` in
+the pattern above: its last segment is an instance, not a destination, and it never joins or commits.
 
 ### 3.7 These values are read from the contract, not copied into code
 
@@ -306,7 +461,7 @@ NOT restate them as literals.
 | Partition counts per class, and the partition budget | runtime, topic creation, Helm |
 | `retention.ms`, `cleanup.policy` per class | topic creation, Helm |
 | `min.insync.replicas`, `unclean.leader.election.enable` | topic creation, Compose, Helm |
-| `session.timeout.ms` (15000), `heartbeat.interval.ms` (5000) | worker and loader consumers |
+| `session.timeout.ms` (15000), `heartbeat.interval.ms` (5000) | worker and loader consumers; the receivers' reply consumer (set 1.2) |
 | `commit_every` | worker and loader consumers |
 | `acks`, `enable.idempotence`, `delivery.timeout.ms` | receiver producer |
 

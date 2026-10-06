@@ -1,0 +1,12 @@
+{
+  "id": "0192f3a4-7100-7abc-8def-0123456789ab",
+  "environment": "prod",
+  "channel": "adt-fanout",
+  "kind": "rollback",
+  "version": 2,
+  "previous_version": 3,
+  "status": "published",
+  "requested_by": "synth-operator-0002",
+  "requested_at": "2026-10-05T09:20:00.000Z",
+  "published_at": "2026-10-05T09:20:00.412Z"
+}

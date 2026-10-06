@@ -1,5 +1,4 @@
-"""`python -m tributary.loaders.http --channel <name> --destination <name> --env <env>
---bootstrap <hosts>`.
+"""`python -m tributary.loaders.http --channel <name> --destination <name> --env <env>`.
 
 Wires `HttpRecordHandler` into `tributary.runtime`'s `ConsumerLoop`, mirroring
 `tributary.runtime.worker.PipelineWorker.build()`: the same `clients.consumer_config`/
@@ -18,9 +17,11 @@ import argparse
 import json
 import os
 import signal
+import sys
 import time
 from typing import cast
 
+from tributary.runtime import load_engine_kafka_or_exit
 from tributary.runtime.channels import open_spec_source
 from tributary.runtime.clients import (
     KafkaSettings,
@@ -38,6 +39,7 @@ from tributary.runtime.worker import KafkaDlqWriter
 from tributary.sdk.context import Logger
 
 from ..secrets import DirSecretResolver
+from ..startup import spec_reader_group_or_exit
 from .config import http_destination_config_from_destination
 from .handler import HttpRecordHandler
 from .loader import HttpLoader
@@ -58,22 +60,22 @@ def emit_lite_profile_warning(log: Logger, *, profile: str) -> None:
     )
 
 
-def build_loop(a: argparse.Namespace) -> tuple[ConsumerLoop, HttpRecordHandler]:
+def build_loop(a: argparse.Namespace, kafka_settings: KafkaSettings) -> tuple[ConsumerLoop, HttpRecordHandler]:
     from confluent_kafka import Consumer, Producer
 
-    kafka_settings = KafkaSettings(bootstrap_servers=a.bootstrap)
     defaults: TopicDefaults = load_topic_defaults(a.contracts_dir)
     instance = a.instance_id or f"loader-{a.destination}-{os.getpid()}"
-    log = JsonLogger(f"loader-{a.destination}", base={"channel": a.channel, "destination": a.destination})
+    log = JsonLogger("loader-http", base={"channel": a.channel, "destination": a.destination})
     emit_lite_profile_warning(log, profile=a.profile)
 
+    spec_group = spec_reader_group_or_exit(a.env, a.channel, instance, log)
     spec_source = open_spec_source(
         channel=a.channel,
         consumer=Consumer(
             consumer_config(
                 kafka_settings,
                 defaults,
-                group_id=f"tb.{a.env}.{a.channel}.channels.{instance}",
+                group_id=spec_group,
                 enable_partition_eof=True,
             )
         ),
@@ -141,11 +143,13 @@ def build_loop(a: argparse.Namespace) -> tuple[ConsumerLoop, HttpRecordHandler]:
 
 
 def main() -> None:
+    # Before parse_args: argparse echoes an unknown flag's value to stderr, so a retired
+    # --bootstrap / --engine-security must reach the ENGINE_KAFKA_RETIRED_INPUT refusal first.
+    kafka_settings = load_engine_kafka_or_exit(argv=sys.argv[1:], log=JsonLogger("loader-http"))
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--channel", required=True, help="the deployed channel name (spec.metadata.name)")
     p.add_argument("--destination", required=True, help="the spec.destinations[].name to load")
     p.add_argument("--env", required=True, help="the topic-name env segment, e.g. 'dev' or 'prod'")
-    p.add_argument("--bootstrap", required=True, help="Kafka bootstrap.servers")
     p.add_argument("--instance-id", help="defaults to loader-<destination>-<pid>")
     p.add_argument("--secrets-dir", help="overrides TB_SECRETS_DIR / the default secrets mount")
     p.add_argument("--contracts-dir", help="overrides TB_CONTRACTS_DIR / the default contracts/ search")
@@ -156,7 +160,7 @@ def main() -> None:
         help="topic-defaults.json profile in use; 'lite' emits the mandatory RF=1 startup warning",
     )
     a = p.parse_args()
-    loop, handler = build_loop(a)
+    loop, handler = build_loop(a, kafka_settings)
 
     def _shutdown(signum: int, _frame: object) -> None:
         loop.stop()

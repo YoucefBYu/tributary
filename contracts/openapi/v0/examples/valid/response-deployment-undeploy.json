@@ -1,0 +1,12 @@
+{
+  "id": "0192f3a4-7200-7abc-8def-0123456789ab",
+  "environment": "dev",
+  "channel": "adt-fanout",
+  "kind": "undeploy",
+  "version": null,
+  "previous_version": 2,
+  "status": "failed",
+  "requested_by": "synth-operator-0002",
+  "requested_at": "2026-10-05T09:30:00.000Z",
+  "failure_code": "PUBLISH_TIMEOUT"
+}

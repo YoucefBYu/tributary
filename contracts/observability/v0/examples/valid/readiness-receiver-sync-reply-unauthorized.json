@@ -1,0 +1,15 @@
+{
+  "v": 0,
+  "component": "receiver",
+  "status": "not_ready",
+  "channel": "orm-synth-sync",
+  "channel_version": 2,
+  "receiver_type": "mllp",
+  "sync_reply": true,
+  "checks": [
+    { "name": "spec", "ok": true },
+    { "name": "component", "ok": true },
+    { "name": "raw_producer", "ok": true },
+    { "name": "reply_consumer", "ok": false, "reason": "unauthorized" }
+  ]
+}

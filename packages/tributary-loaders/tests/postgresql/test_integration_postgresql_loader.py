@@ -1,0 +1,346 @@
+"""`PostgresqlLoader` against a real PostgreSQL server (`testcontainers`), proving invariant 4 and
+README 3.4.3 for real: a duplicate delivery of the same `tb-msg-id` produces exactly one row, and a
+table with no unique index on `idColumn` refuses to start rather than silently duplicate.
+`uv run pytest -m integration packages/tributary-loaders/tests/postgresql`.
+
+`driver=None` on `PostgresContainer`: this loader talks to the server with `asyncpg` directly, never
+through a SQLAlchemy URL, so the container's readiness probe (`psql` run inside the container itself,
+`testcontainers.community.postgres.PostgresContainer._connect`) is all that is needed — no `psycopg2`
+dependency reaches this package for that.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from typing import Any, cast
+
+import asyncpg  # type: ignore[import-untyped]
+import pytest
+from testcontainers.community.postgres import PostgresContainer
+from tributary.loaders.errors import IdempotencyConstraintError
+from tributary.loaders.postgresql.client import PgConnectionSettings, PgPoolLike, create_pool
+from tributary.loaders.postgresql.config import PgAuthSpec, PgTlsSpec, PostgresqlDestinationConfig
+from tributary.loaders.postgresql.loader import PostgresqlLoader
+from tributary.sdk import Message, ids
+from tributary.sdk import headers as h
+
+pytestmark = pytest.mark.integration
+
+
+def _as_asyncpg_pool(pool: PgPoolLike) -> asyncpg.Pool:
+    """Verification-only widening: `PgPoolLike` (what the loader depends on) has no `fetch`, but the
+    real object `create_pool` returns is a real `asyncpg.Pool`, and a test needs to independently read
+    back what landed in the table rather than trust the loader's own report of what it did."""
+    return cast("asyncpg.Pool", pool)
+
+
+def make_message(row: dict[str, Any] | None = None, *, msg_id: str | None = None) -> Message:
+    return Message(
+        headers={
+            h.TB_MSG_ID: msg_id or ids.uuid7(),
+            h.TB_CHANNEL: "c",
+            h.TB_CHANNEL_VERSION: "0",
+            h.TB_SOURCE: "mllp:i@p",
+            h.TB_RECEIVED_AT: "2026-01-01T00:00:00.000Z",
+            h.TB_CONTENT_TYPE: "application/json",
+            h.TB_ATTEMPT: "0",
+            h.TRACEPARENT: ids.new_traceparent(),
+            h.TB_DESTINATION: "warehouse",
+        },
+        payload=json.dumps(row if row is not None else {"value": 1}).encode("utf-8"),
+    )
+
+
+def make_config(**overrides: object) -> PostgresqlDestinationConfig:
+    base: dict[str, object] = {
+        "channel": "c",
+        "destination": "warehouse",
+        "host": "unused",  # the pool is built directly from PgConnectionSettings below, not this
+        "port": 5432,
+        "database": "unused",
+        "table": "observations",
+        "id_column": "tb_msg_id",
+        "auth": PgAuthSpec("password", "unused"),
+        "tls": PgTlsSpec("disable", None),
+        "timeout_s": 5.0,
+        "circuit_breaker": None,
+        "idempotency_technique": "sink-native",
+        "backoff": "fixed",
+        "initial_delay_ms": 10,
+        "max_delay_ms": 100,
+        "max_attempts": 3,
+        "on_exhaust": "halt-partition",
+    }
+    base.update(overrides)
+    return PostgresqlDestinationConfig(**base)  # type: ignore[arg-type]
+
+
+@asynccontextmanager
+async def _open_pool(container: PostgresContainer) -> AsyncIterator[PgPoolLike]:
+    settings = PgConnectionSettings(
+        host=container.get_container_host_ip(),
+        port=int(container.get_exposed_port(container.port)),
+        database=container.dbname,
+        user=container.username,
+        password=container.password,
+        ssl_context=None,  # test container, loopback-published port; see PgConnectionSettings
+    )
+    pool = await create_pool(settings, min_size=1, max_size=2, command_timeout=5.0)
+    try:
+        yield pool
+    finally:
+        # Bounded the same way `PostgresqlLoader.close()` now is (its docstring): a connection this
+        # test itself broke (`test_a_dropped_connection_is_retried_without_crashing_the_shared_loop`)
+        # or left mid-reconnect must not make teardown -- and every later test in the same process --
+        # wait forever. `asyncpg.pool.Pool.close()` calls `Pool.terminate()` itself once
+        # `asyncio.wait_for` cancels it, so the pool is still torn down on timeout.
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(pool.close(), 10.0)
+
+
+def test_duplicate_delivery_produces_one_row() -> None:
+    with PostgresContainer("postgres:16", driver=None) as container:
+
+        async def run() -> tuple[bool, bool, int]:
+            async with _open_pool(container) as pool:
+                await pool.execute("CREATE TABLE observations (tb_msg_id TEXT PRIMARY KEY, value INTEGER NOT NULL)")
+                loader = PostgresqlLoader(make_config(), pool)
+                await loader.verify_idempotency_constraint()  # must not raise: PRIMARY KEY covers it
+                message = make_message({"value": 42})
+
+                first = await loader.deliver(message)
+                second = await loader.deliver(message)  # simulates a blocking-retry redelivery
+
+                row_count = await _as_asyncpg_pool(pool).fetchval(
+                    "SELECT count(*) FROM observations WHERE tb_msg_id = $1", message.msg_id
+                )
+                return first.success and first.inserted, second.success and not second.inserted, int(row_count)
+
+        first_ok, second_ok, row_count = asyncio.run(run())
+        assert first_ok is True
+        assert second_ok is True
+        assert row_count == 1  # the duplicate delivery never became a second row
+
+
+def test_two_different_messages_produce_two_rows() -> None:
+    with PostgresContainer("postgres:16", driver=None) as container:
+
+        async def run() -> int:
+            async with _open_pool(container) as pool:
+                await pool.execute("CREATE TABLE observations (tb_msg_id TEXT PRIMARY KEY, value INTEGER NOT NULL)")
+                loader = PostgresqlLoader(make_config(), pool)
+                await loader.deliver(make_message({"value": 1}))
+                await loader.deliver(make_message({"value": 2}))
+                count = await _as_asyncpg_pool(pool).fetchval("SELECT count(*) FROM observations")
+                return int(count)
+
+        assert asyncio.run(run()) == 2  # two distinct tb-msg-ids: no conflict, both rows land
+
+
+def test_verify_idempotency_constraint_refuses_a_table_with_no_unique_index() -> None:
+    """The startup half of README 3.4.3's proof: a table that CAN silently duplicate must stop the
+    loader before it ever delivers, not be trusted because the spec says `sink-native`."""
+    with PostgresContainer("postgres:16", driver=None) as container:
+
+        async def run() -> None:
+            async with _open_pool(container) as pool:
+                await pool.execute("CREATE TABLE observations (tb_msg_id TEXT NOT NULL, value INTEGER NOT NULL)")
+                loader = PostgresqlLoader(make_config(), pool)
+                await loader.verify_idempotency_constraint()
+
+        with pytest.raises(IdempotencyConstraintError):
+            asyncio.run(run())
+
+
+def test_verify_idempotency_constraint_accepts_a_unique_index_not_just_a_primary_key() -> None:
+    with PostgresContainer("postgres:16", driver=None) as container:
+
+        async def run() -> None:
+            async with _open_pool(container) as pool:
+                await pool.execute("CREATE TABLE observations (tb_msg_id TEXT NOT NULL, value INTEGER NOT NULL)")
+                await pool.execute("CREATE UNIQUE INDEX observations_tb_msg_id_uq ON observations (tb_msg_id)")
+                loader = PostgresqlLoader(make_config(), pool)
+                await loader.verify_idempotency_constraint()  # must not raise
+
+        asyncio.run(run())  # no exception
+
+
+def test_verify_idempotency_constraint_refuses_a_partial_unique_index() -> None:
+    """A partial index does not cover every row, so `ON CONFLICT (idColumn)` cannot infer it — Postgres
+    itself refuses to plan that `ON CONFLICT` clause against a partial index with no matching predicate.
+    Architect (cce95fa): this must not satisfy the startup proof even though `indisunique` is true."""
+    with PostgresContainer("postgres:16", driver=None) as container:
+
+        async def run() -> None:
+            async with _open_pool(container) as pool:
+                await pool.execute("CREATE TABLE observations (tb_msg_id TEXT NOT NULL, value INTEGER NOT NULL)")
+                await pool.execute(
+                    "CREATE UNIQUE INDEX observations_tb_msg_id_partial ON observations (tb_msg_id) WHERE value > 0"
+                )
+                loader = PostgresqlLoader(make_config(), pool)
+                await loader.verify_idempotency_constraint()
+
+        with pytest.raises(IdempotencyConstraintError):
+            asyncio.run(run())
+
+
+def test_verify_idempotency_constraint_refuses_an_expression_index() -> None:
+    """An expression index's key is not the column itself (`i.indkey[0] == 0` for that slot), so it is
+    not a target `ON CONFLICT (idColumn)` can use even though the expression happens to reference
+    `idColumn`. Architect (cce95fa): must not satisfy the startup proof."""
+    with PostgresContainer("postgres:16", driver=None) as container:
+
+        async def run() -> None:
+            async with _open_pool(container) as pool:
+                await pool.execute("CREATE TABLE observations (tb_msg_id TEXT NOT NULL, value INTEGER NOT NULL)")
+                await pool.execute("CREATE UNIQUE INDEX observations_tb_msg_id_expr ON observations (lower(tb_msg_id))")
+                loader = PostgresqlLoader(make_config(), pool)
+                await loader.verify_idempotency_constraint()
+
+        with pytest.raises(IdempotencyConstraintError):
+            asyncio.run(run())
+
+
+def test_undefined_table_is_a_pg_error_code_not_retryable() -> None:
+    """Real `asyncpg.exceptions.UndefinedTableError`, not a hand-picked fixture: the classification in
+    `loader.py` catches what the driver actually raises."""
+    with PostgresContainer("postgres:16", driver=None) as container:
+
+        async def run() -> tuple[bool, str, bool]:
+            async with _open_pool(container) as pool:
+                loader = PostgresqlLoader(make_config(table="does_not_exist"), pool)
+                outcome = await loader.deliver(make_message())
+                return outcome.success, outcome.reason, outcome.retryable
+
+        success, reason, retryable = asyncio.run(run())
+        assert success is False
+        assert reason == "PG_42P01"
+        assert retryable is False
+
+
+def test_row_columns_land_in_the_right_table_columns() -> None:
+    with PostgresContainer("postgres:16", driver=None) as container:
+
+        async def run() -> tuple[str, int]:
+            async with _open_pool(container) as pool:
+                await pool.execute(
+                    "CREATE TABLE observations (tb_msg_id TEXT PRIMARY KEY, patient_ref TEXT NOT NULL, value INTEGER NOT NULL)"
+                )
+                loader = PostgresqlLoader(make_config(), pool)
+                message = make_message({"patient_ref": "SYNTH-1", "value": 99})
+                outcome = await loader.deliver(message)
+                assert outcome.success is True
+                row = await _as_asyncpg_pool(pool).fetchrow(
+                    "SELECT patient_ref, value FROM observations WHERE tb_msg_id = $1", message.msg_id
+                )
+                assert row is not None
+                return row["patient_ref"], row["value"]
+
+        patient_ref, value = asyncio.run(run())
+        assert patient_ref == "SYNTH-1"
+        assert value == 99
+
+
+def test_asyncpg_error_hierarchy_matches_the_loader_classification() -> None:
+    """A cheap sanity check that the classes `loader.py` catches actually exist in this installed
+    `asyncpg` version under the names it expects — a version bump renaming one of these would
+    otherwise fail silently into the generic `PostgresError` branch."""
+    assert issubclass(asyncpg.exceptions.UndefinedTableError, asyncpg.exceptions.PostgresError)
+    assert issubclass(asyncpg.exceptions.DeadlockDetectedError, asyncpg.exceptions.TransactionRollbackError)
+    assert issubclass(asyncpg.exceptions.UniqueViolationError, asyncpg.exceptions.IntegrityConstraintViolationError)
+
+
+class _FakeSpecSource:
+    """Just enough of `tributary.runtime.channels.LiveSpecSource` for `PostgresqlRecordHandler.handle`'s
+    `self._spec_source.current()` call (observability only, `handler.py`'s module docstring)."""
+
+    def current(self) -> _FakeSpecSource:
+        return self
+
+    def close(self) -> None:
+        pass
+
+
+def _make_record(message: Message) -> Any:
+    from tributary.runtime.records import ConsumedRecord
+
+    return ConsumedRecord(topic="dev.c.out.warehouse", partition=0, offset=1, message=message)
+
+
+def test_a_dropped_connection_is_retried_without_crashing_the_shared_loop() -> None:
+    """Regression for the bug `main.py`/`handler.py`'s module docstrings now describe:
+    `PostgresqlRecordHandler` used to run `deliver()` on a loop different from the one the pool was
+    built on (`asyncio.run(_prepare())` in `main.py`, a fresh `asyncio.new_event_loop()` in the
+    handler's own `__init__`). This builds the pool and the handler on one explicit, shared loop --
+    the way `main.py`'s `build_loop` does since the fix -- forces every one of the pool's connections
+    to die from a real server-side termination (not a mock), and then delivers again through the same
+    handler. Before the fix this reproduced `RuntimeError: Event loop is closed` the moment `asyncpg`
+    tried to open a replacement physical connection on the (closed) loop it remembered from
+    `create_pool`; after the fix the same call either reconnects transparently or fails with one of
+    this loader's own classified, retryable errors -- never an uncaught `RuntimeError`.
+    """
+    from tributary.loaders.postgresql.handler import PostgresqlRecordHandler
+
+    with PostgresContainer("postgres:16", driver=None) as container:
+        settings = PgConnectionSettings(
+            host=container.get_container_host_ip(),
+            port=int(container.get_exposed_port(container.port)),
+            database=container.dbname,
+            user=container.username,
+            password=container.password,
+            ssl_context=None,
+        )
+
+        loop = asyncio.new_event_loop()
+        try:
+            pool = loop.run_until_complete(create_pool(settings, min_size=1, max_size=2, command_timeout=5.0))
+            loop.run_until_complete(
+                pool.execute("CREATE TABLE observations (tb_msg_id TEXT PRIMARY KEY, value INTEGER NOT NULL)")
+            )
+            loader = PostgresqlLoader(make_config(), pool)
+            handler = PostgresqlRecordHandler(loader, spec_source=_FakeSpecSource(), destination="warehouse", loop=loop)
+
+            first_message = make_message({"value": 1})
+            handler.handle(_make_record(first_message))  # must not raise: a normal delivery first
+
+            async def _terminate_other_backends() -> None:
+                # A second, independent connection kills every backend this pool holds open -- the
+                # real fault (module docstring), not a mock: the pool's next `execute` must open a
+                # brand new physical connection, which is exactly the step that needs the loop
+                # `create_pool` remembers to still be open.
+                admin = await asyncpg.connect(
+                    host=settings.host,
+                    port=settings.port,
+                    database=settings.database,
+                    user=settings.user,
+                    password=settings.password,
+                )
+                try:
+                    await admin.execute(
+                        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                        "WHERE datname = $1 AND pid <> pg_backend_pid()",
+                        settings.database,
+                    )
+                finally:
+                    await admin.close()
+
+            loop.run_until_complete(_terminate_other_backends())
+
+            second_message = make_message({"value": 2})
+            # The assertion is simply that this does not raise `RuntimeError: Event loop is closed`
+            # (or anything else the loader does not itself classify) -- whether the pool reconnects in
+            # time for a `success` outcome or reports a classified, retryable failure is secondary to
+            # not crashing the process.
+            try:
+                handler.handle(_make_record(second_message))
+            except Exception as exc:
+                assert not isinstance(exc, RuntimeError), f"the shared-loop fix regressed: {exc!r}"
+                from tributary.runtime.errors import DeliveryError
+
+                assert isinstance(exc, DeliveryError), f"unexpected uncaught exception type: {exc!r}"
+        finally:
+            handler.close()  # closes both the pool and the loop

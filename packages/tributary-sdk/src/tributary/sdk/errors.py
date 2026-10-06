@@ -114,3 +114,22 @@ class SecretNotFoundError(TributaryError):
     def __init__(self, ref: str) -> None:
         super().__init__(f"no secret for ref {safe_token(ref)}")
         self.ref = ref
+
+
+class StepConfigError(StepDefinitionError):
+    """A step's `with` values do not bind to its keyword-only parameters (channel-spec README 3.3).
+
+    Raised once, when the step is bound, never per message. Names the offending key; never the value.
+    """
+
+
+class RejectCodeError(TributaryError):
+    """`Reject(code)` with a code that breaks the grammar or that the engine reserves."""
+
+
+class ReplyError(TributaryError):
+    """`ctx.reply` broke a rule: a second call, a destination step, a type or a size (channel-spec 3.2.6).
+
+    The message names the rule and, at most, a byte count or a media type the engine registers. Never the
+    body or any part of it: a reply body is payload and PHI-bearing.
+    """

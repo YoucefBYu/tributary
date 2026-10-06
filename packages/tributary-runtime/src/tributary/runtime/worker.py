@@ -4,6 +4,11 @@ One Kafka hop in, one per destination out, and everything between them in memory
 worker commits its input offset only after every `out.<dest>` record has a delivery callback, so a
 crash mid-flight replays rather than drops (invariants 1 and 4).
 
+`pipeline.transactional: true` (ADR-003 D6) makes each commit window one Kafka transaction: the
+`out.<dest>` and DLQ records and the `raw` offsets commit atomically (`transactions.py`). The flag is
+read at startup, because the producer's transactional identity is fixed at construction; a hot reload
+that flips it is logged and takes effect at the next restart.
+
 Hot reload without a control plane: the channel-spec cache is polled once per message, so a new
 `metadata.version` published to `_tb.<env>.channels` takes effect on the next record. PostgreSQL and
 the API can be down throughout (invariant 3).
@@ -11,33 +16,76 @@ the API can be down throughout (invariant 3).
 
 from __future__ import annotations
 
+import dataclasses
+import functools
 import os
 import signal
+import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, cast
 
-from tributary.sdk import Message, Step
+from tributary.sdk import Drop, Message
 from tributary.sdk import headers as h
+from tributary.sdk.codes import REPLY_BODY_MISSING, TB_OUTPUT_ENVELOPE_INVALID, TB_PIPELINE_TIME_BUDGET
 from tributary.sdk.context import Logger
+from tributary.sdk.errors import EnvelopeError, HeaderError, UsrHeaderError
 from tributary.sdk.ids import child_traceparent, new_traceparent, uuid7
+from tributary.sdk.projection import Ordering, TopicClass, validate_for_produce
+from tributary.sdk.reply import ReplyBody
 
 from .channels import ChannelsConsumerLike, LiveSpecSource, open_spec_source
 from .clients import KafkaSettings, consumer_config, events_producer_config, max_poll_interval_ms, producer_config
 from .config import TopicDefaults, load_topic_defaults
 from .consumer import ConsumerLoop, KafkaConsumerLike, LoopSettings, LoopStats
-from .context import WorkerContext
-from .errors import DeliveryError, PartitionMismatchError, RuntimeConfigurationError, safe_token
+from .context import ContextExtension, WorkerContext
+from .engine_kafka import load_engine_kafka_or_exit
+from .errors import (
+    ChannelSpecError,
+    DeliveryError,
+    DlqUnwritableError,
+    PartitionMismatchError,
+    RuntimeConfigurationError,
+    safe_token,
+)
 from .events import EventEmitter, MessageEvent, NullEmitter
-from .executor import PipelineExecutor
+from .executor import ChannelPlan, PipelineAbort, StepFailure, StepStats, run_splitter
+from .extensions import ContextResolver
 from .logs import JsonLogger
 from .producer import KafkaEventEmitter, KafkaProducerLike, RecordProducer
 from .records import RECORD_UNDECODABLE, ConsumedRecord, quarantine_blob
+from .reply import (
+    ACCEPTED,
+    PIPELINE_RANK,
+    FailureLedger,
+    ReplyOutcome,
+    ReplyPartitionCount,
+    ReplyPublisher,
+    ReplyRoute,
+    RouteInvalid,
+    destination_rank,
+)
 from .spec import ChannelSpec, RetryPolicy
-from .steps import load_steps
-from .topics import channels_topic, consumer_group, dlq_topic, events_topic, out_topic, raw_topic
+from .steps import Node, Resolver, StepResolver, build_plan
+from .topics import (
+    channels_topic,
+    consumer_group,
+    dlq_topic,
+    events_topic,
+    out_topic,
+    raw_topic,
+    reply_topic,
+    spec_reader_group,
+)
+from .transactions import (
+    GroupMetadataSource,
+    TransactionalCommitter,
+    TransactionalProducerLike,
+    transactional_id,
+    transactional_producer_config,
+)
 
 #: Retry policy for the produce half of the pipeline worker. The channel spec carries a policy per
 #: destination, which governs the loader; a failure to produce to `out.<dest>` is a Kafka-side failure
@@ -62,6 +110,14 @@ class WorkerSettings:
     poll_timeout_s: float = 0.2
     flush_timeout_s: float = 30.0
     shadow: str | None = None
+
+    def __post_init__(self) -> None:
+        """Refuse a name the consumer group cannot carry when the settings are made, not at `build()`.
+
+        Builds the group once and throws it away: that checks `env`, `channel` and the shadow label
+        against `contracts/topics/v0` (`TopicNameError`) before any Kafka client exists.
+        """
+        consumer_group(self.env, self.channel, "pipeline", shadow=self.shadow)
 
     @property
     def instance(self) -> str:
@@ -120,7 +176,30 @@ class KafkaDlqWriter:
         self._flush_timeout_s = flush_timeout_s
 
     def dead_letter(self, record: ConsumedRecord, *, error_code: str, stage: str) -> None:
+        """Dead-letter the consumed record. Falls back to registered headers only when the full
+        projection does not fit the envelope.
+
+        The `dlq` projection adds `tb-stage` and `tb-error-code`, which the `raw` class forbids, so a raw
+        record at the 32-header cap (or near the header byte budget) cannot be dead-lettered as it
+        stands - and a dead letter that cannot be written would crash the worker into a replay loop, the
+        very failure dead-lettering exists to end (security review, W2-5). The fallback drops `tb-usr-*`
+        and unregistered headers, which are channel-defined or foreign and never interpreted by the
+        engine; the original record keeps them on `raw` at the logged offset. A payload over the inline
+        limit cannot be dead-lettered at all until claim-check exists; that still raises.
+        """
         message = dlq_message(record.message, error_code=error_code, stage=stage)
+        reduced = 0
+        try:
+            validate_for_produce(message, topic_class="dlq", ordering="none")
+        except EnvelopeError:
+            kept = {name: value for name, value in message.headers.items() if name in h.REGISTERED}
+            reduced = len(message.headers) - len(kept)
+            message = Message(headers=kept, payload=message.payload, key=message.key)
+            try:
+                validate_for_produce(message, topic_class="dlq", ordering="none")
+            except EnvelopeError as exc:
+                # The envelope's messages name a header or a size, never a value.
+                raise DlqUnwritableError(f"dead letter for {safe_token(record.msg_id)} does not fit: {exc}") from None
         self._producer.produce(self._topic, message, topic_class="dlq", ordering="none")
         self._producer.flush_pending(self._flush_timeout_s)
         self._log.warning(
@@ -131,6 +210,7 @@ class KafkaDlqWriter:
             offset=record.offset,
             error_code=error_code,
             stage=stage,
+            headers_dropped=reduced,
         )
 
     def quarantine(self, raw: Any, *, channel: str, channel_version: int) -> str:
@@ -150,6 +230,11 @@ class KafkaDlqWriter:
             channel_version=channel_version,
             source=self._source,
         )
+        try:
+            validate_for_produce(wrapper, topic_class="dlq", ordering="none")
+        except EnvelopeError as exc:
+            # A near-limit undecodable record wraps to a blob over the inline limit.
+            raise DlqUnwritableError(f"quarantine wrapper does not fit: {exc}") from None
         self._producer.produce(self._topic, wrapper, topic_class="dlq", ordering="none")
         self._producer.flush_pending(self._flush_timeout_s)
         return wrapper.require(h.TB_MSG_ID)
@@ -202,11 +287,12 @@ def dlq_message(message: Message, *, error_code: str, stage: str) -> Message:
 
     The original payload is kept intact so the record can be reprocessed after a code fix (ADR-003 D4),
     and the record carries a **code, never exception text** — parser messages quote the offending field
-    value, which is PHI.
+    value, which is PHI. The reply-routing headers are stripped (envelope 6 rule 7): a reprocessed dead
+    letter must never answer on a partition nobody is watching.
     """
     msg_id = message.require(h.TB_MSG_ID)
     return (
-        message.without_experimental()
+        _without_reply_routing(message.without_experimental())
         .with_header(h.TB_STAGE, stage)
         .with_header(h.TB_ERROR_CODE, error_code)
         .without_header(h.TB_RETRY_NOT_BEFORE)
@@ -219,12 +305,13 @@ def out_message(message: Message, destination: str, *, usr: dict[str, str]) -> M
 
     `tb-attempt` resets to 0 because the record is entering a new stage (envelope contract 6 rule 4),
     and the key is untouched: `out` has the same partition count as `raw`, so keeping the key is what
-    keeps one patient's messages on one partition (invariant 5).
+    keeps one patient's messages on one partition (invariant 5). The reply-routing headers are stripped
+    (envelope 6 rule 7): only the worker that read `raw` answers.
     """
     result = (
         # tb-x-* is tolerated inbound and never handed on: the engine must not produce one
         # (envelope contract 2.1 against 1.2).
-        message.without_experimental()
+        _without_reply_routing(message.without_experimental())
         .with_header(h.TB_DESTINATION, destination)
         .with_header(h.TB_STAGE, "routed")
         .with_attempt(0)
@@ -235,8 +322,86 @@ def out_message(message: Message, destination: str, *, usr: dict[str, str]) -> M
     return result
 
 
+def _without_reply_routing(message: Message) -> Message:
+    """Drop `tb-reply-partition`, `tb-reply-deadline` and a stray `tb-reply-status` (set 1.2)."""
+    for name in (*h.REPLY_ROUTING_HEADERS, h.TB_REPLY_STATUS):
+        if message.has(name):
+            message = message.without_header(name)
+    return message
+
+
+@dataclass(slots=True)
+class _Pending:
+    """Everything one `handle` will produce and announce, held until it is known to be deliverable.
+
+    Two phases, so a record that cannot be produced never leaves the others half-delivered: every `out`
+    and `dlq` record is computed and **validated against the envelope before any is produced**, and the
+    lifecycle events that describe them are emitted only after the flush has made them true.
+    """
+
+    records: list[tuple[str, Message, TopicClass, Ordering]] = field(default_factory=list)
+    events: list[Callable[[], None]] = field(default_factory=list)
+    #: Branch failures by spec-order rank, for the synchronous reply's status (channel-spec 3.2.6).
+    failures: FailureLedger = field(default_factory=FailureLedger)
+    dead: int = 0
+    filtered: int = 0
+
+
+class TimeBudget:
+    """The wall-clock budget for one `handle`, checked between units of work (MEDIUM 2, W2-5 review).
+
+    A 10,000-child split times destinations times in-place retries can outlast `max.poll.interval.ms`;
+    the consumer is then evicted, the record is redelivered, and the same fan-out evicts it again, for
+    ever. When the budget is spent, the consumed record is dead-lettered with `TB_PIPELINE_TIME_BUDGET` and
+    committed. Nothing has been produced by then (the produce phase comes after), so no branch is left
+    half-delivered. Checked before every step attempt (so in-place retries count against it) and
+    between children and destinations - not inside a step: a single step that hangs is not interrupted.
+    """
+
+    __slots__ = ("_clock", "_deadline", "budget_s")
+
+    def __init__(self, budget_s: float | None, *, clock: Callable[[], float] = time.monotonic) -> None:
+        self.budget_s = budget_s
+        self._deadline = None if budget_s is None else clock() + budget_s
+        self._clock = clock
+
+    def check(self) -> None:
+        if self._deadline is not None and self._clock() > self._deadline:
+            raise PipelineAbort("pipeline", 1, "TimeBudget", error_code=TB_PIPELINE_TIME_BUDGET, rejected=True)
+
+
+def handle_budget_s(max_poll_interval_ms: int, flush_timeout_s: float) -> float:
+    """Half the poll interval, less the flush that follows the compute phase, and never under 10 s.
+
+    Half, because the loop also polls, commits and retries around `handle`; the flush, because it runs
+    after the budget is checked for the last time.
+    """
+    return max(10.0, max_poll_interval_ms / 1000 / 2 - flush_timeout_s)
+
+
 class PipelineHandler:
-    """Runs the channel's steps and produces the result to every destination."""
+    """Runs the channel's executor tree and produces the result to every destination.
+
+    The tree (README 3.3.2 and 3.5): `head` steps on the consumed message; an optional splitter; `tail`
+    steps per child; then per destination, that destination's steps on its own copy. What fails where
+    decides what is dead-lettered:
+
+    | Fails in | Dead-lettered | `dlq` payload | Other branches |
+    |---|---|---|---|
+    | head or splitter | the consumed record (by the loop) | the raw payload | none run |
+    | tail, for one child | that child | the child as the splitter produced it | continue |
+    | a destination's steps | that message for that destination, `tb-destination` set | the destination steps' input | continue |
+    | any record fails the envelope (`TB_OUTPUT_ENVELOPE_INVALID`) or the time budget runs out (`TB_PIPELINE_TIME_BUDGET`) | the consumed record (by the loop) | the raw payload | nothing was produced |
+
+    `Reject` fails at once; any other exception after `pipeline.stepRetries` in-place retries. The
+    consumed offset is committed by the loop only after this returns, and this returns only after every
+    `out` and `dlq` record it queued has been flushed (or, in a transaction, joined it), so "every child
+    and destination produced or dead-lettered" holds before the commit.
+
+    The extensions named by the version's `pipeline.context` wrap each branch's `WorkerContext` before
+    its first step (`extensions.py`): that is how a mapping step gets `ctx.fhir` without this package
+    importing `tributary-fhir`. They are resolved in `prepare`, with the steps.
+    """
 
     def __init__(
         self,
@@ -247,87 +412,510 @@ class PipelineHandler:
         emitter: EventEmitter,
         log: Logger,
         instance: str,
-        steps_override: tuple[Step, ...] | None = None,
+        steps_override: tuple[Node, ...] | None = None,
+        resolve: Resolver | None = None,
         flush_timeout_s: float = 30.0,
+        transactional: bool = False,
+        stats_interval_s: float = 60.0,
+        time_budget_s: float | None = None,
+        clock: Callable[[], float] = time.monotonic,
+        replies: ReplyPublisher | None = None,
+        context_extensions: Sequence[ContextExtension] | None = None,
+        context_resolver: ContextResolver | None = None,
+        step_resolver: StepResolver | None = None,
     ) -> None:
         self._env = env
+        # L7: an explicit tuple replaces discovery (tests only; nothing in `main` sets it).
+        self._context_override = tuple(context_extensions) if context_extensions is not None else None
+        self._context_resolver = context_resolver if context_resolver is not None else ContextResolver(log=log)
+        self._replies = replies
+        self._transactional = transactional
+        self._warned_version: int | None = None
         self._spec_provider = spec_provider
         self._producer = producer
         self._emitter = emitter
         self._log = log
         self._instance = instance
         self._steps_override = steps_override
+        # `resolve` is a harness seam; the worker's own path is the step resolver, bound per version so a
+        # `uses` step loads from its pinned distribution only (channel-spec README 3.3.5, N1-N6).
+        self._resolve = resolve
+        self._step_resolver = step_resolver if step_resolver is not None else StepResolver(log=log)
         self._flush_timeout_s = flush_timeout_s
-        self._executors: dict[int, PipelineExecutor] = {}
+        self._time_budget_s = time_budget_s
+        self._clock = clock
+        self._plan: ChannelPlan | None = None
+        self._plan_spec: ChannelSpec | None = None
+        self._refused_version: int | None = None
+        self._stats_interval_s = stats_interval_s
+        self._stats_logged_at = time.monotonic()
+        self.stats = StepStats()
+        self.dead_lettered = 0
+        self.filtered = 0
 
-    def _executor(self, spec: ChannelSpec) -> PipelineExecutor:
-        """One executor per channel version, so a hot reload swaps the steps and nothing else."""
-        cached = self._executors.get(spec.version)
-        if cached is None:
-            steps = self._steps_override if self._steps_override is not None else load_steps(spec.pipeline)
-            cached = PipelineExecutor(steps, step_retries=spec.pipeline.step_retries)
-            self._executors = {spec.version: cached}  # drop older versions; only one is ever current
-        return cached
+    # -- plan ------------------------------------------------------------------------------------
+
+    def prepare(self, spec: ChannelSpec) -> ChannelPlan:
+        """Build the plan for `spec` now. At startup this is what makes a bad `with` stop the worker
+        before it consumes anything, rather than on the first message."""
+        resolve = self._resolve if self._resolve is not None else self._step_resolver.bind(spec)
+        plan = build_plan(spec, resolve=resolve, pipeline_override=self._steps_override, stats=self.stats)
+        # `pipeline.context` with the steps, all or nothing (context-extension/v0 L1, L2, L6): only
+        # declared entry points are imported, and a refusal here keeps the previous version running.
+        context = self._context_override if self._context_override is not None else self._context_resolver.resolve(spec)
+        plan = dataclasses.replace(plan, context=context)
+        if spec.sync_reply and plan.splitter is not None:
+            # Channel-spec 3.2.6 refusal 2, at load because a `ref` splitter is known only now: one
+            # request would have N outcomes and there is no aggregator to make them one answer.
+            raise ChannelSpecError(
+                f"channel {safe_token(spec.name)}: source.reply is refused on a channel with a splitter"
+            )
+        if spec.sync_reply and spec.pipeline.transactional:
+            # Refusal 1 is in the schema; the runtime parse is lenient, so it is held here as well.
+            raise ChannelSpecError(
+                f"channel {safe_token(spec.name)}: source.reply is refused on a transactional pipeline"
+            )
+        self._plan, self._plan_spec = plan, spec
+        return plan
+
+    def _current(self) -> tuple[ChannelSpec, ChannelPlan]:
+        """The plan for the latest spec, or the previous plan when the latest one is refused.
+
+        Channel-spec README 3.3: a binding failure is refused loudly at load "and the previous spec keeps
+        running". Logged once per refused version, with the step name and key names only.
+        """
+        spec = self._spec_provider()
+        plan, plan_spec = self._plan, self._plan_spec
+        if plan is not None and plan_spec is not None and plan.version == spec.version:
+            return plan_spec, plan
+        if plan is not None and plan_spec is not None and self._refused_version == spec.version:
+            return plan_spec, plan
+        try:
+            return spec, self.prepare(spec)
+        except ChannelSpecError as exc:
+            if plan is None or plan_spec is None:
+                raise
+            self._refused_version = spec.version
+            self._log.error(
+                "channel_spec_refused",
+                channel=spec.name,
+                channel_version=spec.version,
+                running_version=plan.version,
+                reason=str(exc)[:240].replace("\n", " "),
+            )
+            return plan_spec, plan
+
+    # -- one record ------------------------------------------------------------------------------
 
     def handle(self, record: ConsumedRecord) -> None:
-        spec = self._spec_provider()
+        spec, plan = self._current()
+        if spec.pipeline.transactional != self._transactional and self._warned_version != spec.version:
+            # The producer's transactional identity is fixed at construction: say so, once per version.
+            self._warned_version = spec.version
+            self._log.warning(
+                "transactional_change_needs_restart",
+                channel=spec.name,
+                channel_version=spec.version,
+                running_transactional=self._transactional,
+            )
+        if self._replies is not None:
+            self._replies.poll()  # serve the previous record's reply callback: its `replied` event
+        budget = TimeBudget(self._time_budget_s, clock=self._clock)
+        message = record.message
         ctx = WorkerContext(
             channel=spec.name,
             channel_version=spec.version,
             instance=self._instance,
             log=self._log,
-            attempt=record.message.attempt,
-            traceparent=record.message.traceparent,
+            attempt=message.attempt,
+            traceparent=message.traceparent,
+            source_type=spec.source_type,
+            extensions=plan.context,
+            subject=message,
         )
-        result = self._executor(spec).run(record.message, ctx)
-
-        if result.dropped and result.drop is not None:
-            self._emit(spec, record, stage="filtered", status="dropped", ctx=ctx, error_message=result.drop.reason)
+        # A StepFailure here propagates: the loop dead-letters the consumed record (stage transformed)
+        # and then calls `after_dead_letter`, which answers a synchronous request.
+        result = plan.head.run(message, ctx, before_attempt=budget.check)
+        if result.drop is not None:
+            self.filtered += 1
+            self._emit(
+                spec, record, message, stage="filtered", status="dropped", ctx=ctx, error_message=result.drop.reason
+            )
+            # A whole-message Drop answers `accepted`: committed and filtered on purpose (3.2.6).
+            self._reply(spec, plan, record, ACCEPTED, body=ctx.reply_body, dropped=True)
             return
-
         transformed = result.message
         if transformed is None:  # pragma: no cover - ExecutionResult always carries one or the other
             raise DeliveryError("PIPELINE_EMPTY_RESULT", retryable=False)
+        budget.check()
+
+        branches: tuple[Message, ...]
+        if plan.splitter is None:
+            branches = (transformed,)
+            duration_ms = result.duration_ms
+        else:
+            started = time.perf_counter()
+            split = run_splitter(
+                plan.splitter,
+                transformed,
+                ctx,
+                step_retries=plan.step_retries,
+                stats=plan.stats,
+                before_attempt=budget.check,
+            )
+            duration_ms = result.duration_ms + (time.perf_counter() - started) * 1000
+            if isinstance(split, Drop):
+                self.filtered += 1
+                self._emit(
+                    spec, record, message, stage="filtered", status="dropped", ctx=ctx, error_message=split.reason
+                )
+                self._reply(spec, plan, record, ACCEPTED, body=ctx.reply_body, dropped=True)
+                return
+            branches = split
+            budget.check()
+
+        pending = _Pending()
+        pending.events.append(
+            functools.partial(
+                self._emit,
+                spec,
+                record,
+                message,
+                stage="transformed",
+                status="ok",
+                ctx=ctx,
+                duration_ms=duration_ms,
+                size_bytes=transformed.payload_size,
+            )
+        )
+        for subject in branches:
+            budget.check()
+            branch_ctx = ctx if plan.splitter is None else ctx.fork(traceparent=subject.traceparent, subject=subject)
+            if plan.splitter is not None:
+                child = self._run_child(spec, plan, record, subject, branch_ctx, pending, budget)
+                if child is None:
+                    continue
+                subject = child
+            self._route(spec, plan, record, subject, branch_ctx, pending, budget)
+
+        # Phase 2. Validate every record before producing any: one that cannot be produced (a child or a
+        # destination output over the envelope's limits) must not leave its siblings half-delivered, and
+        # must not crash the worker into a replay loop. The consumed record goes to the DLQ instead.
+        for _topic, outgoing, topic_class, ordering in pending.records:
+            try:
+                validate_for_produce(outgoing, topic_class=topic_class, ordering=ordering)
+            except EnvelopeError:
+                raise PipelineAbort(
+                    "pipeline", 1, "EnvelopeError", error_code=TB_OUTPUT_ENVELOPE_INVALID, rejected=True
+                ) from None
+        for topic, outgoing, topic_class, ordering in pending.records:
+            self._produce(topic, outgoing, topic_class=topic_class, ordering=ordering)
+
+        # Commit-after-delivery: the loop commits the input offset when this returns, so every `out`
+        # and `dlq` record must be acknowledged by the broker first (invariants 1 and 4). Inside a
+        # transaction the commit itself flushes and fails - then aborts - if any record did not land.
+        if not self._transactional:
+            self._producer.flush_pending(self._flush_timeout_s)
+
+        self.dead_lettered += pending.dead
+        self.filtered += pending.filtered
+        for emit in pending.events:
+            emit()
+        # Every `out` and `dlq` record has its delivery callback by now (the flush above), so the answer
+        # can say "routed" truthfully. Fail-fast: this never raises and never delays the commit.
+        self._reply(spec, plan, record, pending.failures.outcome(), body=ctx.reply_body, dropped=False)
+        self._maybe_log_stats(spec)
+
+    def _run_child(
+        self,
+        spec: ChannelSpec,
+        plan: ChannelPlan,
+        record: ConsumedRecord,
+        child: Message,
+        ctx: WorkerContext,
+        pending: _Pending,
+        budget: TimeBudget,
+    ) -> Message | None:
+        """Run the post-split steps on one child. `None` when the child was filtered or dead-lettered."""
+        try:
+            result = plan.tail.run(child, ctx, before_attempt=budget.check)
+        except PipelineAbort:
+            raise  # the whole record, not this child
+        except StepFailure as exc:
+            # The child as the splitter produced it: the input of the subtree that failed.
+            self._dead_letter(
+                spec,
+                record,
+                child,
+                error_code=exc.error_code,
+                destination=None,
+                pending=pending,
+                rank=PIPELINE_RANK,
+                rejected=_is_reject(exc),
+            )
+            return None
+        if result.drop is not None:
+            pending.filtered += 1
+            pending.events.append(
+                functools.partial(
+                    self._emit,
+                    spec,
+                    record,
+                    child,
+                    stage="filtered",
+                    status="dropped",
+                    ctx=ctx,
+                    error_message=result.drop.reason,
+                )
+            )
+            return None
+        if result.message is None:  # pragma: no cover
+            return None
+        pending.events.append(
+            functools.partial(
+                self._emit,
+                spec,
+                record,
+                result.message,
+                stage="transformed",
+                status="ok",
+                ctx=ctx,
+                duration_ms=result.duration_ms,
+                size_bytes=result.message.payload_size,
+            )
+        )
+        return result.message
+
+    def _route(
+        self,
+        spec: ChannelSpec,
+        plan: ChannelPlan,
+        record: ConsumedRecord,
+        subject: Message,
+        ctx: WorkerContext,
+        pending: _Pending,
+        budget: TimeBudget,
+    ) -> None:
+        """Plan one branch's record for every destination, running each destination's own steps first."""
+        for index, destination in enumerate(spec.destinations):
+            executor = plan.destinations.get(destination.name)
+            outgoing, usr, attrs = subject, ctx.usr_headers(), ctx.attrs()
+            if executor is not None and len(executor):
+                budget.check()
+                destination_ctx = ctx.fork(destination=destination.name, subject=subject)
+                try:
+                    result = executor.run(subject, destination_ctx, before_attempt=budget.check)
+                except PipelineAbort:
+                    raise  # the whole record, not this destination
+                except StepFailure as exc:
+                    # README 3.5: the dlq payload is the destination step's input, not the raw payload.
+                    self._dead_letter(
+                        spec,
+                        record,
+                        subject,
+                        error_code=exc.error_code,
+                        destination=destination.name,
+                        pending=pending,
+                        rank=destination_rank(index),
+                        rejected=_is_reject(exc),
+                    )
+                    continue
+                if result.drop is not None:
+                    pending.filtered += 1
+                    pending.events.append(
+                        functools.partial(
+                            self._emit,
+                            spec,
+                            record,
+                            subject,
+                            stage="filtered",
+                            status="dropped",
+                            ctx=destination_ctx,
+                            destination=destination.name,
+                            error_message=result.drop.reason,
+                        )
+                    )
+                    continue
+                if result.message is None:  # pragma: no cover
+                    continue
+                outgoing, usr, attrs = result.message, destination_ctx.usr_headers(), destination_ctx.attrs()
+            try:
+                projected = out_message(outgoing, destination.name, usr=dict(usr))
+            except (HeaderError, UsrHeaderError):
+                # The projection adds headers; one that breaks a header rule is an envelope failure.
+                raise PipelineAbort(
+                    "pipeline", 1, "HeaderError", error_code=TB_OUTPUT_ENVELOPE_INVALID, rejected=True
+                ) from None
+            pending.records.append((out_topic(self._env, spec.name, destination.name), projected, "out", spec.ordering))
+            pending.events.append(
+                functools.partial(
+                    self._emit,
+                    spec,
+                    record,
+                    subject,
+                    stage="routed",
+                    status="ok",
+                    ctx=None,
+                    attrs=dict(attrs),
+                    destination=destination.name,
+                )
+            )
+
+    def _dead_letter(
+        self,
+        spec: ChannelSpec,
+        record: ConsumedRecord,
+        subject: Message,
+        *,
+        error_code: str,
+        destination: str | None,
+        pending: _Pending,
+        rank: int,
+        rejected: bool,
+    ) -> None:
+        """Plan a branch-scoped dead letter. Joins the same flush (or transaction) as the `out` records."""
+        try:
+            failed = subject if destination is None else subject.with_header(h.TB_DESTINATION, destination)
+            projected = dlq_message(failed, error_code=error_code, stage="transformed")
+        except HeaderError:
+            raise PipelineAbort(
+                "pipeline", 1, "HeaderError", error_code=TB_OUTPUT_ENVELOPE_INVALID, rejected=True
+            ) from None
+        pending.records.append((dlq_topic(self._env, spec.name), projected, "dlq", "none"))
+        pending.failures.record(rank, ReplyOutcome.failure(error_code, rejected=rejected))
+        pending.dead += 1
+        pending.events.append(
+            functools.partial(self._emit_dead, spec, record, subject, destination=destination, error_code=error_code)
+        )
+
+    def _produce(self, topic: str, message: Message, *, topic_class: TopicClass, ordering: Ordering) -> None:
+        """Produce, draining the local queue once if a large fan-out filled it.
+
+        A split can queue thousands of records in one `handle`. `PRODUCER_QUEUE_FULL` is back-pressure,
+        so wait for deliveries and try once more before handing the failure to the loop's blocking retry,
+        which would otherwise re-run the whole fan-out and duplicate everything already queued.
+        """
+        try:
+            self._producer.produce(topic, message, topic_class=topic_class, ordering=ordering)
+        except DeliveryError as exc:
+            if exc.error_code != "PRODUCER_QUEUE_FULL":
+                raise
+            self._producer.flush_pending(self._flush_timeout_s)
+            self._producer.produce(topic, message, topic_class=topic_class, ordering=ordering)
+
+    # -- synchronous reply (set 1.2, channel-spec 3.2.6) ----------------------------------------
+
+    def after_dead_letter(self, record: ConsumedRecord, *, error_code: str, rejected: bool) -> None:
+        """The loop dead-lettered the consumed record and its `dlq` callback succeeded: answer now.
+
+        Called by `ConsumerLoop` for a pipeline failure (`Reject` -> `rejected`, anything else ->
+        `failed`) and for a header reject (`HEADER_PARSE_ERROR`). A body from the failed run is never
+        used: only an accepted reply carries one.
+        """
+        if self._replies is None or record.message.get(h.TB_MSG_ID) is None:
+            return
+        spec, plan = self._current()
+        self._reply(spec, plan, record, ReplyOutcome.failure(error_code, rejected=rejected), body=None, dropped=False)
+
+    def _reply_route(self, spec: ChannelSpec, plan: ChannelPlan, record: ConsumedRecord) -> ReplyRoute | None:
+        """The record decides whether to reply (tb-reply-partition present); the spec can only veto."""
+        if self._replies is None:
+            return None
+        route = self._replies.route(record.message)
+        if route is None:
+            return None
+        if isinstance(route, RouteInvalid):
+            self._replies.route_invalid(record, route, channel=spec.name, channel_version=spec.version)
+            return None
+        if self._transactional or spec.pipeline.transactional or plan.splitter is not None:
+            # A reply inside a transaction is late by up to a batch, one outside it could say AA for
+            # aborted work, and a split has N outcomes. The sender gets AE / REPLY_TIMEOUT: truthful.
+            self._replies.skipped()
+            return None
+        return route
+
+    def _reply(
+        self,
+        spec: ChannelSpec,
+        plan: ChannelPlan,
+        record: ConsumedRecord,
+        outcome: ReplyOutcome,
+        *,
+        body: ReplyBody | None,
+        dropped: bool,
+    ) -> None:
+        """Answer one consumed record if it asked for an answer. Never raises."""
+        route = self._reply_route(spec, plan, record)
+        used: ReplyBody | None = None
+        if route is not None and spec.reply_body == "step" and not dropped and outcome.status == "accepted":
+            if body is None:
+                # The reply fails; the message was routed, so there is no dlq record.
+                outcome = ReplyOutcome.failure(REPLY_BODY_MISSING, rejected=False)
+            else:
+                used = body
+        if body is not None and used is None and self._replies is not None:
+            self._replies.body_discarded()  # async record, body: ack, a Drop, or a failed message
+        if route is None or self._replies is None:
+            return
+        self._replies.publish(record, route, outcome, channel=spec.name, channel_version=spec.version, body=used)
+
+    # -- events and stats ------------------------------------------------------------------------
+
+    def _emit_dead(
+        self,
+        spec: ChannelSpec,
+        record: ConsumedRecord,
+        subject: Message,
+        *,
+        destination: str | None,
+        error_code: str,
+    ) -> None:
+        # observability/v0 L6: `message_id`, `parent_id` and `destination` have a fixed shape, so an absent
+        # one is omitted, never written as null or "" (which the log-line schema refuses).
+        fields: dict[str, object] = {
+            "error_code": error_code,
+            "stage": "transformed",
+            "topic": record.topic,
+            "partition": record.partition,
+            "offset": record.offset,
+        }
+        for name, value in (
+            ("message_id", subject.get(h.TB_MSG_ID)),
+            ("parent_id", subject.get(h.TB_PARENT_ID)),
+            ("destination", destination),
+        ):
+            if value:
+                fields[name] = value
+        self._log.warning("dead_lettered", **fields)
         self._emit(
             spec,
             record,
-            stage="transformed",
-            status="ok",
-            ctx=ctx,
-            duration_ms=result.duration_ms,
-            size_bytes=transformed.payload_size,
+            subject,
+            stage="dlq",
+            status="error",
+            ctx=None,
+            destination=destination,
+            error_code=error_code,
+            error_message="routed to the dead-letter queue",
         )
-
-        usr = dict(ctx.usr_headers())
-        for destination in spec.destinations:
-            outgoing = out_message(transformed, destination.name, usr=usr)
-            self._producer.produce(
-                out_topic(self._env, spec.name, destination.name),
-                outgoing,
-                topic_class="out",
-                ordering=spec.ordering,
-            )
-
-        # Commit-after-delivery: the loop commits the input offset when this returns, so every
-        # destination record must be acknowledged by the broker first (invariants 1 and 4).
-        self._producer.flush_pending(self._flush_timeout_s)
-
-        for destination in spec.destinations:
-            self._emit(spec, record, stage="routed", status="ok", ctx=ctx, destination=destination.name)
 
     def _emit(
         self,
         spec: ChannelSpec,
         record: ConsumedRecord,
+        subject: Message,
         *,
         stage: str,
         status: str,
-        ctx: WorkerContext,
+        ctx: WorkerContext | None,
+        attrs: Mapping[str, str] | None = None,
         destination: str | None = None,
         duration_ms: float | None = None,
         size_bytes: int | None = None,
+        error_code: str | None = None,
         error_message: str | None = None,
     ) -> None:
+        event_attrs = dict(attrs if attrs is not None else ctx.attrs() if ctx is not None else {})
         self._emitter.emit(
             MessageEvent(
                 stage=stage,
@@ -335,22 +923,52 @@ class PipelineHandler:
                 channel=spec.name,
                 channel_version=spec.version,
                 instance=self._instance,
-                message_id=record.message.require(h.TB_MSG_ID),
+                message_id=subject.require(h.TB_MSG_ID),
                 destination=destination,
                 attempt=record.message.attempt,
-                content_type=record.message.get(h.TB_CONTENT_TYPE),
+                content_type=subject.get(h.TB_CONTENT_TYPE),
                 size_bytes=size_bytes,
                 topic=record.topic,
                 partition=record.partition,
                 offset=record.offset,
                 duration_ms=duration_ms,
+                error_code=error_code,
                 error_message=error_message,
-                traceparent=record.message.traceparent,
-                parent_id=record.message.get(h.TB_PARENT_ID),
-                correlation_id=record.message.get(h.TB_CORRELATION_ID),
-                attrs=dict(ctx.attrs()) or None,
+                traceparent=subject.traceparent,
+                parent_id=subject.get(h.TB_PARENT_ID),
+                correlation_id=subject.get(h.TB_CORRELATION_ID),
+                attrs=event_attrs or None,
             )
         )
+
+    def _maybe_log_stats(self, spec: ChannelSpec) -> None:
+        now = time.monotonic()
+        if now - self._stats_logged_at >= self._stats_interval_s:
+            self._stats_logged_at = now
+            self.stats.log_summary(self._log, channel=spec.name, channel_version=spec.version)
+
+    def close(self) -> None:
+        """Log the step timing summary once more at shutdown, and the branch-level outcomes.
+
+        The loop's `worker_stopped` line counts only records it dead-lettered itself; children and
+        destinations dead-lettered here are counted here, so the two lines together are the whole story.
+        """
+        if self._replies is not None:
+            self._replies.close()
+        if self._plan_spec is not None:
+            self.stats.log_summary(self._log, channel=self._plan_spec.name, channel_version=self._plan_spec.version)
+            self._log.info(
+                "pipeline_branches",
+                channel=self._plan_spec.name,
+                channel_version=self._plan_spec.version,
+                branch_dead_lettered=self.dead_lettered,
+                filtered=self.filtered,
+            )
+
+
+def _is_reject(exc: StepFailure) -> bool:
+    """A channel's own `Reject` answers `rejected`; an engine abort sets `rejected` too, but is `failed`."""
+    return exc.rejected and not isinstance(exc, PipelineAbort)
 
 
 def check_partition_counts(client: Any, env: str, spec: ChannelSpec, *, timeout_s: float = 10.0) -> None:
@@ -387,12 +1005,16 @@ class PipelineWorker:
     """Wires the cache, the executor, the producer and the loop together for one channel."""
 
     settings: WorkerSettings
-    steps_override: tuple[Step, ...] | None = None
+    steps_override: tuple[Node, ...] | None = None
     defaults: TopicDefaults | None = None
+    #: `None` resolves each version's `pipeline.context` from the installed `tributary.context` entry
+    #: points (`extensions.py`); a tuple, even an empty one, replaces that (L7, tests only).
+    context_extensions: tuple[ContextExtension, ...] | None = None
     log: Logger = field(default_factory=lambda: JsonLogger("worker"))
     loop: ConsumerLoop | None = field(default=None, init=False)
     specs: LiveSpecSource | None = field(default=None, init=False)
     emitter: EventEmitter = field(default_factory=NullEmitter, init=False)
+    handler: PipelineHandler | None = field(default=None, init=False)
 
     def build(self) -> ConsumerLoop:
         from confluent_kafka import Consumer, Producer
@@ -402,6 +1024,8 @@ class PipelineWorker:
         # Before any client is built: a warning emitted after a failed connection is a warning nobody
         # sees on the run where it matters most.
         emit_profile_warning(self.log, defaults, profile=self.settings.profile)
+        # Every client below, the `_tb.<env>.channels` reader first, is built from this one link. Its
+        # `engine_kafka_link` line was logged once by `load_engine_kafka_or_exit` in `main`.
 
         cache_consumer = cast(
             "ChannelsConsumerLike",
@@ -409,7 +1033,7 @@ class PipelineWorker:
                 consumer_config(
                     self.settings.kafka,
                     defaults,
-                    group_id=f"tb.{env}.{channel}.channels.{self.settings.instance_id}",
+                    group_id=spec_reader_group(env, channel, self.settings.instance_id),
                     enable_partition_eof=True,
                 )
             ),
@@ -422,9 +1046,18 @@ class PipelineWorker:
         )
         spec = self.specs.current()
 
-        data_producer = Producer(
-            producer_config(self.settings.kafka, defaults, client_id=f"tb-{env}-{channel}-{self.settings.instance_id}")
+        transactional = spec.pipeline.transactional
+        base_config = producer_config(
+            self.settings.kafka, defaults, client_id=f"tb-{env}-{channel}-{self.settings.instance_id}"
         )
+        if transactional:
+            base_config = transactional_producer_config(
+                base_config,
+                transactional_id_value=transactional_id(
+                    defaults.transactional_id_template, env=env, channel=channel, instance=self.settings.instance_id
+                ),
+            )
+        data_producer = Producer(base_config)
         producer = RecordProducer(cast("KafkaProducerLike", data_producer), log=self.log)
         check_partition_counts(data_producer, env, spec)
 
@@ -439,6 +1072,20 @@ class PipelineWorker:
             log=self.log,
         )
 
+        reply_partitions = ReplyPartitionCount(data_producer.list_topics, reply_topic(env, channel))
+        if spec.sync_reply:
+            # Start-up, before consuming: the one metadata fetch allowed on this thread. After it, the
+            # count refreshes in the background (a list_topics per record would stall the partition).
+            # An async-only channel never asks, so it never names a `reply` topic to the broker.
+            reply_partitions.prime()
+        replies = ReplyPublisher(
+            cast("KafkaProducerLike", data_producer),
+            reply_topic(env, channel),
+            emitter=self.emitter,
+            log=self.log,
+            instance=self.settings.instance,
+            partition_count=reply_partitions,
+        )
         handler = PipelineHandler(
             env=env,
             spec_provider=self._current_spec,
@@ -448,7 +1095,17 @@ class PipelineWorker:
             instance=self.settings.instance,
             steps_override=self.steps_override,
             flush_timeout_s=self.settings.flush_timeout_s,
+            transactional=transactional,
+            # Sized from the same poll interval the consumer is built with (MEDIUM 2, W2-5 review).
+            time_budget_s=handle_budget_s(max_poll_interval_ms(spec), self.settings.flush_timeout_s),
+            replies=replies,
+            context_extensions=self.context_extensions,
         )
+        # Resolve and bind every step, and load the declared context extensions, now: a bad `with`, a
+        # splitter on a per-key channel or an unresolvable `pipeline.context` stops the worker before it
+        # consumes anything rather than on the first message (README 3.3, 3.3.2, 3.3.4).
+        handler.prepare(spec)
+        self.handler = handler
 
         consumer = cast(
             "KafkaConsumerLike",
@@ -462,9 +1119,18 @@ class PipelineWorker:
                 )
             ),
         )
+        committer = None
+        if transactional:
+            committer = TransactionalCommitter(
+                cast("TransactionalProducerLike", data_producer),
+                cast("GroupMetadataSource", consumer),
+                log=self.log,
+            )
+            committer.initialise()  # fences a previous incarnation and aborts what it left open
         self.loop = ConsumerLoop(
             consumer,
             handler,
+            committer=committer,
             topics=[raw_topic(env, channel)],
             retry=PRODUCE_RETRY,
             settings=LoopSettings(
@@ -484,6 +1150,7 @@ class PipelineWorker:
                 source=self.settings.instance,
                 flush_timeout_s=self.settings.flush_timeout_s,
             ),
+            on_dead_lettered=handler.after_dead_letter,
         )
         self.loop.start()
         self.log.info(
@@ -493,6 +1160,7 @@ class PipelineWorker:
             commit_every=defaults.consumer.commit_every,
             session_timeout_ms=defaults.consumer.session_timeout_ms,
             destinations=len(spec.destinations),
+            transactional=transactional,
         )
         return self.loop
 
@@ -507,6 +1175,8 @@ class PipelineWorker:
         try:
             return loop.run(max_iterations=max_iterations)
         finally:
+            if self.handler is not None:
+                self.handler.close()
             # The loop has already committed; this only flushes the event tail, briefly.
             self.emitter.close()
             if self.specs is not None:
@@ -517,12 +1187,19 @@ class PipelineWorker:
             self.loop.stop()
 
 
-def main() -> int:
-    """Entry point for the container image: configuration from the environment, SIGTERM-aware."""
+def main(argv: Sequence[str] | None = None) -> int:
+    """Entry point for the container image: configuration from the environment, SIGTERM-aware.
+
+    The engine link comes only from the `TB_ENGINE_KAFKA_FILE` document (`engine-kafka/v0`, ADR-008):
+    there is no default broker, and `TB_BOOTSTRAP_SERVERS` or `--bootstrap` refuses to start rather
+    than being silently ignored. A refused configuration exits 2 (`SystemExit`) before any Kafka client
+    exists, through the shared `load_engine_kafka_or_exit`.
+    """
+    kafka = load_engine_kafka_or_exit(argv=sys.argv[1:] if argv is None else argv, log=JsonLogger("worker"))
     settings = WorkerSettings(
         env=os.environ.get("TB_ENV", "dev"),
         channel=os.environ["TB_CHANNEL"],
-        kafka=KafkaSettings(bootstrap_servers=os.environ.get("TB_BOOTSTRAP_SERVERS", "localhost:9092")),
+        kafka=kafka,
         instance_id=os.environ.get("TB_INSTANCE_ID", f"pipeline-{os.getpid()}"),
         profile=os.environ.get("TB_PROFILE", "lite"),
         contracts_dir=os.environ.get("TB_CONTRACTS_DIR"),

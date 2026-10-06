@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://tributary.dev/contracts/channel-spec/v0/channel.schema.json",
   "title": "Tributary channel spec, v0",
-  "description": "One deployed channel: source, pipeline steps, destinations, ordering and retry. Authored as YAML in a bundle and published as JSON on the compacted _tb.<env>.channels topic. See README.md. Producers (CLI, control plane) validate strictly; the runtime must ignore unknown fields rather than refusing to start (invariant 3).",
+  "description": "One deployed channel: source, pipeline steps, destinations, ordering and retry. Authored as YAML in a bundle and published as JSON on the compacted _tb.<env>.channels topic. See README.md. Producers (CLI, control plane) validate strictly; the runtime must ignore unknown fields rather than refusing to start (invariant 3). Contract set 1.1 (2026-09-24) added the wave 2 connector types, set 1.2 (2026-09-28) the optional source.reply block for synchronous reply mode, set 1.3 (2026-09-29) the optional tls.allowedClientSans, set 1.5 (2026-09-29) the optional pipeline.context, and set 1.6 (2026-09-30) the optional pipeline.stepNamespaces; every change since set 1.0 is additive and is listed in contracts/CHANGELOG.md.",
   "type": "object",
   "required": ["apiVersion", "kind", "metadata", "spec"],
   "additionalProperties": false,
@@ -81,6 +81,16 @@
           },
           "then": { "required": ["partitionKey"] },
           "else": { "not": { "required": ["partitionKey"] } }
+        },
+        {
+          "$comment": "Set 1.2 (W2-8): synchronous reply is refused on a transactional pipeline. A reply produced inside the transaction stays invisible until the batch commits; a reply produced outside it could answer AA for work that is then aborted. Held by the schema rather than only at startup because it can be (ADR-007 D7). The other W2-8 refusal - any splitter in the channel - is a load-time rule, because a splitter named by 'ref' is only known once the bundle loads (README 3.2.6).",
+          "if": {
+            "properties": { "source": { "required": ["reply"] } },
+            "required": ["source"]
+          },
+          "then": {
+            "properties": { "pipeline": { "properties": { "transactional": { "const": false } } } }
+          }
         }
       ]
     },
@@ -88,8 +98,8 @@
       "type": "string",
       "minLength": 3,
       "maxLength": 160,
-      "pattern": "^(hl7|json|xpath|header):[A-Za-z0-9._:/\\[\\]-]{1,128}$",
-      "$comment": "v0 fixes the SHAPE only: a scheme, a colon, and a scheme-specific locator. The evaluator, the exact scheme set and the semantics are W2-4 (platform-engineer) and reach this contract as an additive enum relaxation. The RESULT of this expression is the Kafka record key, which is frequently a direct patient identifier: see contracts/envelope/v0 section 4 for every surface it must not appear on."
+      "pattern": "^((hl7|json|xpath|header):[A-Za-z0-9._:/\\[\\]-]{1,128}|record:key)$",
+      "$comment": "A scheme, a colon and a scheme-specific locator. Set 1.1 adds the 'record:key' form (the inbound Kafka record key, kafka sources only) and fixes the semantics of every scheme in README section 4.3; the per-scheme grammar is checked by the shared evaluator at deploy, not by this pattern, because tightening the pattern would narrow a frozen contract. 'xpath' is RESERVED: no evaluator exists, and a spec using it is refused at apply, loudly. The RESULT of this expression is the Kafka record key, which is frequently a direct patient identifier: see contracts/envelope/v0 section 4 for every surface it must not appear on."
     },
     "retention": {
       "type": "object",
@@ -109,12 +119,13 @@
     },
     "source": {
       "type": "object",
-      "required": ["type", "bind", "port", "ack"],
+      "required": ["type", "ack"],
       "additionalProperties": false,
+      "$comment": "One object for every receiver type. Listener types (mllp, http) keep their fields flat, as set 1.0 had them; client types (sftp, kafka) nest their connection in an object named after the type, because a remote host and port mean something different from a bind address and port. The per-type allOf branches below say which fields each type requires and permits: a field belonging to another type is a spec error, never silently ignored.",
       "properties": {
         "type": {
-          "enum": ["mllp"],
-          "$comment": "v0 defines only the receiver wave 1 builds (W1-5). Adding 'http', 'sftp' or 'kafka' is an enum RELAXATION, which is additive and non-breaking, so each one arrives with the connector that implements it and its own config object. Publishing config shapes for unbuilt receivers would be invented detail with nothing to check it."
+          "enum": ["mllp", "http", "sftp", "kafka"],
+          "$comment": "Set 1.0 listed mllp only. http, sftp and kafka were added in set 1.1 at the START of the wave that builds them (W2-7), so the contract precedes the code (ADR-007 D6, amended). Until a type's receiver ships, a spec selecting it is refused by the receiver at startup - loudly, the same arrangement as `ref` steps (README 3.3.1). README section 3.0 tracks which types are implemented."
         },
         "bind": { "$ref": "#/$defs/bindAddress" },
         "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
@@ -124,9 +135,26 @@
           "type": "integer",
           "minimum": 1,
           "maximum": 1000000,
-          "$comment": "Cannot exceed the envelope's inline limit (contracts/envelope/v0 section 5). Claim-check for larger payloads is NOT implemented and untested in Phase 0 (gate 7.2 item 18), so a channel cannot yet rely on it."
+          "$comment": "Cannot exceed the envelope's inline limit (contracts/envelope/v0 section 5). Claim-check for larger payloads is NOT implemented and untested (gate 7.2 item 18), so a channel cannot yet rely on it: an oversize input is refused per type, never truncated and never dropped (README 3.2)."
         },
-        "queue": { "$ref": "#/$defs/queue" }
+        "queue": { "$ref": "#/$defs/queue" },
+        "path": { "$ref": "#/$defs/httpPath" },
+        "accept": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/contentType" },
+          "$comment": "http only. Request content types this endpoint admits; anything else is refused with 415 before a byte reaches Kafka."
+        },
+        "auth": { "$ref": "#/$defs/sourceAuth" },
+        "contentType": {
+          "$ref": "#/$defs/contentType",
+          "$comment": "sftp and kafka only: neither protocol says what the bytes are, so the spec must, and it becomes tb-content-type."
+        },
+        "sftp": { "$ref": "#/$defs/sftpSource" },
+        "kafka": { "$ref": "#/$defs/kafkaSource" },
+        "reply": { "$ref": "#/$defs/syncReply" }
       },
       "allOf": [
         {
@@ -142,6 +170,64 @@
             "required": ["bind"]
           },
           "then": { "required": ["tls"] }
+        },
+        {
+          "$comment": "mllp: the set 1.0 shape, plus the optional set 1.2 'reply' block (synchronous reply mode, README 3.2.6).",
+          "if": { "properties": { "type": { "const": "mllp" } }, "required": ["type"] },
+          "then": {
+            "required": ["bind", "port"],
+            "propertyNames": { "enum": ["type", "bind", "port", "tls", "ack", "maxMessageBytes", "queue", "reply"] }
+          }
+        },
+        {
+          "$comment": "http: an ingest listener (HTTP and FHIR REST POST), not a FHIR server. auth must be stated, like tls.clientAuth - a default is the setting everyone inherits and nobody reviews.",
+          "if": { "properties": { "type": { "const": "http" } }, "required": ["type"] },
+          "then": {
+            "required": ["bind", "port", "path", "accept", "auth"],
+            "propertyNames": {
+              "enum": ["type", "bind", "port", "tls", "ack", "maxMessageBytes", "queue", "path", "accept", "auth", "reply"]
+            }
+          }
+        },
+        {
+          "$comment": "An unauthenticated HTTP endpoint that writes into a clinical pipeline is an injection point for fabricated messages, whatever the transport. auth.type none is therefore permitted on loopback only - stricter than mllp, whose senders frequently cannot present a client certificate, while any HTTP client can send a bearer token.",
+          "if": {
+            "properties": {
+              "type": { "const": "http" },
+              "auth": { "properties": { "type": { "const": "none" } }, "required": ["type"] }
+            },
+            "required": ["type", "auth"]
+          },
+          "then": { "properties": { "bind": { "$ref": "#/$defs/loopbackHost" } } }
+        },
+        {
+          "$comment": "auth.type mtls means the certificate IS the authentication, so the listener must actually demand one.",
+          "if": {
+            "properties": {
+              "auth": { "properties": { "type": { "const": "mtls" } }, "required": ["type"] }
+            },
+            "required": ["auth"]
+          },
+          "then": {
+            "required": ["tls"],
+            "properties": { "tls": { "properties": { "clientAuth": { "const": "required" } } } }
+          }
+        },
+        {
+          "$comment": "sftp: a poller, a client of the sender's server.",
+          "if": { "properties": { "type": { "const": "sftp" } }, "required": ["type"] },
+          "then": {
+            "required": ["sftp", "contentType"],
+            "propertyNames": { "enum": ["type", "ack", "maxMessageBytes", "contentType", "sftp"] }
+          }
+        },
+        {
+          "$comment": "kafka: a consumer of a topic outside this engine's own topic layout.",
+          "if": { "properties": { "type": { "const": "kafka" } }, "required": ["type"] },
+          "then": {
+            "required": ["kafka", "contentType"],
+            "propertyNames": { "enum": ["type", "ack", "maxMessageBytes", "contentType", "kafka"] }
+          }
         }
       ]
     },
@@ -150,16 +236,66 @@
       "pattern": "^([0-9]{1,3}(\\.[0-9]{1,3}){3}|localhost|::1?)$",
       "$comment": "An IPv4 literal, 'localhost', '::1' or '::' (the IPv6 wildcard). A hostname other than localhost is not accepted in v0: a listener binds an address, and resolving a name at bind time is a way to bind something you did not mean to."
     },
+    "loopbackHost": {
+      "type": "string",
+      "pattern": "^(127\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}|localhost|::1)$",
+      "$comment": "The one exception every transport rule in this contract makes: plaintext, or no authentication, is acceptable only when the peer is this host."
+    },
+    "hostName": {
+      "type": "string",
+      "maxLength": 253,
+      "pattern": "^(::1|[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?)$",
+      "$comment": "A remote host a CLIENT connects to (sftp, databases, mllp client). Unlike bindAddress a DNS name is accepted: TLS and SSH verify the name, so resolving it is the point. IPv6 literals other than ::1 are not accepted in set 1.1."
+    },
+    "hostPort": {
+      "type": "string",
+      "pattern": "^(\\[::1\\]|[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?):[0-9]{2,5}$"
+    },
+    "loopbackHostPort": {
+      "type": "string",
+      "pattern": "^(localhost|127\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}|\\[::1\\]):[0-9]{2,5}$"
+    },
     "tls": {
       "type": "object",
       "required": ["secretRef", "clientAuth"],
       "additionalProperties": false,
+      "$comment": "SERVER-side TLS for a listener. The client-side equivalent is clientTls.",
       "properties": {
         "secretRef": { "$ref": "#/$defs/secretRef" },
         "clientAuth": {
           "enum": ["none", "required"],
           "$comment": "Required to be stated, with no default. Phase 1 requirement 8 asks for mTLS on receivers; a default would be the setting everyone inherits and nobody reviews. 'required' means the sender presents a client certificate that chains to the trust bundle in secretRef."
         },
+        "minVersion": { "enum": ["1.2", "1.3"] },
+        "allowedClientSans": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/clientSan" },
+          "$comment": "Set 1.3 (ADR-007 D18). Optional allow-list of client-certificate subjectAltName entries, checked after the handshake and before any application byte is read: the leaf certificate must carry at least one listed entry, compared exactly. Absent means any certificate that chains to the trust bundle in secretRef, which is every certificate that CA ever issued. Subject DN and CN matching are deliberately not offered (README 3.2.7). Only with clientAuth: required."
+        }
+      },
+      "allOf": [
+        {
+          "$comment": "An allow-list of client certificate names means nothing unless the listener demands a certificate.",
+          "if": { "required": ["allowedClientSans"] },
+          "then": { "properties": { "clientAuth": { "const": "required" } } }
+        }
+      ]
+    },
+    "clientSan": {
+      "type": "string",
+      "maxLength": 300,
+      "pattern": "^(dns:[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?|uri:[a-z][a-z0-9+.-]{0,31}:[A-Za-z0-9._~:/@%+-]{1,256})$",
+      "$comment": "Set 1.3. A typed subjectAltName: 'dns:' plus a lower-case DNS name (compared case-insensitively, so the spec must be lower-case), or 'uri:' plus a URI such as a SPIFFE ID (compared byte for byte). No wildcard: '*' cannot be written, so a wildcard certificate never matches. No email or IP types in set 1.3: an email SAN is personal data, and an address is not an identity; either can be added later, additively."
+    },
+    "clientTls": {
+      "type": "object",
+      "additionalProperties": false,
+      "$comment": "CLIENT-side TLS. Server certificate and hostname verification are always on, and there is deliberately no field that can turn them off: an 'insecure' flag is the control that gets set once in a test and shipped. secretRef, when present, names a trust bundle and optionally a client certificate and key; absent means the platform trust store and no client certificate.",
+      "properties": {
+        "secretRef": { "$ref": "#/$defs/secretRef" },
         "minVersion": { "enum": ["1.2", "1.3"] }
       }
     },
@@ -175,16 +311,59 @@
       "properties": {
         "mode": {
           "const": "after-commit",
-          "$comment": "A one-member enum on purpose. Invariant 1 has no other legal value, so ACK timing is not a tuning knob; making it a field that can only hold one value means a spec reader sees the guarantee instead of assuming it."
+          "$comment": "A one-member enum on purpose. Invariant 1 has no other legal value, so ACK timing is not a tuning knob; making it a field that can only hold one value means a spec reader sees the guarantee instead of assuming it. What 'ACK' means for each source type (an HL7 AA, an HTTP 202, deleting a remote file, committing a source offset) is tabulated in README 3.2."
         },
         "nackOn": {
           "type": "array",
           "maxItems": 8,
           "uniqueItems": true,
           "items": { "enum": ["parse-error", "spec-invalid", "queue-full"] },
-          "$comment": "Conditions that produce a NACK rather than an ACK. A NACK carries a code and tb-msg-id only: never the record key, never exception text (contracts/envelope/v0 section 4)."
+          "$comment": "Conditions that produce a NACK rather than an ACK. A NACK carries a code and tb-msg-id only: never the record key, never exception text (contracts/envelope/v0 section 4). A per-key channel whose partitionKey does not resolve on a message is a parse-error (README 4.3)."
         },
-        "timeoutMs": { "type": "integer", "minimum": 100, "maximum": 120000 }
+        "timeoutMs": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 120000,
+          "$comment": "Bounds the receiver's wait for the raw commit (queue admission plus publish). Expiry is a NACK before any commit is confirmed. Distinct from reply.timeoutMs, which starts after the commit (README 3.2.6)."
+        }
+      }
+    },
+    "syncReply": {
+      "type": "object",
+      "additionalProperties": false,
+      "$comment": "Set 1.2 (W2-8, approved 2026-09-28): synchronous reply mode. The block's PRESENCE switches it on; an empty object means every default. Permitted on mllp and http sources only (sftp and kafka have no waiting sender), via the per-type propertyNames lists. ack.mode stays after-commit: sync mode changes what the sender waits for, not when the commit happens. What each answer means (AA / AE / AR) is normative in README 3.2.6. Not to be confused with ack.timeoutMs, which bounds the wait for the raw commit; reply.timeoutMs starts only once that commit is confirmed.",
+      "properties": {
+        "timeoutMs": {
+          "type": "integer",
+          "minimum": 1000,
+          "maximum": 60000,
+          "default": 10000,
+          "$comment": "Wait for the reply, counted from the receiver's successful raw delivery callback. Expiry answers AE / REPLY_TIMEOUT: committed, outcome unknown (ADR-003 D9). Default from ADR-001 6.5."
+        },
+        "after": {
+          "const": "routed",
+          "default": "routed",
+          "$comment": "routed: every out.<dest> record was acknowledged by Kafka, or the message was deliberately dropped for that destination. 'delivered' (a loader's outcome) is RESERVED and not accepted in set 1.2: it needs loader WRITE on reply and a rule for which destination answers. AA therefore means committed and routed, never delivered to a destination."
+        },
+        "body": {
+          "enum": ["ack", "step"],
+          "default": "ack",
+          "$comment": "ack: the receiver builds the protocol answer from the reply status. step: a pipeline step supplies the response payload through ctx.reply (README 3.2.6). May be implemented after 'ack'; until then a spec selecting it is refused at component startup."
+        },
+        "maxPending": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 50000,
+          "default": 10000,
+          "$comment": "Cap on in-flight sync requests per receiver process. S3 measured about 4.6 KB per entry, so 10,000 is about 46 MB. Over the cap: AR / REPLY_BUSY and nothing is published."
+        },
+        "partitions": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 64,
+          "default": 3,
+          "$comment": "Partition count of <env>.<ch>.reply, and the ONLY thing that sizes it: spec.partitions does not apply to the reply topic, because reply is sized by receiver processes, not by throughput. MUST be at least the number of receiver processes: a process that holds no reply partition is not ready and refuses sync requests before publishing (README 3.2.6, topics/v0 3.3.1). Counts against the topics/v0 2.2 partition budget."
+        }
       }
     },
     "queue": {
@@ -196,6 +375,204 @@
       "properties": {
         "maxBytes": { "type": "integer", "minimum": 1048576, "maximum": 4294967296 },
         "maxMessages": { "type": "integer", "minimum": 1, "maximum": 1000000 }
+      }
+    },
+    "httpPath": {
+      "type": "string",
+      "pattern": "^/[A-Za-z0-9._~-]{0,64}(/[A-Za-z0-9._~-]{1,64}){0,8}$",
+      "$comment": "A fixed path. No templating and no path parameters: a path parameter is where a sender puts an identifier, and a request line is logged by every proxy in front of the listener."
+    },
+    "contentType": {
+      "enum": [
+        "application/hl7-v2+er7",
+        "application/hl7-v2+xml",
+        "application/fhir+json",
+        "application/fhir+xml",
+        "application/json",
+        "application/xml",
+        "text/csv",
+        "text/plain",
+        "application/edi-x12",
+        "application/octet-stream"
+      ],
+      "$comment": "The registered types of contracts/envelope/v0 section 3, without parameters. application/dicom is deliberately absent: DICOM objects are normally over the 1 MB inline limit and claim-check is unimplemented, so admitting the type would promise an ingest that refuses almost every real input."
+    },
+    "sourceAuth": {
+      "type": "object",
+      "required": ["type"],
+      "additionalProperties": false,
+      "$comment": "http source only. How a sender proves who it is. Must be stated; see the source allOf for the loopback-only rule on 'none' and the tls rule on 'mtls'. JWT/OIDC validation is not in set 1.1: it needs a JWKS fetch and key rotation, which is a design of its own.",
+      "properties": {
+        "type": { "enum": ["none", "bearer", "mtls"] },
+        "secretRef": {
+          "$ref": "#/$defs/secretRef",
+          "$comment": "bearer only: names the expected token(s). Compared in constant time; never logged, never echoed in a response."
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "type": { "const": "bearer" } }, "required": ["type"] },
+          "then": { "required": ["secretRef"] },
+          "else": { "not": { "required": ["secretRef"] } }
+        }
+      ]
+    },
+    "remotePath": {
+      "type": "string",
+      "maxLength": 256,
+      "pattern": "^/([A-Za-z0-9._-]{1,64}(/[A-Za-z0-9._-]{1,64}){0,15})?/?$",
+      "not": { "pattern": "(^|/)\\.\\.?(/|$)" },
+      "$comment": "An absolute path on a remote server. No '.' or '..' segments: the path comes from a tenant-supplied document, and a traversal segment is how a channel reaches a directory its operator did not mean to give it. The separator is mandatory between segments on purpose: an optional one lets a backtracking regex engine split a long run of characters exponentially many ways, and this validator reads tenant input."
+    },
+    "sshHostKeys": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 4,
+      "uniqueItems": true,
+      "items": { "type": "string", "pattern": "^SHA256:[A-Za-z0-9+/]{43}$" },
+      "$comment": "OpenSSH SHA-256 fingerprints of the server host keys the client will accept; more than one only to allow a key rotation. REQUIRED, with no trust-on-first-use and no 'accept any' option: SSH without host key verification is the SFTP equivalent of TLS without certificate verification."
+    },
+    "sshAuth": {
+      "type": "object",
+      "required": ["type", "secretRef"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "enum": ["private-key", "password"] },
+        "secretRef": {
+          "$ref": "#/$defs/secretRef",
+          "$comment": "Names the username together with the key or password. The username is not a secret, but keeping the identity and its credential in one place means rotating one never leaves the other stale."
+        }
+      }
+    },
+    "sftpSource": {
+      "type": "object",
+      "required": [
+        "host",
+        "hostKeys",
+        "auth",
+        "directory",
+        "filePattern",
+        "pollIntervalSeconds",
+        "afterCommit",
+        "rejectDirectory"
+      ],
+      "additionalProperties": false,
+      "$comment": "One file is one message. REMOTE FILE NAMES ARE TREATED AS PHI: senders routinely name files after patients or accession numbers, so a name never appears in a log, metric label, trace attribute, header, event or NACK (README 3.2.3).",
+      "properties": {
+        "host": { "$ref": "#/$defs/hostName" },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "hostKeys": { "$ref": "#/$defs/sshHostKeys" },
+        "auth": { "$ref": "#/$defs/sshAuth" },
+        "directory": { "$ref": "#/$defs/remotePath" },
+        "filePattern": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._*?-]{1,64}$",
+          "$comment": "A glob over names in 'directory', not a path. No recursion in set 1.1."
+        },
+        "pollIntervalSeconds": { "type": "integer", "minimum": 1, "maximum": 3600 },
+        "minFileAgeSeconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 3600,
+          "$comment": "A file younger than this is not read yet, so a file still being uploaded is not ingested half-written. Senders that upload to a temporary name and rename can use 0."
+        },
+        "maxFilesPerPoll": { "type": "integer", "minimum": 1, "maximum": 10000 },
+        "afterCommit": {
+          "enum": ["delete", "move"],
+          "$comment": "What happens to the remote file once its raw record is committed - the SFTP form of the ACK. No default: 'delete' leaves nothing on the sender's side to re-drive from, which is a choice for the operator to write down."
+        },
+        "archiveDirectory": { "$ref": "#/$defs/remotePath" },
+        "rejectDirectory": {
+          "$ref": "#/$defs/remotePath",
+          "$comment": "Where a file the receiver refuses (oversize, key unresolved, unreadable) is moved - the SFTP form of the NACK. Required: without it a refused file is either deleted, which drops a message, or left in place and re-read on every poll."
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "afterCommit": { "const": "move" } }, "required": ["afterCommit"] },
+          "then": { "required": ["archiveDirectory"] },
+          "else": { "not": { "required": ["archiveDirectory"] } }
+        }
+      ]
+    },
+    "kafkaSecurity": {
+      "type": "object",
+      "required": ["protocol"],
+      "additionalProperties": false,
+      "properties": {
+        "protocol": { "enum": ["SSL", "SASL_SSL", "PLAINTEXT"] },
+        "saslMechanism": { "enum": ["SCRAM-SHA-512"] },
+        "secretRef": {
+          "$ref": "#/$defs/secretRef",
+          "$comment": "The client's identity: keys username and password for SASL_SSL, or tls.crt and tls.key (a client certificate, mTLS) for SSL. tls.secretRef is the trust bundle (ca.crt) only. Corrected in set 1.3 to match both implementations and engine-kafka/v0 section 3; set 1.0-1.2 text put the client certificate under tls.secretRef. No validation change."
+        },
+        "tls": { "$ref": "#/$defs/clientTls" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "protocol": { "const": "SASL_SSL" } }, "required": ["protocol"] },
+          "then": { "required": ["saslMechanism", "secretRef"] },
+          "else": { "not": { "required": ["saslMechanism"] } }
+        },
+        {
+          "if": { "properties": { "protocol": { "const": "PLAINTEXT" } }, "required": ["protocol"] },
+          "then": { "not": { "anyOf": [{ "required": ["secretRef"] }, { "required": ["tls"] }] } }
+        }
+      ]
+    },
+    "kafkaConnection": {
+      "type": "object",
+      "required": ["bootstrapServers", "security"],
+      "additionalProperties": false,
+      "$comment": "ALWAYS explicit, with its own credentials - including when it points at the same physical cluster the engine runs on. A kafka connector never borrows the engine's data-plane principal, so contracts/topics/v0 3.4's ACL model (prefix grants on <env>.<channel>.) needs no exception for foreign topics (ADR-007 D11).",
+      "properties": {
+        "bootstrapServers": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/hostPort" }
+        },
+        "security": { "$ref": "#/$defs/kafkaSecurity" }
+      },
+      "allOf": [
+        {
+          "$comment": "PLAINTEXT only when every bootstrap server is this host.",
+          "if": {
+            "properties": {
+              "security": { "properties": { "protocol": { "const": "PLAINTEXT" } }, "required": ["protocol"] }
+            },
+            "required": ["security"]
+          },
+          "then": { "properties": { "bootstrapServers": { "items": { "$ref": "#/$defs/loopbackHostPort" } } } }
+        }
+      ]
+    },
+    "externalTopic": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]{1,249}$",
+      "not": {
+        "anyOf": [
+          { "pattern": "^_tb\\." },
+          { "pattern": "^\\.{1,2}$" },
+          {
+            "pattern": "^[a-z][a-z0-9-]{0,15}\\.[a-z][a-z0-9-]{0,63}\\.(raw|retry|dlq|reply|out\\.[a-z][a-z0-9-]{0,63})$"
+          }
+        ]
+      },
+      "$comment": "A topic OUTSIDE this engine's layout. Platform topics (_tb.*) and anything shaped like a channel topic (contracts/topics/v0 section 1) are refused: reading or writing them through a connector would bypass the per-channel ACL model and, for _tb.<env>.channels, is remote code execution across the data plane (topics/v0 3.4). Channel-to-channel chaining is a separate design and is not in set 1.1."
+    },
+    "kafkaSource": {
+      "type": "object",
+      "required": ["connection", "topic", "startFrom"],
+      "additionalProperties": false,
+      "properties": {
+        "connection": { "$ref": "#/$defs/kafkaConnection" },
+        "topic": { "$ref": "#/$defs/externalTopic" },
+        "startFrom": {
+          "enum": ["earliest", "latest"],
+          "$comment": "Where a consumer group with no committed offset starts. No default: 'latest' silently skips a backlog, 'earliest' may ingest years of it, and either one surprises someone."
+        }
       }
     },
     "pipeline": {
@@ -224,6 +601,31 @@
         "transactional": {
           "type": "boolean",
           "$comment": "Kafka transactions for the raw -> out.<dest> hop (ADR-003 D6, measured in S5). Opt-in, default false: the cost against a plain at-least-once stage was never isolated, and a dead transactional producer stalls read_committed consumers for up to transaction.timeout.ms."
+        },
+        "context": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "uniqueItems": true,
+          "items": { "enum": ["fhir"] },
+          "$comment": "Set 1.5 (ADR-007 D21). The context capabilities this channel's steps need, for example 'fhir' for ctx.fhir and ctx.terminology. It applies to every step the worker runs for the channel, pipeline and destination steps alike. The worker loads ONLY these tributary.context entry points and refuses the spec if one cannot be resolved from its registered distribution (contracts/context-extension/v0 L1-L2). Absent means none: there is one spelling for 'no capabilities', so an empty list is refused. The enum is exactly the registry in contracts/context-extension/v0/capabilities.json, and contracts/validate.py checks that. A set, not a sequence: order carries no meaning."
+        },
+        "stepNamespaces": {
+          "type": "object",
+          "minProperties": 1,
+          "maxProperties": 8,
+          "propertyNames": {
+            "allOf": [
+              { "maxLength": 64, "pattern": "^[a-z][a-z0-9_]*\\.[a-z][a-z0-9_]*$" },
+              { "not": { "pattern": "^tributary\\." } }
+            ]
+          },
+          "additionalProperties": {
+            "type": "string",
+            "maxLength": 100,
+            "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$"
+          },
+          "$comment": "Set 1.6 (ADR-007 D23). Binds each non-engine step namespace this channel's uses names need to the ONE distribution allowed to supply it, e.g. {\"acme.lab\": \"acme-lab-steps\"}. A namespace is the first two segments of a uses name. Namespaces whose first segment is 'tributary' are reserved to the engine registry (step-namespaces.json) and cannot be declared here, so a spec can never rebind an engine step. The value is the distribution name in PEP 503 normalised form: one spelling. The worker loads a uses step only if exactly one installed tributary.steps entry point carries the name and its distribution equals the binding; otherwise the spec is refused and nothing is imported (README 3.3.5). Absent means the channel may use engine namespaces only; an empty object is refused (one spelling for 'none')."
         }
       }
     },
@@ -231,7 +633,7 @@
       "type": "object",
       "required": ["name"],
       "additionalProperties": false,
-      "$comment": "Exactly one of 'uses' (a step registered through the tributary.steps entry point) or 'ref' (a dotted path inside the bundle). There is deliberately NO field carrying inline code: invariant 7 requires every step to be a unit-testable function of (message, ctx), and inline source in a spec cannot be imported by pytest, reviewed in a diff, or type-checked. That is the one Mirth affordance this contract refuses on purpose.",
+      "$comment": "Exactly one of 'uses' (a step registered through the tributary.steps entry point) or 'ref' (a dotted path inside the bundle). Set 1.6: a uses name resolves only from the distribution its namespace (first two segments) is bound to, by step-namespaces.json for tributary.* or by pipeline.stepNamespaces otherwise, and needs at least three segments; the runtime refuses the spec otherwise (README 3.3.5). The pattern still admits two segments because tightening it would be breaking. There is deliberately NO field carrying inline code: invariant 7 requires every step to be a unit-testable function of (message, ctx), and inline source in a spec cannot be imported by pytest, reviewed in a diff, or type-checked. That is the one Mirth affordance this contract refuses on purpose.",
       "properties": {
         "name": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,63}$" },
         "uses": {
@@ -299,6 +701,7 @@
       "type": "object",
       "required": ["name", "type", "with", "idempotency", "retry"],
       "additionalProperties": false,
+      "$comment": "'with' is validated by the params object for the selected type, and 'idempotency.technique' is restricted to the techniques that type can honour (README 5.1). Both are allOf branches keyed on 'type', so a failure is reported at the field that is wrong, not as an opaque oneOf.",
       "properties": {
         "name": {
           "type": "string",
@@ -306,12 +709,142 @@
           "$comment": "Becomes the out.<destination> topic segment and the tb-destination header. Names must be unique within a channel, which JSON Schema cannot express over an array of objects; the control plane checks it."
         },
         "type": {
-          "enum": ["http"],
-          "$comment": "v0 defines only the loader wave 1 builds (W1-6). The wave 2 set (fhir, postgresql, clickhouse, sftp, s3, mllp, kafka) arrives one enum value plus one config object at a time, each with the loader and its duplicate-delivery test. Enum relaxation is additive."
+          "enum": ["http", "fhir", "postgresql", "clickhouse", "sftp", "s3", "mllp", "kafka"],
+          "$comment": "Set 1.0 listed http only. The other seven were added in set 1.1 at the START of W2-6, so the contract precedes the loaders (ADR-007 D6, amended). Until a type's loader ships, a spec selecting it is refused by the loader at startup. README section 3.0 tracks which types are implemented."
         },
-        "with": { "$ref": "#/$defs/httpParams" },
+        "with": { "type": "object" },
+        "steps": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "items": { "$ref": "#/$defs/step" },
+          "$comment": "Set 1.1. Steps that run for THIS destination only, in the pipeline worker, after pipeline.steps and before the record is produced to out.<destination> - in process, so no new Kafka hop (invariant 2). ctx.destination is this destination's name. A Drop here filters the message for this destination only. This is how one channel sends a FHIR Bundle to one sink and a table row to another (README 3.5)."
+        },
         "idempotency": { "$ref": "#/$defs/idempotency" },
         "retry": { "$ref": "#/$defs/retry" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "type": { "const": "http" } }, "required": ["type"] },
+          "then": { "properties": { "with": { "$ref": "#/$defs/httpParams" } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "fhir" } }, "required": ["type"] },
+          "then": {
+            "properties": {
+              "with": { "$ref": "#/$defs/fhirParams" },
+              "idempotency": {
+                "properties": {
+                  "technique": { "enum": ["conditional-update", "idempotency-key-header", "none"] }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "postgresql" } }, "required": ["type"] },
+          "then": {
+            "properties": {
+              "with": { "$ref": "#/$defs/sqlSinkParams" },
+              "idempotency": { "properties": { "technique": { "enum": ["sink-native"] } } }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "clickhouse" } }, "required": ["type"] },
+          "then": {
+            "properties": {
+              "with": { "$ref": "#/$defs/sqlSinkParams" },
+              "idempotency": { "properties": { "technique": { "enum": ["sink-native"] } } }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "sftp" } }, "required": ["type"] },
+          "then": {
+            "properties": {
+              "with": { "$ref": "#/$defs/sftpParams" },
+              "idempotency": { "properties": { "technique": { "enum": ["deterministic-name"] } } }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "s3" } }, "required": ["type"] },
+          "then": {
+            "properties": {
+              "with": { "$ref": "#/$defs/s3Params" },
+              "idempotency": { "properties": { "technique": { "enum": ["deterministic-name"] } } }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "mllp" } }, "required": ["type"] },
+          "then": {
+            "properties": {
+              "with": { "$ref": "#/$defs/mllpParams" },
+              "idempotency": { "properties": { "technique": { "enum": ["sink-native", "none"] } } }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "kafka" } }, "required": ["type"] },
+          "then": {
+            "properties": {
+              "with": { "$ref": "#/$defs/kafkaParams" },
+              "idempotency": { "properties": { "technique": { "enum": ["idempotency-key-header", "none"] } } }
+            }
+          }
+        }
+      ]
+    },
+    "timeoutMs": {
+      "type": "integer",
+      "minimum": 100,
+      "maximum": 120000,
+      "$comment": "The runtime's max.poll.interval.ms must be at least the slowest destination timeout plus backoff (contracts/topics/v0 3.3), or a slow sink looks like a dead consumer and causes a rebalance loop."
+    },
+    "destinationUrl": {
+      "type": "string",
+      "maxLength": 1024,
+      "pattern": "^https?://[A-Za-z0-9._-]{1,253}(:[0-9]{2,5})?(/[A-Za-z0-9._~%-]{0,128}){0,16}$",
+      "$comment": "No query string and no fragment, by pattern. A URL is logged by every proxy, gateway and access log on the path and lands in browser history, and the identifier a healthcare destination wants in a query string is usually the record key - the PHI-in-URL leak named in contracts/envelope/v0 section 4. The FHIR loader avoids the need entirely by sending conditional operations inside a transaction Bundle body (README 3.4.2)."
+    },
+    "plaintextHttpLoopbackOnly": {
+      "$comment": "Plaintext HTTP only to loopback, the same rule as the receiver's bind address. PHI in flight to a remote destination is TLS or it is a breach.",
+      "if": {
+        "properties": { "url": { "pattern": "^http://" } },
+        "required": ["url"]
+      },
+      "then": {
+        "properties": {
+          "url": {
+            "pattern": "^http://(127\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}|localhost|\\[::1\\])(:[0-9]{2,5})?(/|$)"
+          }
+        }
+      }
+    },
+    "staticHeaders": {
+      "type": "object",
+      "maxProperties": 16,
+      "propertyNames": { "pattern": "^[A-Za-z][A-Za-z0-9-]{0,63}$" },
+      "additionalProperties": { "type": "string", "maxLength": 256 },
+      "$comment": "Static headers only. No templating, so a header cannot be built from payload content, which is how an identifier reaches a destination's access log. Credentials go through auth.secretRef."
+    },
+    "httpAuth": {
+      "type": "object",
+      "required": ["type", "secretRef"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "enum": ["basic", "bearer", "oauth2-client-credentials", "mtls"] },
+        "secretRef": { "$ref": "#/$defs/secretRef" }
+      }
+    },
+    "circuitBreaker": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "failureThreshold": { "type": "integer", "minimum": 1, "maximum": 1000 },
+        "openSeconds": { "type": "integer", "minimum": 1, "maximum": 3600 }
       }
     },
     "httpParams": {
@@ -319,66 +852,242 @@
       "required": ["url", "method", "timeoutMs"],
       "additionalProperties": false,
       "properties": {
-        "url": {
-          "type": "string",
-          "maxLength": 1024,
-          "pattern": "^https?://[A-Za-z0-9._-]{1,253}(:[0-9]{2,5})?(/[A-Za-z0-9._~%-]{0,128}){0,16}$",
-          "$comment": "No query string and no fragment, by pattern. A URL is logged by every proxy, gateway and access log on the path and lands in browser history, and the identifier a healthcare destination wants in a query string is usually the record key - the PHI-in-URL leak named in contracts/envelope/v0 section 4. A destination whose API only accepts an identifier in the query (FHIR ?identifier=) needs a deliberate, documented channel behaviour plus a no-log rule, which is wave 2 work and an explicit contract change, not a default anyone can reach for."
-        },
+        "url": { "$ref": "#/$defs/destinationUrl" },
         "method": { "enum": ["POST", "PUT", "PATCH"] },
-        "timeoutMs": {
-          "type": "integer",
-          "minimum": 100,
-          "maximum": 120000,
-          "$comment": "The runtime's max.poll.interval.ms must be at least the slowest destination timeout plus backoff (contracts/topics/v0 3.3), or a slow sink looks like a dead consumer and causes a rebalance loop."
+        "timeoutMs": { "$ref": "#/$defs/timeoutMs" },
+        "headers": { "$ref": "#/$defs/staticHeaders" },
+        "auth": { "$ref": "#/$defs/httpAuth" },
+        "circuitBreaker": { "$ref": "#/$defs/circuitBreaker" }
+      },
+      "allOf": [{ "$ref": "#/$defs/plaintextHttpLoopbackOnly" }]
+    },
+    "fhirParams": {
+      "type": "object",
+      "required": ["url", "fhirVersion", "interaction", "timeoutMs"],
+      "additionalProperties": false,
+      "properties": {
+        "url": {
+          "$ref": "#/$defs/destinationUrl",
+          "$comment": "The FHIR base URL. The loader POSTs to exactly this URL and never appends a query."
         },
-        "headers": {
-          "type": "object",
-          "maxProperties": 16,
-          "propertyNames": { "pattern": "^[A-Za-z][A-Za-z0-9-]{0,63}$" },
-          "additionalProperties": { "type": "string", "maxLength": 256 },
-          "$comment": "Static headers only. No templating, so a header cannot be built from payload content, which is how an identifier reaches a destination's access log. Credentials go through auth.secretRef."
+        "fhirVersion": { "enum": ["4.0.1", "4.3.0", "5.0.0"] },
+        "interaction": {
+          "const": "transaction",
+          "$comment": "Set 1.1 supports a transaction Bundle POSTed to the base URL only. Conditional create and update then live INSIDE the Bundle body (entry.request.ifNoneExist, a conditional entry.request.url), which keeps identifiers out of the request line - the query-string problem README 9 left open for wave 2. Plain create/update/batch are refused on purpose, not overlooked: ADR-007 D12."
+        },
+        "timeoutMs": { "$ref": "#/$defs/timeoutMs" },
+        "headers": { "$ref": "#/$defs/staticHeaders" },
+        "auth": { "$ref": "#/$defs/httpAuth" },
+        "circuitBreaker": { "$ref": "#/$defs/circuitBreaker" }
+      },
+      "allOf": [{ "$ref": "#/$defs/plaintextHttpLoopbackOnly" }]
+    },
+    "sqlIdentifier": {
+      "type": "string",
+      "pattern": "^[a-z_][a-z0-9_]{0,62}$"
+    },
+    "dbTls": {
+      "type": "object",
+      "required": ["mode"],
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "enum": ["verify-full", "disable"],
+          "$comment": "verify-full: TLS with certificate AND hostname verification. There is no middle setting ('require' without verification): encryption to an unauthenticated peer protects against a passive observer only. 'disable' is loopback only (sqlSinkParams allOf)."
+        },
+        "secretRef": {
+          "$ref": "#/$defs/secretRef",
+          "$comment": "The CA trust bundle only. A client certificate and key, like a password, belong to auth.secretRef (README 3.4.3)."
+        }
+      }
+    },
+    "sqlSinkParams": {
+      "type": "object",
+      "required": ["host", "database", "table", "auth", "tls", "timeoutMs"],
+      "additionalProperties": false,
+      "$comment": "postgresql and clickhouse. The payload reaching the loader is a JSON object whose keys are column names (README 3.4.3): a step builds the row, so the mapping is ordinary tested Python (invariant 7) and not a column-mapping language in this document. Identifiers are lowercase and unquoted by pattern, and the loader still quotes them: the table name comes from a tenant-supplied document.",
+      "properties": {
+        "host": { "$ref": "#/$defs/hostName" },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "database": { "$ref": "#/$defs/sqlIdentifier" },
+        "table": {
+          "type": "string",
+          "pattern": "^[a-z_][a-z0-9_]{0,62}(\\.[a-z_][a-z0-9_]{0,62})?$"
+        },
+        "idColumn": {
+          "$ref": "#/$defs/sqlIdentifier",
+          "$comment": "The column the loader fills with tb-msg-id. Default tb_msg_id. Its uniqueness is what makes the sink idempotent, so the loader checks it at startup (README 3.4.3)."
         },
         "auth": {
           "type": "object",
           "required": ["type", "secretRef"],
           "additionalProperties": false,
           "properties": {
-            "type": { "enum": ["basic", "bearer", "oauth2-client-credentials", "mtls"] },
+            "type": { "enum": ["password", "client-certificate"] },
             "secretRef": { "$ref": "#/$defs/secretRef" }
           }
         },
-        "circuitBreaker": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "failureThreshold": { "type": "integer", "minimum": 1, "maximum": 1000 },
-            "openSeconds": { "type": "integer", "minimum": 1, "maximum": 3600 }
-          }
-        }
+        "tls": { "$ref": "#/$defs/dbTls" },
+        "timeoutMs": { "$ref": "#/$defs/timeoutMs" },
+        "circuitBreaker": { "$ref": "#/$defs/circuitBreaker" }
       },
       "allOf": [
         {
-          "$comment": "Plaintext HTTP only to loopback, the same rule as the receiver's bind address. PHI in flight to a remote destination is TLS or it is a breach.",
+          "$comment": "Plaintext database connections to loopback only.",
           "if": {
-            "properties": { "url": { "pattern": "^http://" } },
-            "required": ["url"]
+            "properties": { "tls": { "properties": { "mode": { "const": "disable" } }, "required": ["mode"] } },
+            "required": ["tls"]
           },
+          "then": { "properties": { "host": { "$ref": "#/$defs/loopbackHost" } } }
+        }
+      ]
+    },
+    "fileExtension": {
+      "type": "string",
+      "pattern": "^\\.[a-z0-9]{1,8}$"
+    },
+    "sftpParams": {
+      "type": "object",
+      "required": ["host", "hostKeys", "auth", "directory", "timeoutMs"],
+      "additionalProperties": false,
+      "$comment": "The remote file name is <fileNamePrefix><tb-msg-id><fileExtension> and nothing else: a name built from payload content is an identifier in a directory listing. Written to a temporary name and renamed (README 3.4.5).",
+      "properties": {
+        "host": { "$ref": "#/$defs/hostName" },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "hostKeys": { "$ref": "#/$defs/sshHostKeys" },
+        "auth": { "$ref": "#/$defs/sshAuth" },
+        "directory": { "$ref": "#/$defs/remotePath" },
+        "fileNamePrefix": { "type": "string", "pattern": "^[A-Za-z0-9_-]{0,32}$" },
+        "fileExtension": { "$ref": "#/$defs/fileExtension" },
+        "timeoutMs": { "$ref": "#/$defs/timeoutMs" },
+        "circuitBreaker": { "$ref": "#/$defs/circuitBreaker" }
+      }
+    },
+    "s3Params": {
+      "type": "object",
+      "required": ["bucket", "region", "serverSideEncryption", "auth", "timeoutMs"],
+      "additionalProperties": false,
+      "$comment": "The object key is <prefix>/<yyyy>/<mm>/<dd>/<tb-msg-id><fileExtension>, the date taken from tb-received-at in UTC - the same non-PHI-only rule as claim-check keys (contracts/envelope/v0 section 5). No field carries a credential value; access keys come through auth.secretRef.",
+      "properties": {
+        "bucket": { "type": "string", "pattern": "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$" },
+        "prefix": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,63}(/[a-z0-9][a-z0-9_-]{0,63}){0,7}$"
+        },
+        "region": { "type": "string", "pattern": "^[a-z0-9-]{1,32}$" },
+        "endpoint": {
+          "type": "string",
+          "maxLength": 300,
+          "pattern": "^https?://[A-Za-z0-9._-]{1,253}(:[0-9]{2,5})?/?$",
+          "$comment": "For S3-compatible stores such as MinIO. Scheme and host only - no path, no query. Absent means the AWS endpoint for 'region'."
+        },
+        "serverSideEncryption": {
+          "enum": ["AES256", "aws:kms"],
+          "$comment": "Required, no default: a destination bucket holds whole payloads, and contracts/topics/v0 3.5 requires encryption at rest for every PHI store. Which key and who holds it is ADR-004 plus a human; this field only makes 'on' mandatory."
+        },
+        "kmsKeyId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9:/_-]{1,256}$",
+          "$comment": "An identifier (ARN, alias or id) of an existing KMS key, not key material. Only with aws:kms."
+        },
+        "expectedBucketOwner": {
+          "type": "string",
+          "pattern": "^[0-9]{12}$",
+          "$comment": "Set 1.4. The 12-digit account id that must own 'bucket'. When set, the loader sends it as ExpectedBucketOwner on every call, so a bucket that was deleted and re-created under another account (bucket sniping) refuses the write with 403 instead of receiving PHI. Optional: an S3-compatible store that does not implement the check cannot use it, and making it required would be breaking. Not a credential."
+        },
+        "auth": {
+          "type": "object",
+          "required": ["type"],
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "enum": ["access-key", "ambient"],
+              "$comment": "ambient: credentials from the runtime environment (workload identity, instance profile), never from the spec."
+            },
+            "secretRef": { "$ref": "#/$defs/secretRef" }
+          },
+          "allOf": [
+            {
+              "if": { "properties": { "type": { "const": "access-key" } }, "required": ["type"] },
+              "then": { "required": ["secretRef"] },
+              "else": { "not": { "required": ["secretRef"] } }
+            }
+          ]
+        },
+        "fileExtension": { "$ref": "#/$defs/fileExtension" },
+        "timeoutMs": { "$ref": "#/$defs/timeoutMs" },
+        "circuitBreaker": { "$ref": "#/$defs/circuitBreaker" }
+      },
+      "allOf": [
+        {
+          "$comment": "Plaintext to an S3-compatible endpoint on loopback only.",
+          "if": { "properties": { "endpoint": { "pattern": "^http://" } }, "required": ["endpoint"] },
           "then": {
             "properties": {
-              "url": {
-                "pattern": "^http://(127\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}|localhost|\\[::1\\])(:[0-9]{2,5})?(/|$)"
+              "endpoint": {
+                "pattern": "^http://(127\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}|localhost|\\[::1\\])(:[0-9]{2,5})?/?$"
               }
             }
           }
+        },
+        {
+          "if": {
+            "properties": { "serverSideEncryption": { "const": "aws:kms" } },
+            "required": ["serverSideEncryption"]
+          },
+          "then": true,
+          "else": { "not": { "required": ["kmsKeyId"] } }
         }
       ]
+    },
+    "mllpParams": {
+      "type": "object",
+      "required": ["host", "port", "timeoutMs", "onNegativeAck"],
+      "additionalProperties": false,
+      "properties": {
+        "host": { "$ref": "#/$defs/hostName" },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "tls": { "$ref": "#/$defs/clientTls" },
+        "timeoutMs": {
+          "$ref": "#/$defs/timeoutMs",
+          "$comment": "Connect plus ACK wait. No ACK within it is a retryable failure, never a success."
+        },
+        "onNegativeAck": {
+          "enum": ["retry", "fail"],
+          "$comment": "What an AE/AR (or CE/CR) from the receiving system means. No default, for the same reason as onExhaust: retrying a message the receiver has rejected as malformed blocks that patient's queue behind it, and failing a message rejected for a transient reason abandons it. 'fail' hands the message to retry.onExhaust immediately."
+        },
+        "circuitBreaker": { "$ref": "#/$defs/circuitBreaker" }
+      },
+      "allOf": [
+        {
+          "$comment": "TLS unless the peer is this host.",
+          "if": {
+            "properties": { "host": { "not": { "$ref": "#/$defs/loopbackHost" } } },
+            "required": ["host"]
+          },
+          "then": { "required": ["tls"] }
+        }
+      ]
+    },
+    "kafkaParams": {
+      "type": "object",
+      "required": ["connection", "topic", "key", "timeoutMs"],
+      "additionalProperties": false,
+      "properties": {
+        "connection": { "$ref": "#/$defs/kafkaConnection" },
+        "topic": { "$ref": "#/$defs/externalTopic" },
+        "key": {
+          "enum": ["preserve", "none"],
+          "$comment": "preserve: the external record carries the channel's record key, so per-key order survives into the external topic. none: a null key. The key is usually a patient identifier, and preserve hands it to whoever reads that topic - stated, not defaulted. A per-key channel with key none gives up order at this destination; the control plane refuses that combination (README 3.4.8)."
+        },
+        "timeoutMs": { "$ref": "#/$defs/timeoutMs" }
+      }
     },
     "idempotency": {
       "type": "object",
       "required": ["technique"],
       "additionalProperties": false,
-      "$comment": "Required on every destination, because invariant 4 requires every loader to document AND test its idempotency technique keyed by tb-msg-id. Declaring it in the spec is what makes it reviewable per channel and testable per destination instead of a sentence in a loader's docstring. The key is ALWAYS tb-msg-id and is not configurable: a second idempotency key is a second way to be wrong, and reprocess deliberately mints a new tb-msg-id (ADR-003 D5) so it is not deduplicated away.",
+      "$comment": "Required on every destination, because invariant 4 requires every loader to document AND test its idempotency technique keyed by tb-msg-id. Declaring it in the spec is what makes it reviewable per channel and testable per destination instead of a sentence in a loader's docstring. The key is ALWAYS tb-msg-id and is not configurable: a second idempotency key is a second way to be wrong, and reprocess deliberately mints a new tb-msg-id (ADR-003 D5) so it is not deduplicated away. Which techniques each destination type may declare is restricted in the destination allOf (README 5.1).",
       "properties": {
         "technique": {
           "enum": [
@@ -418,7 +1127,7 @@
         "policy": {
           "enum": ["blocking", "retry-topic"],
           "not": { "const": "retry-topic" },
-          "$comment": "DEFINED AND NOT SELECTABLE. 'retry-topic' is part of the vocabulary (ADR-001 6.4, ADR-003 D1) so that specs, docs and code share one name for it, but it was never implemented or measured in Phase 0 and its delay mechanism is undecided (ADR-003 D2, gate 7.2 item 18). The 'not' keyword is here rather than a sentence in the README because Phase 0's two High findings were both controls that were specified and then quietly not applied. Removing the 'not' after the spike is a relaxation: non-breaking, one line, recorded in the CHANGELOG."
+          "$comment": "DEFINED AND NOT SELECTABLE. 'retry-topic' is part of the vocabulary (ADR-001 6.4, ADR-003 D1) so that specs, docs and code share one name for it, but it was never implemented or measured in Phase 0 and its delay mechanism is undecided (ADR-003 D2, gate 7.2 item 18). The 'not' keyword is here rather than a sentence in the README because Phase 0's two High findings were both controls that were specified and then quietly not applied. README 4.1.1 lists exactly what the spike must show before this 'not' is removed; removing it is a relaxation: non-breaking, one line, recorded in the CHANGELOG."
         },
         "backoff": { "enum": ["exponential", "fixed"] },
         "initialDelayMs": { "type": "integer", "minimum": 10, "maximum": 600000 },

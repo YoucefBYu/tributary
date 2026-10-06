@@ -1,0 +1,28 @@
+# Used by `helm lint` and `helm template` in CI (.github/workflows/helm.yml). Synthetic names only.
+networkPolicy:
+  kubeletCIDR: 10.20.4.0/24
+  allowUnprotectedOpsPort: false
+monitoring:
+  prometheusFrom:
+    - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: monitoring}}
+      podSelector: {matchLabels: {app.kubernetes.io/name: prometheus}}
+channels:
+  - name: adt-passthrough
+    receiver:
+      module: tributary.receivers.mllp
+      port: 6661
+      replicas: 2
+    worker:
+      replicas: 2
+    destinations:
+      - name: http-stub
+        module: tributary.loaders.http
+        replicas: 2
+ingress:
+  enabled: true
+  className: nginx
+  host: ingest.example.invalid
+  tlsSecretName: ingest-tls
+  channel: adt-passthrough
+  logFormat:
+    enabled: true

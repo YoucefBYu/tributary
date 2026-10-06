@@ -4,6 +4,15 @@ One file per spike: `S<n>-<name>.md`, plus `PHASE-0-DECISION.md`. See `docs/agen
 
 Each report states: question, method, environment (hardware and versions), raw results, threshold, verdict, follow-ups.
 
+## Wave 2 Linux re-run of S1 and S2
+
+[`wave-2-linux-rerun.md`](wave-2-linux-rerun.md), 2026-09-28: S1 parse plus the real W2-3 mapping **565 to 617 msg/s/core, PASS against 200** (about 60x below Phase 0's 36,322, which was not a like-for-like transform). S2 ACK p99 at ~1k msg/s **12.9 to 24.8 ms, PASS against 50 ms**, first-ACK outlier traced to a shared producer cold start. Shared 4 vCPU container, single-node Kafka, closed loop: **not** the dedicated 3-broker cluster; low confidence for RF=3.
+
+## Wave 2 evidence reports (2026-10-05)
+
+- [`wave-2-duplicate-rate.md`](wave-2-duplicate-rate.md): exit criterion 2. Five per-key chaos scenarios, 3 runs each: 0 order violations, fault fired 15 of 15, 0 duplicates except the worker kill (20 of 120, deterministic).
+- [`wave-2-sync-reply-latency.md`](wave-2-sync-reply-latency.md): MLLP sync-reply round trip, 5 runs: p50 about 18 ms, p99 25 to 29 ms, none over 100 ms. The earlier 270 ms tail did not reproduce; cause is wave 3 (platform-engineer).
+
 ## Phase 0, as accepted
 
 Synthesis: [`PHASE-0-DECISION.md`](PHASE-0-DECISION.md) — **GO WITH CHANGES**, no invariant changes,

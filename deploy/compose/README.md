@@ -16,11 +16,48 @@ Reaches that state in 16–30 seconds, measured repeatedly, warm or cold (`--bui
 two-minute budget in `docs/agent-team/phases/phase-1.md` W1-7. `worker` and `loader` have no
 healthcheck (see the table below for why) but show "Up" with `RestartCount: 0`.
 
+## Kafka security (ADR-008 D5, engine-kafka/v0 README section 6)
+
+Kafka runs on `SASL_SSL` exactly like production. There is no PLAINTEXT listener and no opt-out: a
+container network is not loopback, and every data-plane process refuses PLAINTEXT to a non-loopback
+broker.
+
+- `kafka-tls-init` writes, at `up`, a dev CA (its key is deleted right after signing; the CA has no
+  nameConstraints, acceptable only because nothing can use it afterwards), a broker certificate (SANs `kafka`, `localhost`, `127.0.0.1`) and one random
+  SCRAM-SHA-512 user per component (`tb-lite-receiver`, `-worker`, `-loader`, `-channel-publish`,
+  `-topic-bootstrap`, `-admin`) password, plus client certificates for the broker, the healthcheck and
+  `kafka-users-init`, into the `kafka-secrets` volume. Nothing is committed, baked into an
+  image or printed. It is idempotent: valid credentials are kept, and regenerated (and the broker's
+  storage reformatted to match) when they have under 7 days left or the script changed. Reset
+  everything with `docker compose down -v`.
+- Each component mounts only its own `tb-lite-<component>` directory and the CA bundle
+  (`tb-lite-kafka-ca`), read-only, by volume subpath under `/var/run/secrets/tributary`, and its own
+  `engine-kafka/<component>.json` (no secrets in it) as `TB_ENGINE_KAFKA_FILE`.
+- `StandardAuthorizer`, `allow.everyone.if.no.acl.found=false`. `topic-bootstrap` (a super user, the
+  control-plane stand-in) creates the topics and applies each role's grants, parsed from
+  `contracts/topics/v0/topic-defaults.json` `security.acls` (not restated). The receiver can write
+  `raw` only; nothing but the control-plane stand-in can write `_tb.dev.channels`.
+- ACLs are only ever added. Narrowing `security.acls` in the contract does not remove an old grant from
+  a running broker. Broker storage is a tmpfs, so any stop or `down` starts the broker clean, and
+  `down -v` also regenerates the credentials. (Regenerated credentials also force a reformat.)
+- The broker's own identity is a client certificate, not a password: the controller, inter-broker and
+  admin listeners are SSL with required client certificates, each on the broker's loopback. The SCRAM
+  users are created after start by `kafka-users-init` (`topic-bootstrap/add_scram_users.py`, granted only ALTER on the cluster, not a super
+  user), which
+  shares the broker's network namespace to reach the loopback admin listener and reads each password
+  from that component's own secret file. No password is ever a process argument (not in a container's
+  `ps`, not in the host's), nor in a properties file, and the broker container never has them. The
+  healthcheck is an ACL-less certificate principal. JMX is off (`-XX:+DisableAttachMechanism`).
+- Clients pin `ECDHE+AESGCM:ECDHE+CHACHA20` and verify the hostname; the broker allows TLS 1.2/1.3
+  AEAD suites only. The controller, inter-broker and admin links are SSL with required client certificates, on the broker's own loopback.
+
 ## What's running
 
 | Service | Image | Reachable at | Notes |
 |---|---|---|---|
-| `kafka` | `apache/kafka:4.0.0` | `127.0.0.1:19092` (host), `kafka:9092` (containers) | KRaft, single node, **lite profile: RF=1, min.insync.replicas=1** |
+| `kafka-tls-init` | `apache/kafka:4.0.0` (for openssl) | n/a (runs once, exits 0) | generates the dev CA, certificates and one SCRAM-SHA-512 password per component into a Compose volume; see "Kafka security" |
+| `kafka-users-init` | built from `topic-bootstrap/` | n/a (runs once, exits 0) | creates those SCRAM users on the broker, from the password files |
+| `kafka` | `apache/kafka:4.0.0` | `127.0.0.1:19092` (host, SASL_SSL), `kafka:9094` (containers, SASL_SSL) | KRaft, single node, **SASL_SSL only, deny-by-default ACLs**, **lite profile: RF=1, min.insync.replicas=1** |
 | `clickhouse` | `clickhouse/clickhouse-server:24.8-alpine` | `127.0.0.1:8123` (HTTP), `127.0.0.1:9000` (native) | empty archive; nothing writes to it yet |
 | `postgres` | `postgres:16-alpine` | `127.0.0.1:5432` (db/user `tributary`, no password: `trust` auth) | empty control-plane DB; nothing writes to it yet |
 | `channel-spec-volume-init` | `python:3.12-slim` | n/a (runs once, exits 0) | chowns the `channel-spec-published` volume so a non-root job can write to it — see Design notes |
@@ -52,7 +89,7 @@ own, before treating a successful delivery to the destination as demonstrated.
 
 **A halted partition does not clear itself**, and there is no resume tooling yet (control plane or CLI,
 not wave 1) — so running the demo twice against the same Kafka data reuses a still-halted partition.
-`docker compose down -v` between runs avoids this; it is why every verification in this file's history
+`docker compose down -v` between runs (which also regenerates the Kafka credentials) avoids this; it is why every verification in this file's history
 uses it.
 
 ## Reaching the MLLP receiver
@@ -94,7 +131,7 @@ variable defaulting to a warning is not.
 
 ## Design notes
 
-- **No named volumes for data.** `stop`/`start` preserves a container's data; `down` starts clean.
+- **No named volumes for data.** `stop`/`start` preserves a container's data (Kafka's is a tmpfs: it starts clean each time); `down` starts clean.
   This avoids the root-owned-volume permission trap on Windows/WSL2 (`spikes/common/docker-compose.yml`
   hit the same thing, and `channel-spec-volume-init` below exists because a *different* named volume
   hit it anyway) and keeps the "under two minutes" bar honest. Add your own volumes for a longer-lived

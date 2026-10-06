@@ -1,0 +1,19 @@
+{
+  "contract": "tributary.context-extension/v0",
+  "set": "1.5",
+  "description": "Registry of context-extension capability names (README section 4). Each name is the entry-point name in the tributary.context group and may be supplied by exactly one distribution. The item enum of channel-spec/v0 spec.pipeline.context must list exactly these names; contracts/validate.py checks that. tributary-runtime checks its loader against this file (two-way, like the error-code registry). Adding a name is additive and needs architect approval plus security-reviewer on the package.",
+  "entry_point_group": "tributary.context",
+  "name_pattern": "^[a-z][a-z0-9_]{0,31}$",
+  "distribution_match": "PEP 503 normalised name (lowercase; runs of '-', '_', '.' become '-'), compared for equality",
+  "capabilities": {
+    "fhir": {
+      "distribution": "tributary-fhir",
+      "factory": "tributary.fhir.runtime:context_extension",
+      "provides": ["ctx.fhir", "ctx.terminology"],
+      "protocol": "tributary.fhir.FhirContext",
+      "reply_protocol": "tributary.fhir.FhirReplyContext",
+      "owner": "healthcare-standards-engineer",
+      "since": "1.5"
+    }
+  }
+}

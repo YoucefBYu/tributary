@@ -42,6 +42,7 @@ ERROR_CODES: dict[Reason, str] = {
     "circuit-open": "CIRCUIT_OPEN",
     "timeout": "TIMEOUT",
     "transport-error": "TRANSPORT_ERROR",
+    "tls-verify-failed": "TLS_VERIFY_FAILED",
     "http-5xx": "HTTP_5XX",
     "http-429": "HTTP_429",
     "http-4xx": "HTTP_4XX",

@@ -275,3 +275,13 @@ def test_mtls_required_rejects_a_client_certificate_from_an_untrusted_ca(tmp_pat
             await server.wait_closed()
 
     asyncio.run(go())
+
+
+def test_cipher_pin_restricts_the_context_to_aead_ecdhe_suites(server_secret: DirSecretResolver) -> None:
+    from tributary.receivers.tls import AEAD_CIPHER_PIN
+
+    pinned = build_ssl_context(TlsSpec("mllp-tls", "none"), server_secret, cipher_pin=AEAD_CIPHER_PIN)
+    plain = build_ssl_context(TlsSpec("mllp-tls", "none"), server_secret)
+    names = [c["name"] for c in pinned.get_ciphers() if c["protocol"] == "TLSv1.2"]
+    assert names and all(n.startswith("ECDHE-") and ("GCM" in n or "CHACHA20" in n) for n in names)
+    assert len(names) < len([c for c in plain.get_ciphers() if c["protocol"] == "TLSv1.2"])

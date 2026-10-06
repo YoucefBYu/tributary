@@ -9,10 +9,13 @@ about — the planning value of 12 survived in the plan after S4 disproved it.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 from pathlib import Path
+from typing import Any, cast, get_args
 
 import pytest
+from jsonschema import Draft202012Validator
 from tributary.runtime import topics
 from tributary.runtime.config import find_contracts_dir, load_topic_defaults
 from tributary.runtime.errors import ConfigError, TopicNameError
@@ -65,6 +68,115 @@ def test_consumer_group_naming() -> None:
         == "tb.prod.adt-to-fhir.loader.fhir-server"
     )
     assert topics.consumer_group("prod", "a", "pipeline", shadow="v2") == "tb.prod.a.pipeline.shadow-v2"
+
+
+def _consumer_group_schema() -> Any:
+    schema = json.loads((CONTRACTS / "topics" / "v0" / "topic-name.schema.json").read_text(encoding="utf-8"))
+    return Draft202012Validator({**schema["$defs"]["consumerGroup"], "$defs": schema["$defs"]})
+
+
+def test_roles_and_platform_groups_match_the_contract() -> None:
+    """Set 1.8: `archiver` is a platform group, not a per-channel role. The schema's role alternation and
+    `consumer_groups.platform_groups` are the source; the type aliases must not drift from them."""
+    pattern = json.loads((CONTRACTS / "topics" / "v0" / "topic-name.schema.json").read_text(encoding="utf-8"))["$defs"][
+        "consumerGroup"
+    ]["anyOf"][0]["pattern"]
+    match = re.search(r"\\\.\(([a-z|]+)\)", pattern)
+    assert match is not None, "role alternation not found in the consumerGroup pattern"
+    assert set(get_args(topics.Role)) == set(match.group(1).split("|"))
+    platform = json.loads((CONTRACTS / "topics" / "v0" / "topic-defaults.json").read_text(encoding="utf-8"))[
+        "consumer_groups"
+    ]["platform_groups"]
+    assert {k: v for k, v in platform.items() if not k.startswith("$")} == {
+        kind: f"tb.<env>.{kind}" for kind in get_args(topics.PlatformGroup)
+    }
+    assert "archiver" not in get_args(topics.Role)
+
+
+def test_archiver_is_refused_as_a_per_channel_role() -> None:
+    # A role that arrives untyped (configuration, the pre-1.8 call) must not build `tb.<env>.<ch>.archiver`,
+    # a group no ACL grants, nor anything a PREFIXED `tb.<env>.archiver` grant would once have covered.
+    with pytest.raises(TopicNameError):
+        topics.consumer_group("prod", "adt", cast(Any, "archiver"))
+    with pytest.raises(TopicNameError):
+        topics.consumer_group("prod", "adt", cast(Any, "pipeline.x"))
+
+
+def test_archiver_platform_group_is_the_literal_contract_name() -> None:
+    validator = _consumer_group_schema()
+    group = topics.platform_group("prod", "archiver")
+    assert group == "tb.prod.archiver"
+    assert validator.is_valid(group)
+    with pytest.raises(TopicNameError):
+        topics.platform_group("Prod", "archiver")
+    with pytest.raises(TopicNameError):
+        topics.platform_group("prod", cast(Any, "pipeline"))
+    # The literal grant cannot reach a channel named `archiver`: its groups have more segments.
+    assert topics.consumer_group("prod", "archiver", "pipeline") != group
+    assert validator.is_valid(topics.consumer_group("prod", "archiver", "pipeline"))
+
+
+@pytest.mark.parametrize(
+    ("role", "destination", "shadow"),
+    [
+        ("pipeline", None, None),
+        ("pipeline", None, "v2"),
+        ("pipeline", None, "a" + "b" * 31),
+        ("loader", "fhir-server", None),
+        ("replier", None, None),
+    ],
+)
+def test_every_built_consumer_group_validates_against_the_schema(
+    role: topics.Role, destination: str | None, shadow: str | None
+) -> None:
+    assert _consumer_group_schema().is_valid(topics.consumer_group("prod", "adt", role, destination, shadow))
+
+
+@pytest.mark.parametrize("shadow", ["a" + "b" * 32, "V2", "", "-x", "a.b"])
+def test_a_shadow_label_the_schema_would_refuse_is_refused(shadow: str) -> None:
+    with pytest.raises(TopicNameError):
+        topics.consumer_group("prod", "adt", "pipeline", shadow=shadow)
+
+
+def test_spec_reader_group_matches_the_contract_pattern_and_acl_prefix() -> None:
+    group = topics.spec_reader_group("dev", "adt-passthrough", "pipeline-1")
+    assert group == "tb.dev.adt-passthrough.channels.pipeline-1"
+    spec_reader = json.loads((CONTRACTS / "topics" / "v0" / "topic-defaults.json").read_text())["consumer_groups"][
+        "spec_reader"
+    ]
+    assert spec_reader["pattern"] == "tb.<env>.<channel>.channels.<instance>"
+    # The ACL is PREFIXED on `tb.<env>.<ch>.channels.` with the trailing delimiter: every group we build
+    # must sit strictly under it, so another channel's prefix can never match.
+    assert group.startswith("tb.dev.adt-passthrough.channels.") and len(group) > len("tb.dev.adt-passthrough.channels.")
+    assert not topics.spec_reader_group("dev", "adt", "p-1").startswith("tb.dev.adt-passthrough.channels.")
+
+
+def test_spec_reader_group_is_reexported_beside_the_reader() -> None:
+    from tributary.runtime import channels
+
+    assert channels.spec_reader_group is topics.spec_reader_group
+
+
+@pytest.mark.parametrize(
+    ("env", "channel", "instance"),
+    [
+        ("dev", "adt", ""),
+        ("dev", "adt", " pipeline-1"),
+        ("dev", "adt", "pipeline 1"),
+        ("dev", "adt", "pipe\nline"),
+        ("dev", "adt", "x" * 129),
+        ("dev", "a.b", "pipeline-1"),
+        ("Dev", "adt", "pipeline-1"),
+    ],
+)
+def test_spec_reader_group_rejects_bad_segments(env: str, channel: str, instance: str) -> None:
+    with pytest.raises(TopicNameError):
+        topics.spec_reader_group(env, channel, instance)
+
+
+def test_spec_reader_group_accepts_the_instance_ids_processes_default_to() -> None:
+    for instance in ("pipeline-4242", "loader-http-stub-4242", "reply-it-lab-query", "worker-2.pod:0@node"):
+        assert topics.spec_reader_group("prod", "lab-query", instance).endswith(f".channels.{instance}")
 
 
 def test_defaults_come_from_the_contract_file() -> None:
@@ -185,3 +297,147 @@ def test_a_contract_without_profiles_is_a_refusal_to_start(tmp_path: Path) -> No
 
     with pytest.raises(ConfigError):
         load_topic_defaults(root)
+
+
+def test_kafka_settings_repr_never_shows_the_security_block() -> None:
+    """Receivers security review: `security` carries SCRAM passwords, and a repr reaches tracebacks."""
+    import dataclasses
+
+    from tributary.runtime.clients import KafkaSettings
+
+    settings = KafkaSettings(
+        bootstrap_servers="broker:9093",
+        security={
+            "security.protocol": "SASL_SSL",
+            "enable.ssl.certificate.verification": True,
+            "ssl.endpoint.identification.algorithm": "https",
+            "ssl.cipher.suites": "ECDHE+AESGCM:ECDHE+CHACHA20",
+            "sasl.mechanism": "SCRAM-SHA-512",
+            "sasl.username": "tb-synthetic-user",
+            "sasl.password": "SYNTH-SECRET-MARKER",
+        },
+    )
+    assert "SYNTH-SECRET-MARKER" not in repr(settings)
+    assert "SYNTH-SECRET-MARKER" not in str(settings)
+    assert "SYNTH-SECRET-MARKER" not in repr(settings.security)
+    assert "SYNTH-SECRET-MARKER" not in repr(dataclasses.asdict(settings))
+    assert "broker:9093" in repr(settings)
+
+
+# --- clients.reply_consumer (set 1.7, topics README 3.3.1 and 3.7) ---------------------------------
+
+REPLY_KEYS = (
+    "session.timeout.ms",
+    "heartbeat.interval.ms",
+    "auto.offset.reset",
+    "isolation.level",
+    "partition.assignment.strategy",
+    "enable.auto.commit",
+)
+
+
+def _contract_clients() -> dict[str, dict[str, object]]:
+    document = json.loads((CONTRACTS / "topics" / "v0" / "topic-defaults.json").read_text(encoding="utf-8"))
+    return document["clients"]  # type: ignore[no-any-return]
+
+
+def _reply_config(root: Path | None = None) -> dict[str, object]:
+    from tributary.runtime.clients import KafkaSettings, consumer_config
+
+    return consumer_config(
+        KafkaSettings(bootstrap_servers="localhost:9092"),
+        load_topic_defaults(root),
+        group_id="tb.dev.adt.replier",
+        group_instance_id="mllp-0-p1",
+        profile="reply_consumer",
+    )
+
+
+def test_reply_consumer_effective_config_equals_the_contract() -> None:
+    """3.7 acceptance for the replier: every value the contract types is the one the client gets."""
+    contract = _contract_clients()["reply_consumer"]
+    config = _reply_config()
+    for key in REPLY_KEYS:
+        assert config[key] == contract[key], key
+    assert config["group.instance.id"] == "mllp-0-p1"
+    # Every must_not_hardcode key of this profile is covered by the comparison above.
+    document = json.loads((CONTRACTS / "topics" / "v0" / "topic-defaults.json").read_text(encoding="utf-8"))
+    pinned = {
+        key.removeprefix("clients.reply_consumer.")
+        for key in document["must_not_hardcode"]["values"]
+        if key.startswith("clients.reply_consumer.")
+    }
+    assert "isolation.level" in pinned
+    assert pinned <= set(REPLY_KEYS)
+
+
+def test_reply_consumer_values_move_with_the_contract_not_with_the_worker(tmp_path: Path) -> None:
+    """Mutation control in both directions: a reply-profile edit moves only the replier, and a
+    worker-profile edit moves only the worker (the defect set 1.7 rules out)."""
+    root = tmp_path / "contracts"
+    shutil.copytree(CONTRACTS / "topics", root / "topics")
+    path = root / "topics" / "v0" / "topic-defaults.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["clients"]["reply_consumer"]["session.timeout.ms"] = 12000
+    document["clients"]["reply_consumer"]["heartbeat.interval.ms"] = 4000
+    document["clients"]["reply_consumer"]["auto.offset.reset"] = "earliest"
+    document["clients"]["reply_consumer"]["isolation.level"] = "read_committed"
+    document["clients"]["worker_consumer"]["session.timeout.ms"] = 9000
+    document["clients"]["worker_consumer"]["heartbeat.interval.ms"] = 3000
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    config = _reply_config(root)
+    assert config["session.timeout.ms"] == 12000
+    assert config["heartbeat.interval.ms"] == 4000
+    assert config["auto.offset.reset"] == "earliest"
+    assert config["isolation.level"] == "read_committed"
+    defaults = load_topic_defaults(root)
+    assert defaults.consumer.session_timeout_ms == 9000
+    assert defaults.reply_consumer.session_timeout_ms == 12000
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("isolation.level", None),
+        ("isolation.level", "read_whatever"),
+        ("auto.offset.reset", None),
+        ("session.timeout.ms", "15 s"),
+        ("heartbeat.interval.ms", 14000),
+        ("enable.auto.commit", True),
+    ],
+)
+def test_a_reply_consumer_profile_without_its_typed_values_is_refused(tmp_path: Path, key: str, value: object) -> None:
+    root = tmp_path / "contracts"
+    shutil.copytree(CONTRACTS / "topics", root / "topics")
+    path = root / "topics" / "v0" / "topic-defaults.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    if value is None:
+        del document["clients"]["reply_consumer"][key]
+    else:
+        document["clients"]["reply_consumer"][key] = value
+    path.write_text(json.dumps(document), encoding="utf-8")
+    with pytest.raises(ConfigError):
+        load_topic_defaults(root)
+
+
+def test_reply_consumer_refuses_an_auto_offset_reset_override() -> None:
+    from tributary.runtime.clients import KafkaSettings, consumer_config
+
+    with pytest.raises(ConfigError):
+        consumer_config(
+            KafkaSettings(bootstrap_servers="localhost:9092"),
+            load_topic_defaults(),
+            group_id="tb.dev.adt.replier",
+            auto_offset_reset="earliest",
+            profile="reply_consumer",
+        )
+
+
+def test_worker_profile_is_unchanged_by_the_reply_profile() -> None:
+    from tributary.runtime.clients import KafkaSettings, consumer_config
+
+    config = consumer_config(KafkaSettings(bootstrap_servers="localhost:9092"), load_topic_defaults(), group_id="g")
+    assert config["auto.offset.reset"] == "earliest"
+    assert "isolation.level" not in config
+    assert config["session.timeout.ms"] == _contract_clients()["worker_consumer"]["session.timeout.ms"]

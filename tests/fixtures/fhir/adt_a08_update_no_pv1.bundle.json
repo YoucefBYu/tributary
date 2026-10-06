@@ -1,0 +1,42 @@
+{
+  "entry": [
+    {
+      "fullUrl": "urn:uuid:test-1",
+      "request": {
+        "method": "PUT",
+        "url": "Patient?identifier=urn:id:SYNTH-HOSPITAL|9000002"
+      },
+      "resource": {
+        "birthDate": "1975-06-30",
+        "gender": "female",
+        "identifier": [
+          {
+            "system": "urn:id:SYNTH-HOSPITAL",
+            "type": {
+              "coding": [
+                {
+                  "code": "MR",
+                  "display": "Medical record number",
+                  "system": "http://terminology.hl7.org/CodeSystem/v2-0203"
+                }
+              ]
+            },
+            "value": "9000002"
+          }
+        ],
+        "name": [
+          {
+            "family": "SYNTHPATIENT",
+            "given": [
+              "GAMMA"
+            ],
+            "use": "official"
+          }
+        ],
+        "resourceType": "Patient"
+      }
+    }
+  ],
+  "resourceType": "Bundle",
+  "type": "transaction"
+}

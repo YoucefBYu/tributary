@@ -1,0 +1,632 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Tributary control-plane API",
+    "version": "0.1.0",
+    "summary": "Channels, versions, validation, deploy, rollback and health. Contract tributary.openapi/v0, set 1.8 part 1.",
+    "description": "See contracts/openapi/v0/README.md. Authentication: OIDC bearer access tokens validated as a resource server (ADR-009). The data plane never calls this API (invariant 3). No response echoes a request body, a token claim, or a value from a channel document beyond what the caller sent and stored; validation errors report json_path and keyword only (invariant 6).",
+    "license": { "name": "Apache-2.0", "identifier": "Apache-2.0" },
+    "x-tributary-contract": "tributary.openapi/v0",
+    "x-tributary-contract-set": "1.8"
+  },
+  "security": [{ "oidcBearer": [] }],
+  "tags": [
+    { "name": "health", "description": "Probes. Unauthenticated, no data." },
+    { "name": "channels", "description": "Channels and their immutable versions." },
+    { "name": "deployments", "description": "What runs in each environment. Publishing goes to _tb.<env>.channels." }
+  ],
+  "paths": {
+    "/livez": {
+      "get": {
+        "operationId": "getLiveness",
+        "tags": ["health"],
+        "summary": "Liveness. Depends on nothing outside the process.",
+        "security": [],
+        "x-tributary-roles": [],
+        "responses": {
+          "200": { "description": "Alive.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Liveness" } } } }
+        }
+      }
+    },
+    "/readyz": {
+      "get": {
+        "operationId": "getReadiness",
+        "tags": ["health"],
+        "summary": "Readiness, per contracts/observability/v0 (component api).",
+        "security": [],
+        "x-tributary-roles": [],
+        "responses": {
+          "200": { "description": "Ready.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiReadiness" } } } },
+          "503": { "description": "Not ready.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiReadiness" } } } }
+        }
+      }
+    },
+    "/v1/environments": {
+      "get": {
+        "operationId": "listEnvironments",
+        "tags": ["deployments"],
+        "summary": "Environments this control plane manages, with their management mode.",
+        "x-tributary-roles": ["viewer", "developer", "operator", "auditor", "admin"],
+        "responses": {
+          "200": { "description": "All environments.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/EnvironmentList" } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      }
+    },
+    "/v1/channels": {
+      "get": {
+        "operationId": "listChannels",
+        "tags": ["channels"],
+        "summary": "List channels, newest version number first within name order.",
+        "x-tributary-roles": ["viewer", "developer", "operator", "auditor", "admin"],
+        "parameters": [{ "$ref": "#/components/parameters/Limit" }, { "$ref": "#/components/parameters/Cursor" }],
+        "responses": {
+          "200": { "description": "One page.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ChannelList" } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      },
+      "post": {
+        "operationId": "createChannel",
+        "tags": ["channels"],
+        "summary": "Create a channel and its version 1 from an authored document (metadata.version absent).",
+        "x-tributary-roles": ["developer", "admin"],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ChannelVersionCreate" } } }
+        },
+        "responses": {
+          "201": { "description": "Created; the body is version 1.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ChannelVersion" } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "409": { "$ref": "#/components/responses/Conflict" },
+          "413": { "$ref": "#/components/responses/PayloadTooLarge" },
+          "415": { "$ref": "#/components/responses/UnsupportedMediaType" },
+          "422": { "$ref": "#/components/responses/Unprocessable" }
+        }
+      }
+    },
+    "/v1/channels/{channel}": {
+      "parameters": [{ "$ref": "#/components/parameters/ChannelPath" }],
+      "get": {
+        "operationId": "getChannel",
+        "tags": ["channels"],
+        "summary": "One channel: latest version and what is deployed where.",
+        "x-tributary-roles": ["viewer", "developer", "operator", "auditor", "admin"],
+        "responses": {
+          "200": { "description": "The channel.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Channel" } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/v1/channels/{channel}/versions": {
+      "parameters": [{ "$ref": "#/components/parameters/ChannelPath" }],
+      "get": {
+        "operationId": "listChannelVersions",
+        "tags": ["channels"],
+        "summary": "Version summaries, newest first. No documents.",
+        "x-tributary-roles": ["viewer", "developer", "operator", "auditor", "admin"],
+        "parameters": [{ "$ref": "#/components/parameters/Limit" }, { "$ref": "#/components/parameters/Cursor" }],
+        "responses": {
+          "200": { "description": "One page.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ChannelVersionList" } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      },
+      "post": {
+        "operationId": "createChannelVersion",
+        "tags": ["channels"],
+        "summary": "Add an immutable version. The server assigns the next version number and sets metadata.version.",
+        "x-tributary-roles": ["developer", "admin"],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ChannelVersionCreate" } } }
+        },
+        "responses": {
+          "201": { "description": "Created.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ChannelVersion" } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "413": { "$ref": "#/components/responses/PayloadTooLarge" },
+          "415": { "$ref": "#/components/responses/UnsupportedMediaType" },
+          "422": { "$ref": "#/components/responses/Unprocessable" }
+        }
+      }
+    },
+    "/v1/channels/{channel}/versions/{version}": {
+      "parameters": [{ "$ref": "#/components/parameters/ChannelPath" }, { "$ref": "#/components/parameters/VersionPath" }],
+      "get": {
+        "operationId": "getChannelVersion",
+        "tags": ["channels"],
+        "summary": "One version with its full document. Documents reveal topology (hosts, ports, buckets), so viewer is not granted.",
+        "x-tributary-roles": ["developer", "operator", "auditor", "admin"],
+        "responses": {
+          "200": { "description": "The version.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ChannelVersion" } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/v1/validate": {
+      "post": {
+        "operationId": "validateChannelDocument",
+        "tags": ["channels"],
+        "summary": "Validate a channel document without storing it: channel-spec schema plus control-plane rules.",
+        "x-tributary-roles": ["developer", "operator", "admin"],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ChannelDocument" } } }
+        },
+        "responses": {
+          "200": { "description": "A report, whether or not the document is valid.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ValidationReport" } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "413": { "$ref": "#/components/responses/PayloadTooLarge" },
+          "415": { "$ref": "#/components/responses/UnsupportedMediaType" }
+        }
+      }
+    },
+    "/v1/environments/{env}/deployments": {
+      "parameters": [{ "$ref": "#/components/parameters/EnvPath" }],
+      "get": {
+        "operationId": "listCurrentDeployments",
+        "tags": ["deployments"],
+        "summary": "The current deployment record of every channel deployed in this environment.",
+        "x-tributary-roles": ["viewer", "developer", "operator", "auditor", "admin"],
+        "parameters": [{ "$ref": "#/components/parameters/Limit" }, { "$ref": "#/components/parameters/Cursor" }],
+        "responses": {
+          "200": { "description": "One page.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DeploymentList" } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/v1/environments/{env}/channels/{channel}/deployments": {
+      "parameters": [{ "$ref": "#/components/parameters/EnvPath" }, { "$ref": "#/components/parameters/ChannelPath" }],
+      "get": {
+        "operationId": "listChannelDeployments",
+        "tags": ["deployments"],
+        "summary": "Deployment history of one channel in one environment, newest first.",
+        "x-tributary-roles": ["viewer", "developer", "operator", "auditor", "admin"],
+        "parameters": [{ "$ref": "#/components/parameters/Limit" }, { "$ref": "#/components/parameters/Cursor" }],
+        "responses": {
+          "200": { "description": "One page.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DeploymentList" } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/v1/environments/{env}/channels/{channel}/deploy": {
+      "parameters": [{ "$ref": "#/components/parameters/EnvPath" }, { "$ref": "#/components/parameters/ChannelPath" }],
+      "post": {
+        "operationId": "deployChannelVersion",
+        "tags": ["deployments"],
+        "summary": "Deploy a version: publish its document to _tb.<env>.channels. 202: publishing is asynchronous, and data-plane pickup is never awaited.",
+        "x-tributary-roles": ["operator", "admin"],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DeployRequest" } } }
+        },
+        "responses": {
+          "202": { "description": "Accepted; the record starts pending.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Deployment" } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "$ref": "#/components/responses/Conflict" },
+          "415": { "$ref": "#/components/responses/UnsupportedMediaType" },
+          "422": { "$ref": "#/components/responses/Unprocessable" }
+        }
+      }
+    },
+    "/v1/environments/{env}/channels/{channel}/rollback": {
+      "parameters": [{ "$ref": "#/components/parameters/EnvPath" }, { "$ref": "#/components/parameters/ChannelPath" }],
+      "post": {
+        "operationId": "rollbackChannel",
+        "tags": ["deployments"],
+        "summary": "Republish an earlier version's stored document unchanged, metadata.version included (README 3.3).",
+        "x-tributary-roles": ["operator", "admin"],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RollbackRequest" } } }
+        },
+        "responses": {
+          "202": { "description": "Accepted; the record starts pending.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Deployment" } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "$ref": "#/components/responses/Conflict" },
+          "415": { "$ref": "#/components/responses/UnsupportedMediaType" },
+          "422": { "$ref": "#/components/responses/Unprocessable" }
+        }
+      }
+    },
+    "/v1/environments/{env}/channels/{channel}/undeploy": {
+      "parameters": [{ "$ref": "#/components/parameters/EnvPath" }, { "$ref": "#/components/parameters/ChannelPath" }],
+      "post": {
+        "operationId": "undeployChannel",
+        "tags": ["deployments"],
+        "summary": "Publish a tombstone for the channel (channel-spec README 6).",
+        "x-tributary-roles": ["operator", "admin"],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UndeployRequest" } } }
+        },
+        "responses": {
+          "202": { "description": "Accepted; the record starts pending.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Deployment" } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "$ref": "#/components/responses/Conflict" },
+          "415": { "$ref": "#/components/responses/UnsupportedMediaType" },
+          "422": { "$ref": "#/components/responses/Unprocessable" }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "oidcBearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "description": "An access token from the operator's OIDC provider, validated as a resource server (ADR-009 rev 2): signature against the issuer's JWKS, keys selected by kid from a cached key set (jku, x5u, x5c and jwk headers ignored); algorithm allow-list RS256, PS256, ES256; typ at+jwt (JWT only when the operator enables it, and never an ID token); exp, iss, aud and sub required; nbf and iat honoured. Roles come from a configured claim that must be an array of strings, mapped to Tributary roles; an operation is allowed only to the roles in its x-tributary-roles. Authorization header only, sent once: a token in a query string or form body is refused, even alongside a header. The API issues no tokens and keeps no sessions."
+      }
+    },
+    "parameters": {
+      "ChannelPath": { "name": "channel", "in": "path", "required": true, "schema": { "$ref": "#/components/schemas/ChannelName" } },
+      "EnvPath": { "name": "env", "in": "path", "required": true, "schema": { "$ref": "#/components/schemas/EnvironmentName" } },
+      "VersionPath": { "name": "version", "in": "path", "required": true, "schema": { "$ref": "#/components/schemas/Version" } },
+      "Limit": { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 } },
+      "Cursor": { "name": "cursor", "in": "query", "required": false, "schema": { "$ref": "#/components/schemas/Cursor" } }
+    },
+    "responses": {
+      "BadRequest": { "description": "Malformed request: not JSON, wrong type, bad cursor (REQUEST_INVALID).", "content": { "application/problem+json": { "schema": { "$ref": "#/components/schemas/Problem" } } } },
+      "Unauthorized": {
+        "description": "No token (AUTH_REQUIRED) or a token that failed validation (TOKEN_INVALID), including a token sent by more than one method, a malformed roles claim, or no usable signing keys. Which check failed is not disclosed.",
+        "headers": { "WWW-Authenticate": { "description": "RFC 6750: Bearer, with error=\"invalid_token\" when a token was sent. Never an error_description built from claims.", "schema": { "type": "string", "maxLength": 200 } } },
+        "content": { "application/problem+json": { "schema": { "$ref": "#/components/schemas/Problem" } } }
+      },
+      "Forbidden": { "description": "Valid token, no role that grants this operation (FORBIDDEN).", "content": { "application/problem+json": { "schema": { "$ref": "#/components/schemas/Problem" } } } },
+      "NotFound": { "description": "Environment, channel or version does not exist (NOT_FOUND).", "content": { "application/problem+json": { "schema": { "$ref": "#/components/schemas/Problem" } } } },
+      "Conflict": { "description": "CHANNEL_EXISTS, CURRENT_VERSION_MISMATCH, MANAGEMENT_MODE, NOTHING_TO_ROLL_BACK or NOT_DEPLOYED.", "content": { "application/problem+json": { "schema": { "$ref": "#/components/schemas/Problem" } } } },
+      "PayloadTooLarge": { "description": "Body over 262144 bytes (PAYLOAD_TOO_LARGE).", "content": { "application/problem+json": { "schema": { "$ref": "#/components/schemas/Problem" } } } },
+      "UnsupportedMediaType": { "description": "Body is not application/json (UNSUPPORTED_MEDIA_TYPE).", "content": { "application/problem+json": { "schema": { "$ref": "#/components/schemas/Problem" } } } },
+      "Unprocessable": { "description": "Well-formed but refused: SPEC_INVALID (with errors), VERSION_SET_BY_CLIENT, CHANNEL_NAME_MISMATCH, REQUEST_INVALID.", "content": { "application/problem+json": { "schema": { "$ref": "#/components/schemas/Problem" } } } }
+    },
+    "schemas": {
+      "ChannelName": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,63}$", "description": "metadata.name; same grammar as the topic segment (topics/v0 1)." },
+      "EnvironmentName": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,15}$", "description": "The <env> of topics/v0." },
+      "Version": { "type": "integer", "minimum": 1, "maximum": 2147483647, "description": "Channel version, assigned by the control plane, becomes metadata.version and tb-channel-version." },
+      "Uuid": { "type": "string", "format": "uuid", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12}$" },
+      "Timestamp": { "type": "string", "format": "date-time", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$" },
+      "Sha256Hex": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+      "Subject": { "type": "string", "pattern": "^[\\x21-\\x7e]{1,255}$", "description": "The token's sub claim. Staff identity, not PHI; stored for audit, never logged with the token." },
+      "Cursor": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,256}$", "description": "Opaque. Clients must not parse it." },
+      "NextCursor": { "type": ["string", "null"], "pattern": "^[A-Za-z0-9_-]{1,256}$" },
+      "Liveness": {
+        "type": "object",
+        "required": ["v", "status", "component"],
+        "additionalProperties": false,
+        "properties": { "v": { "const": 0 }, "status": { "const": "alive" }, "component": { "const": "api" } }
+      },
+      "ApiReadiness": {
+        "type": "object",
+        "description": "The component=api case of contracts/observability/v0 readiness.schema.json, which is authoritative.",
+        "required": ["v", "component", "status", "checks"],
+        "additionalProperties": false,
+        "properties": {
+          "v": { "const": 0 },
+          "component": { "const": "api" },
+          "status": { "enum": ["ready", "not_ready"] },
+          "checks": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 8,
+            "items": {
+              "type": "object",
+              "required": ["name", "ok"],
+              "additionalProperties": false,
+              "properties": {
+                "name": { "enum": ["database", "oidc_keys"] },
+                "ok": { "type": "boolean" },
+                "reason": { "enum": ["unreachable", "keys_unavailable"] }
+              }
+            }
+          },
+          "degraded": { "type": "array", "maxItems": 8, "uniqueItems": true, "items": { "enum": ["channels_publisher_unavailable"] } }
+        }
+      },
+      "Environment": {
+        "type": "object",
+        "required": ["name", "management_mode", "profile"],
+        "additionalProperties": false,
+        "properties": {
+          "name": { "$ref": "#/components/schemas/EnvironmentName" },
+          "management_mode": { "enum": ["git-managed", "ui-managed"], "description": "ADR-001 6.8. git-managed: deploy and rollback accept only versions whose origin.kind is git." },
+          "profile": { "enum": ["lite", "production"], "description": "topics/v0 profile. lite is barred from production use (topics/v0 3.8)." }
+        }
+      },
+      "EnvironmentList": {
+        "type": "object",
+        "required": ["items"],
+        "additionalProperties": false,
+        "properties": { "items": { "type": "array", "maxItems": 64, "items": { "$ref": "#/components/schemas/Environment" } } }
+      },
+      "ChannelDocument": {
+        "type": "object",
+        "description": "A channel-spec document (contracts/channel-spec/v0/channel.schema.json, the authority). Typed loosely here on purpose: the server validates it against the channel-spec schema and answers 422 SPEC_INVALID; clients that want field types generate them from that schema. On create, metadata.version must be absent.",
+        "required": ["apiVersion", "kind", "metadata", "spec"],
+        "properties": {
+          "apiVersion": { "const": "tributary.dev/v1" },
+          "kind": { "const": "Channel" },
+          "metadata": {
+            "type": "object",
+            "required": ["name"],
+            "properties": { "name": { "$ref": "#/components/schemas/ChannelName" }, "version": { "type": "integer", "minimum": 0 } }
+          },
+          "spec": { "type": "object" }
+        },
+        "x-tributary-schema": "https://tributary.dev/contracts/channel-spec/v0/channel.schema.json"
+      },
+      "Origin": {
+        "type": "object",
+        "description": "Where the document came from. Client-asserted: it drives the git-managed rule, it is not a security boundary (RBAC and the audit trail are).",
+        "required": ["kind"],
+        "additionalProperties": false,
+        "properties": {
+          "kind": { "enum": ["git", "ui", "api"] },
+          "commit": { "type": "string", "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$" },
+          "path": { "type": "string", "pattern": "^[A-Za-z0-9._/-]{1,256}$" }
+        },
+        "allOf": [
+          { "if": { "properties": { "kind": { "const": "git" } }, "required": ["kind"] }, "then": { "required": ["commit", "path"] } }
+        ]
+      },
+      "ChannelVersionCreate": {
+        "type": "object",
+        "required": ["document", "origin"],
+        "additionalProperties": false,
+        "properties": { "document": { "$ref": "#/components/schemas/ChannelDocument" }, "origin": { "$ref": "#/components/schemas/Origin" } }
+      },
+      "ChannelVersionSummary": {
+        "type": "object",
+        "required": ["channel", "version", "created_at", "created_by", "origin", "spec_sha256"],
+        "additionalProperties": false,
+        "properties": {
+          "channel": { "$ref": "#/components/schemas/ChannelName" },
+          "version": { "$ref": "#/components/schemas/Version" },
+          "created_at": { "$ref": "#/components/schemas/Timestamp" },
+          "created_by": { "$ref": "#/components/schemas/Subject" },
+          "origin": { "$ref": "#/components/schemas/Origin" },
+          "spec_sha256": { "$ref": "#/components/schemas/Sha256Hex", "description": "SHA-256 of the stored document as published (README 3.2)." },
+          "bundle": { "type": "string", "maxLength": 512, "description": "spec.pipeline.bundle, copied for display." }
+        }
+      },
+      "ChannelVersion": {
+        "type": "object",
+        "required": ["channel", "version", "created_at", "created_by", "origin", "spec_sha256", "document"],
+        "additionalProperties": false,
+        "properties": {
+          "channel": { "$ref": "#/components/schemas/ChannelName" },
+          "version": { "$ref": "#/components/schemas/Version" },
+          "created_at": { "$ref": "#/components/schemas/Timestamp" },
+          "created_by": { "$ref": "#/components/schemas/Subject" },
+          "origin": { "$ref": "#/components/schemas/Origin" },
+          "spec_sha256": { "$ref": "#/components/schemas/Sha256Hex" },
+          "bundle": { "type": "string", "maxLength": 512 },
+          "document": { "$ref": "#/components/schemas/ChannelDocument", "description": "As stored and published: metadata.version equals version." }
+        }
+      },
+      "ChannelVersionList": {
+        "type": "object",
+        "required": ["items", "next_cursor"],
+        "additionalProperties": false,
+        "properties": {
+          "items": { "type": "array", "maxItems": 200, "items": { "$ref": "#/components/schemas/ChannelVersionSummary" } },
+          "next_cursor": { "$ref": "#/components/schemas/NextCursor" }
+        }
+      },
+      "DeploymentState": {
+        "type": "object",
+        "required": ["environment", "version", "status"],
+        "additionalProperties": false,
+        "properties": {
+          "environment": { "$ref": "#/components/schemas/EnvironmentName" },
+          "version": { "type": ["integer", "null"], "minimum": 1, "description": "null when undeployed." },
+          "status": { "$ref": "#/components/schemas/DeploymentStatus" }
+        }
+      },
+      "ChannelSummary": {
+        "type": "object",
+        "required": ["name", "latest_version", "created_at"],
+        "additionalProperties": false,
+        "properties": {
+          "name": { "$ref": "#/components/schemas/ChannelName" },
+          "latest_version": { "$ref": "#/components/schemas/Version" },
+          "created_at": { "$ref": "#/components/schemas/Timestamp" }
+        }
+      },
+      "Channel": {
+        "type": "object",
+        "required": ["name", "latest_version", "created_at", "deployments"],
+        "additionalProperties": false,
+        "properties": {
+          "name": { "$ref": "#/components/schemas/ChannelName" },
+          "latest_version": { "$ref": "#/components/schemas/Version" },
+          "created_at": { "$ref": "#/components/schemas/Timestamp" },
+          "description": { "type": "string", "maxLength": 512, "description": "metadata.description of the latest version." },
+          "labels": {
+            "type": "object",
+            "maxProperties": 16,
+            "propertyNames": { "pattern": "^[a-z][a-z0-9_-]{0,31}$" },
+            "additionalProperties": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:+-]{0,63}$" }
+          },
+          "deployments": { "type": "array", "maxItems": 64, "items": { "$ref": "#/components/schemas/DeploymentState" } }
+        }
+      },
+      "ChannelList": {
+        "type": "object",
+        "required": ["items", "next_cursor"],
+        "additionalProperties": false,
+        "properties": {
+          "items": { "type": "array", "maxItems": 200, "items": { "$ref": "#/components/schemas/ChannelSummary" } },
+          "next_cursor": { "$ref": "#/components/schemas/NextCursor" }
+        }
+      },
+      "DeploymentStatus": {
+        "enum": ["pending", "published", "failed", "superseded"],
+        "description": "pending: accepted, not yet committed to _tb.<env>.channels. published: committed (acks=all); says nothing about which workers have applied it (observe tb_spec_version). failed: the publish did not commit. superseded: a later record in this environment replaced it before it published."
+      },
+      "Deployment": {
+        "type": "object",
+        "required": ["id", "environment", "channel", "kind", "version", "previous_version", "status", "requested_by", "requested_at"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "$ref": "#/components/schemas/Uuid" },
+          "environment": { "$ref": "#/components/schemas/EnvironmentName" },
+          "channel": { "$ref": "#/components/schemas/ChannelName" },
+          "kind": { "enum": ["deploy", "rollback", "undeploy"] },
+          "version": { "type": ["integer", "null"], "minimum": 1, "description": "The version published; null for undeploy (tombstone)." },
+          "previous_version": { "type": ["integer", "null"], "minimum": 1, "description": "What was current when this was requested; null when nothing was." },
+          "status": { "$ref": "#/components/schemas/DeploymentStatus" },
+          "requested_by": { "$ref": "#/components/schemas/Subject" },
+          "requested_at": { "$ref": "#/components/schemas/Timestamp" },
+          "published_at": { "$ref": "#/components/schemas/Timestamp" },
+          "failure_code": { "enum": ["PUBLISH_FAILED", "PUBLISH_TIMEOUT"] }
+        },
+        "allOf": [
+          {
+            "if": { "properties": { "kind": { "const": "undeploy" } }, "required": ["kind"] },
+            "then": { "properties": { "version": { "type": "null" } } },
+            "else": { "properties": { "version": { "type": "integer" } } }
+          },
+          { "if": { "properties": { "status": { "const": "published" } }, "required": ["status"] }, "then": { "required": ["published_at"] } },
+          { "if": { "properties": { "status": { "const": "failed" } }, "required": ["status"] }, "then": { "required": ["failure_code"] } }
+        ]
+      },
+      "DeploymentList": {
+        "type": "object",
+        "required": ["items", "next_cursor"],
+        "additionalProperties": false,
+        "properties": {
+          "items": { "type": "array", "maxItems": 200, "items": { "$ref": "#/components/schemas/Deployment" } },
+          "next_cursor": { "$ref": "#/components/schemas/NextCursor" }
+        }
+      },
+      "DeployRequest": {
+        "type": "object",
+        "required": ["version"],
+        "additionalProperties": false,
+        "properties": {
+          "version": { "$ref": "#/components/schemas/Version" },
+          "expected_current_version": {
+            "type": ["integer", "null"],
+            "minimum": 1,
+            "description": "Optional optimistic-concurrency guard: the version the caller believes is current, null for not deployed. Mismatch: 409 CURRENT_VERSION_MISMATCH. Absent: no check."
+          }
+        }
+      },
+      "RollbackRequest": {
+        "type": "object",
+        "required": ["expected_current_version"],
+        "additionalProperties": false,
+        "properties": {
+          "expected_current_version": { "$ref": "#/components/schemas/Version", "description": "Required, so two operators cannot roll back twice by accident." },
+          "to_version": { "$ref": "#/components/schemas/Version", "description": "Default: the version published before the current one in this environment." }
+        }
+      },
+      "UndeployRequest": {
+        "type": "object",
+        "required": ["expected_current_version"],
+        "additionalProperties": false,
+        "properties": { "expected_current_version": { "$ref": "#/components/schemas/Version" } }
+      },
+      "ValidationIssue": {
+        "type": "object",
+        "description": "Where and which rule, never the message: a jsonschema message embeds the failing value (contracts/README.md).",
+        "required": ["json_path", "validator"],
+        "additionalProperties": false,
+        "properties": {
+          "json_path": { "type": "string", "pattern": "^\\$", "maxLength": 512 },
+          "validator": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}$", "description": "A JSON Schema keyword, or a control-plane rule name (README 3.4)." }
+        }
+      },
+      "ValidationWarning": {
+        "type": "object",
+        "required": ["code", "json_path"],
+        "additionalProperties": false,
+        "properties": {
+          "code": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]{0,63}$" },
+          "json_path": { "type": "string", "pattern": "^\\$", "maxLength": 512 }
+        }
+      },
+      "ValidationReport": {
+        "type": "object",
+        "required": ["valid", "errors", "warnings"],
+        "additionalProperties": false,
+        "properties": {
+          "valid": { "type": "boolean" },
+          "errors": { "type": "array", "maxItems": 100, "items": { "$ref": "#/components/schemas/ValidationIssue" } },
+          "warnings": { "type": "array", "maxItems": 50, "items": { "$ref": "#/components/schemas/ValidationWarning" } }
+        },
+        "allOf": [
+          { "if": { "properties": { "valid": { "const": true } }, "required": ["valid"] }, "then": { "properties": { "errors": { "maxItems": 0 } } } },
+          { "if": { "properties": { "valid": { "const": false } }, "required": ["valid"] }, "then": { "properties": { "errors": { "minItems": 1 } } } }
+        ]
+      },
+      "Problem": {
+        "type": "object",
+        "description": "RFC 9457 problem details, restricted: no instance member (it would echo the path), detail is fixed text per code, never input.",
+        "required": ["type", "title", "status", "code"],
+        "additionalProperties": false,
+        "properties": {
+          "type": { "type": "string", "pattern": "^(about:blank|https://tributary\\.dev/problems/[a-z0-9-]{1,64})$" },
+          "title": { "type": "string", "maxLength": 120 },
+          "status": { "type": "integer", "minimum": 400, "maximum": 599 },
+          "code": {
+            "enum": [
+              "AUTH_REQUIRED",
+              "TOKEN_INVALID",
+              "FORBIDDEN",
+              "NOT_FOUND",
+              "METHOD_NOT_ALLOWED",
+              "PAYLOAD_TOO_LARGE",
+              "UNSUPPORTED_MEDIA_TYPE",
+              "REQUEST_INVALID",
+              "SPEC_INVALID",
+              "VERSION_SET_BY_CLIENT",
+              "CHANNEL_NAME_MISMATCH",
+              "CHANNEL_EXISTS",
+              "CURRENT_VERSION_MISMATCH",
+              "MANAGEMENT_MODE",
+              "NOTHING_TO_ROLL_BACK",
+              "NOT_DEPLOYED",
+              "UNAVAILABLE",
+              "INTERNAL"
+            ]
+          },
+          "detail": { "type": "string", "maxLength": 512 },
+          "request_id": { "$ref": "#/components/schemas/Uuid" },
+          "errors": { "type": "array", "maxItems": 100, "items": { "$ref": "#/components/schemas/ValidationIssue" } }
+        }
+      }
+    }
+  }
+}

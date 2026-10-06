@@ -63,7 +63,8 @@ explicitly so the two schemas stay independent.
 even when a size is `0`. An omitted field would pass the claim-check and size rules by accident, which
 is the opposite of what a conformance test is for. `topic` is optional.
 
-**Conformance.** 28 examples: 8 valid, 20 invalid. Every invalid example is asserted to fail at the
+**Conformance.** 34 examples: 10 valid, 24 invalid (set 1.2 added 2 and 4 for the reply headers;
+their four pairs are **architect predictions, UNMEASURED**). Every invalid example is asserted to fail at the
 `expected_json_path` and `expected_validator` its manifest pins, not merely to fail. Latest run:
 `pytest tests/conformance` **105 passed** and `contracts/validate.py` **100 / 0** at `f5bc92d`
 (2026-09-22), covering the two examples added for section 2.3 (`attempt-not-an-integer`,
@@ -105,9 +106,9 @@ UI against a production cluster. Recommending `kcat` for debugging without that 
 first draft turned an operational convenience into an unaudited PHI viewer.
 
 The 16 KiB total is a producer-side check — JSON Schema cannot sum value lengths. The schema instead
-bounds the worst case: the 16 registered header values sum to about 2.5 KiB, and the 16 remaining
-slots can only be `tb-usr-*` or `tb-x-*` at 256 bytes each, so a schema-valid header set is roughly
-7 KiB including names, comfortably inside the budget. The earlier 1024-byte allowance for those two
+bounds the worst case: the 19 registered header values (set 1.2 added three short ones) sum to about
+2.6 KiB, and every remaining slot up to 32 can only be `tb-usr-*` or `tb-x-*` at 256 bytes each, so a
+schema-valid header set is roughly 7 KiB including names, comfortably inside the budget. The earlier 1024-byte allowance for those two
 prefixes admitted about 32 KiB, twice the stated budget.
 
 ### 2.1 Reserved prefixes
@@ -156,10 +157,10 @@ a deliberately malformed record from a compromised writer all look the same at t
 
 | Class of header | Rule |
 |---|---|
-| Integer (`tb-attempt`, `tb-channel-version`) | Parse with an explicit conversion that cannot raise past the call site. A value that is not decimal ASCII, is signed, is padded, or overflows the documented range is a **reject**. |
-| Timestamp (`tb-received-at`, `tb-retry-not-before`) | Same, against the RFC 3339 form in section 2. A parse failure is a reject, not a silent `now()`. |
+| Integer (`tb-attempt`, `tb-channel-version`, `tb-reply-partition`) | Parse with an explicit conversion that cannot raise past the call site. A value that is not decimal ASCII, is signed, is padded, or overflows the documented range is a **reject** — except the reply-routing headers, 2.3.3. |
+| Timestamp (`tb-received-at`, `tb-retry-not-before`, `tb-reply-deadline`) | Same, against the RFC 3339 form in section 2. A parse failure is a reject, not a silent `now()`. |
 | UUID (`tb-msg-id`, `tb-correlation-id`, `tb-parent-id`) | Same, against the canonical form. |
-| Enumerated (`tb-stage`, `tb-content-type`, `tb-error-code`) | An unknown value is not a parse failure — see "lenient consumers" in 1.2. Do not reject a record for a `tb-stage` value from a newer producer. |
+| Enumerated (`tb-stage`, `tb-content-type`, `tb-error-code`, `tb-reply-status`) | An unknown value is not a parse failure — see "lenient consumers" in 1.2. Do not reject a record for a `tb-stage` value from a newer producer. An unknown `tb-reply-status` is never read as `accepted` (2.3.3). |
 
 **Reject** means: do not process the record, route it to `dlq`, emit an `error` event, and commit the
 offset. It does **not** mean an unhandled exception, and it does not mean skipping the record
@@ -184,13 +185,13 @@ Reserved error codes the contracts themselves rely on:
 |---|---|
 | `HEADER_PARSE_ERROR` | One header was malformed on a record that could still be **identified**. The reject keeps the original `tb-msg-id` and the original identity, and `tb-stage` is the stage that read it. Usually a broken producer field. |
 | `RECORD_UNDECODABLE` | The record could not be identified at all, so no original identity is trustworthy. Produces a quarantine wrapper (section 5.2). Framing damage, corruption or an attack. |
-| `TRANSFORM_ERROR` | A pipeline step raised (ADR-001 6.4). |
+| `TRANSFORM_ERROR` | A pipeline or destination step raised on every attempt (`stepRetries` exhausted; ADR-001 6.4). |
 
 The first two are deliberately separate codes for one operational reason: they need different alerts.
 A rise in `HEADER_PARSE_ERROR` points at one producer's field; a rise in `RECORD_UNDECODABLE` points
 at framing, corruption or someone writing to the topic. Collapsing them hides the second behind the
-first. Other codes are chosen by the component that raises them, within `^[A-Z][A-Z0-9_]{0,63}$`;
-there is deliberately no central registry to keep in sync.
+first. Every code matches `^[A-Z][A-Z0-9_]{0,63}$`. The codes the engine emits are listed in the
+registry in 2.3.2. A channel's own `Reject` codes are chosen by the channel and are not registered.
 
 A component MAY keep a finer internal reason code (`HEADER_NOT_TEXT`, `ENVELOPE_INVALID`) for its own
 log line, below the contract code. Two limits: it MUST NOT appear in an envelope header or an event,
@@ -245,9 +246,125 @@ an ordinary `dlq` record — which is exactly what normalising is for. It is a c
 test per placeholder, in the same category as the rules in 5.2.1 and in the channel-spec contract's
 section 6.
 
+### 2.3.2 Engine error-code registry (set 1.1, 2026-09-25; `REPLY_` added in set 1.2; loader fixed names in set 1.3; two `REPLY_BODY_` codes in set 1.7; five receiver `log_only` codes in set 1.8)
+
+**Machine-readable:** [`error-codes.json`](error-codes.json). This section is its rationale; the file
+is the list.
+
+**Why a registry now, when 2.3 used to say "deliberately no central registry".** That sentence was
+written when nothing consumed the list. Since W2-5, `Reject(code)` (channel-spec README 3.3.2)
+consumes it: a channel step may not raise an engine code, because an alert on `HEADER_PARSE_ERROR`
+must mean a broken producer, not a channel's validation rule. A deny-list needs a list, and the SDK
+had grown one (`tributary.sdk.codes`) with no contract behind it. The cost the old sentence avoided,
+keeping two lists in sync, is paid by a test instead of by review (below).
+
+**Direction: the contract is the source, and the code is checked against it.** The registry is not
+generated from `codes.py`. A contract generated from code is a contract nobody reviewed. That is the
+failure 2.3 names for a log-only taxonomy that operations comes to depend on.
+
+| Part | Meaning |
+|---|---|
+| `codes` | Every exact code the engine emits in `tb-error-code` or an event's `error_code`, with its emitter, its meaning and a status: `emitted`, or `reserved` (never emitted now, but kept so that a record from an older build stays attributable). Whether a code is retryable belongs to the emitter, not the registry. |
+| `reserved_prefixes` | Families whose members are minted at run time (`HTTP_503`, `PG_23505`, `KEY_FIELD_ABSENT`). A new member is reserved without editing the file. |
+| `log_only` | Finer reason codes a component uses in its own log line (2.3 last paragraph). They are reserved so a step cannot raise them, and they **must never appear** in a header or event. |
+
+**Rules**
+
+1. `Reject(code)` refuses every code in `codes` and `log_only`, and every code under a
+   `reserved_prefixes` entry. `Reject.engine(code)`, which only the built-ins use, refuses any code
+   that is **not** registered, so the engine cannot mint an unregistered code either.
+2. A component that emits a new exact code adds it here first, through the architect, as a contract
+   change. That includes a **fixed** name under a reserved prefix, such as `TB_PIPELINE_TIME_BUDGET`,
+   because alert rules key on fixed names and this file is where an operator looks them up. Only
+   family members minted at run time (`HTTP_503`, `PG_23505`, `KEY_FIELD_ABSENT`) need no entry.
+3. **Checker:** a test in `tributary-sdk` loads `error-codes.json` and asserts that
+   `tributary.sdk.codes.ENGINE_CODES` equals the union of `codes` and `log_only`, and that
+   `RESERVED_PREFIXES` equals `reserved_prefixes`. Both directions are checked, so neither side can
+   gain an entry alone. `contracts/validate.py` cannot do this, because it runs on a clean clone with
+   no SDK installed (`contracts/README.md`, the two-checker split).
+4. `SPLIT_TOO_LARGE`, `SPLIT_INPUT_INVALID`, `FILTER_UNRESOLVED` and the three `VALIDATE_*` codes are
+   **engine codes raised by built-in steps**. They are registered, so a channel's own step cannot
+   borrow them. A channel can still write `VALIDATE_ORDER_MISSING`, because `VALIDATE_` is not a
+   reserved prefix. Only the exact codes are taken.
+
+**Drift found while writing it, and how it is resolved.** This section named `TRANSFORM_ERROR` for a
+step that exhausts its retries, and the envelope and events examples use it. The runtime executor
+has emitted `STEP_ERROR` since wave 1 (`tributary.runtime.executor.STEP_ERROR_CODE`). The contract came
+first and the examples depend on it, so **the executor changes to `TRANSFORM_ERROR`**
+(`platform-engineer`). `STEP_ERROR` stays in the registry as `reserved`, so no step can take it and a
+record from a pre-fix build stays attributable. No deployment exists, so nothing downstream keys on
+either code yet. The fix is cheaper now than after the first alert rule is written.
+
+**Not registered:** `Drop` reasons (`FILTERED`, `FILTERED_UNRESOLVED`, `EMPTY_SPLIT`). They are not
+error codes: they reach `_tb.events` as the `error_message` of a `status: dropped` event, and never
+reach `tb-error-code`.
+
+**Set 1.2 (W2-8, 2026-09-28): the `REPLY_` prefix and six exact codes.** Four are receiver codes that
+reach the **sender** (in `MSA-3`, and in the receiver's metrics), not a header or an event:
+`REPLY_TIMEOUT` and `REPLY_ROUTE_LOST` answer `AE`; `REPLY_BUSY` and `REPLY_UNAVAILABLE` answer `AR`.
+They are registered anyway, because integrators and alert rules key on them and a channel's `Reject`
+must not be able to borrow them. Two are worker codes: `REPLY_BODY_MISSING` on a `failed` reply record
+and its event, and `REPLY_ROUTE_INVALID` on a `replied` event only (2.3.3). A failed reply produce
+reuses `PRODUCE_FAILED` with stage `replied`. Channel-spec README 3.2.6 has the full answer table.
+
+**Set 1.3 (2026-09-29): seventeen fixed names registered, no prefix added.** Rule 2 had not been
+applied to the loaders: `HTTP_REDIRECT_REFUSED`, `FHIR_BUNDLE_INVALID`, the two `SSH_` codes and the
+four `MLLP_` codes were named in channel-spec README 3.4 from set 1.1 and never listed here. Added with
+them are the wave 2 loaders' new fixed names (`FHIR_ENTRY_FAILED`, `FHIR_RESPONSE_INVALID`,
+`CH_UNKNOWN`, `SFTP_NAME_CONFLICT`, and the four fixed `S3_` names) and the receivers'
+`TLS_PEER_NOT_ALLOWED` (log and metrics only, never a header or event; channel-spec README 3.2.7). One
+new rule: **a code minted at run time that equals a registered fixed name is not emitted as that name.**
+Only `S3_` can collide today, because it upper-snake-cases a code the store chooses: a store answering
+`KeyConflict` would otherwise read as the loader's own idempotency conflict. It becomes `S3_UNKNOWN`.
+The numeric families (`HTTP_<status>`, `SFTP_<status>`, `CH_<code>`) and `PG_<class>` cannot collide.
+Behaviour of `Reject` does not change: every new name was already under a reserved prefix. Only the
+cross-check test moves, so `ENGINE_CODES` gains all seventeen in the same commit.
+
+**Set 1.4 (2026-09-29): `REPLY_EXPIRED`.** The worker skips a reply that is past `tb-reply-deadline`
+plus the 5 s skew allowance (channel-spec README 3.2.6). Its `replied` event keeps `status: dropped`,
+because the skip is deliberate and must not count toward error-rate alerts. It now also carries
+`error_code: REPLY_EXPIRED`; until set 1.4 it carried only a sentence in `error_message`. **Why a code
+and not a `Drop`-style reason:** `Drop` reasons belong to a channel's step (`FILTERED` is the channel
+author's decision), while an expiry is an engine condition, typically a backlog after an outage (S3
+saw 1,026 late replies in one restart). Operators need to query it in the archive by a stable key.
+**The rule this sets:** a `dropped` event may carry `error_code` only when the code is a registered
+engine code for an engine-initiated skip. `Drop` reasons stay in `error_message`, unregistered. The
+events schema already allows this, so there is no schema change. **What we give up:** the "`dropped`
+never has a code" symmetry, and `ENGINE_CODES` must gain the code in the same commit, or the
+registry cross-check goes red.
+
+**Set 1.7 (2026-10-05): `REPLY_BODY_INVALID` and `REPLY_BODY_OVER_BUDGET`.** Receiver codes, like the
+set 1.2 four: they reach the sender in `MSA-3` and the receiver's metrics, never a header or an event.
+Both answer `AE`, because the message was committed and routed and only the `body: step` answer could
+not be written: a framing byte in the body, or no room in `queue.maxBytes` to hold it (channel-spec
+README 3.2.6). The first build reused `REPLY_BUSY` and `REPLY_BODY_MISSING`. That is **rejected**:
+`REPLY_BUSY` is an `AR` code (not published), so reusing it under `AE` gives one code two opposite
+resend meanings; `REPLY_BODY_MISSING` is the worker's code for a step that never called `ctx.reply`.
+`ENGINE_CODES` gains both in the same commit, or the cross-check goes red.
+
+### 2.3.3 Reply-routing headers: a parse failure disables the reply, not the message (set 1.2)
+
+`tb-reply-partition` and `tb-reply-deadline` on a `raw` record say where and until when to answer.
+They say nothing about the message. So a worker that finds either malformed, or
+`tb-reply-partition` out of range for the real `reply` topic, **processes the message normally,
+produces no reply, and emits a `replied` event with `status: error` and `REPLY_ROUTE_INVALID`.** It
+does not dead-letter the message. That is the one exception to the 2.3 reject rule, and it is narrow:
+dead-lettering a committed, valid message because its answer route is broken would turn an answer
+problem into a delivery problem, while the sender still gets the truthful `AE` / `REPLY_TIMEOUT`.
+
+Two consumer rules for the `reply` topic itself:
+
+1. **The receiver's reply consumer drops a reply record it cannot parse**, with a metric and a log line
+   carrying topic, partition and offset only. It cannot dead-letter (receivers have no `dlq` WRITE,
+   `topics/v0` 3.4) and a reply is not a message. The pending request then times out.
+2. **Only `tb-reply-status: accepted` can become `AA`.** Absent (a set 1.0-shaped reply) or an unknown
+   value from a newer producer answers `AE`. This is how "lenient consumers" and invariant 1's
+   no-false-ACK coexist: the unknown value is tolerated, and never trusted.
+
 ### 2.4 Known envelope drift in Phase 0 code — do not reproduce
 
-Spike code diverged from this contract in three ways. All three are recorded here because the spike
+Spike code diverged from this contract in three ways, and S3 used one experimental header that set
+1.2 replaced. All four are recorded here because the spike
 directories stay in the tree as reference material, and the fastest way to write a Phase 1 emitter
 is to copy one.
 
@@ -256,6 +373,7 @@ is to copy one.
 | `tb-x-stage` used as a load-bearing header | `tb-stage`. `tb-x-*` is experimental, never load-bearing, and must not survive into a released package (section 2.1). |
 | Non-canonical ids: uppercase hex, unhyphenated, or a UUIDv4 in `tb-msg-id` | Canonical lowercase hyphenated form, and `tb-msg-id` is **UUIDv7** specifically — the schema's `uuid7` pattern pins the version nibble. |
 | Timestamps as epoch floats | RFC 3339, UTC, 3 to 9 fractional digits (section 2). The events contract has an `invalid/ts-epoch-float.json` example for the same mistake. |
+| `tb-x-reply-partition` (S3 targeted mode) | `tb-reply-partition`, set 1.2, with `tb-reply-deadline` beside it. The `tb-x-` form is retired. |
 
 Phase 1 requirement 10 is the check that catches a recurrence: every emitter validates its output
 against this contract's schema in its own tests, using the SDK's projection helper rather than a
@@ -282,8 +400,11 @@ hand-built dict.
 | `tb-claim-check` | C | C | C | C | C | Required when the payload exceeded the inline limit. Section 5. |
 | `tb-destination` | – | R | R | C | O | Destination name from the channel spec. **New in v0** (not in ADR-001 5.4): `retry` and `dlq` are per channel, not per destination, so without it a retry consumer cannot tell which loader owns the record. On `dlq` it is required only when the failure happened at a destination. |
 | `tb-stage` | – | O | R | R | O | Stage that last wrote or failed the record, from the event stage enum. **New in v0**: ADR-001 6.4 requires the DLQ to carry the failing stage. |
-| `tb-error-code` | – | – | R | R | – | Stable machine code, `^[A-Z][A-Z0-9_]{0,63}$`, for example `HTTP_503`, `TRANSFORM_ERROR`. **New in v0**. Never a human message: exception text can quote payload, and invariant 6 forbids PHI here. The redacted human message belongs in `_tb.events.error_message`. |
+| `tb-error-code` | – | – | R | R | C | Stable machine code, `^[A-Z][A-Z0-9_]{0,63}$`, for example `HTTP_503`, `TRANSFORM_ERROR`. **New in v0**. Never a human message: exception text can quote payload, and invariant 6 forbids PHI here. The redacted human message belongs in `_tb.events.error_message`. **On `reply` (set 1.2):** required when `tb-reply-status` is `rejected` or `failed`, forbidden otherwise. |
 | `tb-retry-not-before` | – | – | R | – | – | Earliest time a retry consumer may deliver this record. **New in v0**: delay tiers on a shared `retry` topic need a visible-after timestamp, because Kafka has no per-record delay. |
+| `tb-reply-partition` | C | – | – | – | – | **Set 1.2.** Set iff the request is synchronous: the `reply` partition the receiving process holds, decimal `0`-`63`. Requires `tb-correlation-id` and `tb-reply-deadline`. The worker replies iff it is present, and strips it from everything it produces. Not PHI. |
+| `tb-reply-deadline` | C | – | – | – | – | **Set 1.2.** Present iff `tb-reply-partition` is. An upper bound on when the receiver stops waiting, so it **must not be earlier** than the real deadline: set it to produce time + `ack.timeoutMs` + `reply.timeoutMs`, since the reply clock starts only at the commit callback. The worker skips a reply past it plus 5 s of skew. |
+| `tb-reply-status` | – | – | – | – | C | **Set 1.2.** `accepted`, `rejected` or `failed`. Optional in the schema, so a set 1.0-shaped reply stays valid; **every W2-8 worker sets it**. Only `accepted` can become `AA` (2.3.3). |
 
 ### 3.1 Content types
 
@@ -515,7 +636,22 @@ the minted id ([events contract](../../events/v0/README.md)). It deliberately ha
 5. Reprocess and replay mint a **new** `tb-msg-id` and set `tb-parent-id` to the original. This
    keeps the browser's parent/child tree honest and keeps loader idempotency keys distinct, so a
    deliberate reprocess is not silently deduplicated away by the destination.
+   **`tb-received-at` is copied unchanged from the original** (set 1.8 part 2, ruled 2026-10-06 on
+   `archive-engineer`'s W3-3 question). Rule 1 holds: a reprocess or replay is a re-injection, not a
+   receive, and the original receive time is known, unlike a quarantine (5.2). Steps that read
+   `received_at` therefore produce what the original should have produced. The reprocess time is
+   recorded in the lifecycle event's `ts` and in the audit event (W3-1b), not in the header.
+   **Consequence:** `now - tb-received-at` is not a latency for a reprocessed or replayed record and
+   must not be computed as one. Until W3-3's origin discriminator exists (channel-spec section 9), a
+   latency consumer cannot tell such a record from a split child, so it excludes every record that
+   carries `tb-parent-id`. The new `tb-msg-id` may be derived deterministically from the original id
+   and the operator's request id, so a retried action with an unknown outcome is absorbed by loader
+   idempotency (`tributary-archiver` `republish.py`). The layout is pinned with W3-1b.
 6. A step MUST NOT delete a registered header it does not understand.
+7. **Set 1.2:** `tb-reply-partition` and `tb-reply-deadline` are **not** propagated. The worker strips
+   them from every `out`, `retry` and `dlq` record it produces, and reprocess never copies them, so a
+   reprocessed or replayed record never answers on a partition nobody is watching.
+   `tb-correlation-id` still propagates as before.
 
 ---
 

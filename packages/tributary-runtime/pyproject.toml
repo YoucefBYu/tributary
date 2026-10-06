@@ -14,6 +14,10 @@ dependencies = [
 # (ADR-001 6.2, channel-spec README 3.3.1). The entry-point NAME is what a spec writes.
 [project.entry-points."tributary.steps"]
 "tributary.core.passthrough" = "tributary.runtime.core_steps:passthrough"
+"tributary.core.filter" = "tributary.runtime.core_steps:filter_step"
+"tributary.core.enrich" = "tributary.runtime.core_steps:enrich"
+"tributary.core.validate" = "tributary.runtime.core_steps:validate"
+"tributary.core.split" = "tributary.runtime.core_steps:split"
 
 [build-system]
 requires = ["hatchling==1.27.0"]

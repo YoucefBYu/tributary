@@ -1,0 +1,452 @@
+"""Golden-file tests: ADT A01 (admit), A03 (discharge) and A08 (update) to FHIR R4.
+
+Each case parses a synthetic `tests/fixtures/hl7/*.hl7` fixture (MSH-3 `TRIBUTARY-SYNTH`), runs
+`adt_to_fhir`, and compares the resulting `Bundle` JSON to a golden file under `tests/fixtures/fhir/`.
+The mapping-source citation for every rule these golden files exercise lives in `adt.py`'s module
+docstring and inline comments -- not repeated per test, so a rule change has one place to update.
+"""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+from tributary.content_hl7_fhir import UnsupportedTriggerError, adt_to_fhir
+from tributary.content_hl7_fhir.errors import RequiredFieldMissingError
+from tributary.fhir.fakes import fake_fhir_context
+from tributary.hl7v2.step import parse
+from tributary.sdk import Message
+from tributary.sdk.testing import make_message, run_step
+
+from .conftest import GOLDEN_MSG_ID, HL7_FIXTURES, load_golden, map_fixture
+
+
+@pytest.mark.parametrize(
+    ("hl7_fixture", "golden_fixture"),
+    [
+        # ADT^A01 (admit): Encounter.status "in-progress", period.start from EVN-2 (PV1-44 blank).
+        ("adt_a01_admit.hl7", "adt_a01_admit.bundle.json"),
+        # ADT^A03 (discharge), no PV1-19: no `Encounter` entry at all -- a message-scoped identifier
+        # here would create a second, wrong Encounter rather than converge with the one A01 created
+        # (see adt.py's module docstring and `_encounter_identifier`). Only `Patient` is produced.
+        ("adt_a03_discharge.hl7", "adt_a03_discharge.bundle.json"),
+        # ADT^A01 with PV1-19 (Visit Number) populated: `Encounter` is conditional on it, not on
+        # `tb-msg-id` -- this is the case that converges across a clinical flow.
+        ("adt_a01_admit_with_visit_number.hl7", "adt_a01_admit_with_visit_number.bundle.json"),
+        # ADT^A08 (update), no PV1 at all: only a Patient entry, no Encounter -- a pure demographic
+        # update has nothing PV1-shaped to map, and this mapping does not fabricate one.
+        ("adt_a08_update_no_pv1.hl7", "adt_a08_update_no_pv1.bundle.json"),
+        # ADT^A01 with two NK1 repetitions and an outpatient PV1-2 ("O" -> Encounter.class AMB): NK1 is
+        # out of this reference set's resource scope (RelatedPerson is a natural follow-on, not built
+        # here), so the golden file asserts the NK1 repetitions are simply *not* reflected -- proving
+        # the mapping does not choke on them rather than silently mis-mapping one.
+        ("adt_a01_two_nk1.hl7", "adt_a01_two_nk1.bundle.json"),
+    ],
+)
+def test_adt_mapping_matches_golden_bundle(hl7_fixture: str, golden_fixture: str) -> None:
+    assert map_fixture(hl7_fixture, adt_to_fhir) == load_golden(golden_fixture)
+
+
+def test_patient_entry_is_conditional_on_pid3() -> None:
+    """Channel-spec README 3.4.2: every Bundle entry is conditional, keyed on exactly one identifier
+    system. The `Patient` entry's is PID-3's own assigning-authority-derived system -- a real business
+    identifier, never `tb-msg-id` (that fallback is for resources with no identifier of their own)."""
+    bundle = map_fixture("adt_a01_admit.hl7", adt_to_fhir)
+    patient_entry = bundle["entry"][0]  # type: ignore[index]
+    assert patient_entry["request"]["method"] == "PUT"  # type: ignore[index]
+    assert patient_entry["request"]["url"] == "Patient?identifier=urn:id:SYNTH-HOSPITAL|9000001"  # type: ignore[index]
+
+
+def test_encounter_entry_is_conditional_on_message_identifier_when_no_visit_number() -> None:
+    """No PV1-19 in this fixture set, so `Encounter` falls back to the message-scoped identifier
+    (`tributary.fhir.message_identifier`) -- still exactly one identifier system, never unconditional."""
+    bundle = map_fixture("adt_a01_admit.hl7", adt_to_fhir)
+    encounter_entry = bundle["entry"][1]  # type: ignore[index]
+    assert encounter_entry["request"]["method"] == "PUT"  # type: ignore[index]
+    assert f"tb-msg-id|{GOLDEN_MSG_ID}:encounter" in encounter_entry["request"]["url"]  # type: ignore[index]
+
+
+def test_encounter_entry_is_conditional_on_visit_number_when_present() -> None:
+    """PV1-19 (Visit Number), when present, is a real per-visit business identifier -- `Encounter`'s
+    conditional PUT is keyed on it, not on `tb-msg-id` (channel-spec README 3.4.2, and the resource-
+    convergence rule in `adt.py`'s module docstring)."""
+    bundle = map_fixture("adt_a01_admit_with_visit_number.hl7", adt_to_fhir)
+    encounter_entry = bundle["entry"][1]  # type: ignore[index]
+    assert encounter_entry["request"]["url"] == "Encounter?identifier=urn:id:SYNTH-HOSPITAL|VN20260108-00001"  # type: ignore[index]
+    assert GOLDEN_MSG_ID not in encounter_entry["request"]["url"]  # type: ignore[index]
+
+
+@pytest.mark.parametrize("hl7_fixture", ["adt_a03_discharge.hl7", "adt_a08_update_no_pv1.hl7"])
+def test_encounter_entry_is_omitted_without_a_visit_number_for_a03_and_a08(hl7_fixture: str) -> None:
+    """A03/A08 with no PV1-19 must not fall back to a message-scoped `Encounter` identifier: that would
+    create a second, wrong `Encounter` next to whatever A01 already created, instead of converging on
+    it (the CRITICAL finding on `4998f33`). Only `Patient` is produced."""
+    bundle = map_fixture(hl7_fixture, adt_to_fhir)
+    resource_types = [entry["resource"]["resourceType"] for entry in bundle["entry"]]  # type: ignore[index]
+    assert resource_types == ["Patient"]
+
+
+def _adt_message(*, trigger: str, msg_id: str, visit_number: str, control_id: str) -> Message:
+    raw = (
+        f"MSH|^~\\&|TRIBUTARY-SYNTH|SYNTH-HOSPITAL|SYNTH-ADT-RECV|SYNTH-RECV-FACILITY|"
+        f"20260101120000||ADT^{trigger}^ADT_{trigger}|{control_id}|P|2.5.1\r"
+        f"EVN|{trigger}|20260101120000\r"
+        f"PID|1||9000077^^^SYNTH-HOSPITAL^MR||SYNTHPATIENT^CONVERGE||19800101|M\r"
+        f"PV1|1|I|SYNTHUNIT^101^A^SYNTH-HOSPITAL||||9001^SYNTHDOC^ATTENDING^^^^MD|||SUR||||ADM|A0||||"
+        f"{visit_number}^^^SYNTH-HOSPITAL^VN\r"
+    ).encode()
+    ctx = fake_fhir_context()
+    message = make_message(raw, content_type="application/hl7-v2+er7", msg_id=msg_id)
+    parsed = run_step(parse, message, ctx=ctx)
+    mapped = run_step(adt_to_fhir, parsed, ctx=ctx)
+    assert isinstance(mapped, Message)
+    return mapped
+
+
+def test_a01_then_a03_then_a08_for_the_same_visit_converge_on_one_encounter_url() -> None:
+    """Regression for the CRITICAL finding on `4998f33`: three different messages (different `tb-msg-
+    id`, different trigger events) for the *same* visit (same PV1-19) must resolve the same conditional
+    `Encounter` URL, so a real FHIR server updates one `Encounter` instead of creating three."""
+    visit_number = "VN20260109-00002"
+    urls = set()
+    for trigger, msg_id, control_id in (
+        ("A01", "0199036e-0000-7000-8000-000000000001", "SYNTHMSGCONV01"),
+        ("A03", "0199036e-0000-7000-8000-000000000002", "SYNTHMSGCONV02"),
+        ("A08", "0199036e-0000-7000-8000-000000000003", "SYNTHMSGCONV03"),
+    ):
+        mapped = _adt_message(trigger=trigger, msg_id=msg_id, visit_number=visit_number, control_id=control_id)
+        bundle = json.loads(mapped.payload)
+        encounter_entry = next(e for e in bundle["entry"] if e["resource"]["resourceType"] == "Encounter")
+        urls.add(encounter_entry["request"]["url"])
+    assert urls == {"Encounter?identifier=urn:id:SYNTH-HOSPITAL|VN20260109-00002"}
+
+
+def test_encounter_body_carries_its_own_conditional_identifier() -> None:
+    """Security review MEDIUM 4: every resource must include the identifier its entry is conditional
+    on, so a redelivery's conditional search actually matches what a previous delivery wrote."""
+    bundle = map_fixture("adt_a01_admit_with_visit_number.hl7", adt_to_fhir)
+    encounter_entry = bundle["entry"][1]  # type: ignore[index]
+    identifiers = encounter_entry["resource"]["identifier"]  # type: ignore[index]
+    assert len(identifiers) == 1
+    assert identifiers[0]["system"] == "urn:id:SYNTH-HOSPITAL"
+    assert identifiers[0]["value"] == "VN20260108-00001"
+
+
+def test_encounter_omission_is_logged_at_warning_with_no_values() -> None:
+    """Code review follow-up on e48d937/5c42b2f: an operator needs to see a sender that never populates
+    PV1-19, so this is `warning`, not `debug` -- and still carries only the trigger code (a structural
+    MSH-9 value) and a fixed reason string, never a value."""
+    from tributary.sdk.fakes import FakeContext
+
+    ctx = FakeContext()
+    hl7_step_ctx = fake_fhir_context(base=ctx)
+    raw = (HL7_FIXTURES / "adt_a03_discharge.hl7").read_bytes()
+    message = make_message(raw, content_type="application/hl7-v2+er7")
+    parsed = run_step(parse, message, ctx=hl7_step_ctx)
+    run_step(adt_to_fhir, parsed, ctx=hl7_step_ctx)
+    warnings = [record for record in ctx.log.records if record.level == "warning"]
+    assert len(warnings) == 1
+    assert warnings[0].event == "adt_encounter_omitted"
+    assert warnings[0].fields == {"trigger_event": "A03", "reason": "no_visit_number"}
+
+
+def test_message_type_must_be_adt() -> None:
+    """Security review, MEDIUM 2: the message *type* is checked, not only the trigger event -- an
+    ORU^A01 (a nonsensical combination) must not be accepted just because "A01" is in the trigger set."""
+    ctx = fake_fhir_context()
+    raw = (
+        b"MSH|^~\\&|TRIBUTARY-SYNTH|SYNTH-LAB|SYNTH-ORU-RECV|SYNTH-RECV-FACILITY|"
+        b"20260101120000||ORU^A01^ORU_R01|SYNTHMSG00095|P|2.5.1\r"
+        b"PID|1||9000095^^^SYNTH-HOSPITAL^MR||SYNTHPATIENT^X||19800101|M\r"
+    )
+    parsed = run_step(parse, make_message(raw, content_type="application/hl7-v2+er7"), ctx=ctx)
+    with pytest.raises(UnsupportedTriggerError):
+        run_step(adt_to_fhir, parsed, ctx=ctx)
+
+
+def test_non_structural_msh9_never_reaches_the_exception() -> None:
+    """Security review, MEDIUM 2: a malformed MSH-9 is replaced with a fixed placeholder, never echoed
+    -- `errors.py` previously *claimed* this was already true without any check enforcing it."""
+    ctx = fake_fhir_context()
+    raw = (
+        b"MSH|^~\\&|TRIBUTARY-SYNTH|SYNTH-HOSPITAL|SYNTH-ADT-RECV|SYNTH-RECV-FACILITY|"
+        b"20260101120000||not a valid code^A99^ADT_A99|SYNTHMSG00094|P|2.5.1\r"
+        b"PID|1||9000094^^^SYNTH-HOSPITAL^MR||SYNTHPATIENT^X||19800101|M\r"
+    )
+    parsed = run_step(parse, make_message(raw, content_type="application/hl7-v2+er7"), ctx=ctx)
+    with pytest.raises(UnsupportedTriggerError) as excinfo:
+        run_step(adt_to_fhir, parsed, ctx=ctx)
+    assert excinfo.value.message_type == "<non-structural>"
+    assert "not a valid code" not in str(excinfo.value)
+
+
+# -- HIGH 2: no PHI in an exception, even via __context__ ------------------------------------------------
+
+
+def _mapped_patient_resource_or_raise(pid_line: str) -> dict[str, object]:
+    raw = (
+        b"MSH|^~\\&|TRIBUTARY-SYNTH|SYNTH-HOSPITAL|SYNTH-ADT-RECV|SYNTH-RECV-FACILITY|"
+        b"20260101120000||ADT^A01^ADT_A01|SYNTHMSG00093|P|2.5.1\r" + pid_line.encode() + b"\r"
+    )
+    ctx = fake_fhir_context()
+    parsed = run_step(parse, make_message(raw, content_type="application/hl7-v2+er7"), ctx=ctx)
+    mapped = run_step(adt_to_fhir, parsed, ctx=ctx)
+    assert isinstance(mapped, Message)
+    assert mapped.payload is not None
+    bundle = json.loads(mapped.payload)
+    result: dict[str, object] = bundle["entry"][0]["resource"]
+    return result
+
+
+def test_invalid_dob_does_not_crash_and_omits_birth_date() -> None:
+    """Security review, HIGH 2: `19800231` (no 31st of February) must not reach `Patient.birthDate`'s
+    own validator, whose `ValidationError` embeds the value verbatim."""
+    patient = _mapped_patient_resource_or_raise("PID|1||9000093^^^SYNTH-HOSPITAL^MR||SYNTHPATIENT^X||19800231|M")
+    assert "birthDate" not in patient
+
+
+# -- MEDIUM, code-reviewer: an omitted invalid date is logged, path only, never the value ----------------
+
+
+def test_invalid_pid7_logs_a_warning_with_path_only() -> None:
+    raw = (
+        b"MSH|^~\\&|TRIBUTARY-SYNTH|SYNTH-HOSPITAL|SYNTH-ADT-RECV|SYNTH-RECV-FACILITY|"
+        b"20260101120000||ADT^A01^ADT_A01|SYNTHMSG00089|P|2.5.1\r"
+        b"PID|1||9000089^^^SYNTH-HOSPITAL^MR||SYNTHPATIENT^X||19800231|M\r"
+    )
+    ctx = fake_fhir_context()
+    parsed = run_step(parse, make_message(raw, content_type="application/hl7-v2+er7"), ctx=ctx)
+    run_step(adt_to_fhir, parsed, ctx=ctx)
+    warnings = [
+        record for record in ctx.log.records if record.level == "warning" and record.event == "field_invalid_omitted"
+    ]
+    assert len(warnings) == 1
+    assert warnings[0].fields == {"path": "PID.7", "reason": "invalid_value"}
+    for record in ctx.log.records:
+        assert "19800231" not in str(record.fields)
+
+
+def test_invalid_pv1_44_and_45_log_warnings_with_path_only() -> None:
+    raw = (
+        b"MSH|^~\\&|TRIBUTARY-SYNTH|SYNTH-HOSPITAL|SYNTH-ADT-RECV|SYNTH-RECV-FACILITY|"
+        b"20260101120000||ADT^A08^ADT_A01|SYNTHMSG00088|P|2.5.1\r"
+        b"PID|1||9000088^^^SYNTH-HOSPITAL^MR||SYNTHPATIENT^X||19800101|M\r"
+        b"PV1|1|I|SYNTHUNIT^101^A^SYNTH-HOSPITAL||||9001^SYNTHDOC^ATTENDING^^^^MD|||SUR||||ADM|A0||||"
+        b"VN20260101-00001|||||||||||||||||||||||||20261301999999|20261302999999\r"
+    )
+    ctx = fake_fhir_context()
+    parsed = run_step(parse, make_message(raw, content_type="application/hl7-v2+er7"), ctx=ctx)
+    run_step(adt_to_fhir, parsed, ctx=ctx)
+    warnings = {
+        record.fields["path"]: record.fields
+        for record in ctx.log.records
+        if record.level == "warning" and record.event == "field_invalid_omitted"
+    }
+    assert warnings.get("PV1.44") == {"path": "PV1.44", "reason": "invalid_value"}
+    assert warnings.get("PV1.45") == {"path": "PV1.45", "reason": "invalid_value"}
+    for record in ctx.log.records:
+        assert "20261301999999" not in str(record.fields)
+        assert "20261302999999" not in str(record.fields)
+
+
+def test_invalid_evn2_logs_a_warning_with_path_only() -> None:
+    """EVN-2 is only consulted as a fallback for `Encounter.period` on A01/A03 when PV1-44/-45 are
+    blank; an invalid EVN-2 is logged the same way, path and reason only."""
+    raw = (
+        b"MSH|^~\\&|TRIBUTARY-SYNTH|SYNTH-HOSPITAL|SYNTH-ADT-RECV|SYNTH-RECV-FACILITY|"
+        b"20260101120000||ADT^A01^ADT_A01|SYNTHMSG00087|P|2.5.1\r"
+        b"EVN|A01|20261301999999\r"
+        b"PID|1||9000087^^^SYNTH-HOSPITAL^MR||SYNTHPATIENT^X||19800101|M\r"
+        b"PV1|1|I|SYNTHUNIT^101^A^SYNTH-HOSPITAL||||9001^SYNTHDOC^ATTENDING^^^^MD|||SUR||||ADM|A0\r"
+    )
+    ctx = fake_fhir_context()
+    parsed = run_step(parse, make_message(raw, content_type="application/hl7-v2+er7"), ctx=ctx)
+    run_step(adt_to_fhir, parsed, ctx=ctx)
+    warnings = [
+        record for record in ctx.log.records if record.level == "warning" and record.event == "field_invalid_omitted"
+    ]
+    assert {"path": "EVN.2", "reason": "invalid_value"} in [record.fields for record in warnings]
+    for record in ctx.log.records:
+        assert "20261301999999" not in str(record.fields)
+
+
+def test_no_phi_leak_anywhere_in_the_exception_chain() -> None:
+    """Security review, HIGH 2: `str(exc)` and the full chain (`__cause__`, `__context__`) must never
+    carry a field value -- checked directly, not just asserted in a docstring (`errors.safe_build`)."""
+    raw = (
+        b"MSH|^~\\&|TRIBUTARY-SYNTH|SYNTH-HOSPITAL|SYNTH-ADT-RECV|SYNTH-RECV-FACILITY|"
+        b"20260101120000||ADT^A01^ADT_A01|SYNTHMSG00092|P|2.5.1\r"
+        b"PID|1|||SYNTHVERYSECRETPATIENTNAME^X||19800101|M\r"
+    )
+    ctx = fake_fhir_context()
+    parsed = run_step(parse, make_message(raw, content_type="application/hl7-v2+er7"), ctx=ctx)
+    with pytest.raises(RequiredFieldMissingError) as excinfo:
+        run_step(adt_to_fhir, parsed, ctx=ctx)
+    exc = excinfo.value
+    assert "SYNTHVERYSECRETPATIENTNAME" not in str(exc)
+    assert exc.__cause__ is None
+    assert exc.__context__ is None
+
+
+def test_unsupported_trigger_raises_a_typed_error() -> None:
+    raw = (
+        b"MSH|^~\\&|TRIBUTARY-SYNTH|SYNTH-HOSPITAL|SYNTH-ADT-RECV|SYNTH-RECV-FACILITY|"
+        b"20260101120000||ADT^A02^ADT_A02|SYNTHMSG00099|P|2.5.1\r"
+        b"EVN|A02|20260101120000\r"
+        b"PID|1||9000099^^^SYNTH-HOSPITAL^MR||SYNTHPATIENT^X||19800101|M\r"
+    )
+    ctx = fake_fhir_context()
+    parsed = run_step(parse, make_message(raw, content_type="application/hl7-v2+er7"), ctx=ctx)
+    with pytest.raises(UnsupportedTriggerError):
+        run_step(adt_to_fhir, parsed, ctx=ctx)
+
+
+def test_missing_pid3_raises_a_typed_error_not_a_crash() -> None:
+    raw = (
+        b"MSH|^~\\&|TRIBUTARY-SYNTH|SYNTH-HOSPITAL|SYNTH-ADT-RECV|SYNTH-RECV-FACILITY|"
+        b"20260101120000||ADT^A01^ADT_A01|SYNTHMSG00098|P|2.5.1\r"
+        b"EVN|A01|20260101120000\r"
+        b"PID|1|||SYNTHPATIENT^X||19800101|M\r"
+    )
+    ctx = fake_fhir_context()
+    parsed = run_step(parse, make_message(raw, content_type="application/hl7-v2+er7"), ctx=ctx)
+    with pytest.raises(RequiredFieldMissingError) as excinfo:
+        run_step(adt_to_fhir, parsed, ctx=ctx)
+    assert excinfo.value.path == "PID.3"
+
+
+def test_custom_delimiters_fixture_maps_without_misreading_data_as_components() -> None:
+    """Security review, MEDIUM 3: `custom_delimiters.hl7` uses `!`/`@`/`$`/`\\`/`*` as its five
+    delimiters, so the literal `^` characters inside its PID-3 are plain data, not four extra
+    components. This end-to-end run is what would have broken under the old hard-coded `"^".split()`."""
+    bundle = map_fixture("custom_delimiters.hl7", adt_to_fhir)
+    patient_identifier = bundle["entry"][0]["resource"]["identifier"][0]  # type: ignore[index]
+    assert patient_identifier["value"] == "9000004"
+    assert patient_identifier["system"] == "urn:id:SYNTH-HOSPITAL"
+
+
+def test_literal_caret_in_custom_delimiter_pid3_is_data_so_no_authority_is_refused() -> None:
+    raw = (
+        b"MSH!@$\\*!TRIBUTARY-SYNTH!SYNTH-HOSPITAL!R!F!20260106140000!!ADT@A01@ADT_A01!SYNTHMSG00006!P!2.5.1\r"
+        b"PID!1!!9000004^^^SYNTH-HOSPITAL^MR!!SYNTHPATIENT@X\r"
+    )
+    ctx = fake_fhir_context()
+    parsed = run_step(parse, make_message(raw, content_type="application/hl7-v2+er7"), ctx=ctx)
+    with pytest.raises(RequiredFieldMissingError) as excinfo:
+        run_step(adt_to_fhir, parsed, ctx=ctx)
+    assert excinfo.value.path == "PID.3.4"
+
+
+# -- LOW, security: MSH-4 fallback system reads only HD.1, not the whole field --------------------------
+
+
+def test_msh4_hd_value_uses_only_the_namespace_id_component() -> None:
+    """Security review LOW: an HD-valued MSH-4 (`SYNTH-HOSPITAL^UNIV-ID^ISO`) must contribute only its
+    Namespace ID (HD.1) to the fallback `Identifier.system` -- not the HD's other components folded in
+    as if they were part of one string."""
+    raw = (
+        b"MSH|^~\\&|TRIBUTARY-SYNTH|SYNTH-HOSPITAL^UNIV-ID^ISO|SYNTH-ADT-RECV|SYNTH-RECV-FACILITY|"
+        b"20260101120000||ADT^A01^ADT_A01|SYNTHMSG00091|P|2.5.1\r"
+        b"PID|1||9000091^^^SYNTH-HOSPITAL^MR||SYNTHPATIENT^X||19800101|M||||||||||9000091-ACC\r"
+    )
+    ctx = fake_fhir_context()
+    parsed = run_step(parse, make_message(raw, content_type="application/hl7-v2+er7"), ctx=ctx)
+    mapped = run_step(adt_to_fhir, parsed, ctx=ctx)
+    assert isinstance(mapped, Message)
+    assert mapped.payload is not None
+    bundle = json.loads(mapped.payload)
+    identifiers = bundle["entry"][0]["resource"]["identifier"]
+    account = next(i for i in identifiers if i["value"] == "9000091-ACC")
+    assert account["system"] == "urn:id:SYNTH-HOSPITAL"
+
+
+def test_msh4_hd_value_uses_only_the_namespace_id_component_with_custom_delimiters() -> None:
+    """Same as above, with `!`/`@`/`$`/`\\`/`*` as the five delimiters: HD.1 is still read through the
+    component accessor, not by the field's own literal text."""
+    raw = (
+        b"MSH!@$\\*!TRIBUTARY-SYNTH!SYNTH-HOSPITAL$UNIV-ID$ISO!SYNTH-ADT-RECV!SYNTH-RECV-FACILITY!"
+        b"20260101120000!!ADT@A01@ADT_A01!SYNTHMSG00090!P!2.5.1\r"
+        b"PID!1!!9000090@@@SYNTH-HOSPITAL@MR!!SYNTHPATIENT@X!!19800101!M!!!!!!!!!!9000090-ACC\r"
+    )
+    ctx = fake_fhir_context()
+    parsed = run_step(parse, make_message(raw, content_type="application/hl7-v2+er7"), ctx=ctx)
+    mapped = run_step(adt_to_fhir, parsed, ctx=ctx)
+    assert isinstance(mapped, Message)
+    assert mapped.payload is not None
+    bundle = json.loads(mapped.payload)
+    identifiers = bundle["entry"][0]["resource"]["identifier"]
+    account = next(i for i in identifiers if i["value"] == "9000090-ACC")
+    assert account["system"] == "urn:id:SYNTH-HOSPITAL"
+
+
+def test_repeated_run_produces_a_byte_identical_bundle() -> None:
+    """Invariant 4 in miniature: the same message mapped twice (same `tb-msg-id`, same fixture) yields
+    the same Bundle -- no `uuid4` fullUrl or non-deterministic ordering has crept in."""
+    first = map_fixture("adt_a01_admit.hl7", adt_to_fhir)
+    second = map_fixture("adt_a01_admit.hl7", adt_to_fhir)
+    assert first == second
+
+
+# -- Medium, security: no conditional key without an assigning authority --------------------------------
+
+
+def _run_raw(raw: bytes) -> Message:
+    ctx = fake_fhir_context()
+    parsed = run_step(parse, make_message(raw, content_type="application/hl7-v2+er7"), ctx=ctx)
+    mapped = run_step(adt_to_fhir, parsed, ctx=ctx)
+    assert isinstance(mapped, Message)
+    return mapped
+
+
+def _adt_raw(*, msh4: str, pid3: str, pv1_19: str) -> bytes:
+    return (
+        f"MSH|^~\\&|TRIBUTARY-SYNTH|{msh4}|SYNTH-ADT-RECV|SYNTH-RECV-FACILITY|"
+        f"20260101120000||ADT^A01^ADT_A01|SYNTHMSG00120|P|2.5.1\r"
+        f"EVN|A01|20260101120000\r"
+        f"PID|1||{pid3}||SYNTHPATIENT^X||19800101|M\r"
+        f"PV1|1|I|SYNTHUNIT^101^A||||||||||||||||{pv1_19}\r"
+    ).encode()
+
+
+def test_encounter_with_no_authority_and_empty_msh4_is_refused_without_the_value() -> None:
+    raw = _adt_raw(msh4="", pid3="9000120^^^SYNTH-HOSPITAL^MR", pv1_19="VNSECRET120")
+    with pytest.raises(RequiredFieldMissingError) as excinfo:
+        _run_raw(raw)
+    assert excinfo.value.path == "PV1.19.4"
+    assert "VNSECRET120" not in str(excinfo.value)
+    assert "urn:id:" not in str(excinfo.value)
+
+
+def test_patient_with_no_pid3_authority_is_refused_without_the_value() -> None:
+    raw = _adt_raw(msh4="SYNTH-HOSPITAL", pid3="PIDSECRET120", pv1_19="VN120^^^SYNTH-HOSPITAL^VN")
+    with pytest.raises(RequiredFieldMissingError) as excinfo:
+        _run_raw(raw)
+    assert excinfo.value.path == "PID.3.4"
+    assert "PIDSECRET120" not in str(excinfo.value)
+
+
+def test_encounter_without_cx4_uses_msh4_namespace_when_present() -> None:
+    mapped = _run_raw(_adt_raw(msh4="SYNTH-HOSPITAL", pid3="9000120^^^SYNTH-HOSPITAL^MR", pv1_19="VN120"))
+    bundle = json.loads(mapped.payload)  # type: ignore[arg-type]
+    encounter = next(e for e in bundle["entry"] if e["resource"]["resourceType"] == "Encounter")
+    assert encounter["request"]["url"] == "Encounter?identifier=urn:id:SYNTH-HOSPITAL|VN120"
+
+
+# -- High, code review: a mapping refusal is non-retryable ------------------------------------------------
+
+
+def test_mapping_refusal_is_a_reject_with_a_stable_code_and_is_not_retried() -> None:
+    from tributary.runtime.executor import PipelineExecutor, StepFailure
+    from tributary.sdk import Reject
+
+    raw = _adt_raw(msh4="", pid3="PIDSECRET121", pv1_19="VN121")
+    ctx = fake_fhir_context()
+    message = make_message(raw, content_type="application/hl7-v2+er7")
+    executor = PipelineExecutor([parse, adt_to_fhir], step_retries=3)
+    with pytest.raises(StepFailure) as excinfo:
+        executor.run(message, ctx)
+    assert excinfo.value.rejected is True
+    assert excinfo.value.attempts == 1
+    assert excinfo.value.error_code == "HL7_REQUIRED_FIELD_MISSING"
+    assert "PIDSECRET121" not in str(excinfo.value)
+    assert issubclass(RequiredFieldMissingError, Reject)

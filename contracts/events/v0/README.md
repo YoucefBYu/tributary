@@ -65,7 +65,7 @@ events; that made `message_id` meaninglessly non-null.
 | `size_bytes` | integer ≥ 0 | no | Payload size. `0` with a claim-check. |
 | `claim_check` | string | no | Object-store URI, so the browser can fetch large content. |
 | `topic`, `partition`, `offset` | string, integer, integer | required for `kind=partition` | Also useful on message events for replay by offset. |
-| `error_code` | `^[A-Z][A-Z0-9_]{0,63}$` | no | Same vocabulary as `tb-error-code`. Required when `status` is `error` or `timeout`. |
+| `error_code` | `^[A-Z][A-Z0-9_]{0,63}$` | no | Same vocabulary as `tb-error-code`. Required when `status` is `error` or `timeout`. On `dropped` only for a registered engine code for an engine-initiated skip, today only `REPLY_EXPIRED` (set 1.4, envelope README 2.3.2); a `Drop` reason stays in `error_message`. |
 | `error_message` | string ≤ 512 | no | **Redacted, static text only.** Section 3. |
 | `duration_ms` | number ≥ 0 | no | Time spent in the stage the event closes. Lets the archiver compute stage latency without joining two events. |
 | `attrs` | object, string→string | no | Searchable metadata. Section 3. At most 16 entries and 1024 serialized bytes. `tb-usr-*` headers are **not** projected here ([envelope contract](../../envelope/v0/README.md) 2.2). |
@@ -193,10 +193,48 @@ tested against one.
 | `v` | `UInt8` |
 | `kind` | `LowCardinality(String)` |
 | `ts` | `DateTime64(3, 'UTC')` |
-| `message_id` | `Nullable(UUID)` — nullable because partition events have none |
+| `message_id` | `UUID`, **not nullable** (set 1.8). The nil UUID `00000000-0000-0000-0000-000000000000` means "no message identity" (partition events without a triggering message). It cannot collide: the engine mints UUIDv7, which is never nil. *Was `Nullable(UUID)`; ClickHouse refuses a Nullable column in a sort key* |
 | `duration_ms` | `Nullable(Float32)` |
 | `claim_check`, `topic`, `offset`, `partition` | `String`, `String`, `Nullable(Int64)`, `Nullable(Int32)` |
 | everything else | as ADR-001 6.6 |
+
+### 4.1 Archive rules (set 1.8, ruled 2026-10-05 on `archive-engineer`'s W3-2a report)
+
+1. **Dedup key.** Section 2.2's `(message_id, stage, destination, attempt)` becomes, in the archive,
+   `(channel, scope, message_id, stage, destination, attempt)`. `scope` is `''` for `kind=message`;
+   `<topic>:<partition>:<offset>` for `kind=record` (all three are required there); and
+   `<topic>:<partition>` plus `:<offset>` when present for `kind=partition`. A missing `attempt` is
+   stored as `0`. `channel` adds nothing for message events (UUIDv7 is unique) and separates the rest.
+   **Give up:** a partition event re-emitted after a restart, without an `offset`, is kept twice when
+   its `ts` differs. Partition events are a low-volume operator timeline, and alerting reads
+   `tb_partitions_halted`, not the archive. Producers SHOULD set `offset` on partition events (the
+   blocked record's offset); the schema keeps it optional, because requiring it would be breaking.
+2. **Month partitions are accepted.** With `PARTITION BY toYYYYMM(ts)`, `ReplacingMergeTree`'s
+   **background merges** never cross a partition, so a redelivery that crosses a month boundary is
+   **stored** twice, and a plain `count()` counts both. **`SELECT ... FINAL` does collapse across
+   partitions at read time** while the ClickHouse setting `do_not_merge_across_partitions_select_final`
+   is `0`, its default (corrected in set 1.8 part 2, 2026-10-06: the earlier text said `FINAL` does not
+   collapse across months. `archive-engineer` measured 6 rows plain and 5 under `FINAL` on a
+   straddling duplicate in W3-3). An operator profile that sets it to `1`, or any server-side automatic
+   partition-local `FINAL`, brings the duplicate back under `FINAL`. The replay window is
+   `commit_every` records (seconds of traffic), so this affects a tail at month end only. **Rule:** the
+   W3-3 query library deduplicates on the key at read time (`LIMIT 1 BY` the key), which is correct
+   whatever that setting is, so the browser never shows the duplicate. Do not rely on `FINAL` for
+   dedup in product code. A `FINAL` count test that straddles a month is valid only if it pins the
+   setting to `0` in the query (`SETTINGS do_not_merge_across_partitions_select_final = 0`).
+   **Rejected:** partitioning on the UUIDv7 time of `message_id`, which puts every nil-id partition
+   event in one epoch partition and breaks partition-level TTL for them. **Give up:** storage for a
+   rare duplicate, and unqualified `count()` over a month boundary can overcount by that tail.
+3. **Attributes the archive refuses (lead decision, 2026-10-05).** An incoming `attrs` entry whose key
+   ends `_hmac`, or whose key is on the identifier deny-list, is **dropped and counted**
+   (`tb_archiver_attrs_dropped_total{reason}`), and the rest of the event is stored. `_hmac` is
+   dropped even though its shape is schema-valid, because the mechanism is unresolved (3.1) and the
+   human has not answered 7.3. This follows "lenient consumers": one bad entry does not lose the event.
+4. **Retention of archived events.** Default **90 days** (`TB_ARCHIVE_TTL_DAYS`), an engineering
+   placeholder matching ADR-001 6.6's illustrative content TTL. **TODO(human)**, decided together with
+   audit retention (`topics/v0` 2.1, question 3, and `phases/wave-3.md` 7.2): whether a retention duty
+   reaches event metadata is the same legal reading. The archiver keeps the value configurable. It is
+   not a blocker for the build.
 
 ---
 

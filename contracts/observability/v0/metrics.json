@@ -1,0 +1,72 @@
+{
+  "contract": "tributary.observability/v0",
+  "set": "1.8",
+  "note": "Seeded 2026-10-05 from the in-process counters that exist today: receivers/metrics.py (Metrics), runtime executor StepStats, consumer LoopStats, reply ReplyStats, loaders common.py LoaderMetrics; plus ADR-001 6.10 (tb_messages_total, tb_stage_duration_seconds, tb_ack_latency_seconds). Names here are the contract; the snapshot() keys in code are not. Consumer lag comes from a Kafka exporter and is not a Tributary metric.",
+  "buckets": {
+    "latency": [0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
+    "delivery": [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60]
+  },
+  "labels": {
+    "channel": { "description": "Channel name (metadata.name). Spec-defined, topic-safe.", "pattern": "^[a-z][a-z0-9-]{0,63}$" },
+    "destination": { "description": "Destination name from the spec; empty string when the series has no destination.", "pattern": "^([a-z][a-z0-9-]{0,63})?$" },
+    "destination_type": { "description": "Destination type from the spec.", "enum": ["http", "fhir", "postgresql", "clickhouse", "sftp", "s3", "mllp", "kafka"] },
+    "receiver_type": { "description": "Source type from the spec.", "enum": ["mllp", "http", "sftp", "kafka"] },
+    "component": { "description": "Process role.", "enum": ["receiver", "worker", "loader", "archiver", "api"] },
+    "stage": { "description": "Lifecycle stage, exactly the events/v0 stage enum.", "enum": ["received", "queued", "filtered", "transformed", "routed", "pending", "sent", "retrying", "replied", "error", "dlq", "partition_paused", "partition_resumed", "partition_halted", "quarantined"] },
+    "status": { "description": "Lifecycle status, exactly the events/v0 status enum.", "enum": ["ok", "error", "timeout", "dropped"] },
+    "scope": { "description": "'-' for pipeline.steps, else the destination name (StepStats scope).", "pattern": "^(-|[a-z][a-z0-9-]{0,63})$" },
+    "step": { "description": "Step name from the spec (steps[].name), never the uses or ref target.", "pattern": "^[a-z][a-z0-9-]{0,63}$" },
+    "check": { "description": "Readiness check name (README 2.3).", "enum": ["spec", "component", "raw_producer", "reply_consumer", "database", "oidc_keys"] },
+    "outcome": { "description": "Closed per metric; see label_values.", "per_metric": true },
+    "reason": { "description": "Closed per metric; see label_values.", "per_metric": true },
+    "code": { "description": "A code registered in envelope/v0 error-codes.json, or NONE. Never a library's own error string.", "pattern": "^[A-Z][A-Z0-9_]{0,63}$" },
+    "answer": { "description": "Synchronous reply answer sent to the sender (channel-spec 3.2.6).", "enum": ["AA", "AE", "AR"] },
+    "to": { "description": "Circuit-breaker state entered.", "enum": ["open", "closed"] },
+    "version": { "description": "Tributary distribution version of the process (tb_build_info only).", "pattern": "^[0-9A-Za-z.+-]{1,64}$" },
+    "route": { "description": "The OpenAPI path TEMPLATE (/v1/channels/{channel}), never the concrete path, which can contain ids.", "pattern": "^/[a-z0-9/{}_.-]{0,127}$" },
+    "method": { "description": "HTTP method.", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"] },
+    "http_status": { "description": "Response status code as three digits.", "pattern": "^[1-5][0-9]{2}$" }
+  },
+  "metrics": [
+    { "name": "tb_build_info", "type": "gauge", "help": "Always 1. Identifies the component and its version.", "labels": ["component", "version"], "emitters": ["receiver", "worker", "loader", "archiver", "api"] },
+    { "name": "tb_ready", "type": "gauge", "help": "1 when GET /readyz would answer ready, else 0.", "labels": ["component", "channel"], "emitters": ["receiver", "api"] },
+    { "name": "tb_ready_check", "type": "gauge", "help": "1 when the named readiness check passes, else 0.", "labels": ["component", "channel", "check"], "emitters": ["receiver", "api"] },
+    { "name": "tb_spec_version", "type": "gauge", "help": "metadata.version of the channel spec this process is applying.", "labels": ["component", "channel"], "emitters": ["receiver", "worker", "loader"], "note": "The observable for exit criterion 3 (deploy and rollback with no restart)." },
+    { "name": "tb_spec_source_unproven", "type": "gauge", "help": "1 while _tb.<env>.channels cannot be shown readable and the last good spec is serving.", "labels": ["component", "channel"], "emitters": ["receiver", "worker", "loader"] },
+
+    { "name": "tb_receiver_connections_open", "type": "gauge", "help": "Open inbound connections.", "labels": ["channel", "receiver_type"], "emitters": ["receiver"] },
+    { "name": "tb_receiver_connections_total", "type": "counter", "help": "Inbound connections accepted (or outbound sessions opened by a poller).", "labels": ["channel", "receiver_type"], "emitters": ["receiver"] },
+    { "name": "tb_receiver_connections_refused_total", "type": "counter", "help": "Connections refused or failed before any message was read.", "labels": ["channel", "receiver_type", "reason"], "label_values": { "reason": ["max_conns", "not_accepting", "peer_not_allowed", "connect_failed"] }, "emitters": ["receiver"] },
+    { "name": "tb_receiver_received_total", "type": "counter", "help": "Messages read from a sender, before any decision.", "labels": ["channel", "receiver_type"], "emitters": ["receiver"] },
+    { "name": "tb_receiver_responses_total", "type": "counter", "help": "Answers given to a sender. acked only after the raw commit (invariant 1).", "labels": ["channel", "receiver_type", "outcome", "reason"], "label_values": { "outcome": ["acked", "nacked", "rejected"], "reason": ["committed", "parse_error", "oversize", "queue_full", "unavailable", "not_accepting", "auth", "peer_not_allowed", "content_type", "envelope", "reply_busy", "reply_connection_cap", "reply_unavailable"] }, "emitters": ["receiver"] },
+    { "name": "tb_ack_latency_seconds", "type": "histogram", "help": "Time from a complete inbound message to its ACK, NACK included.", "labels": ["channel", "receiver_type"], "buckets": "latency", "emitters": ["receiver"] },
+    { "name": "tb_receiver_publish_failures_total", "type": "counter", "help": "raw produce attempts that failed (the sender was NACKed or refused).", "labels": ["channel", "receiver_type"], "emitters": ["receiver"] },
+    { "name": "tb_receiver_sync_answers_total", "type": "counter", "help": "Synchronous reply answers, by answer and registered code (NONE for AA).", "labels": ["channel", "receiver_type", "answer", "code"], "emitters": ["receiver"] },
+    { "name": "tb_receiver_reply_pending", "type": "gauge", "help": "Entries in the sync-reply pending map.", "labels": ["channel"], "emitters": ["receiver"] },
+    { "name": "tb_receiver_replies_discarded_total", "type": "counter", "help": "Reply records read and not delivered to a waiting request.", "labels": ["channel", "reason"], "label_values": { "reason": ["unmatched", "unreadable", "route_lost"] }, "emitters": ["receiver"] },
+    { "name": "tb_receiver_poll_errors_total", "type": "counter", "help": "Poll cycles that failed (sftp, kafka sources).", "labels": ["channel", "receiver_type"], "emitters": ["receiver"] },
+    { "name": "tb_receiver_files_skipped_total", "type": "counter", "help": "Remote files skipped by the sftp poller.", "labels": ["channel"], "emitters": ["receiver"] },
+    { "name": "tb_receiver_offset_commits_total", "type": "counter", "help": "kafka-source offset commits on the external cluster.", "labels": ["channel", "outcome"], "label_values": { "outcome": ["ok", "failed"] }, "emitters": ["receiver"] },
+
+    { "name": "tb_messages_total", "type": "counter", "help": "One increment per lifecycle event emitted, with the event's stage and status.", "labels": ["component", "channel", "stage", "status", "destination"], "emitters": ["receiver", "worker", "loader"], "note": "Counted at emit time, so it works while the archiver is down (invariant 9)." },
+    { "name": "tb_stage_duration_seconds", "type": "histogram", "help": "Worker: one pipeline execution (stage transformed). Loader: one delivery attempt (stage sent).", "labels": ["component", "channel", "stage", "destination"], "buckets": "delivery", "emitters": ["worker", "loader"] },
+    { "name": "tb_step_duration_seconds", "type": "histogram", "help": "One step call, retries counted as calls.", "labels": ["channel", "scope", "step", "outcome"], "label_values": { "outcome": ["ok", "dropped", "failed", "rejected"] }, "buckets": "latency", "emitters": ["worker"] },
+    { "name": "tb_worker_records_total", "type": "counter", "help": "raw records by what the loop did with them.", "labels": ["channel", "outcome"], "label_values": { "outcome": ["handled", "retried", "dead_lettered", "quarantined", "rejected"] }, "emitters": ["worker"] },
+    { "name": "tb_commits_total", "type": "counter", "help": "Consumer offset commits on the engine cluster.", "labels": ["component", "channel", "outcome"], "label_values": { "outcome": ["ok", "refused", "failed"] }, "emitters": ["worker", "loader", "archiver"] },
+    { "name": "tb_partitions_paused", "type": "gauge", "help": "Partitions paused by blocking retry now.", "labels": ["component", "channel", "destination"], "emitters": ["worker", "loader"] },
+    { "name": "tb_partitions_halted", "type": "gauge", "help": "Partitions halted and waiting for an operator. Alert when above 0.", "labels": ["component", "channel", "destination"], "emitters": ["worker", "loader"], "note": "The W3-8 partition_halted alert reads this; the partition number is in the event, never a label." },
+    { "name": "tb_worker_replies_total", "type": "counter", "help": "Worker-side sync reply records.", "labels": ["channel", "outcome"], "label_values": { "outcome": ["produced", "delivered", "failed", "expired", "skipped", "route_invalid", "body_missing", "body_discarded"] }, "emitters": ["worker"] },
+
+    { "name": "tb_deliveries_total", "type": "counter", "help": "Delivery attempts by outcome and registered code (NONE on success).", "labels": ["channel", "destination", "destination_type", "outcome", "code"], "label_values": { "outcome": ["success", "failure"] }, "emitters": ["loader"] },
+    { "name": "tb_circuit_open", "type": "gauge", "help": "1 while the destination circuit breaker is open.", "labels": ["channel", "destination"], "emitters": ["loader"] },
+    { "name": "tb_circuit_transitions_total", "type": "counter", "help": "Circuit-breaker state changes.", "labels": ["channel", "destination", "to"], "emitters": ["loader"] },
+
+    { "name": "tb_archiver_events_total", "type": "counter", "help": "_tb.<env>.events records consumed by the archiver.", "labels": ["outcome"], "label_values": { "outcome": ["written", "invalid"] }, "emitters": ["archiver"] },
+    { "name": "tb_archiver_attrs_dropped_total", "type": "counter", "help": "attrs entries dropped before storage; the rest of the event is stored (events/v0 4.1 rule 3).", "labels": ["reason"], "label_values": { "reason": ["hmac", "denied_name"] }, "emitters": ["archiver"] },
+    { "name": "tb_archiver_batches_total", "type": "counter", "help": "ClickHouse insert batches.", "labels": ["outcome"], "label_values": { "outcome": ["ok", "failed"] }, "emitters": ["archiver"] },
+    { "name": "tb_archiver_insert_duration_seconds", "type": "histogram", "help": "One ClickHouse insert batch.", "labels": [], "buckets": "delivery", "emitters": ["archiver"] },
+
+    { "name": "tb_api_requests_total", "type": "counter", "help": "API requests by route template, method and status.", "labels": ["route", "method", "http_status"], "emitters": ["api"] },
+    { "name": "tb_api_request_duration_seconds", "type": "histogram", "help": "API request duration.", "labels": ["route", "method"], "buckets": "latency", "emitters": ["api"] }
+  ]
+}

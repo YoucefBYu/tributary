@@ -18,6 +18,7 @@ from typing import Any
 
 import pytest
 from tributary.receivers.mllp.kafka_publisher import RawPublisher
+from tributary.runtime.clients import KafkaSettings
 from tributary.runtime.config import load_topic_defaults
 
 TOPIC_DEFAULTS_PATH = Path(__file__).resolve().parents[4] / "contracts" / "topics" / "v0" / "topic-defaults.json"
@@ -55,7 +56,7 @@ def test_load_topic_defaults_reads_the_same_file_this_test_pins() -> None:
 @pytest.mark.parametrize("key", ["acks", "enable.idempotence", "delivery.timeout.ms"])
 def test_effective_producer_config_matches_the_contract(key: str) -> None:
     contract = _contract_receiver_producer()
-    RawPublisher("localhost:9092", "dev.c.raw")
+    RawPublisher(KafkaSettings("localhost:9092"), "dev.c.raw")
     config = _CapturingProducer.last_config
     assert config is not None
     assert config[key] == contract[key]
@@ -75,7 +76,7 @@ def test_effective_config_cannot_be_downgraded_by_a_caller() -> None:
 
 def test_linger_ms_override_does_not_touch_the_durability_settings() -> None:
     contract = _contract_receiver_producer()
-    RawPublisher("localhost:9092", "dev.c.raw", linger_ms=999)
+    RawPublisher(KafkaSettings("localhost:9092"), "dev.c.raw", linger_ms=999)
     config = _CapturingProducer.last_config
     assert config is not None
     assert config["linger.ms"] == 999

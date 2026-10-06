@@ -1,0 +1,35 @@
+"""`S3RecordHandler`: the `tributary.runtime.consumer.RecordHandler` this loader gives `ConsumerLoop`.
+Synchronous; `handle` returns only once S3 has confirmed the object (or reported it already there), so the
+source offset is committed only after the sink confirms. Any other outcome raises
+`DeliveryError(<tb-error-code>, retryable=...)`. `with.*` is fixed at startup: a change needs a restart.
+"""
+
+from __future__ import annotations
+
+from tributary.runtime.channels import LiveSpecSource
+from tributary.runtime.errors import DeliveryError
+from tributary.runtime.records import ConsumedRecord
+
+from .loader import S3Loader
+
+
+class S3RecordHandler:
+    def __init__(self, loader: S3Loader, *, spec_source: LiveSpecSource, destination: str) -> None:
+        self._loader = loader
+        self._spec_source = spec_source
+        self._destination = destination
+
+    def handle(self, record: ConsumedRecord) -> None:
+        self._spec_source.current()
+        outcome = self._loader.deliver(record.message)
+        if outcome.success:
+            return
+        error_code = "CIRCUIT_OPEN" if outcome.reason == "circuit-open" else outcome.reason
+        raise DeliveryError(error_code, retryable=outcome.retryable)
+
+    def metrics_snapshot(self) -> dict[str, int]:
+        return self._loader.metrics.snapshot()
+
+    def close(self) -> None:
+        self._loader.close()
+        self._spec_source.close()

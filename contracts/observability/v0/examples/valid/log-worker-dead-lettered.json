@@ -1,0 +1,15 @@
+{
+  "ts": "2026-10-05T09:14:03.217Z",
+  "level": "warning",
+  "event": "dead_lettered",
+  "component": "worker",
+  "channel": "adt-synth-in",
+  "channel_version": 4,
+  "destination": "fhir",
+  "message_id": "0192f3a4-5b6c-7d8e-9f01-23456789abcd",
+  "error_code": "TRANSFORM_ERROR",
+  "error": "KeyError",
+  "attempts": 3,
+  "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+  "span_id": "00f067aa0ba902b7"
+}

@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tributary.dev/contracts/engine-kafka/v0/engine-kafka.schema.json",
+  "title": "Tributary engine Kafka connection, v0",
+  "description": "How one data-plane process (receiver, pipeline worker, loader, archiver) connects to THIS engine's own Kafka cluster: bootstrap servers plus transport security and the principal's credentials by secretRef. One document per process, mounted as a file and named by the TB_ENGINE_KAFKA_FILE environment variable. It carries no secret value and no librdkafka property: the client settings invariants 1, 4 and 5 depend on come from contracts/topics/v0 topic-defaults.json and cannot be overridden here. Contract set 1.3 (2026-09-29), ADR-008. See README.md.",
+  "type": "object",
+  "required": ["apiVersion", "kind", "bootstrapServers", "security"],
+  "additionalProperties": false,
+  "$comment": "additionalProperties false at every level, as in the channel spec. In particular there is NO passthrough of librdkafka properties: a free-form map merged into the client config is how acks=all or enable.idempotence=true gets silently overridden (the defect this contract closes in tributary.runtime.clients.KafkaSettings, ADR-008 D4).",
+  "properties": {
+    "apiVersion": { "const": "tributary.dev/v1" },
+    "kind": { "const": "EngineKafkaConnection" },
+    "bootstrapServers": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 16,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/hostPort" },
+      "$comment": "The engine cluster. Replaces the per-role inputs --bootstrap and TB_BOOTSTRAP_SERVERS, which are retired (README 3): bootstrap servers and security live in ONE document so the loopback rule below is checked against both at once. The e3ddee1 finding was the two living in different places."
+    },
+    "security": { "$ref": "#/$defs/security" }
+  },
+  "allOf": [
+    {
+      "$comment": "PLAINTEXT only when every bootstrap server is loopback (topics/v0 3.4). A Docker Compose service name, a Kubernetes service or pod address and host.docker.internal are NOT loopback: traffic to them crosses a network interface other than lo.",
+      "if": {
+        "properties": {
+          "security": { "properties": { "protocol": { "const": "PLAINTEXT" } }, "required": ["protocol"] }
+        },
+        "required": ["security"]
+      },
+      "then": { "properties": { "bootstrapServers": { "items": { "$ref": "#/$defs/loopbackHostPort" } } } }
+    }
+  ],
+  "$defs": {
+    "hostPort": {
+      "type": "string",
+      "pattern": "^(\\[::1\\]|[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?):[0-9]{2,5}$",
+      "$comment": "Same grammar as channel-spec/v0 $defs/hostPort."
+    },
+    "loopbackHostPort": {
+      "type": "string",
+      "pattern": "^(localhost|127\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}|\\[::1\\]):[0-9]{2,5}$",
+      "$comment": "Same grammar as channel-spec/v0 $defs/loopbackHostPort and the runtime's LOOPBACK_HOST_PORT."
+    },
+    "secretRef": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{0,63}$",
+      "$comment": "Resolved from local files at process start (<TB_SECRETS_DIR>/<ref>/<key>, the DirSecretResolver convention), never through the control-plane API or PostgreSQL: invariant 3."
+    },
+    "security": {
+      "type": "object",
+      "required": ["protocol"],
+      "additionalProperties": false,
+      "$comment": "The channel-spec kafkaSecurity shape, tightened for the engine link: SSL must carry a client certificate, because an engine connection without a principal cannot be authorized by the per-component ACLs of topics/v0 3.4. No tls.minVersion: librdkafka cannot enforce one, so the cipher pin in README 4 is the floor.",
+      "properties": {
+        "protocol": { "enum": ["SASL_SSL", "SSL", "PLAINTEXT"] },
+        "saslMechanism": {
+          "enum": ["SCRAM-SHA-512"],
+          "$comment": "topics/v0 3.4 also permits OAUTHBEARER. It is not in v0 because nothing implements it; adding it is additive."
+        },
+        "secretRef": {
+          "$ref": "#/$defs/secretRef",
+          "$comment": "The principal's identity, everything about how this process authenticates: keys `username` and `password` for SASL_SSL; `tls.crt` and `tls.key` for SSL (mTLS). The same layout both Kafka connector implementations already use (README 5)."
+        },
+        "tls": { "$ref": "#/$defs/tls" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "protocol": { "const": "SASL_SSL" } }, "required": ["protocol"] },
+          "then": { "required": ["saslMechanism", "secretRef"] },
+          "else": { "not": { "required": ["saslMechanism"] } }
+        },
+        {
+          "if": { "properties": { "protocol": { "const": "SSL" } }, "required": ["protocol"] },
+          "then": { "required": ["secretRef"] }
+        },
+        {
+          "if": { "properties": { "protocol": { "const": "PLAINTEXT" } }, "required": ["protocol"] },
+          "then": { "not": { "anyOf": [{ "required": ["secretRef"] }, { "required": ["tls"] }] } }
+        }
+      ]
+    },
+    "tls": {
+      "type": "object",
+      "additionalProperties": false,
+      "$comment": "Broker certificate and hostname verification are always on and there is no field that turns them off. secretRef names the trust bundle ONLY (key `ca.crt`); absent means the platform trust store. A client certificate is security.secretRef, never here.",
+      "properties": {
+        "secretRef": { "$ref": "#/$defs/secretRef" }
+      }
+    }
+  }
+}

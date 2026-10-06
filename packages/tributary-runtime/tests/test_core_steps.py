@@ -82,8 +82,9 @@ def test_the_walking_skeleton_example_resolves_to_a_runnable_pipeline() -> None:
 
     assert [step.name for step in steps] == [reference.name for reference in spec.pipeline.steps]
     message = make_message(b"synthetic", key=b"SYNTH-KEY-1", channel=spec.name)
-    for step in steps:
-        outcome = step(message)
+    for node in steps:
+        assert isinstance(node, Step)
+        outcome = node(message)
         assert isinstance(outcome, Message)
         message = outcome
 
@@ -108,11 +109,18 @@ def manifest_entries() -> list[tuple[str, bool, tuple[str, ...]]]:
 
 
 def resolvable(spec: ChannelSpec) -> tuple[bool, list[str]]:
-    """Whether every step in a spec resolves in this distribution, and which ones do not."""
+    """Whether every step in a spec resolves **and binds its `with`** in this distribution.
+
+    Destination steps (README 3.5) count: a runnable example whose destination step does not resolve
+    would fail at load exactly like a pipeline step. Binding counts too, because since README 3.3 set 1.1
+    a step whose `with` does not bind is refused at load, and "resolves" without it would be a claim
+    the worker then contradicts.
+    """
     unresolved: list[str] = []
-    for reference in spec.pipeline.steps:
+    references = [*spec.pipeline.steps, *(ref for destination in spec.destinations for ref in destination.steps)]
+    for reference in references:
         try:
-            load_step(reference)
+            load_step(reference, namespaces=spec.pipeline.step_namespaces)  # N3: the spec's own bindings
         except ChannelSpecError:
             unresolved.append(reference.uses or reference.ref or reference.name)
     return not unresolved, unresolved

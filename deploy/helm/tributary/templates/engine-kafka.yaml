@@ -1,0 +1,11 @@
+{{- range $role := list "receiver" "worker" "loader" "archiver" }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "tb.name" $ }}-engine-kafka-{{ $role }}
+  labels: {{- include "tb.labels" $ | nindent 4 }}
+data:
+  engine-kafka.json: |
+    {{- dict "apiVersion" "tributary.dev/v1" "kind" "EngineKafkaConnection" "bootstrapServers" $.Values.kafka.bootstrapServers "security" (dict "protocol" "SASL_SSL" "saslMechanism" $.Values.kafka.saslMechanism "secretRef" (index $.Values.kafka.roleSecretRefs $role) "tls" (dict "secretRef" $.Values.kafka.caSecretRef)) | toPrettyJson | nindent 4 }}
+{{- end }}

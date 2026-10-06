@@ -1,0 +1,9 @@
+{
+  "apiVersion": "tributary.dev/v1",
+  "kind": "EngineKafkaConnection",
+  "bootstrapServers": ["kafka-0.kafka-brokers.tributary.svc:9094"],
+  "security": {
+    "protocol": "SSL",
+    "tls": { "secretRef": "tb-kafka-ca" }
+  }
+}

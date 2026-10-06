@@ -2,7 +2,7 @@
 
 The public surface a channel bundle imports:
 
-    from tributary.sdk import step, Drop, Message
+    from tributary.sdk import step, splitter, Drop, Reject, Message
 
 Everything a step touches outside itself goes through `ctx` (`tributary.sdk.context`), which is a set
 of protocols with in-memory fakes in `tributary.sdk.fakes`, so a step is unit-testable with no Kafka
@@ -13,7 +13,7 @@ This package has no third-party dependencies and never opens a socket.
 
 from __future__ import annotations
 
-from .context import Context, KeyValueStore, Logger, SecretStore
+from .context import Context, KeyValueStore, Logger, ReplyContext, SecretStore
 from .errors import (
     AttrError,
     DropReasonError,
@@ -24,7 +24,10 @@ from .errors import (
     LogFieldError,
     MissingHeaderError,
     PayloadError,
+    RejectCodeError,
+    ReplyError,
     SecretNotFoundError,
+    StepConfigError,
     StepDefinitionError,
     StepError,
     StepReturnError,
@@ -32,8 +35,8 @@ from .errors import (
     UsrHeaderError,
 )
 from .message import Message
-from .outcome import Drop
-from .step import Step, StepResult, step
+from .outcome import Drop, Reject
+from .step import SplitResult, Splitter, Step, StepResult, splitter, step
 
 __all__ = [
     "AttrError",
@@ -50,14 +53,22 @@ __all__ = [
     "Message",
     "MissingHeaderError",
     "PayloadError",
+    "Reject",
+    "RejectCodeError",
+    "ReplyContext",
+    "ReplyError",
     "SecretNotFoundError",
     "SecretStore",
+    "SplitResult",
+    "Splitter",
     "Step",
+    "StepConfigError",
     "StepDefinitionError",
     "StepError",
     "StepResult",
     "StepReturnError",
     "TributaryError",
     "UsrHeaderError",
+    "splitter",
     "step",
 ]

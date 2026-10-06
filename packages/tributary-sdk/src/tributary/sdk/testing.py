@@ -23,7 +23,7 @@ from .fakes import DEFAULT_NOW, FakeContext
 from .ids import new_traceparent, uuid7
 from .message import Message
 from .outcome import Drop
-from .step import Step, StepResult
+from .step import SplitResult, Splitter, Step, StepResult
 
 DEFAULT_PAYLOAD = b'{"synthetic": true}'
 DEFAULT_SOURCE = "sdk-test:run-step@localhost"
@@ -86,16 +86,42 @@ def run_step(
     message: Message | bytes | str,
     *,
     ctx: Context | None = None,
+    with_: Mapping[str, object] | None = None,
 ) -> StepResult:
     """Run one step against a message (or raw payload bytes) and return `Message` or `Drop`.
+
+    `with_` is the step's `with` block exactly as a channel spec would write it (`{"in": ["A01"]}`), bound
+    through the same binder the runtime uses, so a wrong key fails here with the same `StepConfigError`
+    it would raise at deploy (channel-spec README 3.3). `Reject` propagates: assert it with
+    `pytest.raises(Reject)`.
 
     A `FakeContext` is supplied when none is given. To assert on what the step did through `ctx` —
     attrs, `tb-usr-*` headers, log calls — build the `FakeContext` yourself and pass it in.
     """
     if not isinstance(step, Step):
-        raise TypeError("run_step takes a @step-decorated function")
+        raise TypeError("run_step takes a @step-decorated function; use run_splitter for a @splitter")
+    bound = step if with_ is None else step.bind(with_)
     subject = message if isinstance(message, Message) else make_message(message)
-    return step(subject, ctx if ctx is not None else FakeContext())
+    return bound(subject, ctx if ctx is not None else FakeContext())
+
+
+def run_splitter(
+    splitter: Splitter,
+    message: Message | bytes | str,
+    *,
+    ctx: Context | None = None,
+    with_: Mapping[str, object] | None = None,
+) -> SplitResult:
+    """Run one `@splitter` and return its stamped children (or a `Drop`), exactly as the runtime sees them.
+
+    Children carry their deterministic `tb-msg-id`, `tb-parent-id` and the parent's key, so a test can
+    assert that splitting the same parent twice yields the same ids (channel-spec README 3.3.2).
+    """
+    if not isinstance(splitter, Splitter):
+        raise TypeError("run_splitter takes a @splitter-decorated function")
+    bound = splitter if with_ is None else splitter.bind(with_)
+    subject = message if isinstance(message, Message) else make_message(message)
+    return bound(subject, ctx if ctx is not None else FakeContext())
 
 
 def run_pipeline(
@@ -110,6 +136,9 @@ def run_pipeline(
     visible to a later one, and that is a behaviour a channel's tests should be able to reproduce.
     """
     context = ctx if ctx is not None else FakeContext()
+    steps = tuple(steps)
+    if any(isinstance(node, Splitter) for node in steps):
+        raise TypeError("run_pipeline runs one-to-one steps; test a @splitter with run_splitter")
     current: StepResult = message if isinstance(message, Message) else make_message(message)
     for step in steps:
         if isinstance(current, Drop):

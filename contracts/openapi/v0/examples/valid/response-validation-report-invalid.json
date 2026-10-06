@@ -1,0 +1,10 @@
+{
+  "valid": false,
+  "errors": [
+    { "json_path": "$.spec.destinations[0].retry.policy", "validator": "not" },
+    { "json_path": "$.spec.destinations", "validator": "unique_destination_names" }
+  ],
+  "warnings": [
+    { "code": "SYNC_REPLY_RESEND_DUPLICATES", "json_path": "$.spec.source.reply" }
+  ]
+}

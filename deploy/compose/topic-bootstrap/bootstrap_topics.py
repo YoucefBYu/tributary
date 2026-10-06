@@ -22,6 +22,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,6 +40,170 @@ class TopicSpec:
     partitions: int
     replication_factor: int
     configs: dict[str, str]
+
+
+@dataclass(frozen=True, slots=True)
+class Grant:
+    """One ACL binding, before it is tied to a principal or to confluent-kafka types."""
+
+    resource_type: str  # "TOPIC" | "GROUP" | "CLUSTER"
+    name: str
+    pattern: str  # "LITERAL" | "PREFIXED"
+    operation: str  # AclOperation member name
+
+
+# Which `security.acls` role each compose component takes, and which principal it runs as. The
+# grants themselves are never restated here: they are parsed from the contract (topics README 3.7).
+ROLE_OF_COMPONENT = {
+    "receiver": "receiver",
+    "worker": "pipeline_worker",
+    "loader": "loader",
+    "channel-publish": "control_plane",
+}
+
+_CLAUSE = re.compile(r"^(?P<ops>[A-Z_]+(?:, [A-Z_]+)*) on (?P<rest>.+)$")
+_SYNC_REPLY = "Set 1.2, sync-reply channels only: "
+_PROHIBITION = re.compile(r"^No (?P<op>[A-Z_]+) on (?P<what>[a-z]+)(?:, so .+)?$")
+_KNOWN_OPS = frozenset(
+    {"READ", "WRITE", "DESCRIBE", "IDEMPOTENT_WRITE", "ALL", "CREATE", "DELETE", "ALTER", "CLUSTER_ACTION"}
+)
+DATA_PLANE = frozenset({"receiver", "worker", "loader"})
+_PRINCIPAL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")  # refuses "*" and "User:*" style wildcards
+
+
+def _covers(grant: Grant, topic: str) -> bool:
+    if grant.resource_type != "TOPIC":
+        return False
+    return grant.name == topic if grant.pattern == "LITERAL" else topic.startswith(grant.name)
+
+
+def parse_grants(text: str, *, env: str, channel: str, destinations: tuple[str, ...]) -> list[Grant]:
+    """Turn one `security.acls` role string into concrete bindings.
+
+    The contract states grants as a sentence ("WRITE on <env>.<channel>.out.*, .retry, .dlq; ...").
+    The first sentence is the base grant. Every later sentence must be one of two recognised forms, or
+    this raises: `Set 1.2, sync-reply channels only: ...` (additions for sync-reply channels, which the
+    demo channel is not, so they are not granted here) and `No <OP> on <suffix>, so ...` (a prohibition,
+    enforced against the parsed grants below). Anything else could be a restriction that would silently
+    turn into an unconditional grant if it were dropped, so it is an error, never skipped."""
+    first, *extra = re.split(r"\.\s+", text.strip().rstrip("."))
+    prohibitions: list[tuple[str, str]] = []
+    for sentence in extra:
+        if sentence.startswith(_SYNC_REPLY):
+            continue
+        if m := _PROHIBITION.match(sentence):
+            prohibitions.append((m.group("op"), f"{env}.{channel}.{m.group('what')}"))
+            continue
+        raise ValueError(f"unrecognised ACL sentence: {sentence!r}")
+    grants: list[Grant] = []
+    for clause in first.split(";"):
+        m = _CLAUSE.match(clause.strip())
+        if m is None:
+            raise ValueError(f"unrecognised ACL clause: {clause.strip()!r}")
+        ops, rest = m.group("ops").split(", "), m.group("rest")
+        if unknown := set(ops) - _KNOWN_OPS:
+            raise ValueError(f"unknown ACL operation: {sorted(unknown)}")
+        if rest == "the cluster":
+            grants += [Grant("CLUSTER", "kafka-cluster", "LITERAL", op) for op in ops]
+            continue
+        kind = "TOPIC"
+        if rest.startswith("group "):
+            kind, rest = "GROUP", rest[len("group ") :]
+        for target in re.split(r", | and ", rest):
+            if target.startswith("."):  # relative to the channel prefix
+                target = f"<env>.<channel>{target}"
+            for dest in destinations if "<dest>" in target else (None,):
+                name = target.replace("<env>", env).replace("<channel>", channel)
+                if dest is not None:
+                    name = name.replace("<dest>", dest)
+                if "<" in name or ">" in name:
+                    raise ValueError(f"unresolved placeholder in ACL target: {target!r}")
+                if not name.endswith("*"):
+                    grants += [Grant(kind, name, "LITERAL", op) for op in ops]
+                    continue
+                stem = name[:-1]
+                if dest is not None and stem.endswith(dest):
+                    # `<dest>*` with no delimiter would let a grant for `fhir` also cover `fhir-backup`.
+                    # The destination itself, and anything below it (`<dest>.<suffix>`), and nothing else.
+                    grants += [Grant(kind, stem, "LITERAL", op) for op in ops]
+                    grants += [Grant(kind, stem + ".", "PREFIXED", op) for op in ops]
+                else:
+                    grants += [Grant(kind, stem, "PREFIXED", op) for op in ops]
+    for op, topic in prohibitions:
+        for g in grants:
+            if g.operation in {op, "ALL"} and _covers(g, topic):
+                raise ValueError(f"contract prohibits {op} on {topic}, but a parsed grant allows it")
+    return grants
+
+
+def check_forbidden(component: str, grants: list[Grant], *, env: str) -> None:
+    """`security.acls.forbidden`: no data-plane component gets cluster-wide WRITE, DELETE or ALTER, and
+    none gets WRITE on `_tb.<env>.channels` (a compromised worker must not deploy a channel spec).
+    Enforced on the result, whatever the contract's role strings say. `ALL` counts as each of them,
+    and so does a topic grant on the empty prefix (every topic)."""
+    if component not in DATA_PLANE:
+        return
+    channels = f"_tb.{env}.channels"
+    for g in grants:
+        if g.operation in {"WRITE", "DELETE", "ALTER", "ALL"}:
+            if g.resource_type == "CLUSTER":
+                raise ValueError(f"{component}: forbidden cluster-wide {g.operation}")
+            if g.resource_type == "TOPIC" and g.pattern == "PREFIXED" and g.name == "":
+                raise ValueError(f"{component}: forbidden {g.operation} on every topic")
+        if g.operation in {"WRITE", "ALL"} and _covers(g, channels):
+            raise ValueError(f"{component}: forbidden {g.operation} on {channels}")
+
+
+def derive_acls(
+    defaults: dict[str, Any],
+    *,
+    env: str,
+    channel: str,
+    destinations: tuple[str, ...],
+    principals: dict[str, str],
+    transactional: bool = False,
+) -> list[tuple[str, Grant]]:
+    """(principal, grant) for every component in `principals` (component -> `User:<name>`).
+
+    `transactional`: the channel has `pipeline.transactional: true`. Contract set 1.4 puts the worker's
+    TRANSACTIONAL_ID grant in a separate `pipeline_worker_transactional` key because this parser has no
+    transactional-id target; so a transactional channel is refused rather than bootstrapped without it."""
+    if transactional:
+        raise ValueError(
+            "transactional channels are not supported by the lite bootstrap: "
+            "security.acls.pipeline_worker_transactional needs a TRANSACTIONAL_ID target"
+        )
+    users = list(principals.values())
+    if len(set(users)) != len(users):
+        raise ValueError("two components are mapped to one principal")
+    acls = defaults["security"]["acls"]
+    out: list[tuple[str, Grant]] = []
+    for component, principal in principals.items():
+        if component not in ROLE_OF_COMPONENT:
+            raise ValueError(f"unknown component: {component!r}")
+        if not _PRINCIPAL.match(principal.removeprefix("User:")):
+            raise ValueError(f"invalid principal for {component}")
+        grants = parse_grants(acls[ROLE_OF_COMPONENT[component]], env=env, channel=channel, destinations=destinations)
+        check_forbidden(component, grants, env=env)
+        out += [(principal, g) for g in grants]
+    return out
+
+
+def parse_principals(text: str) -> dict[str, str]:
+    """`receiver=tb-lite-receiver,worker=...` -> component -> `User:<name>`. Refuses wildcards, unknown
+    components, and two components mapped to one user (they would share ACLs)."""
+    result: dict[str, str] = {}
+    for item in filter(None, text.split(",")):
+        component, sep, name = item.partition("=")
+        component, name = component.strip(), name.strip()
+        if not sep or component not in ROLE_OF_COMPONENT:
+            raise ValueError(f"unknown component in principals: {component!r}")
+        if not _PRINCIPAL.match(name):
+            raise ValueError(f"invalid principal name for {component}")
+        result[component] = f"User:{name}"
+    if len(set(result.values())) != len(result):
+        raise ValueError("two components are mapped to one principal")
+    return result
 
 
 def load_defaults(path: Path) -> dict[str, Any]:
@@ -125,17 +290,30 @@ def emit_lite_warning(defaults: dict[str, Any], profile: str) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--bootstrap", default=os.environ.get("KAFKA_BOOTSTRAP", "kafka:9092"))
     p.add_argument("--env", default=os.environ.get("TB_ENV", "dev"))
     p.add_argument("--profile", default=os.environ.get("TB_PROFILE", "lite"), choices=["lite", "production"])
     p.add_argument("--channel", default=os.environ.get("TB_CHANNEL", "adt-passthrough"))
     p.add_argument("--destination", action="append", default=None, help="repeatable; default: http-stub")
     p.add_argument(
+        "--principals",
+        default=os.environ.get("TB_ACL_PRINCIPALS", ""),
+        help="component=scram-user pairs to grant, e.g. receiver=tb-lite-receiver,worker=tb-lite-worker",
+    )
+    p.add_argument(
         "--defaults", type=Path, default=Path(os.environ.get("TB_TOPIC_DEFAULTS", str(DEFAULT_DEFAULTS_PATH)))
     )
     args = p.parse_args(argv)
 
-    from confluent_kafka.admin import AdminClient, NewTopic  # type: ignore[attr-defined]  # deferred import
+    from confluent_kafka.admin import (  # type: ignore[attr-defined]  # deferred import
+        AclBinding,
+        AclOperation,
+        AclPermissionType,
+        AdminClient,
+        NewTopic,
+        ResourcePatternType,
+        ResourceType,
+    )
+    from kafka_conn import KafkaConnError, load_client_config
 
     defaults = load_defaults(args.defaults)
     emit_lite_warning(defaults, args.profile)
@@ -144,7 +322,11 @@ def main(argv: list[str] | None = None) -> int:
         defaults, env=args.env, profile=args.profile, channel=args.channel, destinations=destinations
     )
 
-    admin = AdminClient({"bootstrap.servers": args.bootstrap})
+    try:
+        admin = AdminClient(load_client_config())
+    except KafkaConnError as exc:
+        log.error(json.dumps({"status": "no-kafka-connection", "reason": str(exc)}))
+        return 1
     new_topics = [
         NewTopic(t.name, num_partitions=t.partitions, replication_factor=t.replication_factor, config=t.configs)
         for t in topics
@@ -161,6 +343,37 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 failed = True
                 log.error(json.dumps({"topic": name, "status": "failed", "reason": type(exc).__name__}))
+    if failed:
+        return 1
+
+    # Deny-by-default cluster: nothing but these grants lets a data-plane principal touch a topic.
+    acls = derive_acls(
+        defaults,
+        env=args.env,
+        channel=args.channel,
+        destinations=destinations,
+        principals=parse_principals(args.principals),
+    )
+    bindings = [
+        AclBinding(
+            # confluent-kafka names the cluster resource (Kafka's "kafka-cluster") ResourceType.BROKER.
+            getattr(ResourceType, "BROKER" if g.resource_type == "CLUSTER" else g.resource_type),
+            g.name,
+            getattr(ResourcePatternType, g.pattern),
+            principal,
+            "*",
+            getattr(AclOperation, g.operation),
+            AclPermissionType.ALLOW,
+        )
+        for principal, g in acls
+    ]
+    for future in admin.create_acls(bindings, request_timeout=30).values():
+        try:
+            future.result()
+        except Exception as exc:
+            failed = True
+            log.error(json.dumps({"acl": "create", "status": "failed", "reason": type(exc).__name__}))
+    log.info(json.dumps({"acls": len(bindings), "status": "failed" if failed else "applied"}))
     return 1 if failed else 0
 
 

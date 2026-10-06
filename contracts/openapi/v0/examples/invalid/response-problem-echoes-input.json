@@ -1,0 +1,7 @@
+{
+  "type": "https://tributary.dev/problems/spec-invalid",
+  "title": "The channel document is invalid",
+  "status": 422,
+  "code": "SPEC_INVALID",
+  "input": { "metadata": { "name": "adt-fanout" }, "spec": { "destinations": [{ "with": { "url": "https://primary.example.org/ingest?token=SYNTH" } }] } }
+}

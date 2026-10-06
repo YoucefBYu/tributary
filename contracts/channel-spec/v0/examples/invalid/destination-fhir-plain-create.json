@@ -1,0 +1,27 @@
+{
+  "apiVersion": "tributary.dev/v1",
+  "kind": "Channel",
+  "metadata": { "name": "adt-passthrough" },
+  "spec": {
+    "ordering": "none",
+    "source": { "type": "mllp", "bind": "127.0.0.1", "port": 6661, "ack": { "mode": "after-commit" } },
+    "pipeline": {
+      "bundle": "ghcr.io/tributary-synth/adt-integration@sha256:3f7a1c9e2b5d48a06e1f8c3d7b2a95e04c6d8f1a3b5c7d9e0f2a4b6c8d0e2f46",
+      "steps": [{ "name": "passthrough", "uses": "tributary.core.passthrough" }]
+    },
+    "destinations": [
+      {
+        "name": "fhir-server",
+        "type": "fhir",
+        "with": {
+          "url": "https://fhir.example.org/fhir",
+          "fhirVersion": "4.0.1",
+          "interaction": "create",
+          "timeoutMs": 8000
+        },
+        "idempotency": { "technique": "conditional-update" },
+        "retry": { "policy": "blocking", "maxAttempts": 5, "onExhaust": "halt-partition" }
+      }
+    ]
+  }
+}

@@ -1,0 +1,43 @@
+{
+  "entry": [
+    {
+      "fullUrl": "urn:uuid:test-1",
+      "request": {
+        "method": "PUT",
+        "url": "Patient?identifier=urn:id:SYNTH-HOSPITAL|9000001"
+      },
+      "resource": {
+        "birthDate": "1980-01-15",
+        "gender": "male",
+        "identifier": [
+          {
+            "system": "urn:id:SYNTH-HOSPITAL",
+            "type": {
+              "coding": [
+                {
+                  "code": "MR",
+                  "display": "Medical record number",
+                  "system": "http://terminology.hl7.org/CodeSystem/v2-0203"
+                }
+              ]
+            },
+            "value": "9000001"
+          }
+        ],
+        "name": [
+          {
+            "family": "SYNTHPATIENT",
+            "given": [
+              "ALPHA",
+              "Q"
+            ],
+            "use": "official"
+          }
+        ],
+        "resourceType": "Patient"
+      }
+    }
+  ],
+  "resourceType": "Bundle",
+  "type": "transaction"
+}

@@ -24,22 +24,37 @@ because this package is now runtime-driven (see `mllp/__init__.py`: there is sti
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import re
 import threading
+import time
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from functools import lru_cache
 
 from tributary.runtime.clients import KafkaSettings, producer_config
 from tributary.runtime.config import TopicDefaults, load_topic_defaults
+from tributary.runtime.errors import KafkaSecurityError
 from tributary.sdk import Message, ids
 from tributary.sdk import headers as h
 from tributary.sdk.errors import EnvelopeError
-from tributary.sdk.projection import validate_for_produce
+from tributary.sdk.projection import Ordering, validate_for_produce
+
+from ..errors import PermanentPublishError
 
 _ENV = re.compile(r"^[a-z][a-z0-9-]{0,15}$")
 _CHANNEL = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
 
 CONTENT_TYPE = "application/hl7-v2+er7"
+
+#: Readiness (`contracts/observability/v0` 2.3, R1): while the producer reports every broker down, one
+#: metadata probe at most this often, each bounded by `PROBE_TIMEOUT_S`, tells it that it has recovered.
+PROBE_INTERVAL_S = 5.0
+PROBE_TIMEOUT_S = 2.0
+#: The warm-up round trip (2.4 W1): long enough for the first connection, short enough to retry.
+WARM_TIMEOUT_S = 5.0
+_ALL_DOWN = "_ALL_BROKERS_DOWN"
+_FATAL = "_FATAL"
 
 
 def topic_name(env: str, channel: str) -> str:
@@ -53,12 +68,23 @@ def topic_name(env: str, channel: str) -> str:
 
 
 def build_raw_envelope(
-    *, channel: str, channel_version: int, source: str, payload: bytes, key: bytes | None
+    *,
+    channel: str,
+    channel_version: int,
+    source: str,
+    payload: bytes,
+    key: bytes | None,
+    reply_headers: Mapping[str, str] | None = None,
 ) -> Message:
     """The `class: raw` envelope for one received message: a fresh `tb-msg-id`, no `tb-attempt`
-    beyond `0` (this is the first hop), a fresh `traceparent` (this receiver starts the trace)."""
+    beyond `0` (this is the first hop), a fresh `traceparent` (this receiver starts the trace).
+
+    `reply_headers` is synchronous reply mode's `tb-correlation-id`, `tb-reply-partition` and
+    `tb-reply-deadline` (`reply/pending.py`): engine-minted ids, an integer and a timestamp. The sender's own
+    control id is never a header."""
     return Message(
         headers={
+            **(reply_headers or {}),
             h.TB_MSG_ID: ids.uuid7(),
             h.TB_CHANNEL: channel,
             h.TB_CHANNEL_VERSION: str(channel_version),
@@ -71,6 +97,9 @@ def build_raw_envelope(
         payload=payload,
         key=key,
     )
+
+
+_SSL_CLIENT_CERT_KEYS = ("ssl.certificate.location", "ssl.key.location")
 
 
 @lru_cache(maxsize=1)
@@ -99,27 +128,49 @@ class RawPublisher:
 
     def __init__(
         self,
-        bootstrap_servers: str,
+        kafka: KafkaSettings,
         topic: str,
         *,
         linger_ms: int | None = None,
         queue_max_messages: int = 100_000,
-        security: dict[str, object] | None = None,
         topic_defaults: TopicDefaults | None = None,
+        ordering: Ordering = "none",
+        client_id_prefix: str = "mllp-receiver",
     ) -> None:
         from confluent_kafka import Producer  # lazy: unit tests need no broker client
 
+        # `parse_engine_kafka` requires a client certificate for SSL, but an embedded caller can build
+        # server-auth-only `KafkaSettings` directly. The receiver principal authenticates by mTLS
+        # (contracts/engine-kafka/v0), so refuse here rather than connect anonymously-by-cert.
+        if kafka.protocol == "SSL" and not all(k in kafka.security for k in _SSL_CLIENT_CERT_KEYS):
+            raise KafkaSecurityError("security.protocol SSL requires ssl.certificate.location and ssl.key.location")
+
         self.topic = topic
+        self._ordering: Ordering = ordering
         defaults = topic_defaults if topic_defaults is not None else _cached_topic_defaults()
-        settings = KafkaSettings(bootstrap_servers=bootstrap_servers, security=security or {})
-        config = producer_config(settings, defaults, client_id=f"mllp-receiver-{topic}")
+        config = producer_config(kafka, defaults, client_id=f"{client_id_prefix}-{topic}")
         if linger_ms is not None:
             config["linger.ms"] = linger_ms  # not in the contract's must_not_hardcode list
         config["queue.buffering.max.messages"] = queue_max_messages
         config["socket.keepalive.enable"] = True
+        config["error_cb"] = self._on_error
         self._producer = Producer(config)
+        self._warmed = False
+        self._all_brokers_down = False
+        self._fatal = False
+        self._probe_lock = threading.Lock()
+        self._probe_in_flight = False
+        self._probe_thread: threading.Thread | None = None
+        self._next_probe_at = 0.0
+        #: Bumped on every `_ALL_BROKERS_DOWN`. A probe or warm-up that began before the latest one proves nothing
+        #: about it, so it may not clear the flag.
+        self._down_generation = 0
+        #: Called once, on the producer's poll thread, when librdkafka reports a fatal error. The runner hops
+        #: to its event loop and exits non-zero (observability/v0 R2).
+        self.fatal_handler: Callable[[], None] | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stop = threading.Event()
+        self._closed = False
         self._poller = threading.Thread(target=self._poll, daemon=True, name="raw-publisher-poll")
 
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
@@ -129,27 +180,123 @@ class RawPublisher:
     def _poll(self) -> None:
         while not self._stop.is_set():
             self._producer.poll(0.005)
+            if self._all_brokers_down:
+                self._maybe_probe()
+
+    # -- readiness (state only; nothing here is called on a request path that waits for Kafka) ------
+
+    @property
+    def warmed(self) -> bool:
+        return self._warmed
+
+    def readiness_reason(self) -> str | None:
+        """`None` when ready, else a closed reason from `readiness.schema.json` (`raw_producer` check)."""
+        if self._fatal:
+            return "fatal"
+        if not self._warmed:
+            return "not_warmed"
+        if self._all_brokers_down:
+            return "all_brokers_down"
+        return None
+
+    def _on_error(self, error: object) -> None:
+        """librdkafka `error_cb`, on the poll thread. Only the symbolic name is read, never the text."""
+        name = ""
+        fatal = False
+        with contextlib.suppress(Exception):
+            name = str(error.name())  # type: ignore[attr-defined]
+            fatal = bool(error.fatal())  # type: ignore[attr-defined]
+        if fatal or name == _FATAL:
+            if not self._fatal:
+                self._fatal = True
+                handler = self.fatal_handler
+                if handler is not None:
+                    with contextlib.suppress(Exception):
+                        handler()
+        elif name == _ALL_DOWN:
+            self._down_generation += 1
+            self._all_brokers_down = True
+
+    def _metadata_names_every_leader(self, timeout_s: float) -> bool:
+        """One metadata round trip for this topic: it exists and every partition has a leader."""
+        try:
+            metadata = self._producer.list_topics(self.topic, timeout=timeout_s)
+        except Exception:
+            return False
+        topic = metadata.topics.get(self.topic)
+        if topic is None or topic.error is not None or not topic.partitions:
+            return False
+        for detail in topic.partitions.values():
+            if getattr(detail, "error", None) is not None or getattr(detail, "leader", -1) < 0:
+                return False
+        return True
+
+    def warm_up(self, timeout_s: float = WARM_TIMEOUT_S) -> bool:
+        """Blocking (run it off the event loop): the warm-up of observability/v0 2.4. True once the reply names
+        a leader for every partition of `<env>.<channel>.raw`; `warmed` stays False otherwise."""
+        generation = self._down_generation
+        if self._metadata_names_every_leader(timeout_s):
+            self._warmed = True
+            if generation == self._down_generation:
+                self._all_brokers_down = False
+            return True
+        return False
+
+    def _maybe_probe(self) -> None:
+        now = time.monotonic()
+        with self._probe_lock:
+            if self._probe_in_flight or now < self._next_probe_at:
+                return
+            self._probe_in_flight = True
+            self._next_probe_at = now + PROBE_INTERVAL_S
+        thread = threading.Thread(target=self._probe, name="raw-publisher-probe", daemon=True)
+        thread.start()
+        self._probe_thread = thread  # after start: `close` joins it only once it is running
+
+    def _probe(self) -> None:
+        generation = self._down_generation
+        try:
+            if self._closed:
+                return  # the producer is closing: no metadata call on it
+            if self._metadata_names_every_leader(PROBE_TIMEOUT_S) and generation == self._down_generation:
+                self._all_brokers_down = False
+        finally:
+            with self._probe_lock:
+                self._probe_in_flight = False
 
     def close(self, timeout_s: float = 5.0) -> None:
-        self._stop.set()
+        """Flush what is in flight, then refuse every later `publish` (it returns `False`: not committed, so
+        the caller NACKs). Set before the flush, so nothing new can slip in behind it. Idempotent."""
+        self._closed = True
         self._producer.flush(timeout_s)
+        self._stop.set()  # the poller keeps running through the flush: it delivers the reports
+        probe = self._probe_thread
+        if probe is not None:
+            probe.join(PROBE_TIMEOUT_S + 0.5)  # bounded: `list_topics` honours its timeout
 
     async def publish(self, message: Message, *, timeout_s: float) -> bool:
-        """`True` once committed, `False` on any failure, a full local queue, or `timeout_s`
+        """Raises `PermanentPublishError` for a record that breaks the envelope contract (retrying cannot
+        help). Otherwise `True` once committed, `False` on any failure, a full local queue, or `timeout_s`
         elapsing first — every one of those is "not committed," so every one of them is a NACK,
         never a dropped message that was silently ACKed (invariant 1)."""
         loop = self._loop
         if loop is None:
             raise RuntimeError("RawPublisher.start() must run before publish() is awaited")
+        if self._closed:
+            return False  # a closed producer commits nothing: never ACK
         try:
-            # ordering: none is the only mode this wave's receiver builds (config.py); a null key
-            # is the correct, contract-conformant shape for it, not a thing to special-case away.
-            validate_for_produce(message, topic_class="raw", ordering="none")
+            # `ordering` is the channel's, fixed at construction: `none` (the MLLP receiver's only mode)
+            # takes a null key, `per-key` refuses a record whose key did not resolve (invariant 5).
+            validate_for_produce(message, topic_class="raw", ordering=self._ordering)
         except EnvelopeError:
-            return False  # never produce a record that would fail the envelope contract
+            # Never produce a record that would fail the envelope contract. Not `False`: that means "try again".
+            raise PermanentPublishError("record breaks the envelope contract") from None
         future: asyncio.Future[bool] = loop.create_future()
 
         def on_delivery(err: object, _msg: object) -> None:
+            if err is None:
+                self._all_brokers_down = False  # a delivery report proves the brokers answer (R1)
+
             def set_result() -> None:
                 if not future.done():
                     future.set_result(err is None)

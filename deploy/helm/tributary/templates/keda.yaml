@@ -1,0 +1,64 @@
+{{- if .Values.keda.enabled }}
+{{- if .Values.channels }}
+---
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: {{ include "tb.name" . }}-kafka
+  labels: {{- include "tb.labels" . | nindent 4 }}
+spec:
+  secretTargetRef:
+    - {parameter: sasl, name: {{ .Values.keda.authSecretRef }}, key: sasl}
+    - {parameter: username, name: {{ .Values.keda.authSecretRef }}, key: username}
+    - {parameter: password, name: {{ .Values.keda.authSecretRef }}, key: password}
+    - {parameter: tls, name: {{ .Values.keda.authSecretRef }}, key: tls}
+    - {parameter: ca, name: {{ .Values.keda.authSecretRef }}, key: ca}
+{{- end }}
+{{- range $ch := .Values.channels }}
+{{- /* Worker: group tb.<env>.<ch>.pipeline on <env>.<ch>.raw. Loader: tb.<env>.<ch>.loader.<d> on <env>.<ch>.out.<d>. */}}
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ include "tb.name" $ }}-{{ $ch.name }}-worker
+  labels: {{- include "tb.labels" $ | nindent 4 }}
+spec:
+  scaleTargetRef: {name: {{ include "tb.name" $ }}-{{ $ch.name }}-worker}
+  minReplicaCount: {{ $.Values.keda.minReplicaCount }}
+  maxReplicaCount: {{ $.Values.keda.maxReplicaCount }}
+  pollingInterval: {{ $.Values.keda.pollingInterval }}
+  cooldownPeriod: {{ $.Values.keda.cooldownPeriod }}
+  triggers:
+    - type: kafka
+      metadata:
+        bootstrapServers: {{ join "," $.Values.kafka.bootstrapServers | quote }}
+        consumerGroup: {{ printf "tb.%s.%s.pipeline" $.Values.env $ch.name | quote }}
+        topic: {{ printf "%s.%s.raw" $.Values.env $ch.name | quote }}
+        lagThreshold: {{ $.Values.keda.lagThreshold | quote }}
+        offsetResetPolicy: earliest
+      authenticationRef: {name: {{ include "tb.name" $ }}-kafka}
+{{- range $d := $ch.destinations }}
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ include "tb.name" $ }}-{{ $ch.name }}-loader-{{ $d.name }}
+  labels: {{- include "tb.labels" $ | nindent 4 }}
+spec:
+  scaleTargetRef: {name: {{ include "tb.name" $ }}-{{ $ch.name }}-loader-{{ $d.name }}}
+  minReplicaCount: {{ $.Values.keda.minReplicaCount }}
+  maxReplicaCount: {{ $.Values.keda.maxReplicaCount }}
+  pollingInterval: {{ $.Values.keda.pollingInterval }}
+  cooldownPeriod: {{ $.Values.keda.cooldownPeriod }}
+  triggers:
+    - type: kafka
+      metadata:
+        bootstrapServers: {{ join "," $.Values.kafka.bootstrapServers | quote }}
+        consumerGroup: {{ printf "tb.%s.%s.loader.%s" $.Values.env $ch.name $d.name | quote }}
+        topic: {{ printf "%s.%s.out.%s" $.Values.env $ch.name $d.name | quote }}
+        lagThreshold: {{ $.Values.keda.lagThreshold | quote }}
+        offsetResetPolicy: earliest
+      authenticationRef: {name: {{ include "tb.name" $ }}-kafka}
+{{- end }}
+{{- end }}
+{{- end }}

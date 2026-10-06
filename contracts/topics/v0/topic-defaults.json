@@ -18,6 +18,10 @@
       "clients.worker_consumer.session.timeout.ms",
       "clients.worker_consumer.heartbeat.interval.ms",
       "clients.worker_consumer.commit_every",
+      "clients.reply_consumer.session.timeout.ms",
+      "clients.reply_consumer.heartbeat.interval.ms",
+      "clients.reply_consumer.auto.offset.reset",
+      "clients.reply_consumer.isolation.level",
       "clients.receiver_producer.acks",
       "clients.receiver_producer.enable.idempotence",
       "clients.receiver_producer.delivery.timeout.ms",
@@ -53,6 +57,7 @@
     "raw": {
       "partitions": 3,
       "partitions_source": "MEASURED (S4, ADR-002 D5): 1,000 channels at 3 partitions per topic = 12,009 partitions, healthy on 3 brokers with 1 GB heap. At the former default of 12 the cluster was lost at about 425-450 channels, failing the 500-channel threshold. Override per channel where throughput needs more.",
+      "max.message.bytes_source": "DECIDED 2026-09-26, kept at 1,048,576; NOT an envelope control. Kafka checks max.message.bytes against the record BATCH AFTER COMPRESSION, and raw is compression.type=producer (receivers send lz4). So no value here can make the broker refuse a payload over the envelope's 1,000,000-byte inline limit: a compressible 5 MB HL7 payload passes as a small lz4 batch. The gap above 1,000,000 is therefore not 48,576 bytes but unbounded for compressible data. Lowering to the envelope-derived bound (conservative upper bound 1,019,105 = 61 batch header + 36 worst-case record varints and attributes + 256 key + 1,000,000 payload + 32 x 10 header-length varints + 32 x 64 header names + 16,384 header values) would refuse only uncompressed or incompressible oversize records, and would read as a guarantee it does not give. The controls that do hold: WRITE on raw only for the receiver principal (README 3.4); receivers refuse input over 1,000,000 bytes (channel-spec 3.2.2); a worker that cannot dead-letter halts the partition with TB_DLQ_UNWRITABLE (envelope 2.3.2). Real fix: claim-check.",
       "configs": {
         "cleanup.policy": "delete",
         "retention.ms": 604800000,
@@ -99,7 +104,8 @@
     },
     "reply": {
       "partitions": 3,
-      "partitions_source": "matches the channel default (S4). Sync-reply channels add a fifth topic, so the sharing trigger's channels x 4 x partitions projection understates them.",
+      "partitions_source": "matches the channel default (S4). Set 1.2: overridden ONLY by channel-spec spec.source.reply.partitions (1-64), never by spec.partitions, because the reply topic is sized by receiver processes, not throughput: each process must hold at least one partition (README 3.3.1). It need not match raw - replies are routed to an explicit partition, not by key hash. Sync-reply channels add a fifth topic, so the sharing trigger's channels x 4 x partitions projection understates them: add reply.partitions per sync channel.",
+      "created_when": "Only for a channel whose spec has source.reply (set 1.2). An async channel has no reply topic.",
       "configs": {
         "cleanup.policy": "delete",
         "retention.ms": 600000,
@@ -160,7 +166,7 @@
       "inter.broker.listener.name": "an internal listener using SASL_SSL or mTLS",
       "authorizer.class.name": "org.apache.kafka.metadata.authorizer.StandardAuthorizer",
       "allow.everyone.if.no.acl.found": "false",
-      "super.users": "TODO deployment-specific. The topic-creation job and the control plane only; never a data-plane component.",
+      "super.users": "Set 1.4.1: the broker's own identity (inter-broker and controller links), the topic-creation job and an operator admin principal. A one-shot user-provisioning identity, where the deployment has one, is NOT a super user: it holds only ALTER on CLUSTER (what AlterUserScramCredentials needs; the same grant authorises CreateAcls, so its key is super-user-grade). NEVER a data-plane component, NEVER the control plane's channel publisher (it holds only its control_plane grants), NEVER User:ANONYMOUS. Principal names are deployment-specific; the lite stack's are in engine-kafka/v0 README section 6 rule 3.",
       "ssl.client.auth": "required, when using mTLS"
     },
     "clients": {
@@ -168,7 +174,8 @@
       "sasl.mechanism": "SCRAM-SHA-512 or OAUTHBEARER. Never PLAIN on a listener without TLS.",
       "ssl.endpoint.identification.algorithm": "https",
       "ssl.endpoint.identification.algorithm_note": "Leave hostname verification enabled. Disabling it is the single most common way a TLS Kafka deployment silently accepts a man-in-the-middle.",
-      "credentials": "TODO deployment-specific, resolved from a secretRef or a secrets manager. Never in a channel spec, a Compose file or an image."
+      "credentials": "Set 1.3 (ADR-008): every data-plane process reads one contracts/engine-kafka/v0 document named by TB_ENGINE_KAFKA_FILE (bootstrap servers, protocol, secretRef names), and resolves the secretRefs from local files under TB_SECRETS_DIR at start. The principal names are deployment-specific and ADR-004's. Never in a channel spec, a Compose file or an image; the Compose lite stack generates per-component SCRAM users at `up`.",
+      "plaintext": "Loopback brokers only (127.0.0.0/8, [::1], localhost), enforced by every data-plane role, with no opt-out flag or profile. A container network is not loopback. engine-kafka/v0 section 4."
     },
     "encryption_at_rest": {
       "required": true,
@@ -182,10 +189,15 @@
     },
     "acls": {
       "model": "Deny by default, least privilege per component, granted on the topic prefix <env>.<channel>. so one channel's compromise does not read another's traffic.",
-      "receiver": "WRITE, DESCRIBE on <env>.<channel>.raw; IDEMPOTENT_WRITE on the cluster",
-      "pipeline_worker": "READ on <env>.<channel>.raw; WRITE on <env>.<channel>.out.*, .retry, .dlq; WRITE on _tb.<env>.events; READ on _tb.<env>.channels; READ on group tb.<env>.<channel>.pipeline*",
-      "loader": "READ on <env>.<channel>.out.<dest> and .retry; WRITE on .retry and .dlq; WRITE on _tb.<env>.events; READ on group tb.<env>.<channel>.loader.<dest>*",
-      "archiver": "READ on _tb.<env>.events; READ on group tb.<env>.archiver*",
+      "grammar": "Set 1.4. Each role string is parsed by the lite topic-bootstrap (deploy/compose/topic-bootstrap/bootstrap_topics.py parse_grants), so keep its form: a first sentence of '<OPS> on <targets>' clauses separated by ';', then only 'Set 1.2, sync-reply channels only: ...' or 'No <OP> on <kind>, so ...' sentences. A target without '*' is a LITERAL resource; a target ending '*' is PREFIXED on everything before the '*', so every prefix here ends at a '.' or '-' delimiter; 'group ' names a consumer group; 'the cluster' is the cluster resource. READ and WRITE imply DESCRIBE in Kafka's authorizer, so DESCRIBE is not listed separately.",
+      "reconciled_with_code": "Set 1.4, 2026-09-29: every grant below is one a role's code path uses, found by reading packages/tributary-runtime (worker.py, channels.py, topics.py), packages/tributary-loaders/*/main.py and packages/tributary-receivers. No role holds a grant no code uses, except the receiver's _tb.<env>.channels READ, granted ahead of its invariant-3 migration (README 3.4.1).",
+      "receiver": "WRITE, DESCRIBE on <env>.<channel>.raw; IDEMPOTENT_WRITE on the cluster; READ on _tb.<env>.channels; READ on group tb.<env>.<channel>.channels.*. Set 1.2, sync-reply channels only: READ on <env>.<channel>.reply and READ on group tb.<env>.<channel>.replier. No WRITE on reply, so a receiver cannot forge an answer",
+      "pipeline_worker": "READ on <env>.<channel>.raw; WRITE on <env>.<channel>.out.*, .dlq; WRITE on _tb.<env>.events; READ on _tb.<env>.channels; READ on group tb.<env>.<channel>.pipeline and tb.<env>.<channel>.pipeline.shadow-*; READ on group tb.<env>.<channel>.channels.*. Set 1.2, sync-reply channels only: WRITE on <env>.<channel>.reply",
+      "pipeline_worker_transactional": "Set 1.4. Only for a channel with pipeline.transactional true, in addition to pipeline_worker: WRITE on the TRANSACTIONAL_ID resource PREFIXED tb.<env>.<channel>.pipeline. (the clients.transactional_stage_producer transactional.id template). Kept out of the pipeline_worker string because the lite parser has no transactional-id target and the demo channel is not transactional; without the grant the worker fails at init_transactions with TRANSACTIONAL_ID_AUTHORIZATION_FAILED, before consuming (fail closed).",
+      "loader": "READ on <env>.<channel>.out.<dest>; WRITE on <env>.<channel>.dlq; WRITE on _tb.<env>.events; READ on _tb.<env>.channels; READ on group tb.<env>.<channel>.loader.<dest>; READ on group tb.<env>.<channel>.channels.*",
+      "loader_retry_topic": "Set 1.4, NOT GRANTED in v0: retry.policy retry-topic is refused by the schema and no code reads or writes <env>.<channel>.retry. When it lifts (channel-spec README 4.1.1), the loader gains READ, WRITE on <env>.<channel>.retry and consumes it in its OWN destination group tb.<env>.<channel>.loader.<dest>, filtering on tb-destination. A channel-wide retry group is forbidden: topics README 3.4.1.",
+      "archiver": "READ on _tb.<env>.events; READ on group tb.<env>.archiver",
+      "archiver_note": "Set 1.8: group grant LITERAL (was PREFIXED tb.<env>.archiver*, which broke rule 2 of README 3.4.1 and would also have matched the groups of a channel named 'archiver'). Group name as built in W3-2a (tributary.archiver.config.archiver_group, per archive-engineer's report; the architect has not read the code). Still owed: confirm the archiver touches no other topic, group or cluster resource (W3-23 style exact-grant test).",
       "control_plane": "WRITE on _tb.<env>.channels and _tb.<env>.audit; DESCRIBE on the cluster",
       "forbidden": "No data-plane component gets cluster-wide WRITE, DELETE or ALTER, and none gets WRITE on _tb.<env>.channels — a compromised worker must not be able to deploy a channel spec.",
       "open_question": "The complete role model, credential rotation and key management are ADR-004 plus a human decision. This block is the minimum shape that the config contract must state, not the finished model."
@@ -220,10 +232,28 @@
       "commit_every_source": "MEASURED (S5): committing every 50 records instead of every 1 gave 4.9x throughput (151 -> 733 msg/s) for a replay window of 50 instead of 1. Invariant 4 requires loader idempotency on tb-msg-id anyway, so a window of 1 buys little. 50 is the value that was measured; the surrounding curve was not, so it is a measured point rather than an optimum.",
       "commit_every_note": "This is the REPLAY WINDOW: after an unclean worker death, up to this many records are redelivered (S5 measured 12 replayed at commit_every=20). At-least-once permits that and an idempotent loader absorbs it. A destination declaring idempotency.technique 'none' in its channel spec has no such absorber, so up to 50 visible duplicates at that destination is the consequence - lower it per destination, or accept it in the justification note the channel spec already requires.",
       "commit_every_scope": "Deployment-level in v0. Deliberately NOT a channel-spec field: it is an operational tuning knob rather than channel semantics, and there is no evidence yet about per-destination variation. Revisit when there is."
+    },
+    "reply_consumer": {
+      "$comment": "Set 1.2 (W2-8). The receiver's consumer of <env>.<channel>.reply in synchronous reply mode, one per receiver process, in group tb.<env>.<channel>.replier. Kafka's assignment IS the lease on a reply partition; there is no coordinator (invariant 3). README 3.3.1.",
+      "group": "tb.<env>.<channel>.replier",
+      "enable.auto.commit": false,
+      "commits": "never. A reply older than this process's pending map is useless, so there is nothing to resume from",
+      "auto.offset.reset": "latest",
+      "isolation.level": "read_uncommitted",
+      "isolation.level_source": "the reply producer is not transactional: sync reply is refused on transactional channels (channel-spec README 3.2.6)",
+      "partition.assignment.strategy": "cooperative-sticky",
+      "group.instance.id": "unique PER PROCESS (not per pod or receiver instance): a duplicate fences a live process out of the group",
+      "group.instance.id_format": "<instance>-p<pid>. Set 1.7: --instance is REQUIRED when source.reply is present (no default; the pid is 1 in every container, so a default collides across replicas). Deployment rule: unique per receiver replica of a channel per environment; Helm templates it from the pod name (downward API metadata.name or StatefulSet ordinal), Compose sets it per service. A fenced process (librdkafka _FATAL) is not ready and exits non-zero",
+      "session.timeout.ms": 15000,
+      "heartbeat.interval.ms": 5000,
+      "session.timeout.ms_source": "same measured value as worker_consumer (S5, S4). Here it bounds how long a killed process's reply partition stays unusable; it stalls no other process",
+      "read_from_here": "Set 1.7. These are the reply consumer's own typed values (int ms; auto.offset.reset and isolation.level strings). The receiver reads them from clients.reply_consumer, NOT from clients.worker_consumer and not as literals: equal today, but a Linux re-measurement of the worker's session timeout must not move the replier's silently, nor the reverse (README 3.7)",
+      "advertise_rule": "A process advertises partition p in tb-reply-partition only after it holds p AND its consumer has an established fetch position on p. With auto.offset.reset=latest and no committed offsets, a reply written between assignment and the offset reset would otherwise be skipped",
+      "not_ready_rule": "A process holding no reply partition, or whose reply consumer is disconnected, answers sync requests AR / REPLY_UNAVAILABLE before publishing and fails its readiness probe"
     }
   },
   "partition_budget": {
-    "$comment": "MEASURED (S4, ADR-002 D4). Projected total partitions = channels x 4 x partitions (a sync-reply channel has 5 topics). Applies per tenant partition group, since a share group may not cross a tenant boundary.",
+    "$comment": "MEASURED (S4, ADR-002 D4). Projected total partitions = channels x 4 x partitions, plus reply.partitions for each sync-reply channel (set 1.2: its fifth topic is sized separately). Applies per tenant partition group, since a share group may not cross a tenant boundary.",
     "warn_at_partitions": 8000,
     "warn_at_partitions_basis": "judgement, NOT a measurement",
     "share_new_channels_at_partitions": 12000,
@@ -233,6 +263,16 @@
   },
   "consumer_groups": {
     "pattern": "tb.<env>.<channel>.<role>[.<destination>][.shadow-<label>]",
-    "roles": ["pipeline", "loader", "replier", "archiver"]
+    "roles": ["pipeline", "loader", "replier", "receiver"],
+    "platform_groups": {
+      "$comment": "Set 1.8. Environment-wide groups with no channel segment. The archiver reads _tb.<env>.events for every channel, so 'archiver' moved out of roles, where the pattern implied a per-channel group nothing builds.",
+      "archiver": "tb.<env>.archiver"
+    },
+    "roles_note": "replier (set 1.2) = the receivers' reply-consumer group in synchronous reply mode, on this engine's cluster (clients.reply_consumer). receiver (set 1.1) = a kafka source's group on the EXTERNAL cluster it reads; README 3.6 added it in set 1.1 and this list omitted it until set 1.2",
+    "spec_reader": {
+      "$comment": "Set 1.4. The _tb.<env>.channels reader every data-plane process builds (tributary.runtime.channels.open_spec_source). It uses assign(), never subscribe(), and never commits, but librdkafka still looks up the coordinator for a configured group.id, which needs READ (implying DESCRIBE) on the group: without it the worker logged GROUP_AUTHORIZATION_FAILED (error_code 30) at start on the lite stack. One group per process, so readers never share offsets or partitions.",
+      "pattern": "tb.<env>.<channel>.channels.<instance>",
+      "acl": "READ on group PREFIXED tb.<env>.<channel>.channels. (trailing '.' delimiter), for receiver, pipeline_worker and loader"
+    }
   }
 }

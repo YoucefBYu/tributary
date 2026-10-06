@@ -1,0 +1,10 @@
+{
+  "ts": "2026-10-05T09:16:12.540Z",
+  "level": "info",
+  "event": "sftp_committed",
+  "component": "receiver",
+  "channel": "files-synth-sftp",
+  "tb_msg_id": "0192f3a4-6000-7abc-8def-0123456789ab",
+  "bytes": 2048,
+  "after": "move"
+}

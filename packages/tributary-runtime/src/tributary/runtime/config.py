@@ -40,6 +40,22 @@ class ConsumerDefaults:
 
 
 @dataclass(frozen=True, slots=True)
+class ReplyConsumerDefaults:
+    """`clients.reply_consumer` (set 1.2, typed reading ruled in set 1.7, topics README 3.3.1).
+
+    The receiver's consumer of `<env>.<channel>.reply`. Its own profile, not the worker's: the numbers
+    are equal today, but a re-measurement of one must neither move nor fail to move the other (3.7).
+    """
+
+    session_timeout_ms: int
+    heartbeat_interval_ms: int
+    auto_offset_reset: str
+    isolation_level: str
+    partition_assignment_strategy: str
+    enable_auto_commit: bool
+
+
+@dataclass(frozen=True, slots=True)
 class TopicDefaults:
     """The parts of the topics contract the runtime needs at startup."""
 
@@ -47,8 +63,11 @@ class TopicDefaults:
     partitions: Mapping[str, int | str]
     class_configs: Mapping[str, Mapping[str, Any]]
     consumer: ConsumerDefaults
+    reply_consumer: ReplyConsumerDefaults
     producer: Mapping[str, Any]
     profiles: Mapping[str, Mapping[str, Any]]
+    #: `clients.transactional_stage_producer.transactional.id`, e.g. `tb.<env>.<channel>.pipeline.<instance>`.
+    transactional_id_template: str = ""
 
     def startup_warning(self, profile: str) -> str | None:
         """The warning a profile requires at startup, or `None`.
@@ -148,12 +167,21 @@ def load_topic_defaults(contracts_dir: str | Path | None = None) -> TopicDefault
         # for the whole session timeout (ADR-003 D7).
         raise ConfigError("heartbeat.interval.ms must be about a third of session.timeout.ms")
 
+    reply_consumer = _reply_consumer_defaults(clients, path)
+
     producer_block = clients.get("receiver_producer")
     if not isinstance(producer_block, dict):
         raise ConfigError("clients.receiver_producer is missing from the topics contract")
 
+    txn_block = clients.get("transactional_stage_producer")
+    txn_template = txn_block.get("transactional.id") if isinstance(txn_block, dict) else None
+    if not isinstance(txn_template, str) or "<instance>" not in txn_template:
+        # One id per worker, stable across restarts, is what lets init_transactions fence a zombie.
+        raise ConfigError("clients.transactional_stage_producer.transactional.id must be a template with <instance>")
+
     return TopicDefaults(
         source=path,
+        transactional_id_template=txn_template,
         partitions=partitions,
         class_configs=class_configs,
         consumer=ConsumerDefaults(
@@ -163,6 +191,7 @@ def load_topic_defaults(contracts_dir: str | Path | None = None) -> TopicDefault
             enable_auto_commit=bool(consumer_block.get("enable.auto.commit", False)),
             commit_every=commit_every,
         ),
+        reply_consumer=reply_consumer,
         profiles={name: block for name, block in profiles.items() if isinstance(block, dict)},
         producer={
             "acks": producer_block.get("acks", "all"),
@@ -172,6 +201,47 @@ def load_topic_defaults(contracts_dir: str | Path | None = None) -> TopicDefault
             "linger.ms": producer_block.get("linger.ms", 5),
             "compression.type": producer_block.get("compression.type", "lz4"),
         },
+    )
+
+
+#: `clients.reply_consumer` string values the replier depends on, and what the contract allows for each.
+#: A value outside these sets is a contract edit the replier was not written for, so it refuses to start.
+_REPLY_STRINGS: Mapping[str, frozenset[str]] = {
+    "auto.offset.reset": frozenset({"latest", "earliest"}),
+    "isolation.level": frozenset({"read_uncommitted", "read_committed"}),
+    "partition.assignment.strategy": frozenset({"cooperative-sticky"}),
+}
+
+
+def _reply_consumer_defaults(clients: Mapping[str, Any], path: Path) -> ReplyConsumerDefaults:
+    """Parse `clients.reply_consumer`. Every value the replier sets is required: no fallback to the
+    worker's profile and no literal (topics README 3.3.1 and 3.7, `must_not_hardcode`)."""
+    block = clients.get("reply_consumer")
+    if not isinstance(block, dict):
+        raise ConfigError("clients.reply_consumer is missing from the topics contract")
+    session_timeout = _require_int(block, "session.timeout.ms", path)
+    heartbeat = _require_int(block, "heartbeat.interval.ms", path)
+    if heartbeat * 3 > session_timeout + 1:
+        raise ConfigError("clients.reply_consumer heartbeat.interval.ms must be about a third of session.timeout.ms")
+    strings: dict[str, str] = {}
+    for key, allowed in _REPLY_STRINGS.items():
+        value = block.get(key)
+        if not isinstance(value, str) or value not in allowed:
+            raise ConfigError(
+                f"{path.name}: clients.reply_consumer {safe_token(key)} is missing or not one of {sorted(allowed)}"
+            )
+        strings[key] = value
+    auto_commit = block.get("enable.auto.commit")
+    if auto_commit is not False:
+        # The replier never commits (a reply older than the pending map is useless).
+        raise ConfigError(f"{path.name}: clients.reply_consumer enable.auto.commit must be false")
+    return ReplyConsumerDefaults(
+        session_timeout_ms=session_timeout,
+        heartbeat_interval_ms=heartbeat,
+        auto_offset_reset=strings["auto.offset.reset"],
+        isolation_level=strings["isolation.level"],
+        partition_assignment_strategy=strings["partition.assignment.strategy"],
+        enable_auto_commit=False,
     )
 
 

@@ -1,0 +1,10 @@
+{
+  "v": 0,
+  "component": "api",
+  "status": "ready",
+  "checks": [
+    { "name": "database", "ok": true },
+    { "name": "oidc_keys", "ok": true }
+  ],
+  "degraded": ["channels_publisher_unavailable"]
+}

@@ -17,7 +17,7 @@ import pytest
 from jsonschema import Draft202012Validator
 from tributary.runtime.clients import KafkaSettings
 from tributary.runtime.config import load_topic_defaults
-from tributary.runtime.errors import DeliveryError, PartitionMismatchError
+from tributary.runtime.errors import DeliveryError, PartitionMismatchError, TopicNameError
 from tributary.runtime.events import RecordingEmitter
 from tributary.runtime.executor import StepFailure
 from tributary.runtime.logs import JsonLogger
@@ -196,11 +196,11 @@ def test_the_outgoing_record_gets_a_new_span_in_the_same_trace() -> None:
 
 def test_the_dlq_record_is_keyed_by_message_id_and_keeps_the_payload() -> None:
     original = make_message(b"synthetic-payload", key=b"SYNTH-KEY-1")
-    dead = dlq_message(original, error_code="STEP_ERROR", stage="transformed")
+    dead = dlq_message(original, error_code="TRANSFORM_ERROR", stage="transformed")
 
     assert dead.key == original.msg_id.encode("utf-8")
     assert dead.payload == b"synthetic-payload", "reprocess after a code fix needs the original payload"
-    assert dead.error_code == "STEP_ERROR"
+    assert dead.error_code == "TRANSFORM_ERROR"
     assert dead.stage == "transformed"
 
     validator = Draft202012Validator(json.loads(ENVELOPE_SCHEMA.read_text(encoding="utf-8")))
@@ -210,7 +210,7 @@ def test_the_dlq_record_is_keyed_by_message_id_and_keeps_the_payload() -> None:
 def test_the_dlq_record_carries_a_code_and_never_exception_text() -> None:
     """ADR-003 D4: parser messages quote the offending field value, which is PHI."""
     original = make_message(b"synthetic", key=b"K")
-    dead = dlq_message(original, error_code="STEP_ERROR", stage="transformed")
+    dead = dlq_message(original, error_code="TRANSFORM_ERROR", stage="transformed")
     rendered = " ".join(f"{name}={value}" for name, value in dead.headers.items())
     assert "SYNTH^JANE" not in rendered
     assert "ValueError" not in rendered
@@ -366,3 +366,64 @@ def test_the_worker_defaults_to_the_profile_that_needs_the_warning() -> None:
         instance_id="pipeline-1",
     )
     assert settings.profile == "lite"
+
+
+def test_a_transactional_handler_leaves_the_flush_to_the_transaction_commit() -> None:
+    """commit_transaction flushes and aborts on any failed record; a per-record flush would only cost."""
+    import dataclasses
+
+    producer, emitter = FakeProducer(), RecordingEmitter()
+    base = spec()
+    txn_spec = dataclasses.replace(base, pipeline=dataclasses.replace(base.pipeline, transactional=True))
+    stream = io.StringIO()
+    pipeline = PipelineHandler(
+        env="dev",
+        spec_provider=lambda: txn_spec,
+        producer=RecordProducer(producer, log=JsonLogger("test", stream=stream)),
+        emitter=emitter,
+        log=JsonLogger("worker", stream=stream),
+        instance="worker:test@localhost",
+        steps_override=(passthrough,),
+        transactional=True,
+    )
+    pipeline.handle(consumed())
+    assert producer.flushes == 0
+    assert "transactional_change_needs_restart" not in stream.getvalue()
+
+
+def test_a_hot_reload_that_flips_transactional_is_logged_once_per_version() -> None:
+    import dataclasses
+
+    producer, emitter = FakeProducer(), RecordingEmitter()
+    base = spec()
+    txn_spec = dataclasses.replace(base, pipeline=dataclasses.replace(base.pipeline, transactional=True))
+    stream = io.StringIO()
+    handler(producer, emitter, channel_spec=txn_spec, stream=stream).handle(consumed())
+    pipeline = handler(producer, emitter, channel_spec=txn_spec, stream=stream)
+    pipeline.handle(consumed())
+    pipeline.handle(consumed(offset=8))
+    assert stream.getvalue().count("transactional_change_needs_restart") == 2  # two handlers, once each
+
+
+@pytest.mark.parametrize("shadow", ["a" + "b" * 32, "V2", "", "a.b", "-x"])
+def test_a_shadow_label_the_contract_refuses_is_refused_when_the_settings_are_made(shadow: str) -> None:
+    """Code review MEDIUM: refused at parse time, before any client exists, not at `build()`."""
+    with pytest.raises(TopicNameError):
+        WorkerSettings(
+            env="dev",
+            channel="adt-passthrough",
+            kafka=KafkaSettings(bootstrap_servers="localhost:9092"),
+            instance_id="pipeline-1",
+            shadow=shadow,
+        )
+
+
+def test_a_valid_shadow_label_is_kept() -> None:
+    settings = WorkerSettings(
+        env="dev",
+        channel="adt-passthrough",
+        kafka=KafkaSettings(bootstrap_servers="localhost:9092"),
+        instance_id="pipeline-1",
+        shadow="v2",
+    )
+    assert settings.shadow == "v2"

@@ -41,7 +41,6 @@ def published(document: dict[str, Any], *, version: int) -> dict[str, Any]:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--bootstrap", default=os.environ.get("KAFKA_BOOTSTRAP", "kafka:9092"))
     p.add_argument("--env", default=os.environ.get("TB_ENV", "dev"))
     p.add_argument(
         "--channel-spec", type=Path, default=Path(os.environ.get("TB_CHANNEL_SPEC", "/contracts/channel.json"))
@@ -56,6 +55,7 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
 
     from confluent_kafka import Producer  # deferred: keeps `published` testable without it
+    from kafka_conn import KafkaConnError, load_client_config
 
     document = json.loads(args.channel_spec.read_text(encoding="utf-8"))
     channel = document["metadata"]["name"]
@@ -65,7 +65,11 @@ def main(argv: list[str] | None = None) -> int:
         args.published_out.parent.mkdir(parents=True, exist_ok=True)
         args.published_out.write_text(json.dumps(record), encoding="utf-8")
 
-    producer = Producer({"bootstrap.servers": args.bootstrap})
+    try:
+        producer = Producer({**load_client_config(), "acks": "all", "enable.idempotence": True})
+    except KafkaConnError as exc:
+        log.error(json.dumps({"status": "no-kafka-connection", "reason": str(exc)}))
+        return 1
     failure: BaseException | None = None
 
     def _report(err: Any, _msg: Any) -> None:

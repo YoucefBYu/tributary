@@ -49,6 +49,10 @@ class FrameParser:
         self._max = max_size
         self.fatal = False
 
+    def set_max_size(self, max_size: int) -> None:
+        """Apply a new limit to frames not yet completed (a live spec update)."""
+        self._max = max_size
+
     def buffered(self) -> int:
         return len(self._buf)
 

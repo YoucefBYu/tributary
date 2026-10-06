@@ -1,0 +1,132 @@
+{{- /* kubeletCIDR validation lives here, in the template, so no values file can bypass it. */}}
+{{- define "tb.validCIDR" -}}
+{{- $c := . -}}
+{{- if not (regexMatch "^([0-9]{1,3}[.]){3}[0-9]{1,3}/[0-9]{1,2}$|^[0-9a-fA-F:]+/[0-9]{1,3}$" $c) }}{{ fail "networkPolicy.kubeletCIDR must be a CIDR such as 10.20.4.0/24" }}{{ end -}}
+{{- $bits := int (regexFind "[0-9]+$" $c) -}}
+{{- if contains ":" $c -}}
+{{- if lt $bits 48 }}{{ fail (printf "networkPolicy.kubeletCIDR prefix /%d is too short: use a node-sized IPv6 CIDR (/48 or longer)" $bits) }}{{ end -}}
+{{- else -}}
+{{- if lt $bits 16 }}{{ fail (printf "networkPolicy.kubeletCIDR prefix /%d is too short: use a node-sized IPv4 CIDR (/16 or longer, never /0)" $bits) }}{{ end -}}
+{{- end -}}
+{{- end -}}
+
+{{- if and (not .Values.networkPolicy.enabled) .Values.channels (not .Values.networkPolicy.allowUnprotectedOpsPort) }}
+{{- fail "networkPolicy.enabled=false leaves the receiver ops listener (pod IP, port 9180) unprotected: set networkPolicy.allowUnprotectedOpsPort=true to opt out explicitly" }}
+{{- end }}
+{{- if .Values.networkPolicy.enabled }}
+{{- $kubelet := required "networkPolicy.kubeletCIDR is required: the receiver ops listener binds the pod IP, and this CIDR is the only non-collector ingress on port 9180 (security-reviewer)" .Values.networkPolicy.kubeletCIDR }}
+{{- $_ := include "tb.validCIDR" $kubelet }}
+{{- if .Values.networkPolicy.defaultDeny }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "tb.name" . }}-default-deny
+  labels: {{- include "tb.labels" . | nindent 4 }}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+{{- /* Egress allow-lists: DNS plus values, per component. Nothing else leaves a data-plane pod. */}}
+{{- range $c := list "receiver" "worker" "loader" "archiver" "otel-collector" }}
+{{- $key := ternary "otel" $c (eq $c "otel-collector") }}
+{{- if or (ne $c "otel-collector") $.Values.otel.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "tb.name" $ }}-egress-{{ $c }}
+  labels: {{- include "tb.labels" $ | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ $.Release.Name }}
+      app.kubernetes.io/component: {{ $c }}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    {{- if eq $c "otel-collector" }}
+    - to:
+        - podSelector: {matchLabels: {app.kubernetes.io/part-of: tributary, app.kubernetes.io/instance: {{ $.Release.Name }}}}
+      ports:
+        - {protocol: TCP, port: {{ $.Values.receiver.opsPort }}}
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+        - ipBlock: {cidr: {{ $kubelet | quote }}}
+      ports:
+        - {protocol: TCP, port: 443}
+        - {protocol: TCP, port: 6443}
+    {{- end }}
+    {{- range $.Values.networkPolicy.egress.common }}
+    - {{- toYaml . | nindent 6 }}
+    {{- end }}
+    {{- range (index $.Values.networkPolicy.egress $key) }}
+    - {{- toYaml . | nindent 6 }}
+    {{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- range $ch := .Values.channels }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "tb.name" $ }}-{{ $ch.name }}-receiver
+  labels: {{- include "tb.labels" $ | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ $.Release.Name }}
+      app.kubernetes.io/component: receiver
+      tributary.dev/channel: {{ $ch.name }}
+  policyTypes: [Ingress]
+  ingress:
+    # Ops port: kubelet/node CIDR and the OTel collector only.
+    - from:
+        - ipBlock: {cidr: {{ $kubelet | quote }}}
+        {{- if $.Values.otel.enabled }}
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ $.Release.Name }}
+              app.kubernetes.io/component: otel-collector
+        {{- end }}
+      ports:
+        - {protocol: TCP, port: {{ $.Values.receiver.opsPort }}}
+    {{- with $.Values.networkPolicy.ingestFrom }}
+    # Ingest port: senders listed in networkPolicy.ingestFrom. Empty list means no ingest rule (deny).
+    - from: {{- toYaml . | nindent 8 }}
+      ports:
+        - {protocol: TCP, port: {{ $ch.receiver.port }}}
+    {{- end }}
+{{- end }}
+{{- if .Values.otel.enabled }}
+{{- $prom := required "monitoring.prometheusFrom is required while otel and networkPolicy are enabled: it names who may scrape :8889" .Values.monitoring.prometheusFrom }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "tb.name" . }}-otel-collector
+  labels: {{- include "tb.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: otel-collector
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: tributary
+              app.kubernetes.io/instance: {{ .Release.Name }}
+      ports:
+        - {protocol: TCP, port: 4317}
+        - {protocol: TCP, port: 4318}
+    - from: {{- toYaml $prom | nindent 8 }}
+      ports:
+        - {protocol: TCP, port: 8889}
+{{- end }}
+{{- end }}

@@ -26,8 +26,14 @@
     "destination": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,63}$" },
     "consumerGroup": {
       "type": "string",
-      "description": "tb.<env>.<channel>.<role>[.<destination>][.shadow-<label>]",
-      "pattern": "^tb\\.[a-z][a-z0-9-]{0,15}\\.[a-z][a-z0-9-]{0,63}\\.(pipeline|loader|replier|archiver)(\\.[a-z][a-z0-9-]{0,63})?(\\.shadow-[a-z0-9-]{1,32})?$"
+      "description": "tb.<env>.<channel>.<role>[.<destination>][.shadow-<label>], or (set 1.8) the environment-wide platform group tb.<env>.archiver",
+      "anyOf": [
+        { "pattern": "^tb\\.[a-z][a-z0-9-]{0,15}\\.[a-z][a-z0-9-]{0,63}\\.(pipeline|loader|replier)(\\.[a-z][a-z0-9-]{0,63})?(\\.shadow-[a-z0-9-]{1,32})?$" },
+        {
+          "pattern": "^tb\\.[a-z][a-z0-9-]{0,15}\\.archiver$",
+          "$comment": "Set 1.8. The archiver consumes _tb.<env>.events for every channel, so its group has no channel segment. Its ACL is LITERAL: a PREFIXED tb.<env>.archiver grant would also match the groups of a channel named 'archiver' (tb.<env>.archiver.pipeline)."
+        }
+      ]
     }
   }
 }
