@@ -1,0 +1,129 @@
+{{- range $ch := .Values.channels }}
+{{- $wname := printf "%s-%s-worker" (include "tb.name" $) $ch.name }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $wname }}
+  labels:
+    {{- include "tb.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: worker
+    tributary.dev/channel: {{ $ch.name }}
+spec:
+  {{- if not $.Values.keda.enabled }}
+  replicas: {{ ($ch.worker | default dict).replicas | default 1 }}
+  {{- end }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ $.Release.Name }}
+      app.kubernetes.io/component: worker
+      tributary.dev/channel: {{ $ch.name }}
+  template:
+    metadata:
+      labels:
+        {{- include "tb.labels" $ | nindent 8 }}
+        app.kubernetes.io/component: worker
+        tributary.dev/channel: {{ $ch.name }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext: {{- include "tb.podSecurityContext" $ | nindent 8 }}
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: worker
+          image: {{ include "tb.image" (dict "root" $ "pkg" "runtime") | quote }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          # The worker takes its configuration from the environment; TB_INSTANCE_ID is the pod name.
+          args: [tributary.runtime.worker]
+          env:
+            {{- include "tb.downwardEnv" $ | nindent 12 }}
+            {{- include "tb.commonEnv" $ | nindent 12 }}
+            - {name: TB_ENV, value: {{ $.Values.env | quote }}}
+            - {name: TB_CHANNEL, value: {{ $ch.name | quote }}}
+          resources: {{- toYaml $.Values.worker.resources | nindent 12 }}
+          securityContext: {{- include "tb.containerSecurityContext" $ | nindent 12 }}
+          volumeMounts: {{- include "tb.kafkaMounts" (dict "root" $ "role" "worker") | nindent 12 }}
+      volumes: {{- include "tb.kafkaVolumes" (dict "root" $ "role" "worker") | nindent 8 }}
+{{- if $.Values.podDisruptionBudget.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $wname }}
+  labels: {{- include "tb.labels" $ | nindent 4 }}
+spec:
+  maxUnavailable: {{ $.Values.podDisruptionBudget.maxUnavailable }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ $.Release.Name }}
+      app.kubernetes.io/component: worker
+      tributary.dev/channel: {{ $ch.name }}
+{{- end }}
+{{- range $d := $ch.destinations }}
+{{- $lname := printf "%s-%s-loader-%s" (include "tb.name" $) $ch.name $d.name }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $lname }}
+  labels:
+    {{- include "tb.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: loader
+    tributary.dev/channel: {{ $ch.name }}
+    tributary.dev/destination: {{ $d.name }}
+spec:
+  {{- if not $.Values.keda.enabled }}
+  replicas: {{ $d.replicas | default 1 }}
+  {{- end }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ $.Release.Name }}
+      app.kubernetes.io/component: loader
+      tributary.dev/channel: {{ $ch.name }}
+      tributary.dev/destination: {{ $d.name }}
+  template:
+    metadata:
+      labels:
+        {{- include "tb.labels" $ | nindent 8 }}
+        app.kubernetes.io/component: loader
+        tributary.dev/channel: {{ $ch.name }}
+        tributary.dev/destination: {{ $d.name }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext: {{- include "tb.podSecurityContext" $ | nindent 8 }}
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: loader
+          image: {{ include "tb.image" (dict "root" $ "pkg" "loaders") | quote }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          args:
+            - {{ $d.module }}
+            - --channel={{ $ch.name }}
+            - --destination={{ $d.name }}
+            - --env={{ $.Values.env }}
+            # Loaders name the flag --instance-id; the value is the pod name all the same.
+            - --instance-id=$(POD_NAME)
+          env:
+            {{- include "tb.downwardEnv" $ | nindent 12 }}
+            {{- include "tb.commonEnv" $ | nindent 12 }}
+          resources: {{- toYaml $.Values.loader.resources | nindent 12 }}
+          securityContext: {{- include "tb.containerSecurityContext" $ | nindent 12 }}
+          volumeMounts: {{- include "tb.kafkaMounts" (dict "root" $ "role" "loader") | nindent 12 }}
+      volumes: {{- include "tb.kafkaVolumes" (dict "root" $ "role" "loader") | nindent 8 }}
+{{- if $.Values.podDisruptionBudget.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $lname }}
+  labels: {{- include "tb.labels" $ | nindent 4 }}
+spec:
+  maxUnavailable: {{ $.Values.podDisruptionBudget.maxUnavailable }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ $.Release.Name }}
+      app.kubernetes.io/component: loader
+      tributary.dev/channel: {{ $ch.name }}
+      tributary.dev/destination: {{ $d.name }}
+{{- end }}
+{{- end }}
+{{- end }}

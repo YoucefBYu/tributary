@@ -1,0 +1,145 @@
+{{- if .Values.otel.enabled }}
+{{- $n := printf "%s-otel-collector" (include "tb.name" .) }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $n }}
+  labels: {{- include "tb.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $n }}
+  labels: {{- include "tb.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $n }}
+  labels: {{- include "tb.labels" . | nindent 4 }}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: {{ $n }}}
+subjects:
+  - {kind: ServiceAccount, name: {{ $n }}, namespace: {{ .Release.Namespace }}}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $n }}
+  labels: {{- include "tb.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          grpc: {endpoint: 0.0.0.0:4317}
+          http: {endpoint: 0.0.0.0:4318}
+      prometheus:
+        config:
+          scrape_configs:
+            # Every Tributary pod that declares a container port named "ops" (GET /metrics on the ops
+            # listener, contracts/observability/v0 2.1). Only the pod IP and port are used; no
+            # discovered label is attached to a series except the contract's own.
+            - job_name: tributary
+              scrape_interval: 15s
+              kubernetes_sd_configs:
+                - role: pod
+                  namespaces: {names: [{{ .Release.Namespace }}]}
+              relabel_configs:
+                - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_part_of]
+                  action: keep
+                  regex: tributary
+                - source_labels: [__meta_kubernetes_pod_container_port_name]
+                  action: keep
+                  regex: ops
+    processors:
+      memory_limiter: {check_interval: 1s, limit_percentage: 80, spike_limit_percentage: 20}
+      # Defence in depth for ADR-009 D1 and invariant 6: no URL query, path or credential header
+      # leaves the collector on any signal.
+      attributes/scrub:
+        actions:
+          - {key: url.query, action: delete}
+          - {key: url.full, action: delete}
+          - {key: url.path, action: delete}
+          - {key: http.url, action: delete}
+          - {key: http.target, action: delete}
+          - {key: http.request.header.authorization, action: delete}
+          - {key: http.request.header.cookie, action: delete}
+      batch: {}
+    exporters:
+      # Prometheus scrapes the collector here; metric names pass through unchanged.
+      prometheus:
+        endpoint: 0.0.0.0:8889
+    {{- if .Values.otel.otlpEndpointExporter }}
+      otlp:
+        endpoint: {{ .Values.otel.otlpEndpointExporter | quote }}
+    {{- end }}
+    service:
+      pipelines:
+        metrics:
+          receivers: [prometheus, otlp]
+          processors: [memory_limiter, attributes/scrub, batch]
+          exporters: [prometheus]
+    {{- if .Values.otel.otlpEndpointExporter }}
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, attributes/scrub, batch]
+          exporters: [otlp]
+    {{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $n }}
+  labels:
+    {{- include "tb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: otel-collector
+spec:
+  replicas: {{ .Values.otel.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: otel-collector
+  template:
+    metadata:
+      labels:
+        {{- include "tb.labels" . | nindent 8 }}
+        app.kubernetes.io/component: otel-collector
+    spec:
+      serviceAccountName: {{ $n }}
+      automountServiceAccountToken: true   # the collector lists pods for discovery (Role above)
+      securityContext: {{- include "tb.podSecurityContext" . | nindent 8 }}
+      containers:
+        - name: collector
+          image: {{ .Values.otel.image | quote }}
+          args: [--config=/etc/otel/config.yaml]
+          ports:
+            - {name: otlp-grpc, containerPort: 4317}
+            - {name: otlp-http, containerPort: 4318}
+            - {name: prom, containerPort: 8889}
+          resources: {{- toYaml .Values.otel.resources | nindent 12 }}
+          securityContext: {{- include "tb.containerSecurityContext" . | nindent 12 }}
+          volumeMounts:
+            - {name: config, mountPath: /etc/otel, readOnly: true}
+      volumes:
+        - name: config
+          configMap: {name: {{ $n }}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $n }}
+  labels: {{- include "tb.labels" . | nindent 4 }}
+spec:
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: otel-collector
+  ports:
+    - {name: otlp-grpc, port: 4317, targetPort: otlp-grpc}
+    - {name: otlp-http, port: 4318, targetPort: otlp-http}
+    - {name: prom, port: 8889, targetPort: prom}
+{{- end }}

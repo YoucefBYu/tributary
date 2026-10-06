@@ -1,0 +1,81 @@
+{{- if .Values.monitoring.prometheusRule.enabled }}
+{{- $lag := .Values.monitoring.lagMetric }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "tb.name" . }}
+  labels:
+    {{- include "tb.labels" . | nindent 4 }}
+    {{- with .Values.monitoring.prometheusRule.labels }}{{ toYaml . | nindent 4 }}{{ end }}
+spec:
+  groups:
+    - name: tributary.data-plane
+      rules:
+        # A partition halted by a blocking-retry exhaust (invariant 5): order is preserved and nothing
+        # is dropped, so a human has to act.
+        - alert: TributaryPartitionHalted
+          expr: sum by (component, channel, destination) (tb_partitions_halted) > 0
+          for: 1m
+          labels: {severity: critical}
+          annotations:
+            summary: A partition is halted (stage partition_halted) and will not resume without an operator.
+            description: See the partition_halted event for the channel and destination labelled on this alert.
+        - alert: TributaryReceiverNotReady
+          expr: max by (component, channel) (tb_ready{component="receiver"}) == 0
+          for: 5m
+          labels: {severity: warning}
+          annotations:
+            summary: A receiver has been not ready for 5 minutes (readiness contract, section 2).
+        - alert: TributaryReceiverPublishFailures
+          expr: sum by (channel, receiver_type) (rate(tb_receiver_publish_failures_total[5m])) > 0
+          for: 5m
+          labels: {severity: critical}
+          annotations:
+            summary: Receivers cannot commit to Kafka; senders are being refused or NACKed (invariant 1).
+        - alert: TributaryCircuitOpen
+          expr: max by (channel, destination) (tb_circuit_open) == 1
+          for: 10m
+          labels: {severity: warning}
+          annotations:
+            summary: A destination circuit breaker has been open for 10 minutes.
+        - alert: TributaryDeliveryErrors
+          expr: sum by (channel, destination) (rate(tb_deliveries_total{outcome!="ok"}[10m])) > 0
+          for: 15m
+          labels: {severity: warning}
+          annotations:
+            summary: Deliveries to a destination have been failing for 15 minutes.
+        - alert: TributarySpecSourceUnproven
+          expr: max by (component, channel) (tb_spec_source_unproven) == 1
+          for: 15m
+          labels: {severity: warning}
+          annotations:
+            summary: A process is running on a channel spec it has not proven current.
+        - alert: TributaryArchiverInsertFailures
+          expr: sum(rate(tb_archiver_batches_total{outcome!="ok"}[10m])) > 0
+          for: 15m
+          labels: {severity: warning}
+          annotations:
+            summary: The archiver cannot insert batches. Message flow is unaffected (invariant 9); the archive is lagging.
+        - alert: TributaryConsumerLagHigh
+          expr: sum by (consumergroup) ({{ $lag }}{consumergroup=~"tb[.].+"}) > {{ .Values.keda.lagThreshold }} * {{ .Values.keda.maxReplicaCount }}
+          for: 15m
+          labels: {severity: warning}
+          annotations:
+            summary: Consumer lag exceeds what the maximum replica count is sized for (lag comes from the Kafka exporter).
+{{- end }}
+{{- if .Values.monitoring.dashboards.enabled }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "tb.name" . }}-dashboards
+  labels:
+    {{- include "tb.labels" . | nindent 4 }}
+    {{ .Values.monitoring.dashboards.labelKey }}: {{ .Values.monitoring.dashboards.labelValue | quote }}
+data:
+  {{- range $path, $_ := .Files.Glob "dashboards/*.json" }}
+  {{ base $path }}: |-
+    {{- $.Files.Get $path | nindent 4 }}
+  {{- end }}
+{{- end }}

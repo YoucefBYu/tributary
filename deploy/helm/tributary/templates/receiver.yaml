@@ -1,0 +1,93 @@
+{{- range $ch := .Values.channels }}
+{{- $name := printf "%s-%s-receiver" (include "tb.name" $) $ch.name }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "tb.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: receiver
+    tributary.dev/channel: {{ $ch.name }}
+spec:
+  replicas: {{ $ch.receiver.replicas | default 1 }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ $.Release.Name }}
+      app.kubernetes.io/component: receiver
+      tributary.dev/channel: {{ $ch.name }}
+  template:
+    metadata:
+      labels:
+        {{- include "tb.labels" $ | nindent 8 }}
+        app.kubernetes.io/component: receiver
+        tributary.dev/channel: {{ $ch.name }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext: {{- include "tb.podSecurityContext" $ | nindent 8 }}
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: receiver
+          image: {{ include "tb.image" (dict "root" $ "pkg" "receivers") | quote }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          args:
+            - {{ $ch.receiver.module }}
+            - --channel={{ $ch.name }}
+            - --env={{ $.Values.env }}
+            # Identity from the pod name (downward API): unique per replica, as source.reply requires.
+            - --instance=$(POD_NAME)
+            # The ops listener must be reachable by kubelet, so it binds the pod IP. The NetworkPolicy
+            # (networkpolicy.yaml) limits ingress on this port to the kubelet CIDR and the collector.
+            - --ops-bind=$(POD_IP)
+            - --ops-port={{ $.Values.receiver.opsPort }}
+          env:
+            {{- include "tb.downwardEnv" $ | nindent 12 }}
+            {{- include "tb.commonEnv" $ | nindent 12 }}
+          ports:
+            - {name: ingest, containerPort: {{ $ch.receiver.port }}}
+            - {name: ops, containerPort: {{ $.Values.receiver.opsPort }}}
+          startupProbe:
+            httpGet: {path: /livez, port: ops}
+            {{- toYaml $.Values.receiver.probes.startup | nindent 12 }}
+          readinessProbe:
+            httpGet: {path: /readyz, port: ops}
+            {{- toYaml $.Values.receiver.probes.readiness | nindent 12 }}
+          livenessProbe:
+            httpGet: {path: /livez, port: ops}
+            {{- toYaml $.Values.receiver.probes.liveness | nindent 12 }}
+          resources: {{- toYaml $.Values.receiver.resources | nindent 12 }}
+          securityContext: {{- include "tb.containerSecurityContext" $ | nindent 12 }}
+          volumeMounts: {{- include "tb.kafkaMounts" (dict "root" $ "role" "receiver") | nindent 12 }}
+      volumes: {{- include "tb.kafkaVolumes" (dict "root" $ "role" "receiver") | nindent 8 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "tb.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: receiver
+    tributary.dev/channel: {{ $ch.name }}
+spec:
+  selector:
+    app.kubernetes.io/instance: {{ $.Release.Name }}
+    app.kubernetes.io/component: receiver
+    tributary.dev/channel: {{ $ch.name }}
+  ports:
+    - {name: ingest, port: {{ $ch.receiver.port }}, targetPort: ingest}
+{{- if $.Values.podDisruptionBudget.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $name }}
+  labels: {{- include "tb.labels" $ | nindent 4 }}
+spec:
+  maxUnavailable: {{ $.Values.podDisruptionBudget.maxUnavailable }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ $.Release.Name }}
+      app.kubernetes.io/component: receiver
+      tributary.dev/channel: {{ $ch.name }}
+{{- end }}
+{{- end }}

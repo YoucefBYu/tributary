@@ -1,0 +1,8 @@
+apiVersion: v2
+name: tributary
+description: Tributary data plane (receivers, workers, loaders, archiver) with optional Strimzi Kafka, KEDA scaling, OpenTelemetry collector, Prometheus rules and Grafana dashboards.
+type: application
+version: 0.1.0
+appVersion: "0.0.0-unpublished"
+kubeVersion: ">=1.28.0-0"
+license: Apache-2.0
