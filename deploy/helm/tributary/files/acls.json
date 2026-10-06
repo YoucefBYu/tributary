@@ -1,6 +1,6 @@
 {
   "generatedFrom": "contracts/topics/v0/topic-defaults.json",
-  "sourceSha256": "ca3530231e05f6ed79d25609b008c985daf1cd365e7d8e37e4f96bc14de9ec1d",
+  "sourceSha256": "5cf22532d422c86820fc955ae2cff73a9b82d5430a28eaf5519610e9b5b7f13d",
   "lagReaderIsPlaceholder": true,
   "placeholders": {
     "env": "@ENV@",
