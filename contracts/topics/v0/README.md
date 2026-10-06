@@ -363,6 +363,21 @@ loader path ran end to end. Set 1.4 rebuilds the table from what each role's cod
 | loader | READ `out.<dest>`; WRITE `dlq`, `_tb.<env>.events`; READ `_tb.<env>.channels` | `tb.<env>.<ch>.loader.<dest>` (literal), `tb.<env>.<ch>.channels.` (prefixed) | none |
 | control plane (channel publisher) | WRITE `_tb.<env>.channels`, `_tb.<env>.audit` | none | DESCRIBE |
 | archiver (set 1.8) | READ `_tb.<env>.events` | `tb.<env>.archiver` (literal) | none |
+| reprocessor (set 1.8, W3-29) | READ, WRITE, DESCRIBE on `<env>.<ch>.raw` (literal, per channel) | DESCRIBE on `tb.<env>.reprocessor` (literal); no group READ | IDEMPOTENT_WRITE |
+| lag_reader (set 1.8, W3-29) | DESCRIBE on `<env>.` (prefixed) and `_tb.<env>.events` (literal) | DESCRIBE on `tb.<env>.` (prefixed) | none |
+
+**Set 1.8 roles (W3-29).** The **reprocessor** (W3-3 reprocess and replay) reads the original record
+from `raw` and republishes to the **same channel's** `raw`. There is no cross-channel republish (lead's
+ruling, 2026-10-06), so its topic grant is LITERAL per channel and never PREFIXED `<env>.`, which would
+add WRITE on `out`, `dlq` and `reply`. Its consumer uses `assign()` and never joins or commits.
+librdkafka still requires a `group.id` and sends FindCoordinator for it, so the platform group
+`tb.<env>.reprocessor` gets **DESCRIBE only** (measured by `archive-engineer` on a deny-by-default
+broker, lead-relayed). It produces under the receivers' 1,000,000-byte input limit. A replay into a
+per-key channel needs an explicit, audited `allow_reorder` (invariant 5; W3-1b request shape). The
+**lag_reader** (KEDA, the lag exporter) reads end offsets and committed offsets only, and can never
+read a payload. Both are rendered by the Helm `KafkaUser` generator from `security.acls`. **Unverified
+until the W3-23-style test:** each role works under exactly these grants on a deny-by-default broker.
+Human sign-off folds into ADR-004 H7.
 
 **Rules the table follows.**
 
@@ -446,6 +461,7 @@ likewise an ADR-004 question; the requirement that encryption be on is not.
 ```
 tb.<env>.<channel>.<role>[.<destination>]     role = pipeline | loader | replier | receiver
 tb.<env>.archiver                             environment-wide platform group (set 1.8)
+tb.<env>.reprocessor                          environment-wide platform group, assign-only (set 1.8)
 ```
 
 **Set 1.8: the archiver's group has no channel segment.** It consumes `_tb.<env>.events` for every

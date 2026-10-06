@@ -3,7 +3,30 @@
 Newest first. Each entry names the contract, the version, whether the change is additive or
 breaking, and the reason. Breaking changes reference an ADR.
 
-## 2026-10-06 (latest, later) — contract set 1.8: retention is an operator setting (README and description only)
+## 2026-10-06 (latest) — contract set 1.8: `reprocessor` and `lag_reader` roles (W3-29 items 1 and 4)
+
+**Additive. No example or manifest change, so `validate.py` counts and pinned pairs are unchanged
+(predicted). No invariant changes.**
+
+- **`topic-defaults.json` `security.acls`:** new `reprocessor` = `READ, WRITE, DESCRIBE on
+  <env>.<channel>.raw; IDEMPOTENT_WRITE on the cluster; DESCRIBE on group tb.<env>.reprocessor`.
+  New `lag_reader` = `DESCRIBE on <env>.*, _tb.<env>.events; DESCRIBE on group tb.<env>.*` (the same
+  string as `deploy/helm/gen_acls.py`'s placeholder). Each has a `_note`. Both parse under the set 1.4
+  grammar (`bootstrap_topics.py parse_grants`); read, not run.
+- **`consumer_groups.platform_groups`:** adds `reprocessor: tb.<env>.reprocessor`.
+- **`topic-name.schema.json` `$defs.consumerGroup`:** the platform branch becomes
+  `(archiver|reprocessor)`. Additive: it accepts one more name.
+- **README 3.4.1:** two table rows and a paragraph; **3.6:** the group line.
+- Evidence for the group DESCRIBE: `archive-engineer` measured on a deny-by-default broker that
+  assign-only still needs a `group.id` and FindCoordinator (lead-relayed). Lead's ruling recorded:
+  replay targets only its source channel; "shadow" keeps its 3.6 meaning; per-key replay needs an
+  audited `allow_reorder`.
+- **Coordinated code change:** `tributary-runtime` `test_roles_and_platform_groups_match_the_contract`
+  compares `platform_groups` with `topics.PlatformGroup`. `platform-engineer` adds `"reprocessor"` to
+  that `Literal` in the same push, or the test goes red. `deploy/helm/tributary/files/acls.json`
+  needs regenerating (`gen_acls.py` pins the file's SHA-256).
+
+## 2026-10-06 (later) — contract set 1.8: retention is an operator setting (README and description only)
 
 **Additive, documentation only. No schema, example or manifest change; `validate.py` counts and
 pinned pairs unchanged. No invariant changes.** The human's answer to wave-3 7.2 / ADR-004 H4, relayed

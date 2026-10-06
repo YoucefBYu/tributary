@@ -105,7 +105,8 @@ Builds on `topics/v0` 3.4.1 (set 1.4, reconciled with code) and ADR-008 D6-D9.
 | loader | one per `(env, channel, destination)` | READ `out.<dest>`; WRITE `dlq`, `_tb.<env>.events`; LITERAL `loader.<dest>` group |
 | events archiver | one per `env` | READ `_tb.<env>.events`; **rev 2: READ LITERAL `_tb.<env>.audit`** (R7; set 1.8 part 2); LITERAL group `tb.<env>.archiver` (set 1.8) |
 | **content archiver (new)** | one per `env` | READ `<env>.*.raw`, `<env>.*.out.*`, `<env>.*.dlq` (**PREFIXED on `<env>.`**, the only cross-channel data grant); LITERAL group `tb.<env>.archiver.content` |
-| reprocessor (W3-29, 2026-10-06) | one per `(env, channel)` | READ, WRITE and DESCRIBE on LITERAL `<env>.<ch>.raw`; IDEMPOTENT_WRITE. Assigns partitions and never commits. LITERAL group `tb.<env>.reprocessor` only if assign without `group.id` proves impossible. Replay targets its source channel only (`wave-3.md` 2.6 H8) |
+| reprocessor (W3-29, 2026-10-06) | one per `(env, channel)` | READ, WRITE and DESCRIBE on LITERAL `<env>.<ch>.raw`; IDEMPOTENT_WRITE; **DESCRIBE only** on LITERAL group `tb.<env>.reprocessor` (assign needs a `group.id`; never joined or committed; measured by `archive-engineer`). Replay targets its source channel only (`wave-3.md` 2.6 H8). Set 1.8 `topic-defaults.json` |
+| lag_reader (W3-29) | one per `env` | DESCRIBE on PREFIXED `<env>.` and LITERAL `_tb.<env>.events`; DESCRIBE on PREFIXED group `tb.<env>.`. No READ or WRITE |
 | control-plane publisher | one per `env` | WRITE `_tb.<env>.channels`, `_tb.<env>.audit`; DESCRIBE cluster |
 | topic bootstrap | one per cluster | super user (creates topics and ACLs) |
 | users-init | one per cluster | ALTER on CLUSTER **only during provisioning** (W3-16, rule K3) |

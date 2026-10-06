@@ -218,8 +218,20 @@ class ConsumerLoop:
         clock: Callable[[], float] = time.monotonic,
         committer: Committer | None = None,
         on_dead_lettered: DeadLetterObserver | None = None,
+        on_tick: Callable[[], None] | None = None,
     ) -> None:
         self._consumer = consumer
+        #: Called once per iteration, on the loop's thread, after the poll (busy or idle). The worker uses it
+        #: to refresh the applied spec while idle, so `tb_spec_version` moves without traffic.
+        self._on_tick = on_tick
+        #: `self._clock()` when `run()` started or the last iteration completed; `None` before `run()`. The liveness
+        #: heartbeat: stamped before the first poll, so a first poll or handle that never returns goes stale too.
+        self.last_tick: float | None = None
+        #: `(paused, halted)`, republished by the loop thread after every iteration and every rebalance callback.
+        #: Cross-thread contract: the loop thread only ever *rebinds* this attribute to a new immutable tuple and
+        #: the scrape thread only reads it, and a reference load or store is atomic in CPython with or without the
+        #: GIL (PEP 703 keeps it so). So no lock, and the scrape never iterates `_retry_state` while it changes.
+        self._partition_counts: tuple[int, int] = (0, 0)
         self._on_dead_lettered = on_dead_lettered
         self._handler = handler
         self._topics = topics
@@ -264,6 +276,7 @@ class ConsumerLoop:
         """Poll until `stop()`. `max_iterations` exists so tests can run a bounded loop."""
         self._running = True
         iterations = 0
+        self.last_tick = self._clock()
         try:
             while self._running and (max_iterations is None or iterations < max_iterations):
                 iterations += 1
@@ -274,6 +287,10 @@ class ConsumerLoop:
                 if self._committer.should_commit_now(idle=raw is None):
                     # An open transaction blocks every read_committed reader downstream: never leave one.
                     self._commit_pending(force=True)
+                if self._on_tick is not None:
+                    self._on_tick()
+                self._publish_partition_counts()
+                self.last_tick = self._clock()
         finally:
             self._drain()
         return self.stats
@@ -491,6 +508,28 @@ class ConsumerLoop:
         partition = TopicPartition(record.topic, record.partition, target)
         self._consumer.pause([partition])
         self._consumer.seek(partition)
+
+    def seconds_since_tick(self) -> float | None:
+        """Seconds since `run()` started or last finished an iteration, on the loop's clock; `None` before `run()`."""
+        last = self.last_tick
+        return None if last is None else self._clock() - last
+
+    def partition_counts(self) -> tuple[int, int]:
+        """`(paused, halted)` partitions as of the last iteration: paused for a blocking-retry backoff, or halted for
+        an operator. A partition that was resumed and is being retried is neither. Revocation and loss drop the
+        state, so a halted partition that moves to another member is counted there, not here.
+
+        Safe from any thread (the metrics scrape): it reads the snapshot the loop thread published (see
+        `_partition_counts` in `__init__`), at most one iteration (one poll timeout) old.
+        """
+        return self._partition_counts
+
+    def _publish_partition_counts(self) -> None:
+        """Loop thread only: recount `_retry_state` and rebind the snapshot."""
+        states = self._retry_state.values()
+        halted = sum(1 for state in states if state.halted)
+        paused = sum(1 for state in states if not state.halted and state.resume_at)
+        self._partition_counts = (paused, halted)
 
     def poll_timeout(self) -> float:
         """The configured poll timeout, clamped so `poll()` returns by the next due resume."""
@@ -759,6 +798,7 @@ class ConsumerLoop:
         consumer.incremental_unassign(partitions)
         for partition in partitions:
             self._retry_state.pop((partition.topic, partition.partition), None)
+        self._publish_partition_counts()
         self._log.info("partitions_revoked", channel=self._channel, count=len(partitions))
 
     def _on_lost(self, consumer: KafkaConsumerLike, partitions: list[TopicPartition]) -> None:
@@ -777,6 +817,7 @@ class ConsumerLoop:
             self.stats.pending.pop((partition.topic, partition.partition), None)
             self._retry_state.pop((partition.topic, partition.partition), None)
         consumer.incremental_unassign(partitions)
+        self._publish_partition_counts()
         self._log.warning("partitions_lost", channel=self._channel, count=len(partitions))
 
 

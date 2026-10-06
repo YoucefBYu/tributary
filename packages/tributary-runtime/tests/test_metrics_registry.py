@@ -1,11 +1,10 @@
 """The runtime's in-process counters against `contracts/observability/v0/metrics.json` (README section 3).
 
-Metric export is not built yet (W2-5 ruling: it waits on this contract). What exists are the counters
-the registry was seeded from (`StepStats`, `LoopStats`, `ReplyStats`), and what must not drift is the
-mapping: every closed `outcome` list in the registry for a worker metric has a source counter, and no
-counter is an outcome the registry lacks. Every worker-emitted metric is either mapped here or listed
-in `NOT_TRACKED_YET` with the reason, so adding a worker metric to the registry fails this file until
-someone decides which.
+The exporter (`worker_metrics.py`, W3-25) mirrors `LoopStats`, `ReplyStats` and `StepStats` into registry
+names. What must not drift is the mapping: every closed `outcome` list in the registry for a worker metric
+has a source counter, and no counter is an outcome the registry lacks. Every worker-emitted metric is
+registered by `WorkerMetrics`, so adding a worker metric to the registry fails this file until the
+exporter has a source for it. The exposition itself is checked in `test_worker_metrics.py`.
 """
 
 from __future__ import annotations
@@ -20,31 +19,16 @@ import pytest
 from tributary.runtime import topics
 from tributary.runtime.consumer import LoopStats
 from tributary.runtime.executor import PIPELINE_SCOPE, StepOutcome
+from tributary.runtime.metrics import MetricsContract, MetricsRegistry
 from tributary.runtime.reply import ReplyStats
+from tributary.runtime.worker_metrics import COMMIT_OUTCOMES, RECORD_OUTCOMES, REPLY_OUTCOMES, WorkerMetrics
 
 REGISTRY_PATH = Path(__file__).resolve().parents[3] / "contracts" / "observability" / "v0" / "metrics.json"
 
-#: registry metric -> outcome label value -> `LoopStats` / `ReplyStats` field.
-WORKER_RECORDS = {
-    "handled": "handled",
-    "retried": "retried",
-    "dead_lettered": "dead_lettered",
-    "quarantined": "quarantined",
-    "rejected": "rejected",
-}
-COMMITS = {"ok": "commits", "refused": "commits_refused", "failed": "commits_failed"}
+#: The mapping the exporter uses, under the names the assertions below were written with.
+WORKER_RECORDS = RECORD_OUTCOMES
+COMMITS = COMMIT_OUTCOMES
 
-#: Worker metrics with no in-process source today, and why. Not a contract mismatch: the registry is
-#: ahead of the code until the exporter lands. Each needs a source before `/metrics` ships.
-NOT_TRACKED_YET = {
-    "tb_build_info": "static; written by the exporter",
-    "tb_spec_version": "the applied spec version is known (PipelineHandler) but not published as a gauge",
-    "tb_spec_source_unproven": "ChannelsCache.available exists; not published as a gauge",
-    "tb_messages_total": "no per-(stage, status, destination) counter at emit time in events.py",
-    "tb_stage_duration_seconds": "ExecutionResult.duration_ms exists per execution; no bucketed histogram",
-    "tb_partitions_paused": "LoopStats counts pauses and resumes (cumulative); no current gauge per destination",
-    "tb_partitions_halted": "LoopStats counts halts (cumulative); no current gauge per destination",
-}
 #: Counted in-process, not exported under these names. Not registered; a registry entry is a contract change.
 UNREGISTERED_COUNTERS = {"consumed", "pauses", "resumes", "halts", "aborts", "pending"}
 
@@ -65,10 +49,12 @@ def int_fields(cls: type) -> set[str]:
     return {f.name for f in dataclasses.fields(cls) if f.type in ("int", int)}
 
 
-def test_every_worker_metric_is_mapped_or_explicitly_untracked(registry: dict[str, Any]) -> None:
-    mapped = {"tb_worker_records_total", "tb_commits_total", "tb_worker_replies_total", "tb_step_duration_seconds"}
+def test_every_worker_metric_is_registered_by_the_exporter(registry: dict[str, Any]) -> None:
     worker = {m["name"] for m in registry["metrics"] if "worker" in m["emitters"]}
-    assert worker == mapped | set(NOT_TRACKED_YET), "a worker metric was added or removed in the registry"
+    exporter = WorkerMetrics(
+        MetricsRegistry(MetricsContract.from_document(registry), component="worker", strict=True), channel="lab-in"
+    )
+    assert exporter.registry.names == worker, "a worker metric was added or removed in the registry"
 
 
 def test_worker_records_outcomes_have_a_loop_counter_each(registry: dict[str, Any]) -> None:
@@ -92,7 +78,7 @@ def test_no_loop_counter_is_an_outcome_the_registry_lacks() -> None:
 def test_reply_outcomes_are_exactly_the_reply_counters(registry: dict[str, Any]) -> None:
     entry = metric(registry, "tb_worker_replies_total")
     assert entry["labels"] == ["channel", "outcome"]
-    assert set(entry["label_values"]["outcome"]) == int_fields(ReplyStats)
+    assert set(entry["label_values"]["outcome"]) == int_fields(ReplyStats) == set(REPLY_OUTCOMES)
 
 
 def test_step_outcomes_and_scope_match_step_stats(registry: dict[str, Any]) -> None:

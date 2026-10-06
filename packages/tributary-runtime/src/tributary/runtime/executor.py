@@ -12,9 +12,9 @@ log line, an event or the DLQ record, because HL7 and FHIR parsers routinely quo
 value, which is PHI (ADR-003 D4, events contract section 3).
 
 **Per-step timing** is kept in `StepStats`: counts and durations per `(destination, step)`, both of
-which are spec-defined names and never message data. It is exposed as data and as a periodic structured
-log line; exporting it as metrics waits on `contracts/observability/v0` and on `security-reviewer`'s
-review of a `/metrics` listener, so nothing here opens a socket.
+which are spec-defined names and never message data. It is exposed as data, as a periodic structured
+log line, and through `StepStats.observer` as `tb_step_duration_seconds` (`worker_metrics.py`). Nothing
+here opens a socket.
 """
 
 from __future__ import annotations
@@ -99,6 +99,9 @@ class StepStat:
 
 PIPELINE_SCOPE = "-"
 
+#: `(scope, step, outcome, duration_ms)` for one step call.
+StepObserver = Callable[[str, str, StepOutcome, float], None]
+
 
 @dataclass(slots=True)
 class StepStats:
@@ -111,8 +114,13 @@ class StepStats:
     """
 
     entries: dict[tuple[str, str], StepStat] = field(default_factory=dict)
+    #: Told about every call as `(scope, step, outcome, duration_ms)`: the worker's `tb_step_duration_seconds`.
+    #: Names and numbers only, like the summary line.
+    observer: StepObserver | None = field(default=None, repr=False, compare=False)
 
     def record(self, scope: str | None, step: str, outcome: StepOutcome, duration_ms: float) -> None:
+        if self.observer is not None:
+            self.observer(scope or PIPELINE_SCOPE, step, outcome, duration_ms)
         stat = self.entries.setdefault((scope or PIPELINE_SCOPE, step), StepStat())
         stat.calls += 1
         stat.total_ms += duration_ms
