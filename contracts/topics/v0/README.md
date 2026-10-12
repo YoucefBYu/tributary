@@ -391,6 +391,7 @@ loader path ran end to end. Set 1.4 rebuilds the table from what each role's cod
 | pipeline worker | READ `raw`; WRITE `out.*`, `dlq`, `_tb.<env>.events`; READ `_tb.<env>.channels`; sync-reply only: WRITE `reply` | `tb.<env>.<ch>.pipeline` (literal), `tb.<env>.<ch>.pipeline.shadow-` (prefixed), `tb.<env>.<ch>.channels.` (prefixed) | transactional channels only: WRITE on transactional id prefix `tb.<env>.<ch>.pipeline.` |
 | loader | READ `out.<dest>`; WRITE `dlq`, `_tb.<env>.events`; READ `_tb.<env>.channels` | `tb.<env>.<ch>.loader.<dest>` (literal), `tb.<env>.<ch>.channels.` (prefixed) | none |
 | control plane (channel publisher) | WRITE `_tb.<env>.channels`, `_tb.<env>.audit` | none | DESCRIBE |
+| **api** (set 1.8, 2026-10-12) | READ, WRITE `_tb.<env>.channels`; WRITE `_tb.<env>.audit` (all literal) | DESCRIBE on `tb.<env>.reconciler` (literal); no group READ | IDEMPOTENT_WRITE |
 | archiver (set 1.8) | READ `_tb.<env>.events`; **part 2:** READ `_tb.<env>.audit` (literal) | `tb.<env>.archiver` (literal) | none |
 | reprocessor (set 1.8, W3-29) | READ, WRITE, DESCRIBE on `<env>.<ch>.raw` (literal, per channel) | DESCRIBE on `tb.<env>.reprocessor` (literal); no group READ | IDEMPOTENT_WRITE |
 | lag_reader (set 1.8, W3-29) | DESCRIBE on `<env>.` (prefixed) and `_tb.<env>.events` (literal) | DESCRIBE on `tb.<env>.` (prefixed) | none |
@@ -407,6 +408,25 @@ per-key channel needs an explicit, audited `allow_reorder` (invariant 5; W3-1b r
 read a payload. Both are rendered by the Helm `KafkaUser` generator from `security.acls`. **Unverified
 until the W3-23-style test:** each role works under exactly these grants on a deny-by-default broker.
 Human sign-off folds into ADR-004 H7.
+
+**Set 1.8 `api` role (2026-10-12).** This is the control-plane API process, one principal per
+environment. Each grant has a code path in `packages/tributary-api`:
+
+- WRITE `_tb.<env>.channels`: deploy, rollback, undeploy (`publisher.py`) and the W3-5 reconciler's
+  repairs.
+- READ `_tb.<env>.channels`: the reconciler's table read (`reconciler.py`, `assign` from the beginning
+  to the start-time end offsets). Orphan keys come from this topic alone; it reads nothing else.
+- WRITE `_tb.<env>.audit`: the W3-32 `AuditHook`.
+- IDEMPOTENT_WRITE: both producers are `acks=all` and idempotent, as for the receiver.
+- DESCRIBE only on the group: the reconciler never commits, the same measured case as the
+  reprocessor. **Code change requested:** its `group.id` is the literal `tb-api-reconciler`
+  (`main.py:63`), which is not per environment and not in the 3.6 grammar. It becomes
+  `tb.<env>.reconciler` (`control-plane-engineer`).
+
+There is no cluster DESCRIBE (the `control_plane` row's grant is not carried over) and no READ on
+`audit` or `events`. The `control_plane` row stays as the grant of the lite Compose one-shot
+`channel-publish`. Reprocess and replay run under each channel's `reprocessor` principal, never under
+`api` (`openapi/v0` 3.14). **Unverified until a W3-23-style deny-by-default test.**
 
 **Set 1.8 part 2 (W3-1b).** The **archiver** gains READ on LITERAL `_tb.<env>.audit` in its existing
 group: it fills ClickHouse `audit_log`, the audit system of record (2.1, ADR-004 R7; record shape
@@ -496,6 +516,7 @@ likewise an ADR-004 question; the requirement that encryption be on is not.
 tb.<env>.<channel>.<role>[.<destination>]     role = pipeline | loader | replier | receiver
 tb.<env>.archiver                             environment-wide platform group (set 1.8)
 tb.<env>.reprocessor                          environment-wide platform group, assign-only (set 1.8)
+tb.<env>.reconciler                           environment-wide platform group, assign-only: the API's channels-table reader (set 1.8)
 ```
 
 **Set 1.8: the archiver's group has no channel segment.** It consumes `_tb.<env>.events` for every

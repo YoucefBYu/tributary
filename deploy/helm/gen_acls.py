@@ -25,7 +25,7 @@ SYNC_PREFIX = "Set 1.2, sync-reply channels only: "
 SYNC_PREFIX = "Set 1.2, sync-reply channels only: "
 ENV, CH, DEST = "@ENV@", "@CHANNEL@", "@DEST@"
 # chart role -> security.acls key
-ROLES = {"receiver": "receiver", "worker": "pipeline_worker", "loader": "loader", "archiver": "archiver"}
+ROLES = {"receiver": "receiver", "worker": "pipeline_worker", "loader": "loader", "archiver": "archiver", "api": "api"}
 # Placeholder until the architect adds `lag_reader` to the contract (W3-29): DESCRIBE only, topics
 # PREFIXED `<env>.` and LITERAL `_tb.<env>.events`, groups PREFIXED `tb.<env>.`. No READ, no WRITE.
 LAG_READER_PLACEHOLDER = "DESCRIBE on <env>.*, _tb.<env>.events; DESCRIBE on group tb.<env>.*"

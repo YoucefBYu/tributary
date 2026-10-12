@@ -316,6 +316,9 @@ services:
       # until a spec arrives, so the order is a courtesy, not a requirement.
       - --channel=adt-passthrough
       - --env=dev
+      # Explicit and unique per replica (W3-28d): never a pid-derived default, which is identical in every
+      # container. One replica here; a second would need its own value (mllp-1).
+      - --instance=mllp-0
     environment:
       TB_ENGINE_KAFKA_FILE: /etc/tributary/engine-kafka.json
       # kafka_publisher.py reads clients.receiver_producer (acks, idempotence, delivery timeout)

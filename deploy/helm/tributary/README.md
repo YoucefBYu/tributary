@@ -111,3 +111,36 @@ checklist. Provider-managed keys protect a lost disk, nothing more.
   the archiver, uses a named user; confirm with `SELECT name FROM system.users`. (2) Administrator queries are
   logged outside ClickHouse (a forwarder of the server query log, or the proxy or audit layer in front of it)
   to a store that ClickHouse administrators cannot edit. Neither is automated by this chart.
+
+## Control-plane API (`api.enabled`)
+
+Off by default. A stateless Deployment with a ClusterIP Service on `api.port` (8080) and a NetworkPolicy:
+the API port admits the kubelet CIDR (probes) and `networkPolicy.apiFrom`; nothing else.
+
+- PostgreSQL (ADR-004 C1/C2): `api.database.*` become `TB_DATABASE_HOST/_PORT/_NAME/_USER` plus
+  `TB_DATABASE_SECRET_REF` (file `<secretRef>/password`) and `TB_DATABASE_CA_SECRET_REF` (file `ca.crt`). The
+  API always verifies the server certificate (verify-full), so the CA Secret is required. There is no URL and no
+  password in values or environment (`helm_check.py` refuses `TB_DATABASE_URL` and any `*PASSWORD` variable).
+- Ops listener (`/metrics`, `/livez`): `TB_OPS_BIND` is loopback by default. With `api.opsBindPodIP=true` it
+  binds the pod IP and the NetworkPolicy admits only the OTel collector on `api.opsPort`. The API starts this
+  listener only while the tamper check is configured. Liveness, readiness and startup probes use `/livez` and
+  `/readyz` on the API port, which the kubelet CIDR can reach.
+- Tamper check (ADR-004 R7 rev 3): `api.clickhouse.*` set `TB_CLICKHOUSE_URL` (https), `_USER`, `_SECRET_REF`
+  and `TB_AUDIT_TAMPER_TARGETS`. Use a read-only user that cannot write what it grades:
+  `CREATE USER tb_api_audit_ro IDENTIFIED WITH sha256_password BY '<from your secrets store>'; GRANT SELECT ON tributary.audit_log TO tb_api_audit_ro;`
+  Verify with `SHOW GRANTS FOR tb_api_audit_ro;` (one SELECT row, no INSERT).
+- Kafka role `api` (`kafka.roleSecretRefs.api`, default `tb-api`): the chart renders its engine-kafka ConfigMap and,
+  when `strimzi.enabled` is also true, a `KafkaUser` with the 5 ACLs of the `api` role in
+  `contracts/topics/v0/topic-defaults.json` (generated into `files/acls.json`): READ and WRITE on
+  `_tb.<env>.channels`, WRITE on `_tb.<env>.audit`, IDEMPOTENT_WRITE on the cluster and DESCRIBE on group
+  `tb.<env>.reconciler`. `helm_check.py` requires the rendered ACLs to equal that role exactly. Without Strimzi,
+  create an equivalent user yourself.
+
+## Real-scrape check (W3-8)
+
+`deploy/scrape-check/verify_scrape.sh` starts the lite Compose stack, runs a real Prometheus (pinned by digest)
+inside the worker's and the receiver's network namespaces, and requires: both `/metrics` targets up, the worker
+exporting `tb_partitions_halted`, and every alert expression of the rendered `PrometheusRule` evaluating without
+error. It does not make an alert fire; `partition_halted` firing needs a blocking-retry exhaust and belongs to
+the chaos suite. It is Compose-based, not kind: kind is not installed on the lite-stack runner and adds nothing
+to the scrape and rule-evaluation proof. Set `TB_COMPOSE_EXTRA` for local compose overrides behind a proxy.

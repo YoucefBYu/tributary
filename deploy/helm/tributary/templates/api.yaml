@@ -1,0 +1,160 @@
+{{- if .Values.api.enabled }}
+{{- $a := .Values.api }}
+{{- $db := $a.database }}
+{{- $ch := $a.clickhouse }}
+{{- $name := printf "%s-api" (include "tb.name" .) }}
+{{- /* Required inputs fail the render rather than start an API that refuses (or worse, runs weak). */}}
+{{- $_ := required "api.database.host is required" $db.host }}
+{{- $_ := required "api.database.name is required" $db.name }}
+{{- $_ := required "api.database.user is required" $db.user }}
+{{- $_ := required "api.database.secretRef is required (the password is the file <secretRef>/password, never a value)" $db.secretRef }}
+{{- $_ := required "api.database.caSecretRef is required: the API verifies the server certificate (sslmode verify-full, ADR-004 C1)" $db.caSecretRef }}
+{{- $_ := required "api.oidc.issuer is required (https)" $a.oidc.issuer }}
+{{- $_ := required "api.oidc.audience is required" $a.oidc.audience }}
+{{- if not $a.oidc.roleMap }}{{ fail "api.oidc.roleMap is required" }}{{ end }}
+{{- if or $ch.url $ch.user $ch.secretRef $ch.targets }}
+{{- if not (and $ch.url $ch.user $ch.secretRef $ch.targets) }}{{ fail "api.clickhouse.url, user, secretRef and targets go together" }}{{ end }}
+{{- if not (hasPrefix "https://" $ch.url) }}{{ fail "api.clickhouse.url must be https" }}{{ end }}
+{{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "tb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  replicas: {{ $a.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: api
+  template:
+    metadata:
+      labels:
+        {{- include "tb.labels" . | nindent 8 }}
+        app.kubernetes.io/component: api
+    spec:
+      automountServiceAccountToken: false
+      securityContext: {{- include "tb.podSecurityContext" . | nindent 8 }}
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: api
+          image: {{ include "tb.image" (dict "root" . "pkg" "api") | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: [tributary.api]
+          env:
+            {{- include "tb.downwardEnv" . | nindent 12 }}
+            {{- include "tb.commonEnv" . | nindent 12 }}
+            - {name: TB_SECRETS_DIR, value: /var/run/secrets/tributary}
+            - {name: TB_API_BIND, value: "$(POD_IP)"}
+            - {name: TB_API_PORT, value: {{ $a.port | quote }}}
+            {{- /* Ops listener (/metrics, /livez): loopback unless api.opsBindPodIP, then the pod IP with a
+                   NetworkPolicy that admits the OTel collector only. */}}
+            {{- if $a.opsBindPodIP }}
+            - {name: TB_OPS_BIND, value: "$(POD_IP)"}
+            {{- else }}
+            - {name: TB_OPS_BIND, value: "127.0.0.1"}
+            {{- end }}
+            - {name: TB_OPS_PORT, value: {{ $a.opsPort | quote }}}
+            - {name: TB_DATABASE_HOST, value: {{ $db.host | quote }}}
+            - {name: TB_DATABASE_PORT, value: {{ $db.port | quote }}}
+            - {name: TB_DATABASE_NAME, value: {{ $db.name | quote }}}
+            - {name: TB_DATABASE_USER, value: {{ $db.user | quote }}}
+            - {name: TB_DATABASE_SECRET_REF, value: {{ $db.secretRef | quote }}}
+            - {name: TB_DATABASE_CA_SECRET_REF, value: {{ $db.caSecretRef | quote }}}
+            - {name: TB_OIDC_ISSUER, value: {{ $a.oidc.issuer | quote }}}
+            - {name: TB_OIDC_AUDIENCE, value: {{ $a.oidc.audience | quote }}}
+            - {name: TB_OIDC_ROLE_MAP, value: {{ $a.oidc.roleMap | toJson | quote }}}
+            - {name: TB_OIDC_ROLES_CLAIM, value: {{ $a.oidc.rolesClaim | quote }}}
+            {{- if $a.oidc.jwksUri }}
+            - {name: TB_OIDC_JWKS_URI, value: {{ $a.oidc.jwksUri | quote }}}
+            {{- end }}
+            {{- if $a.corsOrigins }}
+            - {name: TB_CORS_ORIGINS, value: {{ join "," $a.corsOrigins | quote }}}
+            {{- end }}
+            {{- if $ch.url }}
+            - {name: TB_CLICKHOUSE_URL, value: {{ $ch.url | quote }}}
+            - {name: TB_CLICKHOUSE_USER, value: {{ $ch.user | quote }}}
+            - {name: TB_CLICKHOUSE_SECRET_REF, value: {{ $ch.secretRef | quote }}}
+            - {name: TB_AUDIT_TAMPER_TARGETS, value: {{ $ch.targets | toJson | quote }}}
+            - {name: TB_AUDIT_TAMPER_CHECK_INTERVAL_S, value: {{ $ch.intervalSeconds | quote }}}
+            {{- end }}
+          ports:
+            - {name: http, containerPort: {{ $a.port }}}
+            {{- if $a.opsBindPodIP }}
+            - {name: ops, containerPort: {{ $a.opsPort }}}
+            {{- end }}
+          # Kubelet probes the API port (NetworkPolicy admits the kubelet CIDR). /livez and /readyz carry no
+          # data and need no token (openapi security []). Not the ops /livez, which also tracks the tamper
+          # task: the ops listener is collector-only by policy (the kubelet is not admitted to it), exists only
+          # while the tamper check is configured, and a stuck tamper task must not restart an API that is
+          # serving requests. The tamper task's health is the stale-check alert on its timestamp gauge.
+          startupProbe:
+            httpGet: {path: /livez, port: http}
+            {{- toYaml $a.probes.startup | nindent 12 }}
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            {{- toYaml $a.probes.readiness | nindent 12 }}
+          livenessProbe:
+            httpGet: {path: /livez, port: http}
+            {{- toYaml $a.probes.liveness | nindent 12 }}
+          resources: {{- toYaml $a.resources | nindent 12 }}
+          securityContext: {{- include "tb.containerSecurityContext" . | nindent 12 }}
+          volumeMounts:
+            {{- include "tb.kafkaMounts" (dict "root" . "role" "api") | nindent 12 }}
+            - {name: database, mountPath: /var/run/secrets/tributary/{{ $db.secretRef }}, readOnly: true}
+            - {name: database-ca, mountPath: /var/run/secrets/tributary/{{ $db.caSecretRef }}, readOnly: true}
+            {{- if $ch.secretRef }}
+            - {name: clickhouse, mountPath: /var/run/secrets/tributary/{{ $ch.secretRef }}, readOnly: true}
+            {{- end }}
+            {{- if $ch.caSecretRef }}
+            # Optional private CA for the ClickHouse endpoint (<caSecretRef>/ca.crt). The API reads it once it
+            # grows the setting (control-plane-engineer); the mount is here so the chart need not change.
+            - {name: clickhouse-ca, mountPath: /var/run/secrets/tributary/{{ $ch.caSecretRef }}, readOnly: true}
+            {{- end }}
+      volumes:
+        {{- include "tb.kafkaVolumes" (dict "root" . "role" "api") | nindent 8 }}
+        - name: database
+          secret: {secretName: {{ $db.secretRef }}}
+        - name: database-ca
+          secret: {secretName: {{ $db.caSecretRef }}}
+        {{- if $ch.secretRef }}
+        - name: clickhouse
+          secret: {secretName: {{ $ch.secretRef }}}
+        {{- end }}
+        {{- if $ch.caSecretRef }}
+        - name: clickhouse-ca
+          secret: {secretName: {{ $ch.caSecretRef }}}
+        {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "tb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: api
+  ports:
+    - {name: http, port: {{ $a.port }}, targetPort: http}
+{{- if .Values.podDisruptionBudget.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $name }}
+  labels: {{- include "tb.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: api
+{{- end }}
+{{- end }}

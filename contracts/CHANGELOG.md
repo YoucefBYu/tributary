@@ -3,6 +3,34 @@
 Newest first. Each entry names the contract, the version, whether the change is additive or
 breaking, and the reason. Breaking changes reference an ADR.
 
+## 2026-10-12 (final) — set 1.8: `API_TLS_REQUIRED` named (README only)
+
+- **`observability/v0` L6a** names `API_TLS_REQUIRED`, the API's startup refusal for plaintext on a
+  non-loopback bind (ADR-004 C1a, ruled 2026-10-12). It is not registered; counts are unchanged.
+
+## 2026-10-12 (newest) — set 1.8: `api` Kafka role and the `tb.<env>.reconciler` group
+
+**Additive: a new role string, a new platform group, and one more alternative in the
+`consumerGroup` pattern. No example, manifest or pinned pair changes, so `validate.py` is predicted
+unchanged (244 / 0; 154 invalid / 0 drifted). No invariant changes.**
+
+- **`topic-defaults.json` `security.acls.api`:** `READ, WRITE on _tb.<env>.channels; WRITE on
+  _tb.<env>.audit; IDEMPOTENT_WRITE on the cluster; DESCRIBE on group tb.<env>.reconciler`, with
+  `api_note`. All LITERAL. Each grant was checked against `packages/tributary-api` (publisher,
+  reconciler, audit; read, not run). The reconciler reads only `_tb.<env>.channels` and never commits.
+  No cluster DESCRIBE, no READ on audit or events. `control_plane` is unchanged (lite Compose
+  one-shot).
+- **`consumer_groups.platform_groups.reconciler`** and **`topic-name.schema.json` `consumerGroup`**
+  `(archiver|reprocessor|reconciler)`; README 3.4.1 row and paragraph; 3.6 line.
+- **Coordinated changes:**
+  - `devops-engineer`: regenerate `acls.json`, and add `api` to `gen_acls.py` `ROLES` (it renders only
+    the roles it lists).
+  - `control-plane-engineer`: reconciler `group.id` `tb-api-reconciler` → `tb.<env>.reconciler`
+    (`main.py:63`).
+  - `platform-engineer`: add `"reconciler"` to `topics.PlatformGroup` in the same push, or
+    `test_roles_and_platform_groups_match_the_contract` goes red.
+  - `qa-engineer`: a deny-by-default test for the API under exactly this role.
+
 ## 2026-10-12 (latest) — set 1.8: HTTP synchronous reply mapping ruled (W3-19; README only)
 
 **Additive, documentation only. No schema, example, manifest, header or error-code change, so

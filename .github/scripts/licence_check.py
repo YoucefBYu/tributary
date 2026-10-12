@@ -66,8 +66,10 @@ MPL_APPROVED: dict[str, str] = {
 #   2026-09-23 one above): unmodified, in the runtime, only as clickhouse-connect's dependency in the
 #   archiver. Modelled like LGPL_APPROVED's `importers_of`: a package approved "non-runtime" above may
 #   ALSO be in the runtime closure, but only when every workspace member that pulls it in is listed
-#   here. `tributary-archiver` does not exist yet; until it does, certifi in the runtime closure by any
-#   member still fails, which is correct. `tributary-loaders` must never gain it.
+#   here. CONFIRMED against the real tributary-archiver (W3-15, 2026-10-12): `importers_of("certifi")` is
+#   exactly {"tributary-archiver"} (via clickhouse-connect), and the negative fixtures in
+#   test_licence_check.py fail when any other member (for example tributary-loaders) pulls it in.
+#   `tributary-loaders` must never gain it.
 MPL_RUNTIME_IMPORTERS: dict[str, frozenset[str]] = {
     "certifi": frozenset({"tributary-archiver"}),
 }

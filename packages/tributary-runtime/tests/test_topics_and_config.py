@@ -116,6 +116,14 @@ def test_archiver_platform_group_is_the_literal_contract_name() -> None:
     assert validator.is_valid(topics.consumer_group("prod", "archiver", "pipeline"))
 
 
+@pytest.mark.parametrize("kind", get_args(topics.PlatformGroup))
+def test_every_platform_group_builds_a_contract_valid_literal_name(kind: str) -> None:
+    # Set 1.8 added `reconciler` (the API's spec reconciler); each kind must build `tb.<env>.<kind>`.
+    group = topics.platform_group("prod", cast(Any, kind))
+    assert group == f"tb.prod.{kind}"
+    assert _consumer_group_schema().is_valid(group)
+
+
 @pytest.mark.parametrize(
     ("role", "destination", "shadow"),
     [

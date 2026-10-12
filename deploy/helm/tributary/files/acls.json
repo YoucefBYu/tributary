@@ -13,7 +13,7 @@
     }
   },
   "generatedFrom": "contracts/topics/v0/topic-defaults.json",
-  "sourceSha256": "b7f2e13fd2eecebf19c24e52dd0b56c3eed923842a32cf28cc106a180aac0312",
+  "sourceSha256": "cd26fb055e5ea6c294be6ca937524b1944245fa034e6963f3550b38115861160",
   "lagReaderIsPlaceholder": false,
   "placeholders": {
     "env": "@ENV@",
@@ -180,6 +180,38 @@
         "name": "_tb.@ENV@.events",
         "patternType": "LITERAL",
         "operation": "READ"
+      }
+    ],
+    "api": [
+      {
+        "resourceType": "CLUSTER",
+        "name": "kafka-cluster",
+        "patternType": "LITERAL",
+        "operation": "IDEMPOTENT_WRITE"
+      },
+      {
+        "resourceType": "GROUP",
+        "name": "tb.@ENV@.reconciler",
+        "patternType": "LITERAL",
+        "operation": "DESCRIBE"
+      },
+      {
+        "resourceType": "TOPIC",
+        "name": "_tb.@ENV@.audit",
+        "patternType": "LITERAL",
+        "operation": "WRITE"
+      },
+      {
+        "resourceType": "TOPIC",
+        "name": "_tb.@ENV@.channels",
+        "patternType": "LITERAL",
+        "operation": "READ"
+      },
+      {
+        "resourceType": "TOPIC",
+        "name": "_tb.@ENV@.channels",
+        "patternType": "LITERAL",
+        "operation": "WRITE"
       }
     ],
     "lag_reader": [

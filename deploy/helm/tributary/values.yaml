@@ -13,6 +13,7 @@ image:
     runtime: ""
     loaders: ""
     archiver: ""
+    api: ""
 
 # Engine-to-Kafka connection (engine-kafka/v0), rendered to a ConfigMap per role. SCRAM secrets are
 # Strimzi KafkaUser secrets (or your own) named in secretRef; they hold no value in this chart.
@@ -25,6 +26,7 @@ kafka:
     worker: tb-worker
     loader: tb-loader
     archiver: tb-archiver
+    api: tb-api                # the API's channels/audit producer and reconciler consumer (ACLs: architect, topic-defaults.json)
 
 # One entry per channel. The channel spec itself is read from the compacted _tb.<env>.channels topic
 # (invariant 3), not from this chart.
@@ -47,6 +49,48 @@ worker:
   resources: {requests: {cpu: 200m, memory: 256Mi}, limits: {memory: 1Gi}}
 loader:
   resources: {requests: {cpu: 100m, memory: 128Mi}, limits: {memory: 512Mi}}
+
+# Control-plane API (packages/tributary-api). Off by default; it is not part of the data plane (invariant 3),
+# so receivers, workers and loaders never depend on it. A Deployment because it is stateless.
+api:
+  enabled: false
+  replicas: 2
+  port: 8080
+  opsPort: 9180
+  # TB_OPS_BIND. false (default): the ops listener (/metrics, /livez) stays on loopback and cannot be scraped.
+  # true: it binds the pod IP, and the NetworkPolicy then lets only the OTel collector reach it.
+  opsBindPodIP: false
+  resources: {requests: {cpu: 200m, memory: 256Mi}, limits: {memory: 1Gi}}
+  probes:
+    startup: {periodSeconds: 5, failureThreshold: 30}
+    readiness: {periodSeconds: 5, failureThreshold: 3, timeoutSeconds: 2}
+    liveness: {initialDelaySeconds: 10, periodSeconds: 10, failureThreshold: 3, timeoutSeconds: 2}
+  # PostgreSQL (ADR-004 C1/C2). The API always connects with TLS verify-full; the password is the file
+  # <secretRef>/password and the CA is <caSecretRef>/ca.crt. There is no URL and no password in values.
+  database:
+    host: ""
+    port: 5432
+    name: ""
+    user: ""
+    secretRef: ""
+    caSecretRef: ""
+  oidc:
+    issuer: ""            # https URL
+    audience: ""
+    roleMap: {}           # IdP role or group -> one of the five Tributary roles
+    rolesClaim: roles
+    jwksUri: ""
+  corsOrigins: []
+  # Audit tamper check (ADR-004 R7 rev 3). Leave url empty to turn it off (its series stay absent). The user
+  # is a READ-ONLY ClickHouse user: SELECT on <database>.audit_log only, never INSERT (the writer does not
+  # grade itself). See the README for the exact GRANT.
+  clickhouse:
+    url: ""               # https://...
+    user: ""
+    secretRef: ""
+    caSecretRef: ""       # optional Secret with ca.crt for a private ClickHouse CA (mounted; the API side follows)
+    targets: {}           # environment name -> ClickHouse database
+    intervalSeconds: 900  # keep equal to monitoring.auditTamperCheckIntervalSeconds
 
 archiver:
   enabled: true
@@ -92,9 +136,12 @@ networkPolicy:
     worker: []
     loader: []           # destinations (HTTP, FHIR, SFTP, ...)
     archiver: []         # ClickHouse
+    api: []              # PostgreSQL (5432 TLS), Kafka, the OIDC issuer, and ClickHouse when the tamper check is on
     otel: []             # an OTLP trace backend, if otel.otlpEndpointExporter is set
     # Each entry is a raw NetworkPolicy egress rule, e.g.
     #   - {to: [{podSelector: {matchLabels: {strimzi.io/cluster: tributary}}}], ports: [{protocol: TCP, port: 9093}]}  # Peers allowed to reach each receiver's ingest port. Empty means ingest is denied (default-deny).
+  # Peers allowed to reach the API port (ingress controller, UI). The kubelet CIDR is always allowed on it.
+  apiFrom: []
   ingestFrom: []
   #  - ipBlock: {cidr: 10.20.0.0/16}
   #  - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: ingress-nginx}}

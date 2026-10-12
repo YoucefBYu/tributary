@@ -37,3 +37,16 @@ ingress:
 archiver:
   clickhouse:
     caCertSecretRef: chca
+api:
+  enabled: true
+  opsBindPodIP: true
+  database: {host: pg.example.internal, name: tributary, user: tb_api, secretRef: tb-api-db, caSecretRef: tb-api-db-ca}
+  oidc:
+    issuer: https://idp.example.internal/realms/tb
+    audience: tributary-api
+    roleMap: {tb-admins: admin}
+  clickhouse:
+    url: https://clickhouse.example.internal:8443
+    user: tb_api_audit_ro
+    secretRef: tb-api-clickhouse
+    targets: {prod: tributary}

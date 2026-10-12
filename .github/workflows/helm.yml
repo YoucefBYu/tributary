@@ -78,6 +78,18 @@ jobs:
           # C1: ClickHouse TLS off
           helm template tb "$CHART" -f "$CHART/ci/values-ci.yaml" --set strimzi.enabled=true --set archiver.clickhouse.secure=false > tampered-tls.yaml
           $py tampered-tls.yaml --negative
+      - name: mutation controls, API (database CA, ops bind, liveness port, ClickHouse user and TLS) must fail
+        run: |
+          py="uv run --no-project --with pyyaml==6.0.3 python .github/scripts/helm_check.py"
+          mut() { sed "$1" rendered.yaml > tampered-api.yaml; cmp -s rendered.yaml tampered-api.yaml && exit 1; $py tampered-api.yaml --negative; }
+          mut 's/{name: TB_DATABASE_CA_SECRET_REF, value: "tb-api-db-ca"}/{name: TB_X, value: "1"}/'
+          mut 's/{name: TB_OPS_BIND, value: "\$(POD_IP)"}/{name: TB_OPS_BIND, value: "0.0.0.0"}/'
+          mut '/livenessProbe/,+1 s#port: http#port: ops#'
+          mut 's/value: "tb_api_audit_ro"/value: "default"/'
+          mut 's#value: "https://clickhouse.example.internal:8443"#value: "http://clickhouse.example.internal:8123"#'
+      - name: an API ops listener on the pod IP without a NetworkPolicy is refused
+        run: |
+          helm template tb "$CHART" -f "$CHART/ci/values-ci.yaml" --set channels=null --set networkPolicy.enabled=false 2>&1 | grep -q "unprotected"
       - name: default values refuse to render without a kubelet CIDR
         run: |
           helm template tb "$CHART" 2>&1 | grep -q "networkPolicy.kubeletCIDR is required"

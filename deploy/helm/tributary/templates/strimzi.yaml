@@ -56,6 +56,7 @@ spec:
 {{- $types := dict "TOPIC" "topic" "GROUP" "group" "CLUSTER" "cluster" }}
 {{- $pat := dict "LITERAL" "literal" "PREFIXED" "prefix" }}
 {{- $users := dict "receiver" .Values.kafka.roleSecretRefs.receiver "worker" .Values.kafka.roleSecretRefs.worker "loader" .Values.kafka.roleSecretRefs.loader "archiver" .Values.kafka.roleSecretRefs.archiver "lag_reader" .Values.keda.lagReaderUser }}
+{{- if .Values.api.enabled }}{{ $_ := set $users "api" .Values.kafka.roleSecretRefs.api }}{{ end }}
 {{- range $role, $user := $users }}
 ---
 apiVersion: kafka.strimzi.io/v1beta2

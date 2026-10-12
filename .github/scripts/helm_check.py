@@ -94,7 +94,7 @@ def check(docs: list[dict[str, Any]]) -> list[str]:
     for np in by_kind.get("NetworkPolicy", []):
         for rule in np["spec"].get("ingress", []):
             if any(p["port"] == 9180 for p in rule["ports"]):
-                froms = rule["from"]
+                froms = rule.get("from", [])
                 if any("ipBlock" in f and f["ipBlock"]["cidr"] not in ("0.0.0.0/0", "::/0") for f in froms) and all(
                     "ipBlock" in f or "podSelector" in f for f in froms
                 ):
@@ -147,6 +147,7 @@ def check(docs: list[dict[str, Any]]) -> list[str]:
                 bad.append("runtime and migration secretRef are the same")
 
     bad += check_adr004_conditions(docs, by_kind)
+    bad += check_api(by_kind)
     bad += check_workloads(docs, by_kind)
     bad += check_retention(docs, by_kind)
     bad += check_acls(by_kind)
@@ -182,7 +183,7 @@ def check_workloads(docs: list[dict[str, Any]], by_kind: dict[str, list[dict[str
     """StatefulSets (ruling H3), no PVCs, no contracts volume (ruling H4), archiver CA path (W3-8 follow-up)."""
     bad: list[str] = []
     for d in by_kind.get("Deployment", []):
-        if "otel-collector" not in d["metadata"]["name"]:
+        if "otel-collector" not in d["metadata"]["name"] and not d["metadata"]["name"].endswith("-api"):
             bad.append(f"{d['metadata']['name']}: data-plane workload is a Deployment, must be a StatefulSet")
     sets = by_kind.get("StatefulSet", [])
     if not sets:
@@ -308,6 +309,73 @@ def check_adr004_conditions(docs: list[dict[str, Any]], by_kind: dict[str, list[
     return bad
 
 
+def _envs(dep: dict[str, Any]) -> dict[str, str]:
+    c = dep["spec"]["template"]["spec"]["containers"][0]
+    return {e["name"]: str(e.get("value", "$(valueFrom)")) for e in c.get("env", [])}
+
+
+def check_api(by_kind: dict[str, list[dict[str, Any]]]) -> list[str]:
+    """tributary-api (W3-34, ADR-004 C1/C2, ops/v0 O2): PostgreSQL by secretRef with verify-full inputs, ops
+    listener on loopback or on the pod IP behind a collector-only NetworkPolicy, a kubelet probe on the API
+    port, a read-only ClickHouse user, a ClusterIP Service and a NetworkPolicy."""
+    apis = [d for d in by_kind.get("Deployment", []) if d["metadata"]["name"].endswith("-api")]
+    bad: list[str] = []
+    for dep in apis:
+        n = dep["metadata"]["name"]
+        env = _envs(dep)
+        spec = dep["spec"]["template"]["spec"]
+        c = spec["containers"][0]
+        for k in ("TB_DATABASE_HOST", "TB_DATABASE_NAME", "TB_DATABASE_USER", "TB_DATABASE_SECRET_REF"):
+            if not env.get(k):
+                bad.append(f"{n}: {k} is not set (ADR-004 C2)")
+        if not env.get("TB_DATABASE_CA_SECRET_REF"):
+            bad.append(f"{n}: no database CA secretRef, so sslmode verify-full cannot be met (C1)")
+        for k in env:
+            if k == "TB_DATABASE_URL" or "PASSWORD" in k:
+                bad.append(f"{n}: {k} carries a database credential in the environment (C2)")
+        if env.get("TB_DATABASE_SSLMODE", "verify-full") != "verify-full":
+            bad.append(f"{n}: TB_DATABASE_SSLMODE is not verify-full (C1)")
+        ops = env.get("TB_OPS_BIND", "")
+        if ops not in ("127.0.0.1", "$(POD_IP)"):
+            bad.append(f"{n}: TB_OPS_BIND must be loopback or the pod IP, got {ops!r}")
+        if env.get("TB_API_BIND") not in ("$(POD_IP)", "127.0.0.1"):
+            bad.append(f"{n}: TB_API_BIND is not the pod IP")
+        if ops == "$(POD_IP)":
+            ops_port = int(env["TB_OPS_PORT"])
+            nps = [
+                np
+                for np in by_kind.get("NetworkPolicy", [])
+                if np["spec"].get("podSelector", {}).get("matchLabels", {}).get("app.kubernetes.io/component") == "api"
+            ]
+            if not nps:
+                bad.append(f"{n}: ops bound to the pod IP without an api NetworkPolicy")
+            for np in nps:
+                for rule in np["spec"].get("ingress", []):
+                    if any(p.get("port") == ops_port for p in rule.get("ports", [])):
+                        if not rule.get("from"):
+                            bad.append(f"{n}: an ops-port ingress rule with no `from` admits everyone")
+                        for f in rule.get("from", []):
+                            comp = f.get("podSelector", {}).get("matchLabels", {}).get("app.kubernetes.io/component")
+                            if "ipBlock" in f or comp != "otel-collector":
+                                bad.append(f"{n}: the ops port admits more than the OTel collector")
+                    elif not rule.get("ports"):
+                        bad.append(f"{n}: an ingress rule without ports opens the ops port")
+        live = c.get("livenessProbe", {}).get("httpGet", {})
+        if live.get("path") != "/livez" or live.get("port") != "http":
+            bad.append(f"{n}: liveness must be kubelet httpGet /livez on the API port")
+        if env.get("TB_CLICKHOUSE_URL"):
+            if not env["TB_CLICKHOUSE_URL"].startswith("https://"):
+                bad.append(f"{n}: TB_CLICKHOUSE_URL is not https (C1)")
+            if env.get("TB_CLICKHOUSE_USER", "default") == "default":
+                bad.append(f"{n}: the tamper check uses the ClickHouse default user (needs a SELECT-only user)")
+        if not c["securityContext"].get("readOnlyRootFilesystem"):
+            bad.append(f"{n}: root filesystem is writable")
+    for svc in by_kind.get("Service", []):
+        if svc["metadata"]["name"].endswith("-api") and svc["spec"].get("type", "ClusterIP") != "ClusterIP":
+            bad.append(f"Service {svc['metadata']['name']} is not ClusterIP")
+    return bad
+
+
 def check_retention(docs: list[dict[str, Any]], by_kind: dict[str, list[dict[str, Any]]]) -> list[str]:
     """ADR-004 R2/R3: the three TTL vars on archiver and migrate Job with the R2 defaults; the decrease guard
     on the Job only; the audit topic buffer read from the contract."""
@@ -361,7 +429,7 @@ def check_acls(by_kind: dict[str, list[dict[str, Any]]]) -> list[str]:
                 bad.append(f"KafkaUser {role}: wildcard or empty resource name")
             if op in ("Alter", "Delete", "All") or (t == "cluster" and op not in ("IdempotentWrite", "Describe")):
                 bad.append(f"KafkaUser {role}: forbidden operation {op} on {t}")
-            if op == "Write" and name.endswith(".channels"):
+            if op == "Write" and name.endswith(".channels") and role != "api":
                 bad.append(f"KafkaUser {role}: WRITE on the channels topic")
     # Sync-reply grants (set 1.2): present for the syncReply channel, absent for the other one.
     rcv, wrk = rendered.get("receiver", set()), rendered.get("worker", set())
@@ -397,6 +465,22 @@ def check_acls(by_kind: dict[str, list[dict[str, Any]]]) -> list[str]:
         for t, n in want:
             if t != "cluster" and (t, n) not in have:
                 bad.append(f"KafkaUser {role}: contract grant on {n} missing from the render")
+    if "api" in rendered:  # rendered only with api.enabled: exactly the contract's `api` role, nothing more
+        camel = lambda op: "".join(w.capitalize() for w in op.split("_"))  # noqa: E731
+        want_api = {
+            (
+                g["resourceType"].lower(),
+                "" if g["resourceType"] == "CLUSTER" else g["name"].replace("@ENV@", "prod"),
+                "" if g["resourceType"] == "CLUSTER" else g["patternType"].lower(),
+                camel(g["operation"]),
+            )
+            for g in gen["api"]
+        }
+        have_api = {(t, n, p, op) for t, n, p, op in rendered["api"]}
+        if have_api != want_api:
+            bad.append(
+                f"KafkaUser api: ACLs differ from acls.json (missing {sorted(want_api - have_api)}, extra {sorted(have_api - want_api)})"
+            )
     return bad
 
 
@@ -420,7 +504,11 @@ def check_network(
         for rule in n["spec"].get("ingress", []):
             ports = {p["port"] for p in rule.get("ports", [])}
             if 9180 in ports:
-                for f in rule["from"]:
+                if not rule.get("from"):
+                    bad.append(
+                        f"NetworkPolicy {n['metadata']['name']}: a 9180 ingress rule with no `from` admits everyone"
+                    )
+                for f in rule.get("from", []):
                     sel = f.get("podSelector", f.get("namespaceSelector"))
                     if ("podSelector" in f or "namespaceSelector" in f) and not sel:
                         bad.append("NetworkPolicy allows 9180 from podSelector {} (all pods)")
