@@ -86,6 +86,9 @@ class Settings:
     profile: str = "production"
     cors_origins: tuple[str, ...] = field(default_factory=tuple)
     publish_timeout_s: float = DEFAULT_PUBLISH_TIMEOUT_S
+    #: Seconds between reconciler passes (W3-5); 0 turns the loop off (`Reconciler.run_once` still works).
+    reconcile_interval_s: float = 30.0
+    reconcile_pending_grace_s: float = 120.0
 
     def __post_init__(self) -> None:
         if self.profile not in PROFILES:
@@ -95,6 +98,13 @@ class Settings:
         if self.oidc.jwks_file is not None and not (self.profile == "lite" and is_loopback(self.bind)):
             raise ConfigurationError(
                 "OIDC_JWKS_FILE_NOT_ALLOWED", "a static JWKS file needs profile lite and a loopback bind (ADR-009 D9)"
+            )
+        if not 0.0 <= self.reconcile_interval_s <= 3600.0:
+            raise ConfigurationError("RECONCILE_INTERVAL_OUT_OF_RANGE", "TB_RECONCILE_INTERVAL_S must be within 0-3600")
+        if not 2 * MAX_PUBLISH_TIMEOUT_S <= self.reconcile_pending_grace_s <= 86400.0:
+            raise ConfigurationError(
+                "RECONCILE_GRACE_OUT_OF_RANGE",
+                "TB_RECONCILE_PENDING_GRACE_S must exceed twice the publish timeout cap, so a live deploy is never expired",
             )
         if not 1.0 <= self.publish_timeout_s <= MAX_PUBLISH_TIMEOUT_S:
             raise ConfigurationError(
@@ -241,4 +251,6 @@ def from_env(env: Mapping[str, str]) -> Settings:
         publish_timeout_s=_number(
             env, "TB_PUBLISH_TIMEOUT_S", DEFAULT_PUBLISH_TIMEOUT_S, "PUBLISH_TIMEOUT_OUT_OF_RANGE"
         ),
+        reconcile_interval_s=_number(env, "TB_RECONCILE_INTERVAL_S", 30.0, "RECONCILE_INTERVAL_OUT_OF_RANGE"),
+        reconcile_pending_grace_s=_number(env, "TB_RECONCILE_PENDING_GRACE_S", 120.0, "RECONCILE_GRACE_OUT_OF_RANGE"),
     )

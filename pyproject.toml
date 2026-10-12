@@ -22,6 +22,7 @@ tributary-fhir = { workspace = true }
 tributary-content-hl7-fhir = { workspace = true }
 tributary-api = { workspace = true }
 tributary-archiver = { workspace = true }
+tributary-cli = { workspace = true }
 
 [dependency-groups]
 dev = [
@@ -34,6 +35,7 @@ dev = [
     "tributary-content-hl7-fhir",
     "tributary-api",
     "tributary-archiver",
+    "tributary-cli",
     "pytest>=8.3",
     "hypothesis>=6.112",   # MPL-2.0, human-approved 2026-09-22, unmodified
     "jsonschema>=4.23",    # conformance suite (tests/conformance)
@@ -94,5 +96,10 @@ mypy_path = [
     "packages/tributary-content-hl7-fhir/src",
     "packages/tributary-api/src",
     "packages/tributary-archiver/src",
+    "packages/tributary-cli/src",
 ]
 exclude = ['/tests/', '^spikes/']
+
+[[tool.mypy.overrides]]
+module = ["yaml"]
+ignore_missing_imports = true  # PyYAML ships no stubs; the CLI parses channel files into plain dicts

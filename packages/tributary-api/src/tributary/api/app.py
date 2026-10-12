@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import logging
 import time
@@ -31,6 +33,7 @@ from .health import LIVE, Readiness
 from .operations import OPERATIONS, check_routes
 from .problems import ApiProblem, render
 from .publisher import ChannelsPublisher
+from .reconciler import Reconciler, TopicReader
 from .service import _ABSENT, INFLIGHT_WAIT_S, MAX_INFLIGHT_DEPLOYS, ControlPlane
 from .validation import control_plane_issues, validate_document
 
@@ -177,9 +180,15 @@ def create_app(
     on_shutdown: list[Callable[[], Awaitable[None]]] | None = None,
     max_inflight_deploys: int = MAX_INFLIGHT_DEPLOYS,
     inflight_wait_s: float = INFLIGHT_WAIT_S,
+    topic_reader: TopicReader | None = None,
 ) -> FastAPI:
     service = ControlPlane(sessions, publisher, log, max_inflight=max_inflight_deploys, inflight_wait_s=inflight_wait_s)
     readiness = Readiness(service.ping_database, keys, publisher)
+    reconciler = (
+        None
+        if topic_reader is None
+        else Reconciler(sessions, publisher, topic_reader, log, pending_grace_s=settings.reconcile_pending_grace_s)
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -192,10 +201,17 @@ def create_app(
         if settings.oidc.jwks_file is not None:
             log.warning("static_jwks_file_in_use", profile=settings.profile)
         keys.start()
+        loop_task: asyncio.Task[None] | None = None
+        if reconciler is not None and settings.reconcile_interval_s > 0:
+            loop_task = asyncio.create_task(reconciler.run_forever(settings.reconcile_interval_s))
         log.info("api_started", profile=settings.profile)
         try:
             yield
         finally:
+            if loop_task is not None:
+                loop_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await loop_task
             await keys.stop()
             for hook in on_shutdown or []:
                 await hook()
@@ -212,6 +228,7 @@ def create_app(
     app.state.operations = {(o.method, o.path): o for o in OPERATIONS}
     app.state.validator = TokenValidator(settings.oidc, keys)
     app.state.keys = keys
+    app.state.reconciler = reconciler
 
     def request_id(request: Request) -> str | None:
         return getattr(request.state, "request_id", None)

@@ -244,6 +244,47 @@ class DeploymentRepository:
         )
         return (await self._s.execute(stmt)).scalar_one_or_none()
 
+    async def latest_published(self, channel_id: uuid.UUID, environment_id: uuid.UUID) -> Deployment | None:
+        """The newest record whose publish was acknowledged: what `_tb.<env>.channels` must hold (W3-5)."""
+        stmt = (
+            select(Deployment)
+            .where(
+                Deployment.channel_id == channel_id,
+                Deployment.environment_id == environment_id,
+                Deployment.status == "published",
+            )
+            .order_by(Deployment.seq.desc())
+            .limit(1)
+        )
+        return (await self._s.execute(stmt)).scalar_one_or_none()
+
+    async def pending(self, channel_id: uuid.UUID, environment_id: uuid.UUID) -> Deployment | None:
+        stmt = select(Deployment).where(
+            Deployment.channel_id == channel_id,
+            Deployment.environment_id == environment_id,
+            Deployment.status == "pending",
+        )
+        return (await self._s.execute(stmt)).scalar_one_or_none()
+
+    async def channel_names_in_environment(self, environment_id: uuid.UUID) -> list[str]:
+        """Every channel with at least one deployment record in the environment, by name."""
+        stmt = (
+            select(Channel.name)
+            .join(Deployment, Deployment.channel_id == Channel.id)
+            .where(Deployment.environment_id == environment_id)
+            .distinct()
+            .order_by(Channel.name)
+        )
+        return list((await self._s.execute(stmt)).scalars().all())
+
+    async def has_records(self, channel_id: uuid.UUID, environment_id: uuid.UUID) -> bool:
+        stmt = (
+            select(Deployment.id)
+            .where(Deployment.channel_id == channel_id, Deployment.environment_id == environment_id)
+            .limit(1)
+        )
+        return (await self._s.execute(stmt)).first() is not None
+
     async def previous_published_version(self, current: Deployment) -> ChannelVersion | None:
         """The most recent version published before `current` that differs from it: the default rollback
         target (`openapi/v0` RollbackRequest.to_version)."""

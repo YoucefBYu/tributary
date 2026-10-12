@@ -161,3 +161,12 @@ def test_the_producer_profile_refusal() -> None:
         with pytest.raises(ConfigurationError) as exc:
             check_producer_profile(bad)
         assert exc.value.code == "PRODUCER_PROFILE"
+
+
+def test_reconciler_settings_default_and_refuse_out_of_range() -> None:
+    s = config.from_env(BASE)
+    assert (s.reconcile_interval_s, s.reconcile_pending_grace_s) == (30.0, 120.0)
+    assert config.from_env({**BASE, "TB_RECONCILE_INTERVAL_S": "0"}).reconcile_interval_s == 0.0
+    refused("RECONCILE_INTERVAL_OUT_OF_RANGE", TB_RECONCILE_INTERVAL_S="-1")
+    refused("RECONCILE_INTERVAL_OUT_OF_RANGE", TB_RECONCILE_INTERVAL_S="7200")
+    refused("RECONCILE_GRACE_OUT_OF_RANGE", TB_RECONCILE_PENDING_GRACE_S="30")  # would expire a live deploy

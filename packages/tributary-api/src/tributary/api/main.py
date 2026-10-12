@@ -13,7 +13,7 @@ from collections.abc import Awaitable, Callable
 
 import uvicorn
 from fastapi import FastAPI
-from tributary.runtime.clients import producer_config
+from tributary.runtime.clients import consumer_config, producer_config
 from tributary.runtime.config import load_topic_defaults
 from tributary.runtime.engine_kafka import load_engine_kafka_or_exit
 from tributary.runtime.logs import JsonLogger
@@ -26,6 +26,7 @@ from .db.engine import make_session_factory
 from .errors import ConfigurationError
 from .operations import check_routes
 from .publisher import KafkaChannelsPublisher
+from .reconciler import KafkaTopicReader
 
 EXIT_CONFIG_REFUSED = 2
 
@@ -37,16 +38,20 @@ def check_producer_profile(kconf: dict[str, object]) -> None:
 
 
 def build_app(environ: dict[str, str] | None = None) -> FastAPI:
-    from confluent_kafka import Producer
+    from confluent_kafka import Consumer, Producer
 
     env = dict(os.environ if environ is None else environ)
     settings = config.from_env(env)
     log = JsonLogger("api")
     kafka = load_engine_kafka_or_exit(env, log=log)
-    kconf = producer_config(kafka, load_topic_defaults(), client_id="tb-api")
+    defaults = load_topic_defaults()
+    kconf = producer_config(kafka, defaults, client_id="tb-api")
     kconf["delivery.timeout.ms"] = int(settings.publish_timeout_s * 1000)
     check_producer_profile(kconf)
     publisher = KafkaChannelsPublisher(Producer(kconf), timeout_s=settings.publish_timeout_s)
+    reader = KafkaTopicReader(
+        lambda: Consumer(consumer_config(kafka, defaults, group_id="tb-api-reconciler", enable_partition_eof=True))
+    )
     oidc = settings.oidc
     fetch: Fetch
     if oidc.jwks_file is not None:
@@ -67,6 +72,7 @@ def build_app(environ: dict[str, str] | None = None) -> FastAPI:
         keys=keys,
         log=log,
         on_shutdown=hooks,
+        topic_reader=reader,
     )
 
 
