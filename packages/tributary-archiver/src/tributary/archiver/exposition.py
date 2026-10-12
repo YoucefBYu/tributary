@@ -44,6 +44,7 @@ class ArchiverExposition:
         version: str | None = None,
         log: Logger | None = None,
         strict: bool = False,
+        content: bool = False,
     ) -> None:
         self.source = metrics
         self.registry = MetricsRegistry(
@@ -52,8 +53,10 @@ class ArchiverExposition:
         registry = self.registry
         self._build_info = registry.gauge("tb_build_info")
         self._commits = registry.counter("tb_commits_total")
-        self._events = registry.counter("tb_archiver_events_total")
-        self._attrs = registry.counter("tb_archiver_attrs_dropped_total")
+        # The content archiver (W3-2b) has no event or attrs figures: those families stay unregistered, not zero.
+        self._content = content
+        self._events = None if content else registry.counter("tb_archiver_events_total")
+        self._attrs = None if content else registry.counter("tb_archiver_attrs_dropped_total")
         self._batches = registry.counter("tb_archiver_batches_total")
         self._insert = registry.histogram("tb_archiver_insert_duration_seconds")
         self._build_info.set(1, component=COMPONENT, version=version or build_version("tributary-archiver"))
@@ -64,10 +67,11 @@ class ArchiverExposition:
         m = self.source
         for outcome, total in (("ok", m.commits_ok), ("refused", 0), ("failed", m.commit_failures)):
             self._commits.set_total(total, component=COMPONENT, channel=ARCHIVER_CHANNEL, outcome=outcome)
-        self._events.set_total(m.rows_written, outcome="written")
-        self._events.set_total(m.events_rejected, outcome="invalid")
-        self._attrs.set_total(m.attrs_dropped_hmac, reason="hmac")
-        self._attrs.set_total(max(0, m.attrs_dropped - m.attrs_dropped_hmac), reason="denied_name")
+        if self._events is not None and self._attrs is not None:
+            self._events.set_total(m.rows_written, outcome="written")
+            self._events.set_total(m.events_rejected, outcome="invalid")
+            self._attrs.set_total(m.attrs_dropped_hmac, reason="hmac")
+            self._attrs.set_total(max(0, m.attrs_dropped - m.attrs_dropped_hmac), reason="denied_name")
         self._batches.set_total(m.batches_written, outcome="ok")
         self._batches.set_total(m.insert_failures, outcome="failed")
 

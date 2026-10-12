@@ -35,3 +35,27 @@ def test_scrape_series_carry_only_contract_labels() -> None:
     series = [line for line in text.splitlines() if line and not line.startswith("#")]
     assert series and all(line.startswith("tb_") for line in series)
     assert not [line for line in series if "message_id" in line or "attrs=" in line or "topic=" in line]
+
+
+def _contract_archiver_names() -> set[str]:
+    from tributary.runtime.metrics import MetricsContract
+
+    return {name for name, d in MetricsContract.load().metrics.items() if "archiver" in d.emitters}
+
+
+def test_the_events_archiver_registers_exactly_the_contracts_archiver_metrics() -> None:
+    """Two-way: nothing outside the contract, and no contract metric left unregistered."""
+    assert set(ArchiverExposition(ArchiverMetrics(), strict=True).registry.names) == _contract_archiver_names()
+
+
+def test_the_content_archiver_registers_a_strict_subset_of_the_contract_and_scrapes() -> None:
+    """`content=True` omits the events and attrs families (they describe events, not content). Everything it does
+    register is a contract name, so the registry accepts it; no content-specific family exists in the contract."""
+    metrics = ArchiverMetrics()
+    exposition = ArchiverExposition(metrics, strict=True, content=True)
+    names = set(exposition.registry.names)
+    assert names < _contract_archiver_names()
+    assert _contract_archiver_names() - names == {"tb_archiver_events_total", "tb_archiver_attrs_dropped_total"}
+    metrics.batches_written, metrics.commits_ok = 3, 3
+    text = exposition.render().decode()
+    assert 'tb_archiver_batches_total{outcome="ok"} 3' in text and "tb_archiver_events_total" not in text

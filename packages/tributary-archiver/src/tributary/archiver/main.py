@@ -34,7 +34,8 @@ from tributary.runtime.startup import (
 from tributary.runtime.topics import events_topic
 
 from .archiver import Archiver, ArchiverSettings, ConsumerLike
-from .config import load_config
+from .config import ArchiverConfig, load_config
+from .content import CONTENT_TABLE, content_ddl
 from .errors import (
     ArchiverError,
     ArchiverGrantsExcessive,
@@ -55,10 +56,17 @@ from .sink import ClickhouseSink, connect
 LIVENESS_STALE_S = 60.0
 
 
-def migrate(args: argparse.Namespace, log: JsonLogger, *, extra_tables: tuple[TableSpec, ...] = ()) -> None:
+def extra_tables(config: ArchiverConfig) -> tuple[TableSpec, ...]:
+    if config.content_ttl_days is None:
+        return ()
+    return (TableSpec(CONTENT_TABLE, config.content_ttl_days, content_ddl),)
+
+
+def migrate(args: argparse.Namespace, log: JsonLogger) -> None:
     """`--migrate-only`: create tables and apply retention (ADR-004 R6) with the MIGRATION credential, then exit.
 
-    No Kafka. `extra_tables` is where W3-2b adds `message_content` with `config.content_ttl_days`.
+    No Kafka. `message_content` joins the plan (create, TTL, decrease guard, `archive_settings` row) only when
+    `TB_ARCHIVE_CONTENT=true`, with `TB_ARCHIVE_CONTENT_TTL_DAYS` (W3-2b).
     """
     resolver = DirSecretResolver(args.secrets_dir) if args.secrets_dir else DirSecretResolver.from_environ()
     try:
@@ -73,7 +81,7 @@ def migrate(args: argparse.Namespace, log: JsonLogger, *, extra_tables: tuple[Ta
                 allow_decrease=config.allow_ttl_decrease,
                 log=log,
                 release=build_version("tributary-archiver"),
-                extra=extra_tables,
+                extra=extra_tables(config),
             )
         except (RetentionChanged, RetentionDecreaseRefused, AuditLogEngineInvalid):
             raise

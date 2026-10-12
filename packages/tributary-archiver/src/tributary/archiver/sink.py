@@ -193,15 +193,16 @@ def connect(target: ClickhouseTarget) -> Any:
 class ClickhouseSink:
     """Inserts one batch per call. Thread-confined: one client per archiver process (a session is not shared)."""
 
-    def __init__(self, client: Any, *, table: str = TABLE) -> None:
+    def __init__(self, client: Any, *, table: str = TABLE, columns: Sequence[str] = COLUMNS) -> None:
         self._client = client
         self._table = table
+        self._columns = list(columns)
 
     def insert(self, rows: Sequence[Sequence[Any]]) -> None:
         if not rows:
             return
         try:
-            self._client.insert(self._table, list(rows), column_names=list(COLUMNS))
+            self._client.insert(self._table, list(rows), column_names=self._columns)
         except Exception as exc:
             raise SinkError(
                 f"clickhouse insert failed ({type(exc).__name__})", transient=not is_permanent(exc), code=_code(exc)

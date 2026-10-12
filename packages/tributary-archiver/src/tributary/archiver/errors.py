@@ -92,6 +92,17 @@ class ArchiverSettingsUnsafe(ArchiverConfigError):
         self.setting = setting
 
 
+class ContentConfigError(ArchiverConfigError):
+    """The content archiver cannot start (W3-2b). Codes: `CONTENT_DISABLED` (`TB_ARCHIVE_CONTENT` is not true:
+    nothing is stored), `CONTENT_CHANNELS_EMPTY`, `CONTENT_CHANNEL_NOT_ENABLED` (backfill of a channel not in
+    `TB_ARCHIVE_CONTENT_CHANNELS`), `CONTENT_SCHEMA_MISSING` (run the migrate step first: the content archiver
+    never runs DDL, ADR-004 A5)."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
 class AuditLogEngineInvalid(ArchiverConfigError):
     """An existing `audit_log` is not a plain `MergeTree` (a `ReplacingMergeTree` would let INSERT overwrite)."""
 

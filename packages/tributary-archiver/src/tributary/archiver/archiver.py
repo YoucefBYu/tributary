@@ -37,11 +37,37 @@ from confluent_kafka import KafkaException, TopicPartition
 from tributary.sdk.context import Logger
 
 from .errors import EventRejected, SinkError
-from .event import EventRow, parse_event
+from .event import parse_event
 from .metrics import ArchiverMetrics, now_ms
 from .sink import Sink
 
 _PARTITION_EOF: Final = -191  # confluent_kafka.KafkaError._PARTITION_EOF
+
+
+class RowLike(Protocol):
+    """What the loop needs from a parsed record: the values to insert and the figures it counts."""
+
+    @property
+    def values(self) -> tuple[Any, ...]: ...
+    @property
+    def ts(self) -> Any: ...
+    @property
+    def attrs_dropped(self) -> int: ...
+    @property
+    def attrs_dropped_hmac(self) -> int: ...
+    @property
+    def fields_blanked(self) -> int: ...
+
+
+#: Turns one consumed Kafka message into a row, or raises `EventRejected`. The default parses an event from the value.
+RecordParser = Callable[[Any], RowLike]
+
+
+def parse_event_record(message: Any) -> RowLike:
+    value = message.value()
+    if value is None:
+        raise EventRejected("EVENT_EMPTY")
+    return parse_event(value)
 
 
 class ConsumerLike(Protocol):
@@ -62,7 +88,15 @@ class ConsumerLike(Protocol):
 class ArchiverSettings:
     """Batch shape and backoff. Defaults are the measured ones in the package README."""
 
-    __slots__ = ("backoff_initial_s", "backoff_max_s", "flush_interval_s", "max_batch", "stats_interval_s")
+    __slots__ = (
+        "backoff_initial_s",
+        "backoff_max_s",
+        "consume_chunk",
+        "flush_interval_s",
+        "max_batch",
+        "max_batch_bytes",
+        "stats_interval_s",
+    )
 
     def __init__(
         self,
@@ -72,14 +106,28 @@ class ArchiverSettings:
         backoff_initial_s: float = 0.5,
         backoff_max_s: float = 30.0,
         stats_interval_s: float = 10.0,
+        max_batch_bytes: int = 64 * 1024 * 1024,
+        consume_chunk: int | None = None,
     ) -> None:
-        if max_batch < 1 or flush_interval_s <= 0 or backoff_initial_s <= 0 or backoff_max_s < backoff_initial_s:
+        if (
+            max_batch < 1
+            or max_batch_bytes < 1
+            or (consume_chunk is not None and consume_chunk < 1)
+            or flush_interval_s <= 0
+            or backoff_initial_s <= 0
+            or backoff_max_s < backoff_initial_s
+        ):
             raise ValueError("invalid archiver settings")
         self.max_batch = max_batch
         self.flush_interval_s = flush_interval_s
         self.backoff_initial_s = backoff_initial_s
         self.backoff_max_s = backoff_max_s
         self.stats_interval_s = stats_interval_s
+        #: A batch stops growing at this many payload bytes. Content records can be ~1 MiB each, so a count cap
+        #: alone (`max_batch` x 1 MiB) is not a memory bound. Only enforced when `consume_chunk < max_batch`:
+        #: the loop then consumes in chunks and stops once the bytes are reached (the events archiver does not).
+        self.max_batch_bytes = max_batch_bytes
+        self.consume_chunk = max_batch if consume_chunk is None else min(consume_chunk, max_batch)
 
 
 class Archiver:
@@ -92,7 +140,9 @@ class Archiver:
         settings: ArchiverSettings | None = None,
         sleep: Callable[[float], None] = time.sleep,
         metrics: ArchiverMetrics | None = None,
+        parser: RecordParser = parse_event_record,
     ) -> None:
+        self._parse = parser
         self._consumer = consumer
         self._sink = sink
         self._log = log
@@ -122,11 +172,9 @@ class Archiver:
     def run_once(self) -> int:
         """Consume up to one batch, write it, commit it. Returns records consumed (0 when idle)."""
         self._ticked = time.monotonic()
-        messages = self._consumer.consume(
-            num_messages=self._settings.max_batch, timeout=self._settings.flush_interval_s
-        )
+        messages = self._consume_batch()
         handled = 0
-        rows: list[EventRow] = []
+        rows: list[RowLike] = []
         offsets: dict[tuple[str, int], int] = {}
         for message in messages:
             error = message.error()
@@ -139,9 +187,7 @@ class Archiver:
             value = message.value()
             self.metrics.bytes_consumed += len(value) if value is not None else 0
             try:
-                if value is None:
-                    raise EventRejected("EVENT_EMPTY")
-                rows.append(parse_event(value))
+                rows.append(self._parse(message))
             except EventRejected as rejected:
                 self.metrics.events_rejected += 1
                 self._log.warning(
@@ -158,7 +204,27 @@ class Archiver:
         self._maybe_stats()
         return handled
 
-    def _write(self, rows: list[EventRow]) -> bool:
+    def _consume_batch(self) -> Sequence[Any]:
+        settings = self._settings
+        if settings.consume_chunk >= settings.max_batch:
+            return self._consumer.consume(num_messages=settings.max_batch, timeout=settings.flush_interval_s)
+        deadline = time.monotonic() + settings.flush_interval_s
+        batch: list[Any] = []
+        total = 0
+        while len(batch) < settings.max_batch and total < settings.max_batch_bytes:
+            remaining = max(0.0, deadline - time.monotonic())
+            got = self._consumer.consume(
+                num_messages=min(settings.consume_chunk, settings.max_batch - len(batch)), timeout=remaining
+            )
+            if not got:
+                break
+            batch.extend(got)
+            total += sum(len(m.value() or b"") for m in got if m.error() is None)
+            if remaining <= 0.0:
+                break
+        return batch
+
+    def _write(self, rows: list[RowLike]) -> bool:
         delay = self._settings.backoff_initial_s
         paused: dict[tuple[str, int], TopicPartition] = {}
         halted = False

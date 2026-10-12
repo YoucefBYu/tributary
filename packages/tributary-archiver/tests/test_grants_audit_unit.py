@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from tributary.archiver.audit import ACTOR, AuditEvent, error_code_of
 from tributary.archiver.errors import ArchiverGrantsExcessive, ArchiverSettingsUnsafe, PublishError, ReprocessRefused
-from tributary.archiver.grants import check_audit_grants, check_session_settings, excess_on_audit_log
+from tributary.archiver.grants import check_audit_grants, check_grants, check_session_settings, excess_on_audit_log
 from tributary.archiver.schema import AUDIT_DEDUP_ORDER, audit_ddl, audit_dedup_sql, audit_tamper_sql
 
 
@@ -114,3 +114,40 @@ def test_session_settings_unpinned_or_enabled_are_refused(value: object, readonl
     assert (
         raised.value.code == "ARCHIVER_SETTINGS_UNSAFE" and raised.value.setting == "insert_allow_materialized_columns"
     )
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "GRANT ALTER ON d.message_content TO a",
+        "GRANT ALTER MODIFY TTL ON d.message_content TO a",
+        "GRANT DELETE ON d.message_content TO a",
+        "GRANT TRUNCATE ON d.message_content TO a",
+        "GRANT DROP TABLE ON d.* TO a",
+        "GRANT ALL ON d.* TO a",
+        "GRANT ALTER ON d.message_* TO a",
+        "GRANT ALTER ON *.* TO a",
+        "GRANT INSERT ON d.message_content TO a WITH GRANT OPTION",
+    ],
+)
+def test_content_archiver_refuses_more_than_insert_and_select_on_message_content(line: str) -> None:
+    with pytest.raises(ArchiverGrantsExcessive) as raised:
+        check_grants(
+            Shown("GRANT INSERT, SELECT ON d.audit_log TO a", line),
+            database="d",
+            tables=("audit_log", "message_content"),
+        )
+    assert raised.value.code == "ARCHIVER_GRANTS_EXCESSIVE"
+    assert raised.value.table in ("audit_log", "message_content")
+
+
+def test_content_archiver_passes_with_insert_select_on_both_tables() -> None:
+    check_grants(
+        Shown("GRANT INSERT, SELECT ON d.message_content TO a", "GRANT INSERT, SELECT ON d.audit_log TO a"),
+        database="d",
+        tables=("audit_log", "message_content"),
+    )
+
+
+def test_the_events_archiver_check_does_not_look_at_message_content() -> None:
+    check_audit_grants(Shown("GRANT ALTER ON d.message_content TO a"), database="d")
