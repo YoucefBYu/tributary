@@ -35,19 +35,41 @@ wave's exit criteria here.
   lead ruled that replay targets its source channel only, and "shadow" keeps its consumer-group
   meaning. A replay into a per-key channel needs an audited `allow_reorder` flag.
 - **Human-only questions for wave 3:** `phases/wave-3.md` section 7, mirrored under Open questions below.
-- **Architect batch 1, delivered 2026-10-05, ALL UNVERIFIED (the architect has no shell; the lead
-  runs the verify lines):**
+- **Architect batch 4, 2026-10-12 (README only; counts predicted unchanged at 244 / 0 and 154 / 0):**
+  W3-29 items 2-3 published (`topics/v0` 3.3 instance rule; `INSTANCE_REQUIRED` named in
+  `observability/v0` L6a, not registered). Gap found: the `kafka` source receiver defaults `--instance`
+  to `kafka-0` and uses it as `group.instance.id` (sent to `connector-engineer`). **W3-19 ruled:** HTTP
+  sync `200`/coded `202`/`503`; `Idempotency-Key` ignored; `body: step` deferred (`channel-spec/v0`
+  3.2.6). The connector may build.
+- **Architect batch 1, delivered 2026-10-05; closure status 2026-10-12.** The coordinator's run on
+  2026-10-12 covered every contract delivered so far: `validate.py` **244 passed / 0 failed**,
+  `--check-expectations` **154 invalid / 0 drifted** (exit 0). Its counts include W3-12, W3-1a, W3-17
+  and W3-1b. They cannot be split per task, because the predictions per task were never measured
+  separately.
 
-  | Task | Delivered | Verify owed |
-  |---|---|---|
-  | W3-12 | `contracts/observability/v0`: readiness section 2 (**unblocks W3-17**), metric registry (35 metrics, 19 labels), log line schema | `validate.py` N / 0; observability adds 30 checks, 19 pinned pairs |
-  | W3-1a | `contracts/openapi/v0` part 1; ADR-009 Proposed | `validate.py --with openapi-spec-validator`: predicted **210 / 0** in total; openapi adds 24 checks, 10 pairs |
-  | W3-11 | `validate.py --check-expectations` | Exit 0 on the tree (predicted `139 invalid examples, 0 drifted`); exit 1 on a scratchpad copy with one pair altered |
-  | W3-10 | ADR-004 draft, H1-H7 `TODO(human)` | `security-reviewer` reads it |
-  | W3-17 amend | `reply_consumer` reason `unauthorized`; per-check reason binding; `spec` gets no `unauthorized` (ruling, README 2.3); five `log_only` codes in `error-codes.json` (set `1.8`); `OPS_LISTENER_BIND_FAILED` named in O4, not registered (L6a) | `validate.py` predicted **213 / 0**; `--check-expectations` `141 ..., 0 drifted`; `platform-engineer` adds the five codes to `sdk.codes` in the same push or `test_codes_contract.py` goes red |
+  | Task | Delivered | State | Still owed (exact) |
+  |---|---|---|---|
+  | W3-12 | `observability/v0` readiness, metric registry, log line | **CLOSED** by the 244 / 0 run | none |
+  | W3-1a | `openapi/v0` part 1; ADR-009 | **CLOSED 2026-10-12** (coordinator's run): 244 / 0, and `pytest tests/conformance -q -k openapi` → **44 passed** | none |
+  | W3-11 | `--check-expectations` | **CLOSED 2026-10-12** (coordinator's run): exit 0 on the tree (154 invalid / 0 drifted). Negative control on a scratch copy with `request-deploy-unknown-field.json` `expected_validator=required`: `DRIFT openapi: invalid/request-deploy-unknown-field.json`, `154 invalid examples, 1 drifted`, `exit=1` | none |
+  | W3-10 | ADR-004 draft | **CLOSED**: `security-reviewer` read it and concurred with conditions C1-C8 (ADR-004 7.1, lead-relayed 2026-10-06) | none |
+  | W3-17 amend | readiness `unauthorized`, five `log_only` codes | **CLOSED 2026-10-12** (coordinator's run): 244 / 0, and `test_codes_contract.py` → **15 passed** | none |
 
   **CI note:** the `contracts` job must add `--with openapi-spec-validator`, or the default run fails by
   design (W3-14, `devops-engineer`).
+
+### Wave 3 exit criteria (`phases/wave-3.md` section 4), state 2026-10-12
+
+| # | Criterion | State | Evidence | Still owed |
+|---|---|---|---|---|
+| 1 | Message browser API returns per-stage content and destination statuses | **OPEN** | Contract published and verified (W3-1b, `openapi/v0` `getMessage`, `getMessageContent`) | W3-6 endpoints, W3-9b E2E against real ClickHouse with responses validated against `openapi/v0` |
+| 2 | Workers at full rate with ClickHouse, PostgreSQL and the API stopped | **MET under the lead's one-sided rule** | `docs/spikes/wave-3-outage-control-plane.md`, `ec7a3ec`. Set 3: the stopped median of 726 msg/s is at or above the control minimum of 395. Control median 711, and the stopped median also falls inside the control range. 0 order violations, 0 ACKed loss in 30 runs; the fault fired in 15/15 stopped runs; the mutation control is red | **Ruling recorded:** the lead replaced the plan's two-sided "inside the control min-max" with the one-sided "stopped median ≥ control minimum" (set 1 failed two-sided by being *faster*). **Caveat:** set 3's control minimum (395) is an outlier against 697-735, so the one-sided bound is loose there. Sets 1 and 2 (848 ≥ 484, 888 ≥ 701) carry the tighter evidence |
+| 3 | Deploy and rollback through the API and the CLI | **EVIDENCE CITED, NOT CLOSED** | API `d9e3bef`, CLI `a2ddeb5` (coordinator-relayed; the architect has not read them) | For each path: the owner's handoff line, i.e. the integration test name and its `pytest -q` summary, showing deploy v2, then the worker on v2 with the **same PID** (W3-5 verify: same PID and new `metadata.version`, or `tb_spec_version`), then rollback to v1, observed the same way. Plus a green CI run at or after both commits |
+| 4 | `security-reviewer` clean on API authn, audit and PHI | **OPEN** | ADR-009 reviewed (rev 2); `audit/v0` published | W3-32 audit producer (fail closed, one record per view, no payload bytes), W3-6, then the reviewer's pass with no unresolved Critical or High, closing audit against W3-30 (2) and W3-32 |
+
+**Also gate-tracked:** no image before W3-13 is green; `tb_partitions_halted` exported and the
+`partition_halted` alert shown firing (W3-25, W3-8); ADR-004 drafted (done). State of these not
+re-checked on 2026-10-12.
 - **W3-8 open risks ruled 2026-10-06** (`phases/wave-3.md` 2.4-2.5; chart uncommitted under
   `deploy/helm/tributary/`). New tasks: **W3-25** runtime ops listener + `/metrics` + worker
   (`platform-engineer`, on call); **W3-26** receivers `/metrics`, loaders ops listener

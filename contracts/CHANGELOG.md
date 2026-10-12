@@ -3,6 +3,42 @@
 Newest first. Each entry names the contract, the version, whether the change is additive or
 breaking, and the reason. Breaking changes reference an ADR.
 
+## 2026-10-12 (latest) — set 1.8: HTTP synchronous reply mapping ruled (W3-19; README only)
+
+**Additive, documentation only. No schema, example, manifest, header or error-code change, so
+`validate.py` is predicted unchanged (244 / 0; 154 invalid / 0 drifted). No invariant changes; the
+ruling checks invariant 1.**
+
+- **`channel-spec/v0` 3.2.6:** the set 1.2 placeholder "HTTP mapping: not fixed" is replaced by the
+  normative HTTP table. `200` = `AA`; coded `202` (`Tb-Reply-Code` and a JSON body) for every `AE`;
+  `503` + `Retry-After` for every `AR`; pre-publish errors unchanged. The response shape, the
+  invariant 1 check and the pending-map bounds are written into the section. Rulings: `202` not `409`
+  for `Reject`; `Idempotency-Key` ignored (no dedupe, never logged or echoed); `body: step` deferred for
+  `http` and refused at startup.
+- **3.2.2** `http` row points to 3.2.6 for sync mode. The **3.0** status row says the mapping is ruled,
+  the build is pending, and the refusal stays until it lands. The proposal also cited the 3.2.8
+  `nackOn` table; it is unrelated to `reply` and unchanged.
+- **Follow-ups:** `connector-engineer` builds and removes the startup refusal for `body: ack` only. When
+  it lands, the architect updates the `REPLY_*` emitter strings in `error-codes.json` (descriptions
+  only; `test_codes_contract.py` compares codes, so it is unaffected).
+
+## 2026-10-12 (later) — set 1.8: W3-29 items 2 and 3, the instance rule (README only)
+
+**Additive, documentation only. No schema, example or manifest change, so `validate.py` counts and
+pinned pairs are predicted unchanged (244 / 0; 154 invalid / 0 drifted). No invariant changes.**
+
+- **`topics/v0` 3.3, rules 1-6:** worker, loader and archiver require `--instance-id` or
+  `TB_INSTANCE_ID` (flag wins, no default) and use it verbatim as `group.instance.id`; grammar
+  `^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$`; unique per replica (pod name). Receivers keep `--instance`
+  (two spellings, `wave-3.md` 2.5 H2). The rule applies to any process whose id becomes a
+  `group.instance.id`. That covers the `kafka` source receiver, which still defaults to `kafka-0`
+  (gap, sent to `connector-engineer`). The text matches what `tributary-runtime` `startup.py` and the
+  loaders' `startup.py` already do (read, not run).
+- **`observability/v0` L6a:** `INSTANCE_REQUIRED`, `ARGUMENTS_INVALID` and `RETENTION_DECREASE_REFUSED`
+  are named as `startup_refused` codes. They are still **not registered**: no `error-codes.json` change,
+  so `test_codes_contract.py` is unaffected. Section 6 updated.
+- `topic-defaults.json` is deliberately untouched (no `acls.json` regeneration).
+
 ## 2026-10-12 — set 1.8: `audit_log` tamper-check metrics (`observability/v0` 3.4)
 
 **Additive. No example, manifest or pinned pair changes, so `validate.py` is predicted unchanged at

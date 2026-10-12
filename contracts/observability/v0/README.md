@@ -227,7 +227,7 @@ One JSON object per line on stderr, as `tributary.runtime.logs.JsonLogger` write
 | L4 Content deny-list (**new**) | `payload`, `body`, `content`, `raw`, `message`, `msg`, `text`, `segment`, `headers`, `traceback`, `stack`, `stack_trace`, `exc_info`, `exception`, `exc_text`, `query`, `query_string`, `sql` |
 | L5 Values | Scalars only, at most 256 characters, no CR or LF (`guards.validate_log_field`) |
 | L6 Well-known fields | `message_id`, `parent_id`, `correlation_id` (uuid shape); `channel`, `channel_version`, `destination`; `error_code` (registered code); `error` (an exception **class name**, never `str(exc)`); `ready`; `instance`; `trace_id`, `span_id` (W3C hex, for log-trace correlation) |
-| L6a Two code fields (set 1.8) | `error_code` holds a code **registered** in `envelope/v0` `error-codes.json` (`codes` or `log_only`) or a minted member of a reserved prefix. `code` on a `startup_refused` line is a startup-refusal code (`OPS_LISTENER_BIND_FAILED`, `SECRET_UNRESOLVED`, `ENGINE_KAFKA_SECRET_UNRESOLVED`): an exit reason for the operator, never on a record, an event or a metric label, and **not registered in v0** (section 6) |
+| L6a Two code fields (set 1.8) | `error_code` holds a code **registered** in `envelope/v0` `error-codes.json` (`codes` or `log_only`) or a minted member of a reserved prefix. `code` on a `startup_refused` line is a startup-refusal code (`OPS_LISTENER_BIND_FAILED`, `SECRET_UNRESOLVED`, `ENGINE_KAFKA_SECRET_UNRESOLVED`; **set 1.8, W3-29 item 3:** `INSTANCE_REQUIRED` and `ARGUMENTS_INVALID` (`topics/v0` 3.3 rules 1-2), `RETENTION_DECREASE_REFUSED` (ADR-004 R6)): an exit reason for the operator, never on a record, an event or a metric label, and **not registered in v0** (section 6) |
 | L7 Message id spelling | **`message_id`** (as in `events/v0`). `tb_msg_id` and `msg_id` (receivers, wave 2) are accepted in v0 as deprecated aliases with the same uuid shape |
 
 **What the schema cannot check:** that a permitted name like `reason` or `path` carries no PHI. Code
@@ -258,5 +258,5 @@ lines (`kafka_source/receiver.py`, `sftp/poller.py`, the `listening` events) lac
   vocabulary as the labels plus `message_id`. Not written yet; no code emits spans with attributes today.
 - Whether metadata warm-up alone removes the first-ACK outlier (2.4, W3-17 measures).
 - A registry for `startup_refused` `code` values (L6a). Today they are named where they are defined
-  (O4 for `OPS_LISTENER_BIND_FAILED`). Registering one family member alone would make the list look
-  complete when it is not.
+  (O4 for `OPS_LISTENER_BIND_FAILED`, `topics/v0` 3.3 for `INSTANCE_REQUIRED`). Registering one family
+  member alone would make the list look complete when it is not. L6a names six now; still not a registry.

@@ -273,6 +273,31 @@ available, it NACKs or refuses the connection. It never ACKs optimistically.
 | `isolation.level` | `read_committed` on topics written by a transactional stage | Otherwise a consumer sees aborted records. |
 | `max.poll.interval.ms` | ≥ the slowest destination timeout plus backoff | Otherwise a slow sink looks like a dead consumer and causes a rebalance loop. |
 
+**Set 1.8 (W3-29 item 2): the instance rule for worker, loader and archiver.** The defect set 1.7
+fixed for receivers recurred here. `pipeline-<pid>`, `loader-<dest>-<pid>` and `archiver-<pid>` are
+the same string in every container (the pid is 1), so replicas fenced one another (`wave-3.md` W3-28).
+
+1. **Required, no default.** The id comes from `--instance-id` or `TB_INSTANCE_ID`; the flag wins, and
+   an explicit empty flag counts as missing. Without one, the process logs `startup_refused` with `code:
+   INSTANCE_REQUIRED` and exits 2 (`observability/v0` L6a).
+2. **Grammar** `^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$`. The id is also the free segment of the
+   spec-reader group `tb.<env>.<ch>.channels.<instance>`, which a PREFIXED ACL covers. Any other value
+   gets `code: ARGUMENTS_INVALID`, exit 2, and the value is never echoed.
+3. **Used verbatim as `group.instance.id`** on the process's engine consumer: the worker in
+   `tb.<env>.<ch>.pipeline`, a loader in `tb.<env>.<ch>.loader.<dest>`, the archiver in
+   `tb.<env>.archiver`. There is no pid suffix, because each replica runs one consuming process.
+4. **Unique per replica**, per group and environment. Helm uses the pod's `metadata.name` (StatefulSets,
+   `wave-3.md` 2.5 H3), and Compose sets it per service.
+5. **Two spellings in v0** (`wave-3.md` 2.5 H2). Receivers keep `--instance` (set 1.7: required with
+   `source.reply`; the reply consumer's id is `<instance>-p<pid>`, 3.3.1). Worker, loader and archiver
+   use `--instance-id` / `TB_INSTANCE_ID`. The value rule is the same and the flag name differs.
+   Rejected: renaming ten entry points for cosmetics.
+6. **The rule follows the use, not the role.** Any process that puts its instance id into a
+   `group.instance.id` must require it. That includes the `kafka` source receiver, which uses
+   `--instance` verbatim as its static member id on the foreign cluster. **Gap (2026-10-12, read, not
+   run):** that receiver still defaults to `kafka-0` (`kafka_source/receiver.py:376`), so two replicas
+   left on the default fence each other. Sent to `connector-engineer`.
+
 #### 3.3.1 Receiver reply consumer (set 1.2, synchronous reply mode)
 
 Machine-readable in `topic-defaults.json` `clients.reply_consumer`. One per receiver process of a
