@@ -13,6 +13,11 @@ Each report states: question, method, environment (hardware and versions), raw r
 - [`wave-2-duplicate-rate.md`](wave-2-duplicate-rate.md): exit criterion 2. Five per-key chaos scenarios, 3 runs each: 0 order violations, fault fired 15 of 15, 0 duplicates except the worker kill (20 of 120, deterministic).
 - [`wave-2-sync-reply-latency.md`](wave-2-sync-reply-latency.md): MLLP sync-reply round trip, 5 runs: p50 about 18 ms, p99 25 to 29 ms, none over 100 ms. The earlier 270 ms tail did not reproduce; cause is wave 3 (platform-engineer).
 
+## Wave 3 evidence reports (2026-10-06)
+
+- [`wave-3-outage-control-plane.md`](wave-3-outage-control-plane.md): W3-9a, exit criterion 2. 5 control plus 5 stopped runs, two sets: 0 order violations, 0 loss, fault fired 10 of 10 per set. Rule made one-sided after set 1 (stopped median >= control min): set 1 848 vs 484 to 847 (two-sided miss by 0.7 msg/s, stopped faster), set 2 888 vs 701 to 928, set 3 726 vs 395 to 735, all pass one-sided. Mutation control (archive in the message path) is red.
+- [`wave-3-rf3-free-cluster.md`](wave-3-rf3-free-cluster.md): W3-33b, RF=3 chaos on a free 3-broker cluster; B1 ACK latency ratio at 750 msg/s: p50 about 1.2 to 1.3, p99 noisy (0.5 to 6.7).
+
 ## Phase 0, as accepted
 
 Synthesis: [`PHASE-0-DECISION.md`](PHASE-0-DECISION.md) — **GO WITH CHANGES**, no invariant changes,
