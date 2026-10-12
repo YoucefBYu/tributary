@@ -26,7 +26,7 @@ def env(tmp_path: Path) -> dict[str, Path]:
 
 
 def _start(env: dict[str, Path], ttl: int = 120) -> tuple[subprocess.Popen[bytes], subprocess.Popen[bytes]]:
-    broker = subprocess.Popen(["sleep", "60"])  # noqa: S607
+    broker = subprocess.Popen(["sleep", "60"])
     e = {
         **os.environ,
         "GRANT": str(env["grant"]),
@@ -35,7 +35,7 @@ def _start(env: dict[str, Path], ttl: int = 120) -> tuple[subprocess.Popen[bytes
         "TB_GRANT_TTL_SECONDS": str(ttl),
         "TB_GRANT_POLL_SECONDS": "0.1",
     }
-    loop = subprocess.Popen(["bash", str(LOOP), str(broker.pid)], env=e)  # noqa: S603,S607
+    loop = subprocess.Popen(["bash", str(LOOP), str(broker.pid)], env=e)
     assert _wait(lambda: (env["grant"] / "loop-started").exists())
     return broker, loop
 

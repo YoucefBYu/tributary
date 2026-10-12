@@ -150,6 +150,8 @@ otel:
   resources: {requests: {cpu: 100m, memory: 128Mi}, limits: {memory: 512Mi}}
 
 monitoring:
+  # TB_AUDIT_TAMPER_CHECK_INTERVAL_S of the API (default 900); the stale-check alert fires after 3x this.
+  auditTamperCheckIntervalSeconds: 900
   # Peers allowed to scrape the collector on :8889 (NetworkPolicy peers). Required while
   # networkPolicy.enabled and otel.enabled.
   prometheusFrom: []

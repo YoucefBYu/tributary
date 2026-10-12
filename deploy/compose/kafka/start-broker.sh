@@ -58,7 +58,11 @@ export GRANT=/var/run/tb-grant TB_ACLS_BIN=/opt/kafka/bin/kafka-acls.sh
 export TB_ACL_ARGS="--bootstrap-server 127.0.0.1:9096 --command-config $CONF/broker-client.properties --allow-principal User:CN=tb-lite-users-init --operation Alter --cluster"
 rm -f "$GRANT/granted"
 $TB_ACLS_BIN $TB_ACL_ARGS --remove --force >/dev/null 2>&1 || true
+rm -f "$GRANT/loop-started"
 bash /opt/tb/grant-loop.sh "$broker" &
+# Ready only once the loop has taken its stale-request snapshot, or a request could slip past it.
+for _ in $(seq 1 30); do [[ -f "$GRANT/loop-started" ]] && break; sleep 1; done
+[[ -f "$GRANT/loop-started" ]] || { echo "grant loop did not start" >&2; kill -TERM "$broker" 2>/dev/null || true; wait "$broker" || true; exit 1; }
 touch /tmp/tb-ready
 # `wait` returns early when the trap fires; wait again until the broker is really gone.
 while kill -0 "$broker" 2>/dev/null; do wait "$broker" || true; done

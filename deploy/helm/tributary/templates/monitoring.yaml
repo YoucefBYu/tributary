@@ -21,6 +21,21 @@ spec:
           annotations:
             summary: A partition is halted (stage partition_halted) and will not resume without an operator.
             description: See the partition_halted event for the channel and destination labelled on this alert.
+        # ADR-004 R7 rev 3, observability README 3.4. Emitted by the API (SELECT holder).
+        - alert: TributaryAuditTamperSuspected
+          expr: max by (environment) (tb_audit_tamper_suspect_ids) > 0
+          for: 0m
+          labels: {severity: critical}
+          annotations:
+            summary: audit_log holds audit_ids whose copies differ; something other than a redelivery wrote it.
+        - alert: TributaryAuditTamperCheckStale
+          expr: >-
+            (time() - max by (environment) (tb_audit_tamper_check_timestamp_seconds)) > {{ mul 3 (.Values.monitoring.auditTamperCheckIntervalSeconds | int) }}
+            or absent(tb_audit_tamper_check_timestamp_seconds)
+          for: 5m
+          labels: {severity: warning}
+          annotations:
+            summary: The audit tamper check has not completed for 3 intervals, or never ran (failing check or stopped API).
         - alert: TributaryReceiverNotReady
           expr: max by (component, channel) (tb_ready{component="receiver"}) == 0
           for: 5m

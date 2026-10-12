@@ -88,9 +88,23 @@ checklist. Provider-managed keys protect a lost disk, nothing more.
   GRANT SELECT, INSERT ON tributary.archive_settings TO tb_archiver;  -- only if the archiver reads its settings row
   ```
 
+  Pin the archiver away from the `MATERIALIZED inserted_at` column. Without this, an INSERT-only user can write
+  it with `SETTINGS insert_allow_materialized_columns=1`. The archiver refuses to start without the profile:
+
+  ```sql
+  CREATE SETTINGS PROFILE IF NOT EXISTS tb_archiver_profile SETTINGS insert_allow_materialized_columns = 0 CONST;
+  ALTER USER tb_archiver SETTINGS PROFILE 'tb_archiver_profile';
+  ```
+
+  Verify as the archiver user (not as an administrator): `SELECT name, value, readonly FROM system.settings
+  WHERE name = 'insert_allow_materialized_columns';` returns value `0` and readonly `1`.
+
   Verify, and expect no ALTER, DROP, TRUNCATE, CREATE or `ON *.*` row for the user:
-  `SELECT access_type, database, table FROM system.grants WHERE user_name = 'tb_archiver' ORDER BY 1, 2, 3;`
-  The migration user (`archiver.clickhouse.migrateSecretRef`) holds CREATE and ALTER on `tributary.*` and is
+  `SHOW GRANTS FOR tb_archiver;` and `SELECT * FROM system.role_grants WHERE user_name = 'tb_archiver';` (must
+  return no rows). Grant directly to the user: the archiver refuses privileges that arrive through a role.
+  The migration user (`archiver.clickhouse.migrateSecretRef`) holds only `CREATE TABLE`, `ALTER ADD COLUMN` and
+  `ALTER MODIFY TTL` on `tributary.*` (not the broad `ALTER`, which includes `ALTER DELETE` and `ALTER UPDATE`
+  on `audit_log`) and is
   mounted by the migrate Job only. An archiver startup check of its own grants is the archive engineer's.
 - C8, before content storage is turned on in production: (1) the ClickHouse `default` user is disabled
   (`<users><default remove="remove"/></users>` or an equivalent `users.d` override), and every client, including

@@ -129,7 +129,9 @@ plaintext on the Compose network, so **this stack does not meet ADR-004 C1**. Th
 (C7), not a deployment to copy. The broker sets `connections.max.reauth.ms=3600000`. Every ClickHouse client in this file connects as the
 `default` user without a password, which can ALTER, TRUNCATE and DROP `audit_log`; the lite stack has no
 INSERT-only archiver user. That is accepted only because the data is synthetic (C7). The production
-INSERT-only grants and their verification query are in the chart README.
+INSERT-only grants, the `insert_allow_materialized_columns = 0 CONST` settings profile the archiver requires,
+and their verification queries are in the chart README. This stack has no archiver service; a stack that runs
+the archiver must provision that user and profile itself.
 
 ## The lite-profile durability warning
 

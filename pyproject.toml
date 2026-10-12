@@ -78,6 +78,7 @@ ignore = [
 "**/tests/**" = ["S101"]
 "tests/**" = ["S101"]
 "**/test_*.py" = ["S101"]
+"deploy/**/test_*.py" = ["S101", "S603", "S607"]  # tests that start local bash and sleep stubs
 ".github/scripts/**" = ["S404", "S603", "S607", "E402"]  # CI tooling shells out to git and uv
 "benchmarks/**" = ["S311", "RUF046"]  # seeded synthetic-data RNG, not cryptographic
 
