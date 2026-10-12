@@ -137,3 +137,17 @@ def test_unlisted_pth_file(tmp_path: Path) -> None:
     assert run(tmp_path) == []
     (tmp_path / "evil.pth").write_text("import os\n")
     assert run(tmp_path) == [f"unlisted .pth file 'evil.pth' in {tmp_path}"]
+
+
+def test_required_and_forbidden_distributions(tmp_path: Path) -> None:
+    install(tmp_path, "clickhouse-connect")
+    install(tmp_path, "certifi")
+    caps = tmp_path / "c"
+    (caps / "context-extension/v0").mkdir(parents=True)
+    (caps / "channel-spec/v0").mkdir(parents=True)
+    (caps / "context-extension/v0/capabilities.json").write_text(json.dumps({"capabilities": {}}))
+    (caps / "channel-spec/v0/step-namespaces.json").write_text(json.dumps({"namespaces": {}}))
+    base = ["--contracts", str(caps), "--path", str(tmp_path)]
+    assert main([*base, "--require-dist", "clickhouse_connect", "--require-dist", "certifi"]) == 0
+    assert main([*base, "--forbid-dist", "certifi"]) == 1  # an api image would fail here
+    assert main([*base, "--require-dist", "orjson"]) == 1

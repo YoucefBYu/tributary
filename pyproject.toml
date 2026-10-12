@@ -34,7 +34,7 @@ dev = [
     "tributary-fhir",
     "tributary-content-hl7-fhir",
     "tributary-api",
-    "tributary-archiver",
+    "tributary-archiver[clickhouse]",
     "tributary-cli",
     "pytest>=8.3",
     "hypothesis>=6.112",   # MPL-2.0, human-approved 2026-09-22, unmodified

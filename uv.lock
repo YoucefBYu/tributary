@@ -2077,7 +2077,7 @@ dev = [
     { name = "ruff" },
     { name = "testcontainers" },
     { name = "tributary-api" },
-    { name = "tributary-archiver" },
+    { name = "tributary-archiver", extra = ["clickhouse"] },
     { name = "tributary-cli" },
     { name = "tributary-content-hl7-fhir" },
     { name = "tributary-fhir" },
@@ -2101,7 +2101,7 @@ dev = [
     { name = "ruff", specifier = ">=0.8" },
     { name = "testcontainers", extras = ["kafka"], specifier = ">=4.8" },
     { name = "tributary-api", editable = "packages/tributary-api" },
-    { name = "tributary-archiver", editable = "packages/tributary-archiver" },
+    { name = "tributary-archiver", extras = ["clickhouse"], editable = "packages/tributary-archiver" },
     { name = "tributary-cli", editable = "packages/tributary-cli" },
     { name = "tributary-content-hl7-fhir", editable = "packages/tributary-content-hl7-fhir" },
     { name = "tributary-fhir", editable = "packages/tributary-fhir" },
@@ -2144,7 +2144,6 @@ name = "tributary-archiver"
 version = "0.0.0"
 source = { editable = "packages/tributary-archiver" }
 dependencies = [
-    { name = "clickhouse-connect" },
     { name = "confluent-kafka" },
     { name = "orjson" },
     { name = "tributary-runtime" },
@@ -2152,15 +2151,21 @@ dependencies = [
     { name = "urllib3" },
 ]
 
+[package.optional-dependencies]
+clickhouse = [
+    { name = "clickhouse-connect" },
+]
+
 [package.metadata]
 requires-dist = [
-    { name = "clickhouse-connect", specifier = ">=1.9,<1.10" },
+    { name = "clickhouse-connect", marker = "extra == 'clickhouse'", specifier = ">=1.9,<1.10" },
     { name = "confluent-kafka", specifier = ">=2.6.0" },
     { name = "orjson", specifier = ">=3.10" },
     { name = "tributary-runtime", editable = "packages/tributary-runtime" },
     { name = "tributary-sdk", editable = "packages/tributary-sdk" },
     { name = "urllib3", specifier = ">=2.0" },
 ]
+provides-extras = ["clickhouse"]
 
 [[package]]
 name = "tributary-cli"

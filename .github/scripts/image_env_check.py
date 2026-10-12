@@ -203,16 +203,29 @@ def check(
     )
 
 
+def presence_problems(dists: Iterable[Distribution], required: Iterable[str], forbidden: Iterable[str]) -> list[str]:
+    """Distribution presence by PEP 503 name: the archiver image must ship the ClickHouse driver, and no other
+    image may ship certifi (MPL-2.0, approved for the archiver only)."""
+    have = {normalise(d.metadata["Name"]) for d in dists if d.metadata["Name"]}
+    return [f"required distribution '{r}' is not installed" for r in required if normalise(r) not in have] + [
+        f"forbidden distribution '{f}' is installed" for f in forbidden if normalise(f) in have
+    ]
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--contracts", type=Path, required=True)
     parser.add_argument("--path", action="append", help="scan these directories instead of sys.path")
+    parser.add_argument(
+        "--require-dist", action="append", default=[], help="fail unless this distribution is installed"
+    )
+    parser.add_argument("--forbid-dist", action="append", default=[], help="fail if this distribution is installed")
     args = parser.parse_args(argv)
     caps = json.loads((args.contracts / "context-extension/v0/capabilities.json").read_text())["capabilities"]
     spaces = json.loads((args.contracts / "channel-spec/v0/step-namespaces.json").read_text())["namespaces"]
     dists = list(distributions(path=args.path) if args.path else distributions())
     directories = [Path(p) for p in (args.path or sys.path) if p]
-    problems = check(dists, caps, spaces, directories)
+    problems = check(dists, caps, spaces, directories) + presence_problems(dists, args.require_dist, args.forbid_dist)
     for problem in problems:
         print(f"FAIL: {problem}")
     print(f"image_env_check: {len(dists)} distributions, {len(problems)} problems")

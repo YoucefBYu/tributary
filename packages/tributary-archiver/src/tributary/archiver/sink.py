@@ -34,10 +34,7 @@ from dataclasses import dataclass
 from ssl import CertificateError
 from typing import Any, Final, Protocol
 
-import clickhouse_connect
 import urllib3
-from clickhouse_connect.driver import exceptions as ch_exc
-from clickhouse_connect.driver.httputil import get_pool_manager_options
 
 from .errors import ArchiverConfigError, SinkError
 from .event import COLUMNS
@@ -53,6 +50,10 @@ _CODE = re.compile(r"Code: (\d{1,4})")
 def is_permanent(exc: BaseException) -> bool:
     """Whether retrying the same insert is pointless. Reads the driver's text only to extract a number;
     nothing from it is logged or kept."""
+    from clickhouse_connect.driver import (
+        exceptions as ch_exc,  # extra `clickhouse`; lazy so importing this module needs no driver
+    )
+
     if isinstance(exc, ch_exc.OperationalError):
         return False
     if isinstance(exc, ch_exc.DataError | ch_exc.ProgrammingError):
@@ -151,6 +152,8 @@ def _code(exc: BaseException) -> str:
 
 
 def build_pool(target: ClickhouseTarget) -> urllib3.PoolManager:
+    from clickhouse_connect.driver.httputil import get_pool_manager_options
+
     options = get_pool_manager_options(
         ca_cert=(target.ca_cert or "certifi") if target.secure else None,
         verify=target.secure,
@@ -161,6 +164,14 @@ def build_pool(target: ClickhouseTarget) -> urllib3.PoolManager:
 
 def connect(target: ClickhouseTarget) -> Any:
     """A client with driver-side retries off. Raises `SinkError` (fixed text) if the server is unreachable."""
+    try:
+        import clickhouse_connect
+    except ImportError:
+        raise SinkError(
+            "clickhouse-connect is not installed; install tributary-archiver[clickhouse]",
+            transient=False,
+            code="DRIVER_MISSING",
+        ) from None
     quiet_driver_logging()
     pool = build_pool(target)
     try:
