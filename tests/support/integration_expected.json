@@ -1,7 +1,7 @@
 {
   "marker": "integration",
   "command": "uv run pytest -m integration",
-  "count": 283,
+  "count": 287,
   "modules": {
     "packages/tributary-api/tests/api/test_audit_integration.py": 6,
     "packages/tributary-api/tests/api/test_db_tls_integration.py": 2,
@@ -58,6 +58,7 @@
     "tests/integration/test_fhir_loader_duplicate_delivery_uncommitted_redelivery.py": 2,
     "tests/integration/test_http_loader_duplicate_delivery_uncommitted_redelivery.py": 1,
     "tests/integration/test_kafka_loader_duplicate_delivery_uncommitted_redelivery.py": 1,
+    "tests/integration/test_platform_roles_deny_by_default_acls.py": 4,
     "tests/integration/test_postgresql_loader_duplicate_delivery_uncommitted_redelivery.py": 2,
     "tests/integration/test_receivers_deny_by_default_acls.py": 22,
     "tests/integration/test_s3_loader_duplicate_delivery_uncommitted_redelivery.py": 2,
