@@ -82,7 +82,7 @@ class KafkaTopicReader:
     `assign`, not `subscribe`: a table read with no consumer group state (nothing to commit, nothing to
     rebalance), the same way workers read it (`runtime.channels`)."""
 
-    def __init__(self, consumer_factory: Callable[[], Any], *, timeout_s: float = 30.0) -> None:
+    def __init__(self, consumer_factory: Callable[[str], Any], *, timeout_s: float = 30.0) -> None:
         self._factory = consumer_factory
         self._timeout_s = timeout_s
         self._stopped = threading.Event()
@@ -97,7 +97,7 @@ class KafkaTopicReader:
         from confluent_kafka import OFFSET_BEGINNING, TopicPartition
 
         topic = channels_topic(env)
-        consumer = self._factory()
+        consumer = self._factory(env)  # the factory names the group for this environment
         try:
             try:
                 meta = consumer.list_topics(topic, timeout=min(self._timeout_s, METADATA_TIMEOUT_S)).topics.get(topic)

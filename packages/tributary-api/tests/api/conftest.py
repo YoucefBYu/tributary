@@ -12,7 +12,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from api_kit import Contract, FakePublisher, Harness, Idp, TlsPg, oidc_settings
+from api_kit import Contract, FakePublisher, Harness, Idp, TlsPg, fake_audit, oidc_settings
 from tributary.api.app import create_app
 from tributary.api.auth.jwks import HttpsJwksFetcher, KeySet
 from tributary.api.config import DatabaseSettings, OidcSettings, Settings
@@ -45,7 +45,9 @@ def make_harness(idp: Idp) -> Callable[..., Harness]:
         tamper: object | None = None,
     ) -> Harness:
         oidc_cfg = oidc or oidc_settings(idp)
-        settings = Settings(database=DatabaseSettings("127.0.0.1", "tb", "u", "ref"), oidc=oidc_cfg)
+        settings = Settings(
+            database=DatabaseSettings("127.0.0.1", "tb", "u", "ref"), oidc=oidc_cfg, audit_home_env="dev"
+        )
         keys = KeySet(
             HttpsJwksFetcher(
                 oidc_cfg.issuer, jwks_uri=None, timeout_s=oidc_cfg.http_timeout_s, ssl_context=idp.client_context()
@@ -66,6 +68,7 @@ def make_harness(idp: Idp) -> Callable[..., Harness]:
             max_inflight_deploys=max_inflight,
             inflight_wait_s=inflight_wait_s,
             tamper=tamper,  # type: ignore[arg-type]
+            audit=fake_audit(),
         )
         return Harness(app, keys, pub)
 

@@ -23,7 +23,7 @@ from confluent_kafka.admin import NewTopic
 from tributary.api.db.engine import make_engine, make_session_factory
 from tributary.api.db.migrate import upgrade
 from tributary.api.db.repository import EnvironmentRepository
-from tributary.runtime.topics import channels_topic, dlq_topic, events_topic, out_topic, raw_topic
+from tributary.runtime.topics import channels_topic, dlq_topic, events_topic, out_topic, platform_topic, raw_topic
 from tributary.sdk.testing import make_message
 
 from tests.support.channel_spec import walking_skeleton_document
@@ -57,6 +57,7 @@ def test_worker_keeps_processing_with_the_api_and_postgresql_stopped(kafka: str,
         (dlq_topic(ENV, CHANNEL), {}),
         (events_topic(ENV), {}),
         (channels_topic(ENV), {"cleanup.policy": "compact"}),
+        (platform_topic(ENV, "audit"), {}),
     ):
         create_topics_with_retry(kafka, [NewTopic(topic, 1, 1, config=config)])
 

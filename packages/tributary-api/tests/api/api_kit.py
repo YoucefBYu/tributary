@@ -23,9 +23,11 @@ from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from cryptography.x509.oid import NameOID
 from fastapi import FastAPI
 from jsonschema import Draft202012Validator, FormatChecker
+from tributary.api.audit import Actor, AuditHook
 from tributary.api.auth.jwks import KeySet
 from tributary.api.config import OidcSettings
 from tributary.api.publisher import PublishError
+from tributary.runtime.logs import JsonLogger
 
 REPO = Path(__file__).resolve().parents[4]
 OPENAPI = REPO / "contracts" / "openapi" / "v0" / "openapi.json"
@@ -188,6 +190,23 @@ class FakePublisher:
             raise self.fail_with
         self._degraded = False
         self.records.append((env, channel, value))
+
+
+class RecordingSender:
+    """An `AuditSender` that records instead of producing: what a test passes where the API needs an audit hook."""
+
+    def __init__(self) -> None:
+        self.sent: list[tuple[str, bytes, bytes]] = []
+
+    async def send(self, env: str, key: bytes, value: bytes) -> None:
+        self.sent.append((env, key, value))
+
+
+def fake_audit(sender: RecordingSender | None = None) -> AuditHook:
+    return AuditHook(sender or RecordingSender(), JsonLogger("api", level="error"), retry_pause_s=0)
+
+
+TEST_ACTOR = Actor("tester", frozenset({"admin"}))
 
 
 class Contract:

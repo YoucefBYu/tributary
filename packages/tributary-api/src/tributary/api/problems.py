@@ -30,6 +30,11 @@ CODES: dict[str, tuple[int, str, str]] = {
     "NOTHING_TO_ROLL_BACK": (409, "Nothing to roll back", "There is no earlier published version."),
     "NOT_DEPLOYED": (409, "Not deployed", "The channel is not deployed in this environment."),
     "UNAVAILABLE": (503, "Unavailable", "A dependency is unavailable; retry later."),
+    "AUDIT_UNAVAILABLE": (
+        503,
+        "Audit unavailable",
+        "The audit record could not be committed, so the action was not performed.",
+    ),
     "ARCHIVE_UNAVAILABLE": (503, "Archive unavailable", "The message archive is unavailable; retry later."),
     "INTERNAL": (500, "Internal error", "The request failed."),
 }

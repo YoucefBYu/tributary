@@ -20,12 +20,12 @@ from api_kit import AUDIENCE, ROLE_MAP, Contract, Idp, TlsPg, run
 from confluent_kafka import Consumer
 from confluent_kafka.admin import NewTopic
 from sqlalchemy import text
-from test_routes_integration import Api
+from test_routes_integration import Api, document
 from tributary.api.db.engine import make_engine, make_session_factory
 from tributary.api.db.migrate import upgrade
 from tributary.api.db.repository import EnvironmentRepository
 from tributary.api.main import build_app
-from tributary.runtime.topics import channels_topic
+from tributary.runtime.topics import channels_topic, platform_topic
 
 from tests.support.engine_kafka import engine_kafka_env
 from tests.support.kafka_helpers import create_topics_with_retry, free_port
@@ -50,7 +50,7 @@ def api_environ(pg: TlsPg, secrets: Path, idp: Idp, bootstrap: str, jwks_file: P
     return engine_kafka_env(bootstrap, base)
 
 
-def seed(pg_url: str) -> None:
+def seed(pg_url: str, env: str = ENV) -> None:
     upgrade(pg_url)
 
     async def go() -> None:
@@ -61,7 +61,7 @@ def seed(pg_url: str) -> None:
                     text("TRUNCATE deployments, channel_versions, channels, environments RESTART IDENTITY CASCADE")
                 )
             async with make_session_factory(engine)() as s, s.begin():
-                await EnvironmentRepository(s).create(ENV, "ui-managed")
+                await EnvironmentRepository(s).create(env, "ui-managed")
         finally:
             await engine.dispose()
 
@@ -98,9 +98,11 @@ def read_topic(bootstrap: str, topic: str) -> list[Any]:
 def test_deploy_rollback_undeploy_publish_to_the_channels_topic(
     tls_pg: TlsPg, kafka: str, idp: Idp, contract: Contract, tmp_path: Path
 ) -> None:
-    seed(tls_pg.plain_url)
-    topic = channels_topic(ENV)
+    env = f"dp{uuid.uuid4().hex[:6]}"  # its own environment: its own topics, nothing shared with other tests
+    seed(tls_pg.plain_url, env)
+    topic = channels_topic(env)
     create_topics_with_retry(kafka, [NewTopic(topic, 1, 1, config={"cleanup.policy": "compact"})])
+    create_topics_with_retry(kafka, [NewTopic(platform_topic(env, "audit"), 1, 1)])  # deploys are audited
     app = build_app(
         api_environ(tls_pg, tls_pg.secrets_dir(tmp_path), idp, kafka, idp.jwks_file(tmp_path / "jwks.json"))
     )
@@ -114,10 +116,10 @@ def test_deploy_rollback_undeploy_publish_to_the_channels_topic(
                 api = Api(c, idp, contract)
                 v1 = await api.create(name)
                 v2 = await api.add_version(name, retries=4)
-                d1 = await api.deploy(ENV, name, 1)
-                d2 = await api.deploy(ENV, name, 2, expected_current_version=1)
-                rb = await api.rollback(ENV, name, 2)
-                und = await api.undeploy(ENV, name, 1)
+                d1 = await api.deploy(env, name, 1)
+                d2 = await api.deploy(env, name, 2, expected_current_version=1)
+                rb = await api.rollback(env, name, 2)
+                und = await api.undeploy(env, name, 1)
                 ready = await c.get("/readyz")
                 assert ready.status_code == 200
                 return {"v1": v1, "v2": v2, "d": [d1, d2, rb, und]}
@@ -125,7 +127,7 @@ def test_deploy_rollback_undeploy_publish_to_the_channels_topic(
     out = run(go())
     assert [d["status"] for d in out["d"]] == ["published"] * 4  # the broker acknowledged each (acks=all)
 
-    records = read_topic(kafka, topic)
+    records = [r for r in read_topic(kafka, topic) if r.key() == name.encode()]  # other tests share the env
     assert [r.key() for r in records] == [name.encode()] * 4
     values = [r.value() for r in records]
     assert hashlib.sha256(values[0] or b"").hexdigest() == out["v1"]["spec_sha256"]
@@ -136,11 +138,13 @@ def test_deploy_rollback_undeploy_publish_to_the_channels_topic(
     assert json.loads(values[1] or b"") == out["v2"]["document"]
 
 
-def test_unreachable_broker_is_a_failed_record_and_degraded_readiness(
+def test_unreachable_broker_refuses_audited_writes_before_anything_is_stored(
     tls_pg: TlsPg, idp: Idp, contract: Contract, tmp_path: Path
 ) -> None:
-    """Never ACK-and-drop: with no broker the deploy is recorded `failed`, not `published`, and the API says so."""
-    seed(tls_pg.plain_url)
+    """Never ACK-and-drop: with no broker the deploy is refused (`requested` audit fails closed, W3-32) and the
+    request is abandoned, never `published`. The failed-publish path itself is in `test_routes_integration`."""
+    env = f"un{uuid.uuid4().hex[:6]}"
+    seed(tls_pg.plain_url, env)
     app = build_app(
         api_environ(
             tls_pg,
@@ -149,6 +153,7 @@ def test_unreachable_broker_is_a_failed_record_and_degraded_readiness(
             f"127.0.0.1:{free_port()}",
             idp.jwks_file(tmp_path / "jwks.json"),
             TB_PUBLISH_TIMEOUT_S="1",
+            TB_AUDIT_TIMEOUT_S="1",
         )
     )
 
@@ -157,10 +162,14 @@ def test_unreachable_broker_is_a_failed_record_and_degraded_readiness(
             await app.state.keys.refresh()
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
                 api = Api(c, idp, contract)
-                await api.create("adt-passthrough")
-                d = await api.deploy(ENV, "adt-passthrough", 1)
-                assert d["status"] == "failed" and d["failure_code"] in ("PUBLISH_TIMEOUT", "PUBLISH_FAILED")
-                ready = await c.get("/readyz")
-                assert ready.json()["degraded"] == ["channels_publisher_unavailable"]
+                # Every audited write fails closed with the broker down: nothing is stored.
+                body = await api.call(
+                    "POST",
+                    "/v1/channels",
+                    expect=503,
+                    json_body={"document": document("adt-passthrough"), "origin": {"kind": "api"}},
+                )
+                assert body["code"] == "AUDIT_UNAVAILABLE"
+                await api.call("GET", "/v1/channels/{channel}", expect=404, channel="adt-passthrough")
 
     run(go())

@@ -16,6 +16,9 @@
 {{- if .Values.networkPolicy.enabled }}
 {{- $kubelet := required "networkPolicy.kubeletCIDR is required: the receiver ops listener binds the pod IP, and this CIDR is the only non-collector ingress on port 9180 (security-reviewer)" .Values.networkPolicy.kubeletCIDR }}
 {{- $_ := include "tb.validCIDR" $kubelet }}
+{{- if and .Values.api.enabled (eq .Values.api.tls.mode "mesh") (not (contains ":" $kubelet)) (lt (int (regexFind "[0-9]+$" $kubelet)) 24) }}
+{{- fail "networkPolicy.kubeletCIDR must be /24 or tighter when api.tls.mode=mesh: a wider block also admits hostNetwork pods to the plaintext API port" }}
+{{- end }}
 {{- if .Values.networkPolicy.defaultDeny }}
 ---
 apiVersion: networking.k8s.io/v1
@@ -150,8 +153,12 @@ spec:
   ingress:
     - from:
         - ipBlock: {cidr: {{ $kubelet | quote }}}
+        {{- if eq .Values.api.tls.mode "mesh" }}
+        {{- toYaml .Values.api.tls.ingressControllerFrom | nindent 8 }}
+        {{- else }}
         {{- with .Values.networkPolicy.apiFrom }}
         {{- toYaml . | nindent 8 }}
+        {{- end }}
         {{- end }}
       ports:
         - {protocol: TCP, port: {{ .Values.api.port }}}

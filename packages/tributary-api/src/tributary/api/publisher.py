@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 from typing import Any, Protocol
 
 from tributary.runtime.topics import channels_topic
@@ -71,14 +72,13 @@ class KafkaChannelsPublisher:
             raise PublishError from None
         # The producer's delivery.timeout.ms equals this timeout, so librdkafka reports the timeout itself;
         # the wait below is only a backstop.
-        deadline_hit = True
-        for _ in range(int((self._timeout_s + 2.0) / 0.05)):
-            self._producer.poll(0.05)
-            if done.is_set():
-                deadline_hit = False
-                break
-        if deadline_hit:
-            raise PublishTimeoutError
+        # A monotonic deadline, not a count of polls: `poll` returns early when another thread's callback runs.
+        deadline = time.monotonic() + self._timeout_s + 2.0
+        while not done.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise PublishTimeoutError
+            self._producer.poll(min(0.05, remaining))
         if errors:
             err = errors[0]
             if getattr(err, "code", lambda: None)() == KafkaError._MSG_TIMED_OUT:

@@ -13,9 +13,7 @@ from tributary.api.operations import OPERATIONS
 MSG = "0191a2b3-c4d5-7e6f-8a9b-0c1d2e3f4a5b"
 REPLAY = "0191a2b3-c4d5-7e6f-8a9b-0c1d2e3f4a5c"
 PART2 = [
-    o
-    for o in OPERATIONS
-    if "/messages" in o.path or "/replays" in o.path or o.path.endswith(("/stats", "/events", "/retention"))
+    o for o in OPERATIONS if "/messages" in o.path or "/replays" in o.path or o.path.endswith(("/stats", "/events"))
 ]
 NOT_FOUND_STUBS = {"listReplays", "getReplay"}
 Make = Callable[..., Harness]
@@ -25,8 +23,8 @@ def url(path: str) -> str:
     return path.format(env="dev", channel="adt", message_id=MSG, replay_id=REPLAY)
 
 
-def test_all_ten_part_2_operations_are_in_the_table() -> None:
-    assert len(PART2) == 10
+def test_the_nine_remaining_part_2_stubs_are_in_the_table() -> None:
+    assert len(PART2) == 9  # getRetention is real (test_retention_integration)
 
 
 @pytest.mark.parametrize("op", PART2, ids=lambda o: o.operation_id)

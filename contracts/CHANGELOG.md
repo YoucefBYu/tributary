@@ -3,6 +3,45 @@
 Newest first. Each entry names the contract, the version, whether the change is additive or
 breaking, and the reason. Breaking changes reference an ADR.
 
+## 2026-10-12 (W3-23, W3-37a) — set 1.8: grant notes and the API TLS cipher pin (description only)
+
+- **`topic-defaults.json`:** in `lag_reader_note` and `api_note`, "UNVERIFIED until a W3-23-style test" is
+  replaced by a pointer to `qa-engineer`'s deny-by-default test
+  (`tests/integration/test_platform_roles_deny_by_default_acls.py`, coordinator-relayed). No role string
+  changes.
+- **ADR-004 C1a amended:** the API's TLS 1.2 suites are restricted to `ECDHE+AESGCM:ECDHE+CHACHA20`, the
+  `engine-kafka/v0` pin. Counts unchanged.
+
+## 2026-10-12 (W3-32 gap) — set 1.8: `openapi/v0` 0.2.1, `503` on audited part 1 operations
+
+**Additive.** An operation gains a declared response; no previously valid document becomes invalid.
+
+- **`openapi.json` 0.2.0 → 0.2.1:** `503` (`ServiceUnavailable`, code `AUDIT_UNAVAILABLE`) declared on
+  `createChannel`, `createChannelVersion`, `deployChannelVersion`, `rollbackChannel` and
+  `undeployChannel`. Since W3-32 their audit `requested` record fails closed (`audit/v0` 3 rule 1). The
+  code was already in the closed `Problem` list.
+- **Example:** +1 valid, `response-problem-audit-unavailable.json`. **Predicted:** `validate.py`
+  **245 / 0**; `--check-expectations` unchanged at **154 invalid / 0 drifted**.
+- **`observability/v0` L6a** also names `API_TLS_INVALID` and `AUDIT_HOME_ENV_UNKNOWN` (not registered);
+  `audit/v0` 2 names the latter.
+
+## 2026-10-12 (rulings) — set 1.8: audit home environment, W3-19 clarifications (README only)
+
+**Documentation only. No schema, example or code-registry change; counts unchanged. No invariant
+changes.**
+
+- **`audit/v0` 2:** `channel.version.create` goes to the audit home environment `TB_AUDIT_HOME_ENV`.
+  It defaults only when one environment is managed; otherwise startup is refused with
+  `AUDIT_HOME_ENV_REQUIRED` (named in `observability/v0` L6a, not registered). Rejected: every
+  environment, and the environment from the request.
+- **`channel-spec/v0` 3.2.6 (W3-19):**
+  - `tb-msg-id` and `Tb-Msg-Id` are present exactly when a `raw` publish was attempted, so they are
+    absent on `REPLY_BUSY` and `REPLY_UNAVAILABLE`.
+  - `Tb-Reply-Code` may be absent on a fail-safe `202`. The table wins, and `AE` is identified by the
+    body `status`, so the "never uncoded" sentence was removed.
+  - A `raw` delivery timeout answers `PRODUCE_TIMEOUT`, not `PRODUCE_FAILED`. The receiver currently
+    reports `PRODUCE_FAILED` (`connector-engineer`, coordinator-relayed), so this is a code fix.
+
 ## 2026-10-12 (final) — set 1.8: `API_TLS_REQUIRED` named (README only)
 
 - **`observability/v0` L6a** names `API_TLS_REQUIRED`, the API's startup refusal for plaintext on a

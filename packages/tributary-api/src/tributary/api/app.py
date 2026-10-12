@@ -23,6 +23,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from tributary.sdk.context import Logger
 
 from . import schemas
+from .audit import Actor, AuditHook
 from .auth.jwks import KeySet
 from .auth.request import authorize
 from .auth.validator import TokenValidator
@@ -33,6 +34,7 @@ from .operations import OPERATIONS, check_routes
 from .problems import ApiProblem, render
 from .publisher import ChannelsPublisher
 from .reconciler import Reconciler, TopicReader
+from .retention import RetentionReader
 from .service import _ABSENT, INFLIGHT_WAIT_S, MAX_INFLIGHT_DEPLOYS, ControlPlane
 from .tamper import TamperChecker
 from .validation import control_plane_issues, validate_document
@@ -101,8 +103,11 @@ def _parse[M: schemas._Strict](model: type[M], raw: Any) -> M:
 Body = Annotated[Any, Depends(json_body)]
 
 
-def _subject(request: Request) -> str:
-    return str(request.state.principal.subject)
+def _actor(request: Request) -> Actor:
+    """Who is asking, for the audit record: `sub`, the mapped Tributary roles and the request id. Nothing else
+    from the token or the request."""
+    principal = request.state.principal
+    return Actor(str(principal.subject), frozenset(principal.roles), getattr(request.state, "request_id", None))
 
 
 class _RequestLog:
@@ -188,8 +193,18 @@ def create_app(
     inflight_wait_s: float = INFLIGHT_WAIT_S,
     topic_reader: TopicReader | None = None,
     tamper: TamperChecker | None = None,
+    audit: AuditHook,
+    retention: RetentionReader | None = None,
 ) -> FastAPI:
-    service = ControlPlane(sessions, publisher, log, max_inflight=max_inflight_deploys, inflight_wait_s=inflight_wait_s)
+    service = ControlPlane(
+        sessions,
+        publisher,
+        log,
+        max_inflight=max_inflight_deploys,
+        inflight_wait_s=inflight_wait_s,
+        audit=audit,
+        audit_home=settings.audit_home_env,
+    )
     readiness = Readiness(service.ping_database, keys, publisher)
     reconciler = (
         None
@@ -202,6 +217,7 @@ def create_app(
         try:
             assert_access_log_off()
             check_routes(list(app.routes))
+            await service.resolve_audit_home(settings.audit_home_env)  # several environments and none set: refuse
         except ConfigurationError as exc:
             app.state.startup_error = exc  # `main` turns this into `startup_refused` and exit 2
             raise
@@ -287,7 +303,8 @@ def create_app(
         req = _parse(schemas.ChannelVersionCreate, body)
         name = _checked_document(req.document)
         return JSONResponse(
-            await service.create_channel(name, req.document, req.origin.stored(), _subject(request)), status_code=201
+            await service.create_channel(name, req.document, req.origin.stored(), _actor(request)),
+            status_code=201,
         )
 
     async def get_channel(channel: ChannelPath) -> JSONResponse:
@@ -302,7 +319,8 @@ def create_app(
         if name != channel:
             raise ApiProblem("CHANNEL_NAME_MISMATCH")
         return JSONResponse(
-            await service.add_version(channel, req.document, req.origin.stored(), _subject(request)), status_code=201
+            await service.add_version(channel, req.document, req.origin.stored(), _actor(request)),
+            status_code=201,
         )
 
     async def get_version(channel: ChannelPath, version: VersionPath) -> JSONResponse:
@@ -325,17 +343,17 @@ def create_app(
     async def deploy(request: Request, env: EnvPath, channel: ChannelPath, body: Body) -> JSONResponse:
         req = _parse(schemas.DeployRequest, body)
         expected: Any = req.expected_current_version if "expected_current_version" in req.model_fields_set else _ABSENT
-        result = await service.deploy(env, channel, req.version, expected, _subject(request))
+        result = await service.deploy(env, channel, req.version, expected, _actor(request))
         return JSONResponse(result, status_code=202)
 
     async def rollback(request: Request, env: EnvPath, channel: ChannelPath, body: Body) -> JSONResponse:
         req = _parse(schemas.RollbackRequest, body)
-        result = await service.rollback(env, channel, req.expected_current_version, req.to_version, _subject(request))
+        result = await service.rollback(env, channel, req.expected_current_version, req.to_version, _actor(request))
         return JSONResponse(result, status_code=202)
 
     async def undeploy(request: Request, env: EnvPath, channel: ChannelPath, body: Body) -> JSONResponse:
         req = _parse(schemas.UndeployRequest, body)
-        result = await service.undeploy(env, channel, req.expected_current_version, _subject(request))
+        result = await service.undeploy(env, channel, req.expected_current_version, _actor(request))
         return JSONResponse(result, status_code=202)
 
     # -- part 2 stubs (W3-6 replaces them). Authn and RBAC ran in the global dependency, so only a permitted
@@ -374,7 +392,11 @@ def create_app(
         return await archive_unavailable()
 
     async def get_retention(env: EnvPath) -> JSONResponse:
-        return await archive_unavailable()
+        if env not in {e["name"] for e in (await service.environments())["items"]}:
+            raise ApiProblem("NOT_FOUND")
+        if retention is None:
+            raise ApiProblem("ARCHIVE_UNAVAILABLE")
+        return JSONResponse(await retention.read(env))
 
     endpoints: dict[str, Callable[..., Any]] = {
         "getLiveness": livez,

@@ -8,6 +8,7 @@ import asyncio
 import base64
 import binascii
 import hashlib
+import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -17,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from tributary.sdk.context import Logger
 
 from . import render
+from .audit import Actor, AuditHook
 from .db.errors import (
     AlreadyExistsError,
     InvalidValueError,
@@ -30,6 +32,7 @@ from .db.repository import (
     EnvironmentRepository,
     published_bytes,
 )
+from .errors import ConfigurationError
 from .problems import ApiProblem
 from .publisher import ChannelsPublisher, PublishError
 
@@ -84,9 +87,14 @@ class ControlPlane:
         publisher: ChannelsPublisher,
         log: Logger,
         *,
+        audit: AuditHook,
         max_inflight: int = MAX_INFLIGHT_DEPLOYS,
         inflight_wait_s: float = INFLIGHT_WAIT_S,
+        audit_home: str | None = None,
     ) -> None:
+        self._audit = audit  # required: a control plane that cannot audit does not run (no fail-open default)
+        self._audit_home_configured = audit_home
+        self._audit_home: str | None = None
         self._inflight = asyncio.Semaphore(max_inflight)
         self._inflight_wait_s = inflight_wait_s
         self._sessions = sessions
@@ -205,37 +213,96 @@ class ControlPlane:
 
     # -- channel writes --------------------------------------------------------------------------
 
+    async def resolve_audit_home(self, configured: str | None) -> str | None:
+        """The one environment whose audit topic records `channel.version.create` (versions belong to no
+        environment; audit/v0 README 2). `configured` (`TB_AUDIT_HOME_ENV`) must name a known environment. Without
+        it the API must manage exactly one environment, which becomes the home; several is a refusal at startup
+        (`AUDIT_HOME_ENV_REQUIRED`). No environment yet, or a database that cannot answer, leaves it unresolved:
+        the next version write retries, and fails closed until it can resolve."""
+        try:
+            names: list[str] | None = [e["name"] for e in (await self.environments())["items"]]
+        except Exception:  # database not reachable (any driver error): decide later, never crash startup for it
+            names = None
+        if configured is not None:
+            if names and configured not in names:  # (an empty list: nothing to check against yet)
+                raise ConfigurationError("AUDIT_HOME_ENV_UNKNOWN", "TB_AUDIT_HOME_ENV names no known environment")
+            self._audit_home = configured
+        elif names is not None and len(names) == 1:
+            self._audit_home = names[0]
+        elif names is not None and len(names) > 1:
+            raise ConfigurationError(
+                "AUDIT_HOME_ENV_REQUIRED", "several environments: set TB_AUDIT_HOME_ENV to the audit home"
+            )
+        return self._audit_home
+
+    async def _audit_version(self, name: str, version: int, actor: Actor) -> None:
+        """`requested` for a version write, fail closed against the home topic, BEFORE any database transaction is
+        opened (no pooled connection is held while Kafka is awaited)."""
+        try:
+            home = self._audit_home or await self.resolve_audit_home(self._audit_home_configured)
+        except ConfigurationError:
+            home = None  # environments were added after startup: refuse the write until an operator sets the home
+        if home is None:
+            raise ApiProblem("AUDIT_UNAVAILABLE")
+        await self._audit.requested(
+            action="channel.version.create", environment=home, actor=actor, channel=name, version=version
+        )
+
     async def create_channel(
-        self, name: str, document: dict[str, Any], origin: dict[str, Any], by: str
+        self, name: str, document: dict[str, Any], origin: dict[str, Any], actor: Actor
     ) -> dict[str, Any]:
+        await self._audit_version(name, 1, actor)
+
         async def work(s: AsyncSession) -> dict[str, Any]:
             repo = ChannelRepository(s)
-            await repo.create(name, by)
-            return render.version_full(name, await repo.add_version(name, document, by, origin))
+            await repo.create(name, actor.subject)
+            return render.version_full(name, await repo.add_version(name, document, actor.subject, origin))
 
         return await self._run(work)
 
-    async def add_version(self, name: str, document: dict[str, Any], origin: dict[str, Any], by: str) -> dict[str, Any]:
+    async def add_version(
+        self, name: str, document: dict[str, Any], origin: dict[str, Any], actor: Actor
+    ) -> dict[str, Any]:
+        async def next_number(s: AsyncSession) -> int:
+            return await ChannelRepository(s).next_version(name)
+
+        expected = await self._run(next_number)  # 404 here if the channel does not exist
+        await self._audit_version(name, expected, actor)
+
         async def work(s: AsyncSession) -> dict[str, Any]:
-            return render.version_full(name, await ChannelRepository(s).add_version(name, document, by, origin))
+            stored = await ChannelRepository(s).add_version(name, document, actor.subject, origin)
+            if stored.version != expected:
+                raise ApiProblem("UNAVAILABLE")  # a concurrent writer took the number that was audited: retry
+            return render.version_full(name, stored)
 
         return await self._run(work)
 
     # -- deployments -----------------------------------------------------------------------------
 
-    async def deploy(self, env: str, channel: str, version: int, expected: Any, by: str) -> dict[str, Any]:
-        return await self._submit("deploy", env, channel, by, target=version, expected=expected)
+    async def deploy(self, env: str, channel: str, version: int, expected: Any, actor: Actor) -> dict[str, Any]:
+        return await self._submit("deploy", env, channel, target=version, expected=expected, actor=actor)
 
-    async def rollback(self, env: str, channel: str, expected: int, to_version: int | None, by: str) -> dict[str, Any]:
-        return await self._submit("rollback", env, channel, by, target=to_version, expected=expected)
+    async def rollback(
+        self, env: str, channel: str, expected: int, to_version: int | None, actor: Actor
+    ) -> dict[str, Any]:
+        return await self._submit("rollback", env, channel, target=to_version, expected=expected, actor=actor)
 
-    async def undeploy(self, env: str, channel: str, expected: int, by: str) -> dict[str, Any]:
-        return await self._submit("undeploy", env, channel, by, target=None, expected=expected)
+    async def undeploy(self, env: str, channel: str, expected: int, actor: Actor) -> dict[str, Any]:
+        return await self._submit("undeploy", env, channel, target=None, expected=expected, actor=actor)
 
     async def _submit(
-        self, kind: str, env_name: str, channel: str, by: str, *, target: int | None, expected: Any
+        self,
+        kind: str,
+        env_name: str,
+        channel: str,
+        *,
+        target: int | None,
+        expected: Any,
+        actor: Actor,
     ) -> dict[str, Any]:
-        """Two transactions. (1) Under the channel row lock: check, then commit a `pending` record, so a crash
+        """Three steps. (0) Check, under the channel lock, without storing anything; then the `requested` audit
+        record (fail closed; no connection held, nothing stored, no other request superseded if it is refused).
+        (1) Under the lock again: re-check and commit a `pending` record, so a crash (1) Under the channel row lock: check, then commit a `pending` record, so a crash
         after the publish leaves a visible record for the reconciler (W3-5). (2) Under the same lock, re-read
         the record: if a newer request superseded it, do not publish; otherwise publish, bounded by the
         publish timeout, and commit `published` or `failed`. The lock serialises publishes per channel across
@@ -250,15 +317,24 @@ class ControlPlane:
         except TimeoutError:
             raise ApiProblem("UNAVAILABLE") from None
         try:
-            return await self._submit_locked(kind, env_name, channel, by, target=target, expected=expected)
+            return await self._submit_locked(kind, env_name, channel, target=target, expected=expected, actor=actor)
         finally:
             self._inflight.release()
 
     async def _submit_locked(
-        self, kind: str, env_name: str, channel: str, by: str, *, target: int | None, expected: Any
+        self,
+        kind: str,
+        env_name: str,
+        channel: str,
+        *,
+        target: int | None,
+        expected: Any,
+        actor: Actor,
     ) -> dict[str, Any]:
 
-        async def request(s: AsyncSession) -> Any:
+        async def request(s: AsyncSession, store: tuple[uuid.UUID, int | None, int | None] | None) -> Any:
+            """The checks. With `store` = (deployment id, audited version, audited previous version), also insert
+            the pending record, but only if the world still matches what was audited."""
             crepo, drepo = ChannelRepository(s), DeploymentRepository(s)
             ch = await drepo.lock_channel(channel)
             env = await EnvironmentRepository(s).get_by_name(env_name)
@@ -287,10 +363,19 @@ class ControlPlane:
                         raise ApiProblem("NOTHING_TO_ROLL_BACK")
             if version is not None and env.mode == "git-managed" and version.origin.get("kind") != "git":
                 raise ApiProblem("MANAGEMENT_MODE")
-            dep = await drepo.request(ch, env, kind, version, cur_number, by)
-            return dep.id
+            new_number = None if version is None else version.version
+            if store is None:
+                return None, new_number, cur_number
+            dep_id, audited_version, audited_previous = store
+            if (new_number, cur_number) != (audited_version, audited_previous):
+                raise ApiProblem("CURRENT_VERSION_MISMATCH")  # changed since the audit: store nothing, ask again
+            dep = await drepo.request(ch, env, kind, version, cur_number, actor.subject, dep_id=dep_id)
+            return dep.id, new_number, cur_number
 
-        dep_id = await self._run(request, locked=True)
+        _, new_version, previous = await self._run(lambda s: request(s, None), locked=True)
+        dep_id = uuid.uuid4()
+        await self._audit_deployment(kind, env_name, channel, dep_id, new_version, previous, actor)
+        await self._run(lambda s: request(s, (dep_id, new_version, previous)), locked=True)
 
         async def publish(s: AsyncSession) -> dict[str, Any]:
             drepo = DeploymentRepository(s)
@@ -311,6 +396,28 @@ class ControlPlane:
         body = await self._run(publish, locked=True)
         self._log.info("deployment_finished", kind=kind, status=body["status"], channel=channel, environment=env_name)
         return body
+
+    async def _audit_deployment(
+        self,
+        kind: str,
+        env_name: str,
+        channel: str,
+        dep_id: uuid.UUID,
+        version: int | None,
+        previous: int | None,
+        actor: Actor,
+    ) -> None:
+        """`requested`, fail closed, before anything is stored or published (audit/v0 README 3 rule 1). Refused:
+        503 `AUDIT_UNAVAILABLE`, and no row exists, so nothing else is superseded or stranded."""
+        await self._audit.requested(
+            action=f"deployment.{kind}",
+            environment=env_name,
+            actor=actor,
+            channel=channel,
+            deployment_id=str(dep_id),
+            version=version,
+            previous_version=previous,
+        )
 
     async def _publish(self, env: str, channel: str, kind: str, version: ChannelVersion | None) -> str | None:
         value: bytes | None = None

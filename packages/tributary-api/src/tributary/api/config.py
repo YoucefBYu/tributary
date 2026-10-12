@@ -14,6 +14,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
+from .audit import SEND_ATTEMPTS
 from .errors import ConfigurationError
 
 ROLES: frozenset[str] = frozenset({"admin", "developer", "operator", "auditor", "viewer"})
@@ -78,6 +79,7 @@ class DatabaseSettings:
             raise ConfigurationError("PORT_INVALID", "TB_DATABASE_PORT is out of range")
 
 
+_SECRET_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _ENV_NAME = re.compile(r"^[a-z][a-z0-9-]{0,15}$")
 _DB_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 TAMPER_INTERVAL_RANGE = (60.0, 86400.0)
@@ -95,6 +97,9 @@ class ArchiveSettings:
     secret_ref: str
     targets: Mapping[str, str]
     interval_s: float = DEFAULT_TAMPER_INTERVAL_S
+    #: Optional private CA for the ClickHouse endpoint: `<ca_secret_ref>/ca.crt` under `TB_SECRETS_DIR`. Without
+    #: it the system trust store is used. Verification is never turned off.
+    ca_secret_ref: str | None = None
 
 
 def archive_from_env(env: Mapping[str, str]) -> ArchiveSettings | None:
@@ -144,7 +149,14 @@ def archive_from_env(env: Mapping[str, str]) -> ArchiveSettings | None:
         raise ConfigurationError(
             "CLICKHOUSE_URL_INVALID", "TB_CLICKHOUSE_URL must be https (http only on loopback)"
         ) from None
-    return ArchiveSettings(url=url, user=user, secret_ref=ref, targets=parsed, interval_s=interval)
+    ca_ref = env.get("TB_CLICKHOUSE_CA_SECRET_REF") or None
+    if ca_ref is not None and not _SECRET_REF.fullmatch(ca_ref):
+        raise ConfigurationError(
+            "CLICKHOUSE_CA_SECRET_REF_INVALID", "TB_CLICKHOUSE_CA_SECRET_REF is not a secretRef name"
+        )
+    return ArchiveSettings(
+        url=url, user=user, secret_ref=ref, targets=parsed, interval_s=interval, ca_secret_ref=ca_ref
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +172,14 @@ class Settings:
     reconcile_interval_s: float = 30.0
     reconcile_pending_grace_s: float = 120.0
     archive: ArchiveSettings | None = None
+    #: Per-attempt bound on producing one audit record (`requested` fails closed after it).
+    audit_timeout_s: float = 10.0
+    #: ADR-004 C1a. `listener`: TLS on the API's own listener (cert and key from `tls_secret_ref`). `mesh`: plaintext,
+    #: an explicit opt-in for sites whose mesh enforces mTLS.
+    #: `TB_AUDIT_HOME_ENV`: the environment whose audit topic records `channel.version.create`.
+    audit_home_env: str | None = None
+    tls_mode: str = "listener"
+    tls_secret_ref: str | None = None
 
     def __post_init__(self) -> None:
         if self.profile not in PROFILES:
@@ -170,12 +190,36 @@ class Settings:
             raise ConfigurationError(
                 "OIDC_JWKS_FILE_NOT_ALLOWED", "a static JWKS file needs profile lite and a loopback bind (ADR-009 D9)"
             )
+        if self.audit_home_env is not None and not _ENV_NAME.fullmatch(self.audit_home_env):
+            raise ConfigurationError("AUDIT_HOME_ENV_INVALID", "TB_AUDIT_HOME_ENV is not an environment name")
+        if self.tls_mode not in ("listener", "mesh"):
+            raise ConfigurationError("API_TLS_MODE_INVALID", "TB_API_TLS_MODE must be listener or mesh")
+        if self.tls_secret_ref is not None and not _SECRET_REF.fullmatch(self.tls_secret_ref):
+            raise ConfigurationError("API_TLS_SECRET_REF_INVALID", "TB_API_TLS_SECRET_REF is not a secretRef name")
+        if self.tls_mode == "mesh" and self.tls_secret_ref is not None:
+            raise ConfigurationError(
+                "API_TLS_MODE_CONFLICT", "TB_API_TLS_MODE=mesh binds plaintext; unset the TLS secretRef"
+            )
+        if self.tls_mode == "listener" and self.tls_secret_ref is None and not is_loopback(self.bind):
+            # ADR-004 C1a: tokens and PHI never cross a non-loopback hop in plaintext unless the operator
+            # opted into a mesh explicitly.
+            raise ConfigurationError(
+                "API_TLS_REQUIRED",
+                "plaintext on a non-loopback bind needs TB_API_TLS_SECRET_REF or TB_API_TLS_MODE=mesh",
+            )
         if not 0.0 <= self.reconcile_interval_s <= 3600.0:
             raise ConfigurationError("RECONCILE_INTERVAL_OUT_OF_RANGE", "TB_RECONCILE_INTERVAL_S must be within 0-3600")
-        if not 2 * MAX_PUBLISH_TIMEOUT_S <= self.reconcile_pending_grace_s <= 86400.0:
+        # A live deploy spends: the audit step (up to SEND_ATTEMPTS sends of `audit_timeout_s`), two lock waits
+        # (15 s each) and the publish. Its pending record must never look orphaned before that is over.
+        longest_deploy = SEND_ATTEMPTS * self.audit_timeout_s + self.publish_timeout_s + 30.0
+        if not longest_deploy <= self.reconcile_pending_grace_s <= 86400.0:
             raise ConfigurationError(
                 "RECONCILE_GRACE_OUT_OF_RANGE",
-                "TB_RECONCILE_PENDING_GRACE_S must exceed twice the publish timeout cap, so a live deploy is never expired",
+                "TB_RECONCILE_PENDING_GRACE_S must exceed the longest live deploy (audit, locks and publish), so one is never expired",
+            )
+        if not 1.0 <= self.audit_timeout_s <= MAX_PUBLISH_TIMEOUT_S:
+            raise ConfigurationError(
+                "AUDIT_TIMEOUT_OUT_OF_RANGE", f"TB_AUDIT_TIMEOUT_S must be within 1-{MAX_PUBLISH_TIMEOUT_S:g}"
             )
         if not 1.0 <= self.publish_timeout_s <= MAX_PUBLISH_TIMEOUT_S:
             raise ConfigurationError(
@@ -323,6 +367,10 @@ def from_env(env: Mapping[str, str]) -> Settings:
             env, "TB_PUBLISH_TIMEOUT_S", DEFAULT_PUBLISH_TIMEOUT_S, "PUBLISH_TIMEOUT_OUT_OF_RANGE"
         ),
         archive=archive_from_env(env),
+        audit_home_env=env.get("TB_AUDIT_HOME_ENV") or None,
+        tls_mode=env.get("TB_API_TLS_MODE", "listener") or "listener",
+        tls_secret_ref=env.get("TB_API_TLS_SECRET_REF") or None,
+        audit_timeout_s=_number(env, "TB_AUDIT_TIMEOUT_S", 10.0, "AUDIT_TIMEOUT_OUT_OF_RANGE"),
         reconcile_interval_s=_number(env, "TB_RECONCILE_INTERVAL_S", 30.0, "RECONCILE_INTERVAL_OUT_OF_RANGE"),
         reconcile_pending_grace_s=_number(env, "TB_RECONCILE_PENDING_GRACE_S", 120.0, "RECONCILE_GRACE_OUT_OF_RANGE"),
     )

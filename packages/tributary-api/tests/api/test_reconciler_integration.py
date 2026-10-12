@@ -10,7 +10,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
-from api_kit import run
+from api_kit import TEST_ACTOR, fake_audit, run
 from sqlalchemy import text
 from test_routes_integration import API, GIT, document
 from tributary.api.db.engine import make_engine, make_session_factory
@@ -57,7 +57,7 @@ class Rig:
         self.engine = make_engine(url)
         self.sessions = make_session_factory(self.engine)
         self.topic = TopicModel()
-        self.service = ControlPlane(self.sessions, self.topic, LOG)
+        self.service = ControlPlane(self.sessions, self.topic, LOG, audit=fake_audit(), audit_home="dev")
 
     def reconciler(self, **kw: Any) -> Reconciler:
         return Reconciler(self.sessions, self.topic, self.topic, LOG, **kw)
@@ -98,8 +98,8 @@ def rig(pg_url: str) -> Callable[[], Rig]:
 
 
 async def two_versions(r: Rig, name: str = "adt", origin: dict[str, Any] = API) -> None:
-    await r.service.create_channel(name, document(name), origin, "u")
-    await r.service.add_version(name, document(name, 4), origin, "u")
+    await r.service.create_channel(name, document(name), origin, TEST_ACTOR)
+    await r.service.add_version(name, document(name, 4), origin, TEST_ACTOR)
 
 
 def test_missing_and_stale_records_are_repaired_and_a_second_pass_publishes_nothing(rig: Callable[[], Rig]) -> None:
@@ -107,7 +107,7 @@ def test_missing_and_stale_records_are_repaired_and_a_second_pass_publishes_noth
         r = rig()
         try:
             await two_versions(r)
-            d = await r.service.deploy("dev", "adt", 2, None, "u")
+            d = await r.service.deploy("dev", "adt", 2, None, TEST_ACTOR)
             assert d["status"] == "published"
             v2 = await r.spec_bytes("adt", 2)
             assert r.topic.records[("dev", "adt")] == v2
@@ -134,8 +134,8 @@ def test_an_undeployed_channel_gets_a_tombstone_and_an_absent_key_is_already_con
         r = rig()
         try:
             await two_versions(r)
-            await r.service.deploy("dev", "adt", 1, None, "u")
-            await r.service.undeploy("dev", "adt", 1, "u")
+            await r.service.deploy("dev", "adt", 1, None, TEST_ACTOR)
+            await r.service.undeploy("dev", "adt", 1, TEST_ACTOR)
             assert r.topic.records[("dev", "adt")] is None
             await r.drop_topic("dev", "adt")  # compaction removed the tombstone: still converged
             before = len(r.topic.published)
@@ -153,10 +153,10 @@ def test_a_failed_deployment_is_never_published_and_its_leftover_is_overwritten(
         r = rig()
         try:
             await two_versions(r)
-            await r.service.deploy("dev", "adt", 1, None, "u")
+            await r.service.deploy("dev", "adt", 1, None, TEST_ACTOR)
             v1, v2 = await r.spec_bytes("adt", 1), await r.spec_bytes("adt", 2)
             r.topic.fail = PublishTimeoutError
-            failed = await r.service.deploy("dev", "adt", 2, 1, "u")
+            failed = await r.service.deploy("dev", "adt", 2, 1, TEST_ACTOR)
             assert failed["status"] == "failed"
             r.topic.fail = None
             published_before = list(r.topic.published)
@@ -176,7 +176,7 @@ def test_a_young_pending_record_is_left_alone_and_an_orphaned_one_expires(rig: C
         r = rig()
         try:
             await two_versions(r)
-            await r.service.deploy("dev", "adt", 1, None, "u")
+            await r.service.deploy("dev", "adt", 1, None, TEST_ACTOR)
             v1 = await r.spec_bytes("adt", 1)
             async with r.sessions() as s, s.begin():  # a deploy that crashed between its two transactions
                 crepo, drepo = ChannelRepository(s), DeploymentRepository(s)
@@ -213,7 +213,7 @@ def test_git_managed_refuses_non_git_origins_and_prunes_orphans_ui_managed_only_
                     await crepo.get_by_name("from-ui"), env, "deploy", await crepo.get_version("from-ui", 1), None, "u"
                 )
                 await drepo.mark_published(dep)
-            assert (await r.service.deploy("prod", "from-git", 1, None, "u"))["status"] == "published"
+            assert (await r.service.deploy("prod", "from-git", 1, None, TEST_ACTOR))["status"] == "published"
             await r.drop_topic("prod", "from-git")
             await r.drop_topic("prod", "ghost", b"{}")
             await r.drop_topic("dev", "ghost", b"{}")
@@ -236,7 +236,7 @@ def test_an_unreadable_topic_or_a_failed_publish_changes_nothing_and_the_next_pa
         r = rig()
         try:
             await two_versions(r)
-            await r.service.deploy("dev", "adt", 1, None, "u")
+            await r.service.deploy("dev", "adt", 1, None, TEST_ACTOR)
             await r.drop_topic("dev", "adt")
             r.topic.unreadable = True
             published = len(r.topic.published)
@@ -275,6 +275,33 @@ def test_cancelling_the_loop_stops_a_blocked_topic_read(rig: Callable[[], Rig]) 
             assert release.is_set()  # the reader was told to stop, so the thread ends instead of waiting 30 s
         finally:
             release.set()
+            await r.engine.dispose()
+
+    run(go())
+
+
+def test_a_refused_audit_stores_nothing_and_does_not_strand_the_request_in_flight(rig: Callable[[], Rig]) -> None:
+    from api_kit import RecordingSender, fake_audit
+    from tributary.api.audit import AuditSendError
+    from tributary.api.problems import ApiProblem
+
+    class Refusing(RecordingSender):
+        async def send(self, env: str, key: bytes, value: bytes) -> None:
+            raise AuditSendError
+
+    async def go() -> None:
+        r = rig()
+        try:
+            await two_versions(r)
+            await r.service.deploy("dev", "adt", 1, None, TEST_ACTOR)  # A is current and published
+            r.service._audit = fake_audit(Refusing())
+            with pytest.raises(ApiProblem) as e:
+                await r.service.deploy("dev", "adt", 2, 1, TEST_ACTOR)  # B: its audit is refused
+            assert e.value.code == "AUDIT_UNAVAILABLE"
+            history = await r.service.channel_deployments("dev", "adt", 10, None)
+            assert [(i["version"], i["status"]) for i in history["items"]] == [(1, "published")]  # no B row at all
+            assert r.topic.records[("dev", "adt")] == await r.spec_bytes("adt", 1)  # and B never reached the topic
+        finally:
             await r.engine.dispose()
 
     run(go())

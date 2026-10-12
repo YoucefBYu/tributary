@@ -91,6 +91,7 @@ class ClickHouseHttp:
         *,
         timeout_s: float = QUERY_TIMEOUT_S,
         deadline_s: float = QUERY_TIMEOUT_S,
+        ca_file: str | None = None,
     ) -> None:
         check_url(url)
         parts = urlsplit(url)
@@ -105,7 +106,8 @@ class ClickHouseHttp:
         self._headers = {"X-ClickHouse-User": user, "X-ClickHouse-Key": password}
         self._timeout_s = timeout_s
         self._deadline_s = deadline_s
-        self._context = ssl.create_default_context()
+        # System trust store, or exactly the operator's CA file when one is mounted. Never unverified.
+        self._context = ssl.create_default_context(cafile=ca_file)
         self._workers: dict[str, threading.Thread] = {}  # by SQL text, which names the environment's database
 
     def query(self, sql: str) -> str:

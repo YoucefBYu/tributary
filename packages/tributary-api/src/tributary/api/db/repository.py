@@ -173,6 +173,15 @@ class ChannelRepository:
             raise _classify(exc, f"channel {_n(name)} version") from None
         return ver
 
+    async def next_version(self, name: str) -> int:
+        """The number `add_version` would assign now (404 if the channel is missing). A read, not a reservation:
+        the writer re-checks under the row lock."""
+        ch = await self.get_by_name(name)
+        current = (
+            await self._s.execute(select(func.max(ChannelVersion.version)).where(ChannelVersion.channel_id == ch.id))
+        ).scalar_one_or_none()
+        return int(current or 0) + 1
+
     async def get_version(self, name: str, version: int) -> ChannelVersion:
         ch = await self.get_by_name(name)
         ver = (
@@ -315,6 +324,7 @@ class DeploymentRepository:
         created_by: str,
         *,
         restored_from: uuid.UUID | None = None,
+        dep_id: uuid.UUID | None = None,
     ) -> Deployment:
         """Insert a `pending` record and supersede any older pending one, in one savepoint. `image_digest` is
         copied from the version's `pipeline.bundle`; a deploy whose document has none is refused."""
@@ -322,6 +332,7 @@ class DeploymentRepository:
         if kind != "undeploy" and (version is None or (image := image_digest_of(version.spec)) is None):
             raise InvalidValueError("the document has no digest-pinned pipeline.bundle")
         dep = Deployment(
+            id=dep_id or uuid.uuid4(),
             channel_id=ch.id,
             environment_id=env.id,
             kind=kind,

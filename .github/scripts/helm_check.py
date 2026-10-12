@@ -360,19 +360,97 @@ def check_api(by_kind: dict[str, list[dict[str, Any]]]) -> list[str]:
                                 bad.append(f"{n}: the ops port admits more than the OTel collector")
                     elif not rule.get("ports"):
                         bad.append(f"{n}: an ingress rule without ports opens the ops port")
+        mode = env.get("TB_API_TLS_MODE", "listener")
+        if mode not in ("listener", "mesh"):
+            bad.append(f"{n}: TB_API_TLS_MODE must be unset, listener or mesh, got {mode!r} (C1a)")
+        want_port, want_scheme = ("https", "HTTPS") if mode == "listener" else ("http", "HTTP")
+        for probe in ("startupProbe", "readinessProbe", "livenessProbe"):
+            pr = c.get(probe, {}).get("httpGet", {})
+            if pr.get("port") != want_port or pr.get("scheme") != want_scheme:
+                bad.append(f"{n}: {probe} must be {want_scheme} on port {want_port} in {mode} mode (C1a)")
         live = c.get("livenessProbe", {}).get("httpGet", {})
-        if live.get("path") != "/livez" or live.get("port") != "http":
+        if live.get("path") != "/livez":
             bad.append(f"{n}: liveness must be kubelet httpGet /livez on the API port")
+        if [p["name"] for p in c["ports"] if p.get("containerPort") == int(env.get("TB_API_PORT", "0") or 0)] != [
+            want_port
+        ]:
+            bad.append(
+                f"{n}: the API port must be named {want_port} in {mode} mode (a plaintext API port in listener mode)"
+            )
+        for v in spec.get("volumes", []):
+            if v["name"] in ("api-tls", "clickhouse-ca") and v.get("secret", {}).get("defaultMode") != 0o400:
+                bad.append(f"{n}: Secret volume {v['name']} must set defaultMode 0400 (owner read only)")
+        if mode == "listener":
+            ref = env.get("TB_API_TLS_SECRET_REF", "")
+            mounts = [m for m in c.get("volumeMounts", []) if m["mountPath"] == f"/var/run/secrets/tributary/{ref}"]
+            if not ref or not mounts:
+                bad.append(f"{n}: listener mode without the TLS Secret mounted (C1a)")
+            elif any("subPath" in m or "subPathExpr" in m for m in mounts):
+                bad.append(f"{n}: the TLS Secret is mounted with subPath (C1a, C4)")
+        else:
+            rules: list[dict[str, Any]] = []
+            for np in by_kind.get("NetworkPolicy", []):
+                if np["spec"].get("podSelector", {}).get("matchLabels", {}).get("app.kubernetes.io/component") != "api":
+                    continue
+                rules += [
+                    r
+                    for r in np["spec"].get("ingress", [])
+                    if not r.get("ports") or any(p.get("port") == int(env["TB_API_PORT"]) for p in r["ports"])
+                ]
+
+            def rule_ok(rule: dict[str, Any]) -> bool:
+                frm = rule.get("from", [])
+                sel = [f for f in frm if "ipBlock" not in f]
+                blocks = [f for f in frm if "ipBlock" in f]
+                sel_ok = bool(sel) and all(
+                    f.get("podSelector", {}).get("matchLabels") or f.get("namespaceSelector", {}).get("matchLabels")
+                    for f in sel
+                )
+                # The only ipBlock is the kubelet CIDR the chart always adds; mesh mode wants it node-sized
+                # or tighter (/24): a wider block would admit hostNetwork pods of a flat CNI, plaintext.
+                blocks_ok = len(blocks) <= 1 and all(int(b["ipBlock"]["cidr"].split("/")[1]) >= 24 for b in blocks)
+                return sel_ok and blocks_ok
+
+            # EVERY rule that reaches the API port must be ingress-controller-only (plus kubelet).
+            peers_ok = bool(rules) and all(rule_ok(r) for r in rules)
+            if not peers_ok:
+                bad.append(
+                    f"{n}: mesh mode without a NetworkPolicy admitting only the ingress controller to the API port (C1a)"
+                )
         if env.get("TB_CLICKHOUSE_URL"):
             if not env["TB_CLICKHOUSE_URL"].startswith("https://"):
                 bad.append(f"{n}: TB_CLICKHOUSE_URL is not https (C1)")
+            ca = env.get("TB_CLICKHOUSE_CA_SECRET_REF")
+            mounted = {m["mountPath"] for m in c.get("volumeMounts", []) if "subPath" not in m}
+            secrets_dir = env.get("TB_SECRETS_DIR", "/var/run/secrets/tributary")
+            if ca and f"{secrets_dir}/{ca}" not in mounted:
+                bad.append(f"{n}: TB_CLICKHOUSE_CA_SECRET_REF {ca} is not mounted at TB_SECRETS_DIR/{ca} (no subPath)")
+            if any("clickhouse-ca" in m["name"] for m in c.get("volumeMounts", [])) and not ca:
+                bad.append(f"{n}: a ClickHouse CA is mounted but TB_CLICKHOUSE_CA_SECRET_REF is not set")
             if env.get("TB_CLICKHOUSE_USER", "default") == "default":
                 bad.append(f"{n}: the tamper check uses the ClickHouse default user (needs a SELECT-only user)")
         if not c["securityContext"].get("readOnlyRootFilesystem"):
             bad.append(f"{n}: root filesystem is writable")
+    for ing in by_kind.get("Ingress", []):
+        if not ing["metadata"]["name"].endswith("-api"):
+            continue
+        ann = ing["metadata"].get("annotations", {})
+        mesh = any(_envs(d).get("TB_API_TLS_MODE") == "mesh" for d in apis)
+        if not mesh and (
+            ann.get("nginx.ingress.kubernetes.io/backend-protocol") != "HTTPS"
+            or ann.get("nginx.ingress.kubernetes.io/proxy-ssl-verify") != "on"
+            or not ann.get("nginx.ingress.kubernetes.io/proxy-ssl-secret")
+        ):
+            bad.append(
+                f"Ingress {ing['metadata']['name']}: listener mode must re-encrypt and verify the API certificate (C1a)"
+            )
     for svc in by_kind.get("Service", []):
         if svc["metadata"]["name"].endswith("-api") and svc["spec"].get("type", "ClusterIP") != "ClusterIP":
             bad.append(f"Service {svc['metadata']['name']} is not ClusterIP")
+        if svc["metadata"]["name"].endswith("-api"):
+            listener = any(_envs(d).get("TB_API_TLS_MODE", "listener") == "listener" for d in apis)
+            if listener and [p["name"] for p in svc["spec"]["ports"]] != ["https"]:
+                bad.append(f"Service {svc['metadata']['name']}: listener mode must expose the port `https` only (C1a)")
     return bad
 
 

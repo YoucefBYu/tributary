@@ -81,6 +81,21 @@ api:
     rolesClaim: roles
     jwksUri: ""
   corsOrigins: []
+  # ADR-004 C1a: the ingress-to-API hop carries bearer tokens (and PHI later), so it is TLS.
+  #   listener (default): TLS on the API's own listener; secretRef holds tls.crt and tls.key (cert-manager or
+  #     your store), caSecretRef holds ca.crt for the ingress to verify the pod certificate (api.ingress).
+  #   mesh: explicit opt-in for a service mesh that enforces mTLS. The API then serves plaintext (it logs
+  #     api_tls_delegated_to_mesh) and a NetworkPolicy admits only ingressControllerFrom to the API port.
+  tls:
+    mode: listener
+    secretRef: ""
+    caSecretRef: ""
+    ingressControllerFrom: []   # mesh only: peers (the ingress controller pods) allowed on the API port
+  ingress:
+    enabled: false
+    className: nginx
+    host: ""
+    tlsSecretName: ""           # the external certificate the ingress presents
   # Audit tamper check (ADR-004 R7 rev 3). Leave url empty to turn it off (its series stay absent). The user
   # is a READ-ONLY ClickHouse user: SELECT on <database>.audit_log only, never INSERT (the writer does not
   # grade itself). See the README for the exact GRANT.

@@ -22,7 +22,7 @@ MARK = "ZZ-EXC-MARKER-ZZ"
 PROGRAM = """
 import json, os, sys
 import uvicorn
-from api_kit import ROLE_MAP, AUDIENCE
+from api_kit import ROLE_MAP, AUDIENCE, fake_audit
 from tributary.api.app import create_app
 from tributary.api.auth.jwks import FileJwksFetcher, KeySet
 from tributary.api.config import DatabaseSettings, OidcSettings, Settings
@@ -41,7 +41,9 @@ class Pub:
     degraded = False
     async def publish(self, *a): ...
 
-app = create_app(settings=settings, sessions=Boom(), publisher=Pub(), keys=keys, log=JsonLogger("api"))
+app = create_app(
+    settings=settings, sessions=Boom(), publisher=Pub(), keys=keys, log=JsonLogger("api"), audit=fake_audit()
+)
 uvicorn.run(app, host="127.0.0.1", port=port, access_log=False, log_config=None)
 """
 

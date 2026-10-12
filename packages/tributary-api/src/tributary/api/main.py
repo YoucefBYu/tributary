@@ -8,21 +8,24 @@ runtime's `producer_config`, so the producer is `acks=all` and idempotent (invar
 from __future__ import annotations
 
 import os
+import ssl
 import sys
 from collections.abc import Awaitable, Callable
 
 import uvicorn
 from fastapi import FastAPI
-from tributary.runtime.clients import consumer_config, producer_config
-from tributary.runtime.config import load_topic_defaults
+from tributary.runtime.clients import KafkaSettings, consumer_config, producer_config
+from tributary.runtime.config import TopicDefaults, load_topic_defaults
 from tributary.runtime.engine_kafka import load_engine_kafka_or_exit
 from tributary.runtime.errors import RuntimeConfigurationError
 from tributary.runtime.logs import JsonLogger
 from tributary.runtime.ops import OpsConfigError, OpsServer, resolve_ops_settings, start_ops_or_exit
 from tributary.runtime.secrets import DirSecretResolver
+from tributary.runtime.topics import platform_group
 
-from . import config
+from . import config, tls
 from .app import assert_access_log_off, create_app
+from .audit import AuditHook, KafkaAuditSender
 from .auth.jwks import Fetch, FileJwksFetcher, HttpsJwksFetcher, KeySet
 from .db.connect import engine_from_settings
 from .db.engine import make_session_factory
@@ -30,6 +33,7 @@ from .errors import ConfigurationError
 from .operations import check_routes
 from .publisher import KafkaChannelsPublisher
 from .reconciler import KafkaTopicReader
+from .retention import RetentionReader
 from .tamper import AuditMetrics, ClickHouseHttp, TamperChecker
 
 EXIT_CONFIG_REFUSED = 2
@@ -39,6 +43,12 @@ def check_producer_profile(kconf: dict[str, object]) -> None:
     """Invariant 1: the channels producer must be `acks=all` and idempotent, whatever the loaded settings say."""
     if kconf.get("acks") not in ("all", -1, "-1") or kconf.get("enable.idempotence") not in (True, "true"):
         raise ConfigurationError("PRODUCER_PROFILE", "the channels producer is not acks=all and idempotent")
+
+
+def reconciler_consumer_config(kafka: KafkaSettings, defaults: TopicDefaults, env: str) -> dict[str, object]:
+    """The reconciler's table-read consumer: the platform group `tb.<env>.reconciler` (topics/v0 3.3), never an
+    env-less name, so the `api` role's group grant matches."""
+    return consumer_config(kafka, defaults, group_id=platform_group(env, "reconciler"), enable_partition_eof=True)
 
 
 def build_app(environ: dict[str, str] | None = None) -> FastAPI:
@@ -53,23 +63,36 @@ def build_app(environ: dict[str, str] | None = None) -> FastAPI:
     kconf["delivery.timeout.ms"] = int(settings.publish_timeout_s * 1000)
     check_producer_profile(kconf)
     publisher = KafkaChannelsPublisher(Producer(kconf), timeout_s=settings.publish_timeout_s)
-    reader = KafkaTopicReader(
-        lambda: Consumer(consumer_config(kafka, defaults, group_id="tb-api-reconciler", enable_partition_eof=True))
-    )
+    audit_conf = producer_config(kafka, defaults, client_id="tb-api-audit")
+    audit_conf["delivery.timeout.ms"] = int(settings.audit_timeout_s * 1000)
+    check_producer_profile(audit_conf)  # invariant 1: the audit producer is acks=all and idempotent too
+    audit_sender = KafkaAuditSender(Producer(audit_conf), timeout_s=settings.audit_timeout_s)
+    audit = AuditHook(audit_sender, log)
+    reader = KafkaTopicReader(lambda env: Consumer(reconciler_consumer_config(kafka, defaults, env)))
     tamper: TamperChecker | None = None
+    retention: RetentionReader | None = None
     app_metrics: AuditMetrics | None = None
     if settings.archive is not None:
         archive = settings.archive
         try:
-            password = DirSecretResolver.from_environ(env).resolve_text(archive.secret_ref, "password")
+            resolver = DirSecretResolver.from_environ(env)
+            password = resolver.resolve_text(archive.secret_ref, "password")
+            ca_file = (
+                None if archive.ca_secret_ref is None else str(resolver.resolve_file(archive.ca_secret_ref, "ca.crt"))
+            )
         except RuntimeConfigurationError:
             raise ConfigurationError(
                 "CLICKHOUSE_SECRET_UNRESOLVED", "the ClickHouse secretRef did not resolve"
             ) from None
         app_metrics = AuditMetrics()
+        try:
+            clickhouse = ClickHouseHttp(archive.url, archive.user, password, ca_file=ca_file)
+        except (ssl.SSLError, OSError):  # a CA file that is not a readable PEM bundle
+            raise ConfigurationError("CLICKHOUSE_CA_INVALID", "the ClickHouse CA bundle is not usable") from None
+        retention = RetentionReader(clickhouse.query, archive.targets)
         tamper = TamperChecker(
             archive.targets,
-            ClickHouseHttp(archive.url, archive.user, password).query,
+            clickhouse.query,
             app_metrics,
             log,
             interval_s=archive.interval_s,
@@ -86,7 +109,10 @@ def build_app(environ: dict[str, str] | None = None) -> FastAPI:
     async def close_publisher() -> None:
         publisher.close()
 
-    hooks: list[Callable[[], Awaitable[None]]] = [engine.dispose, close_publisher]
+    async def close_audit() -> None:
+        audit_sender.close()
+
+    hooks: list[Callable[[], Awaitable[None]]] = [engine.dispose, close_publisher, close_audit]
     app = create_app(
         settings=settings,
         sessions=make_session_factory(engine),
@@ -96,6 +122,8 @@ def build_app(environ: dict[str, str] | None = None) -> FastAPI:
         on_shutdown=hooks,
         topic_reader=reader,
         tamper=tamper,
+        retention=retention,
+        audit=audit,
     )
     app.state.audit_metrics = app_metrics
     app.state.tamper = tamper
@@ -110,11 +138,8 @@ def main() -> int:
         app = build_app()
         check_routes(list(app.routes))  # the same checks the lifespan makes, before any listener binds
         assert_access_log_off()
-        server = uvicorn.Server(
-            uvicorn.Config(
-                app, host=settings.bind, port=settings.port, access_log=False, log_config=None, server_header=False
-            )
-        )
+        resolver = DirSecretResolver.from_environ(os.environ) if settings.tls_secret_ref is not None else None
+        server = uvicorn.Server(tls.server_config(app, settings, resolver, log))
         assert_access_log_off()  # again: `uvicorn.Config` configures logging
         ops = None
         metrics: AuditMetrics | None = app.state.audit_metrics

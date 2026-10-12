@@ -405,8 +405,11 @@ librdkafka still requires a `group.id` and sends FindCoordinator for it, so the 
 broker, lead-relayed). It produces under the receivers' 1,000,000-byte input limit. A replay into a
 per-key channel needs an explicit, audited `allow_reorder` (invariant 5; W3-1b request shape). The
 **lag_reader** (KEDA, the lag exporter) reads end offsets and committed offsets only, and can never
-read a payload. Both are rendered by the Helm `KafkaUser` generator from `security.acls`. **Unverified
-until the W3-23-style test:** each role works under exactly these grants on a deny-by-default broker.
+read a payload. Both are rendered by the Helm `KafkaUser` generator from `security.acls`. **lag_reader:
+grants verified 2026-10-12** on a deny-by-default broker by `qa-engineer`'s
+`tests/integration/test_platform_roles_deny_by_default_acls.py` (coordinator-relayed; the architect has
+not seen the run). **reprocessor: still unverified** until the same kind of test shows reprocess
+publishing under that role alone.
 Human sign-off folds into ADR-004 H7.
 
 **Set 1.8 `api` role (2026-10-12).** This is the control-plane API process, one principal per
@@ -426,7 +429,9 @@ environment. Each grant has a code path in `packages/tributary-api`:
 There is no cluster DESCRIBE (the `control_plane` row's grant is not carried over) and no READ on
 `audit` or `events`. The `control_plane` row stays as the grant of the lite Compose one-shot
 `channel-publish`. Reprocess and replay run under each channel's `reprocessor` principal, never under
-`api` (`openapi/v0` 3.14). **Unverified until a W3-23-style deny-by-default test.**
+`api` (`openapi/v0` 3.14). **Grants verified 2026-10-12** on a deny-by-default broker by
+`qa-engineer`'s `tests/integration/test_platform_roles_deny_by_default_acls.py` (coordinator-relayed;
+the architect has not seen the run).
 
 **Set 1.8 part 2 (W3-1b).** The **archiver** gains READ on LITERAL `_tb.<env>.audit` in its existing
 group: it fills ClickHouse `audit_log`, the audit system of record (2.1, ADR-004 R7; record shape

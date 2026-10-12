@@ -19,7 +19,7 @@ from typing import Any
 
 import httpx
 import pytest
-from api_kit import Contract, Idp, TlsPg, bearer, run
+from api_kit import TEST_ACTOR, Contract, Idp, TlsPg, bearer, fake_audit, run
 from confluent_kafka import Producer
 from confluent_kafka.admin import NewTopic
 from sqlalchemy import text
@@ -31,7 +31,7 @@ from tributary.api.main import build_app
 from tributary.api.reconciler import KafkaTopicReader, TopicReadError
 from tributary.api.service import ControlPlane
 from tributary.runtime.logs import JsonLogger
-from tributary.runtime.topics import channels_topic, dlq_topic, events_topic, out_topic, raw_topic
+from tributary.runtime.topics import channels_topic, dlq_topic, events_topic, out_topic, platform_topic, raw_topic
 
 from tests.support.channel_spec import walking_skeleton_document
 from tests.support.kafka_helpers import create_topics_with_retry, free_port
@@ -89,6 +89,7 @@ def test_a_reconciled_channel_change_reaches_a_running_worker_without_a_restart(
         (dlq_topic(ENV, CHANNEL), {}),
         (events_topic(ENV), {}),
         (channels_topic(ENV), {"cleanup.policy": "compact"}),
+        (platform_topic(ENV, "audit"), {}),
     ):
         create_topics_with_retry(kafka, [NewTopic(topic, 1, 1, config=config)])
     seed(tls_pg.plain_url)
@@ -142,9 +143,13 @@ def test_a_reconciled_channel_change_reaches_a_running_worker_without_a_restart(
                 engine = make_engine(tls_pg.plain_url)
                 try:
                     lost = ControlPlane(
-                        make_session_factory(engine), DroppingPublisher(), JsonLogger("t", level="error")
+                        make_session_factory(engine),
+                        DroppingPublisher(),
+                        JsonLogger("t", level="error"),
+                        audit=fake_audit(),
+                        audit_home=ENV,
                     )
-                    d = await lost.deploy(ENV, CHANNEL, 2, 1, "hr-test")
+                    d = await lost.deploy(ENV, CHANNEL, 2, 1, TEST_ACTOR)
                     assert d["status"] == "published"
                 finally:
                     await engine.dispose()
@@ -182,7 +187,9 @@ def test_the_topic_reader_returns_the_last_record_per_key_and_tombstones(kafka: 
     from confluent_kafka import Consumer
 
     reader = KafkaTopicReader(
-        lambda: Consumer({"bootstrap.servers": kafka, "group.id": f"rd-{uuid.uuid4()}", "enable.auto.commit": False})
+        lambda _env: Consumer(
+            {"bootstrap.servers": kafka, "group.id": f"rd-{uuid.uuid4()}", "enable.auto.commit": False}
+        )
     )
     assert reader.snapshot(env) == {"a": b"2", "b": None, "c": b"3"}
     empty = f"em{uuid.uuid4().hex[:6]}"
@@ -206,7 +213,9 @@ def test_stop_ends_a_snapshot_in_progress_promptly(kafka: str) -> None:
     producer.produce(topic, key=b"a", value=b"1")
     assert producer.flush(30) == 0
     reader = KafkaTopicReader(
-        lambda: Consumer({"bootstrap.servers": kafka, "group.id": f"st-{uuid.uuid4()}", "enable.auto.commit": False}),
+        lambda _env: Consumer(
+            {"bootstrap.servers": kafka, "group.id": f"st-{uuid.uuid4()}", "enable.auto.commit": False}
+        ),
         timeout_s=60.0,
     )
     reader.stop()  # before the read: refuses at once
@@ -215,6 +224,8 @@ def test_stop_ends_a_snapshot_in_progress_promptly(kafka: str) -> None:
 
     # Mid-read: a consumer whose polls never deliver, so only the stop flag can end the loop.
     class Silent:
+        def __init__(self, _env: str) -> None: ...
+
         def list_topics(self, *_a: Any, **_k: Any) -> Any:
             return Consumer({"bootstrap.servers": kafka, "group.id": "x"}).list_topics(topic, timeout=10)
 

@@ -34,11 +34,25 @@ Required on every record: `v`, `audit_id`, `ts`, `environment`, `action`, `phase
 | `message.content.view` | `requested` only | `channel`, `message_id`, `stage` (`destination` when the row has one) |
 | `message.reprocess` | `requested`, then `completed` or `failed` | `channel`, `message_id`, `operation_id`; `allow_reorder` on `requested`; `count` on `completed`/`failed` |
 | `channel.replay` | `requested`, then `completed` or `failed` | `channel`, `operation_id`, `target_topic`, `range_start`, `range_end`; `allow_reorder` on `requested`; `count` on `completed`/`failed` |
-| `channel.version.create` | `requested` only | `channel`, `version` |
+| `channel.version.create` | `requested` only | `channel`, `version`; `environment` is the control plane's **audit home environment** (below) |
 | `deployment.deploy`, `deployment.rollback` | `requested` only | `channel`, `deployment_id`, `version` (`previous_version` when one was current) |
 | `deployment.undeploy` | `requested` only | `channel`, `deployment_id`; no `version` |
 
 Any `failed` record also carries `error_code` (the library's or the API's problem code).
+
+**Environment-less actions (ruled 2026-10-12).** A version belongs to no environment, but every record
+goes to one `_tb.<env>.audit`, and `environment` names that topic's `<env>`. `channel.version.create`
+goes to the **audit home environment**, `TB_AUDIT_HOME_ENV`. It must name a managed environment and
+should be the most protected one, normally the `production` profile. With exactly one managed
+environment it defaults to that one. With more and no setting, the API refuses to start
+(`startup_refused`, `code: AUDIT_HOME_ENV_REQUIRED`, exit 2; `observability/v0` L6a, not registered). A
+value that names no managed environment gets `AUDIT_HOME_ENV_UNKNOWN`, also exit 2.
+`requested` fails closed against that topic only. **Rejected:** writing to every environment (N
+fail-closed writes, so a `dev` broker outage would block every version creation, plus N copies of one
+fact) and "the environment named in the request" (the create request names none). **Give up:** an
+auditor looking at one environment's `audit_log` finds version creations only in the home
+environment. Each `deployment.*` record names its `version`, which links the two. Any future
+environment-less action follows the same rule.
 
 ## 3. Rules
 

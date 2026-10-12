@@ -40,6 +40,8 @@ archiver:
 api:
   enabled: true
   opsBindPodIP: true
+  tls: {mode: listener, secretRef: tb-api-tls, caSecretRef: tb-api-tls-ca}
+  ingress: {enabled: true, host: api.example.internal, tlsSecretName: tb-api-ingress-tls}
   database: {host: pg.example.internal, name: tributary, user: tb_api, secretRef: tb-api-db, caSecretRef: tb-api-db-ca}
   oidc:
     issuer: https://idp.example.internal/realms/tb

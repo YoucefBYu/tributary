@@ -13,7 +13,7 @@
     }
   },
   "generatedFrom": "contracts/topics/v0/topic-defaults.json",
-  "sourceSha256": "cd26fb055e5ea6c294be6ca937524b1944245fa034e6963f3550b38115861160",
+  "sourceSha256": "d3bee50a1573126475d22639dbfbee05075546037ed6d9b178df3cb98da9bbf7",
   "lagReaderIsPlaceholder": false,
   "placeholders": {
     "env": "@ENV@",

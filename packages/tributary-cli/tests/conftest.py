@@ -24,7 +24,7 @@ API_TESTS = Path(__file__).resolve().parents[2] / "tributary-api" / "tests" / "a
 sys.path.insert(0, str(API_TESTS))
 sys.path.insert(0, str(HERE))
 
-from api_kit import FakePublisher, Idp, oidc_settings  # noqa: E402
+from api_kit import FakePublisher, Idp, fake_audit, oidc_settings  # noqa: E402
 from smoke_kit import LiveApi  # noqa: E402
 from testcontainers.community.postgres import PostgresContainer  # noqa: E402
 from tributary.api.app import create_app  # noqa: E402
@@ -61,11 +61,12 @@ def live_api(pg_url: str, idp: Idp) -> Iterator[LiveApi]:
     )
     publisher = FakePublisher()
     app = create_app(
-        settings=Settings(database=DatabaseSettings("127.0.0.1", "tb", "u", "ref"), oidc=oidc),
+        settings=Settings(database=DatabaseSettings("127.0.0.1", "tb", "u", "ref"), oidc=oidc, audit_home_env="dev"),
         sessions=make_session_factory(make_engine(pg_url)),
         publisher=publisher,
         keys=keys,
         log=JsonLogger("api", level="error"),
+        audit=fake_audit(),
     )
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))

@@ -29,7 +29,8 @@
     { "file": "valid/response-problem-ordering-would-break.json", "schema": "../openapi.json#/components/schemas/Problem", "note": "Part 2. The W3-1b refusal code for a per-key replay or reprocess without allow_reorder" },
     { "file": "valid/response-channel-stats.json", "schema": "../openapi.json#/components/schemas/ChannelStats", "note": "Part 2. Two versions seen during a rollout" },
     { "file": "valid/response-retention.json", "schema": "../openapi.json#/components/schemas/RetentionSettings", "note": "Part 2. ADR-004 R2 defaults with content raised to 60" },
-    { "file": "valid/stream-event-message.json", "schema": "../openapi.json#/components/schemas/MessageEvent", "note": "Part 2. data of an SSE message event" }
+    { "file": "valid/stream-event-message.json", "schema": "../openapi.json#/components/schemas/MessageEvent", "note": "Part 2. data of an SSE message event" },
+    { "file": "valid/response-problem-audit-unavailable.json", "schema": "../openapi.json#/components/schemas/Problem", "note": "0.2.1. 503 from any audited operation (part 1 create, deploy, rollback, undeploy included) when the requested audit record is not committed: fail closed, nothing done" }
   ],
   "invalid": [
     { "file": "invalid/request-origin-git-without-commit.json", "schema": "../openapi.json#/components/schemas/ChannelVersionCreate", "violates": "a git origin names its commit and path", "expected_json_path": "$.origin", "expected_validator": "required" },

@@ -87,6 +87,39 @@ jobs:
           mut '/livenessProbe/,+1 s#port: http#port: ops#'
           mut 's/value: "tb_api_audit_ro"/value: "default"/'
           mut 's#value: "https://clickhouse.example.internal:8443"#value: "http://clickhouse.example.internal:8123"#'
+      - name: API TLS, ADR-004 C1a (mesh render passes; plaintext, missing mount, plain ingress and a missing mesh policy fail)
+        run: |
+          py="uv run --no-project --with pyyaml==6.0.3 python .github/scripts/helm_check.py"
+          helm template tb "$CHART" -f "$CHART/ci/values-ci.yaml" --set strimzi.enabled=true --set api.tls.mode=mesh \
+            --set 'api.tls.ingressControllerFrom[0].podSelector.matchLabels.app\.kubernetes\.io/name=ingress-nginx' > mesh.yaml
+          $py mesh.yaml
+          python3 - <<'PY'
+          import re
+          t = open("mesh.yaml").read()
+          docs = t.split("\n---\n")
+          kept = [d for d in docs if not (re.search(r"kind: NetworkPolicy", d) and re.search(r"name: tb-api\n", d))]
+          assert len(kept) < len(docs), "no api NetworkPolicy to remove"
+          open("mesh-nopolicy.yaml", "w").write("\n---\n".join(kept))
+          PY
+          $py mesh-nopolicy.yaml --negative
+          mut() { sed "$1" rendered.yaml > tampered-tls.yaml; cmp -s rendered.yaml tampered-tls.yaml && exit 1; $py tampered-tls.yaml --negative; }
+          mut 's/{name: TB_API_TLS_MODE, value: "listener"}/{name: TB_API_TLS_MODE, value: "plaintext"}/'
+          mut 's/scheme: HTTPS/scheme: HTTP/'
+          mut '/name: api-tls, mountPath/d'
+          mut 's/backend-protocol: "HTTPS"/backend-protocol: "HTTP"/'
+          mut 's/proxy-ssl-verify: "on"/proxy-ssl-verify: "off"/'
+          ! helm template tb "$CHART" -f "$CHART/ci/values-ci.yaml" --set api.tls.mode=mesh > /dev/null 2>&1
+          mesh_set=(--set api.tls.mode=mesh --set 'api.tls.ingressControllerFrom[0].podSelector.matchLabels.app=x')
+          # mesh with the NetworkPolicy off (even with the ops opt-out) is refused, with no opt-out
+          helm template tb "$CHART" -f "$CHART/ci/values-ci.yaml" "${mesh_set[@]}" --set channels=null --set ingress.enabled=false --set api.opsBindPodIP=false \
+            --set networkPolicy.enabled=false --set networkPolicy.allowUnprotectedOpsPort=true 2>&1 | grep -q "networkPolicy.enabled must be true"
+          # open or empty controller peers are refused at render time
+          helm template tb "$CHART" -f "$CHART/ci/values-ci.yaml" --set api.tls.mode=mesh --set 'api.tls.ingressControllerFrom[0].ipBlock.cidr=0.0.0.0/0' 2>&1 | grep -q "ipBlock peer is not allowed"
+          helm template tb "$CHART" -f "$CHART/ci/values-ci.yaml" --set api.tls.mode=mesh --set 'api.tls.ingressControllerFrom[0].namespaceSelector=null' 2>&1 | grep -q "selects nothing"
+          helm template tb "$CHART" -f "$CHART/ci/values-ci.yaml" --set api.tls.mode=mesh --set 'api.tls.ingressControllerFrom[0].podSelector.matchLabels=null' 2>&1 | grep -q "selects nothing"
+          printf 'api:\n  tls:\n    mode: mesh\n    ingressControllerFrom:\n      - namespaceSelector: {matchExpressions: [{key: kubernetes.io/metadata.name, operator: Exists}]}\n' > mesh-expr.yaml
+          helm template tb "$CHART" -f "$CHART/ci/values-ci.yaml" -f mesh-expr.yaml 2>&1 | grep -q "matchExpressions is not allowed"
+          helm template tb "$CHART" -f "$CHART/ci/values-ci.yaml" "${mesh_set[@]}" --set networkPolicy.kubeletCIDR=10.20.0.0/16 2>&1 | grep -q "/24 or tighter"
       - name: an API ops listener on the pod IP without a NetworkPolicy is refused
         run: |
           helm template tb "$CHART" -f "$CHART/ci/values-ci.yaml" --set channels=null --set networkPolicy.enabled=false 2>&1 | grep -q "unprotected"

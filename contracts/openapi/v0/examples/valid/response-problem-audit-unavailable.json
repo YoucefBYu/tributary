@@ -1,0 +1,8 @@
+{
+  "type": "https://tributary.dev/problems/audit-unavailable",
+  "title": "The audit record could not be committed",
+  "status": 503,
+  "code": "AUDIT_UNAVAILABLE",
+  "detail": "The audit record could not be committed, so the action was not performed.",
+  "request_id": "0192f3a4-7500-7abc-8def-0123456789ab"
+}

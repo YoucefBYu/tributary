@@ -125,6 +125,22 @@ the API port admits the kubelet CIDR (probes) and `networkPolicy.apiFrom`; nothi
   binds the pod IP and the NetworkPolicy admits only the OTel collector on `api.opsPort`. The API starts this
   listener only while the tamper check is configured. Liveness, readiness and startup probes use `/livez` and
   `/readyz` on the API port, which the kubelet CIDR can reach.
+- TLS to the API (ADR-004 C1a). `api.tls.mode: listener` (default): TLS on the API's own listener. The cert and
+  key are the files `tls.crt` and `tls.key` of Secret `api.tls.secretRef`, mounted whole (never `subPath`) and
+  named to the API by `TB_API_TLS_SECRET_REF` and `TB_API_TLS_MODE=listener` (the API reads them once at start;
+  that side is W3-37a). Probes use `scheme: HTTPS`, the Service port is `https`. With `api.ingress.enabled` the
+  chart renders an Ingress whose ingress-nginx annotations re-encrypt to the pod and verify its certificate:
+  `backend-protocol: HTTPS`, `proxy-ssl-verify: "on"`, `proxy-ssl-secret: <namespace>/<api.tls.caSecretRef>`
+  (key `ca.crt`) and `proxy-ssl-name: <service>.<namespace>.svc` (the certificate must carry that name). Other
+  controllers need the equivalent: Traefik `ServersTransport` with `rootCAsSecrets` and `serverName`, HAProxy
+  `server-ssl` with `server-ca`, Contour `UpstreamValidation`. `api.tls.mode: mesh` is an explicit opt-in for a
+  mesh that enforces mTLS: the API serves plaintext, `NOTES.txt` warns, and the NetworkPolicy admits only the
+  kubelet CIDR and `api.tls.ingressControllerFrom` (not `networkPolicy.apiFrom`) to the API port. Mesh mode
+  refuses to render with `networkPolicy.enabled=false` (no opt-out) and refuses `ipBlock` peers and empty selectors
+  in `ingressControllerFrom`. The kubelet-CIDR admission can also admit hostNetwork pods on a flat CNI, so keep
+  `networkPolicy.kubeletCIDR` at /24 or tighter (`helm_check.py` requires it in mesh mode). `helm_check.py`
+  fails a plaintext render outside mesh mode, a missing or `subPath` cert mount, a re-encryption without
+  verification, and a mesh render without that policy. The Compose lite stack does not run the API.
 - Tamper check (ADR-004 R7 rev 3): `api.clickhouse.*` set `TB_CLICKHOUSE_URL` (https), `_USER`, `_SECRET_REF`
   and `TB_AUDIT_TAMPER_TARGETS`. Use a read-only user that cannot write what it grades:
   `CREATE USER tb_api_audit_ro IDENTIFIED WITH sha256_password BY '<from your secrets store>'; GRANT SELECT ON tributary.audit_log TO tb_api_audit_ro;`
