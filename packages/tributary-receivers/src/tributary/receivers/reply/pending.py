@@ -80,6 +80,12 @@ class Outcome:
     msg_id: str | None
     body: bytes = b""
     body_charged: int = 0
+    #: The reply record's `tb-reply-status` (`accepted`, `rejected`, `failed`), or `None` when no reply was read
+    #: (a timeout, a revoked partition) or its status was absent or unrecognised. Names only.
+    reply_status: str | None = None
+    #: `PRODUCE_FAILED` or `PRODUCE_TIMEOUT`, for an `AR` from a failed `raw` publish (the state machine's `AR`
+    #: carries no code). A timeout is the one `AR` where a resend can duplicate (librdkafka may still complete it).
+    produce_code: str | None = None
 
     def take_charge(self) -> int:
         charged, self.body_charged = self.body_charged, 0
@@ -101,6 +107,11 @@ class Pending:
     body: bytes = b""
     body_charged: int = 0
     body_mode: str = "ack"
+    reply_status: str | None = None
+    produce_code: str | None = None
+    #: What the fairness bound counts this entry against: its connection (MLLP, many frames per connection) or, for
+    #: HTTP (one request per connection), the sender's address, so one peer cannot take every slot.
+    fairness_key: object = None
 
     def bind(self, msg_id: str) -> None:
         """Record the `tb-msg-id` of the `raw` record, before it is produced: no reply can name it earlier."""
@@ -130,8 +141,12 @@ class PendingMap:
         metrics: Metrics,
         schedule: Schedule | None = None,
         request_factory: Callable[[], SyncRequest] = SyncRequest,
+        max_connections: int | None = None,
     ) -> None:
         self._settings = settings
+        #: A server whose every request holds one connection (HTTP) passes its connection limit: that, not
+        #: `maxPending`, bounds the entries, so the fairness cap is a quarter of the smaller.
+        self._max_connections = max_connections
         self._feed = feed
         self._loop = loop
         self._budget = budget
@@ -139,7 +154,7 @@ class PendingMap:
         self._schedule: Schedule = schedule if schedule is not None else loop.call_later
         self._request_factory = request_factory
         self._by_id: dict[str, Pending] = {}
-        self._per_connection: dict[int, int] = {}
+        self._per_connection: dict[object, int] = {}
         self._background: set[asyncio.Task[None]] = set()
         self._retired = False
 
@@ -159,7 +174,10 @@ class PendingMap:
         """Most entries one connection may hold: a quarter of `maxPending`, at least 1, so one peer cannot take the
         whole pool and starve the others into `REPLY_BUSY`. (The contract's `maxPending` is the per-process cap;
         this is a fairness bound inside it, not a new setting.)"""
-        return max(1, self._settings.max_pending // 4)
+        limit = self._settings.max_pending
+        if self._max_connections is not None:
+            limit = min(limit, self._max_connections)
+        return max(1, limit // 4)
 
     @property
     def settings(self) -> ReplySettings:
@@ -171,9 +189,10 @@ class PendingMap:
 
     # -- admission --------------------------------------------------------------------------------
 
-    def open(self, *, sender_control_id: str, connection: object) -> Pending | str:
+    def open(self, *, sender_control_id: str, connection: object, peer: str | None = None) -> Pending | str:
         """A pending entry for a new request, or the refusal code (`REPLY_UNAVAILABLE` / `REPLY_BUSY`) when it
-        must be answered `AR` **before anything is published**."""
+        must be answered `AR` **before anything is published**. `peer` (a sender address) makes the fairness bound
+        per peer instead of per connection, for a protocol with one request per connection."""
         partition = self._feed.choose_partition()
         if partition is None:
             self._metrics.nacked_reply_unavailable += 1
@@ -181,7 +200,8 @@ class PendingMap:
         if len(self._by_id) >= self._settings.max_pending:
             self._metrics.nacked_reply_busy += 1
             return REPLY_BUSY
-        if self._per_connection.get(id(connection), 0) >= self.connection_cap:
+        fairness_key: object = ("peer", peer) if peer is not None else id(connection)
+        if self._per_connection.get(fairness_key, 0) >= self.connection_cap:
             self._metrics.nacked_reply_connection_cap += 1  # same answer (AR / REPLY_BUSY), counted apart
             return REPLY_BUSY
         entry = Pending(
@@ -193,9 +213,10 @@ class PendingMap:
             request=self._request_factory(),
             outcome=self._loop.create_future(),
             body_mode=self._settings.body,
+            fairness_key=fairness_key,
         )
         self._by_id[entry.correlation_id] = entry
-        self._per_connection[id(connection)] = self._per_connection.get(id(connection), 0) + 1
+        self._per_connection[fairness_key] = self._per_connection.get(fairness_key, 0) + 1
         self._metrics.reply_pending = len(self._by_id)
         return entry
 
@@ -223,6 +244,7 @@ class PendingMap:
             return True, None  # the first reply counts (SyncRequest ignores a later one; no second charge)
         entry.reply_seen = True
         status, code, body = record.status, _safe_code(record.code), record.body
+        entry.reply_status = status if status in ("accepted", "rejected", "failed") else None
         if status == "accepted" and entry.body_mode == "step" and body:
             if any(byte in body for byte in _FRAMING):
                 status, code, body = "failed", REPLY_BODY_INVALID, b""  # would break the sender's framing
@@ -252,6 +274,12 @@ class PendingMap:
         for entry in [e for e in self._by_id.values() if e.connection is connection]:
             self._settle(entry, entry.request.disconnected())
 
+    def route_lost_all(self) -> list[Resolution]:
+        """The receiver is stopping: every entry's reply route is given up now. A committed entry is answered
+        `AE` / `REPLY_ROUTE_LOST`; one whose `raw` callback is still pending waits for it (`AE` on success, `AR` on
+        failure), so nothing is answered ahead of the commit."""
+        return self.partitions_revoked(frozenset(e.partition for e in self._by_id.values()))
+
     def abandon_all(self) -> None:
         for entry in list(self._by_id.values()):
             self._settle(entry, entry.request.disconnected())
@@ -266,7 +294,7 @@ class PendingMap:
         if resolution is None:
             return None
         if self._by_id.pop(entry.correlation_id, None) is not None:
-            key = id(entry.connection)
+            key = entry.fairness_key
             left = self._per_connection.get(key, 1) - 1
             if left > 0:
                 self._per_connection[key] = left
@@ -282,6 +310,8 @@ class PendingMap:
             msg_id=entry.msg_id,
             body=entry.body if resolution.answer == "AA" else b"",
             body_charged=entry.body_charged,
+            reply_status=entry.reply_status,
+            produce_code=entry.produce_code,
         )
         entry.body, entry.body_charged = b"", 0
         if not entry.outcome.done():

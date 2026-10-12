@@ -407,9 +407,15 @@ proxies retry automatically** (`5xx`, `408`, `429`). Without `source.reply` noth
 | Before any publish: parse, content type, auth, size, queue full | no | unchanged (3.2.2): `400`, `415`, `401`/`403`, `413`, `422`, `503` | as today | as today | `AR` |
 
 **Response.** `Content-Type: application/json` and `Cache-Control: no-store` on every sync answer.
-The body is `{"v": 0, "status": <above>, "tb-msg-id": <id>, "code": <registered code>}`, with `code`
-present exactly when `Tb-Reply-Code` is (`tb-msg-id` keeps the async `202` body's key, 3.2.2). The
-response header `Tb-Msg-Id` carries the id, and `Retry-After` is on every `503`, in integer seconds.
+The body is `{"v": 0, "status": <above>, "tb-msg-id": <id>, "code": <registered code>}`. `code` is
+present exactly when `Tb-Reply-Code` is; `tb-msg-id` keeps the async `202` body's key (3.2.2).
+**Clarified 2026-10-12:** `tb-msg-id` and the `Tb-Msg-Id` header are present **exactly when a `raw`
+publish was attempted**. That means every `200` and `202`, and the `503` with `PRODUCE_FAILED` or
+`PRODUCE_TIMEOUT`, where the id lets an operator check whether a timed-out write landed. They are
+absent on `503` `REPLY_BUSY` and `REPLY_UNAVAILABLE`, where nothing was published, and on every
+pre-publish error. `Retry-After` is on every `503`, in integer seconds. **A `raw` delivery timeout
+answers `PRODUCE_TIMEOUT`, not `PRODUCE_FAILED`.** It is the one `AR` after which a resend can
+duplicate (integrator rule above), so the sender and the operator must be able to tell it apart.
 Ids and registered codes only: never payload, a header value from the request, or exception text
 (invariant 6). No new request header and no new Kafka header. `tb_receiver_sync_answers_total` maps
 `200` → `AA`, sync `202` → `AE`, `503` → `AR`, so `metrics.json` is unchanged.
@@ -436,8 +442,11 @@ processed (sync mode never cancels work), and a late reply is dropped as unknown
    from the not-committed side. A `4xx` reads as "your request was wrong, fix it and resend", and for a
    committed message that resend is a duplicate. `422` already means "not committed" here (3.2.2).
    **Give up:** a sender cannot tell `AE` from success by status class alone. It must read
-   `Tb-Reply-Code` or the body. A sync channel never sends an uncoded `202`, so "`202` with a code"
-   identifies `AE` exactly.
+   the body. **Clarified 2026-10-12, the table wins:** `Tb-Reply-Code` is present whenever a code
+   exists, and it is absent on a `202` whose reply carried an unrecognised status and no code. What
+   identifies `AE` exactly is the body: on a sync channel every `202` carries `status` `rejected`,
+   `failed` or `unknown`, never `accepted`. Rejected: a new code for that case (an `error-codes.json`
+   change for a fail-safe path the body already marks).
 2. **`Idempotency-Key` never deduplicates in v0.** A deduplicating store keyed by a sender value is
    state on the receive path outside Kafka (invariant 2) and is ADR-003 D8's deferred edge dedupe. The
    key may also be derived from a patient identifier. So the receiver **ignores the header**: it is

@@ -649,3 +649,22 @@ def test_a_body_reply_arriving_after_the_writer_was_cancelled_does_not_stay_char
         server.stop_accepting("test")
 
     asyncio.run(go())
+
+
+@pytest.mark.parametrize(("result", "code"), [("failed", "PRODUCE_FAILED"), ("timeout", "PRODUCE_TIMEOUT")])
+def test_a_failed_publish_is_counted_as_produce_timeout_or_produce_failed(result: str, code: str) -> None:
+    """The MLLP sender still gets `AR` (a resend is safe, bar the timeout's duplicate risk); the sync-answer metric
+    keeps the two apart, as the HTTP receiver's `Tb-Reply-Code` does."""
+
+    class Timing:
+        async def publish_result(self, message: Message, *, timeout_s: float) -> str:
+            return result
+
+    async def client(server: MllpServer, port: int) -> None:
+        r, w = await send(port, "C1")
+        [f] = await _read_frames(r, 1)
+        assert msa3(f)[0] == "AR"
+        assert server.metrics.sync_answers == {("AR", code): 1} and len(server.pending or []) == 0
+        w.close()
+
+    run(sync_settings(), Timing(), client)

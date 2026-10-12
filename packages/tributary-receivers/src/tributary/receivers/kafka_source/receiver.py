@@ -357,7 +357,7 @@ def main() -> None:
     restarts on 0), 2 for a refused startup configuration."""
     from tributary.runtime.errors import RuntimeConfigurationError
     from tributary.runtime.ops import add_ops_arguments, ops_settings_or_exit
-    from tributary.runtime.startup import QuietArgumentParser
+    from tributary.runtime.startup import QuietArgumentParser, refuse_configuration, resolve_instance_id
 
     from ..cli import run_until_stopped, spec_feed_opener
     from ..startup import refuse, refuse_retired_channel_spec_flag, spec_reader_group_or_exit
@@ -373,12 +373,21 @@ def main() -> None:
     p = QuietArgumentParser(log, description=__doc__)
     p.add_argument("--channel", required=True, help="the deployed channel name (spec.metadata.name)")
     p.add_argument("--env", required=True, help="the topic-name env segment, e.g. 'dev' or 'prod'")
-    p.add_argument("--instance", default="kafka-0", help="this process's identity: static group member and tb-source")
+    p.add_argument(
+        "--instance",
+        default=None,
+        help="this process's identity: static group member and tb-source. REQUIRED and unique per replica "
+        "(or TB_INSTANCE_ID): a shared id makes replicas fence each other out of the group",
+    )
     p.add_argument("--secrets-dir", help="overrides TB_SECRETS_DIR / the default secrets mount")
     p.add_argument("--contracts-dir", help="overrides TB_CONTRACTS_DIR / the default contracts/ search")
     p.add_argument("--metrics-file")
     add_ops_arguments(p)
     a = p.parse_args(argv)
+    try:
+        a.instance = resolve_instance_id(a.instance)  # no default: it is the static member id (INSTANCE_REQUIRED)
+    except RuntimeConfigurationError as exc:
+        refuse_configuration(log, exc)
     logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(message)s")
     # Operator input is validated (and refused without being echoed) before it becomes a log field.
     spec_group = spec_reader_group_or_exit(a.env, a.channel, a.instance, log)

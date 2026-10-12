@@ -13,6 +13,7 @@ function only has to agree with the schema on shape).
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import UTC, datetime
 
 from tributary.sdk import Message, ids
@@ -20,11 +21,22 @@ from tributary.sdk import headers as h
 
 
 def build_raw_envelope(
-    *, channel: str, channel_version: int, source: str, payload: bytes, key: bytes | None, content_type: str
+    *,
+    channel: str,
+    channel_version: int,
+    source: str,
+    payload: bytes,
+    key: bytes | None,
+    content_type: str,
+    reply_headers: Mapping[str, str] | None = None,
 ) -> Message:
-    """A fresh `tb-msg-id`, `tb-attempt: 0` (this is the first hop), a fresh `traceparent`."""
+    """A fresh `tb-msg-id`, `tb-attempt: 0` (this is the first hop), a fresh `traceparent`.
+
+    `reply_headers` is synchronous reply mode's `tb-correlation-id`, `tb-reply-partition` and `tb-reply-deadline`
+    (`reply/pending.py`): engine-minted ids, an integer and a timestamp. Nothing the sender supplied is a header."""
     return Message(
         headers={
+            **(reply_headers or {}),
             h.TB_MSG_ID: ids.uuid7(),
             h.TB_CHANNEL: channel,
             h.TB_CHANNEL_VERSION: str(channel_version),

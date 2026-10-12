@@ -62,7 +62,7 @@ from ..tls import AEAD_CIPHER_PIN, build_ssl_context, log_peer_refused, peer_san
 from .ack import build_ack
 from .config import MllpSettings
 from .framing import CR, EB, SB, Fatal, FrameParser, Oversize, control_id, looks_like_hl7
-from .kafka_publisher import RawPublisher, build_raw_envelope
+from .kafka_publisher import RawPublisher, build_raw_envelope, publish_outcome
 from .kafka_publisher import topic_name as raw_topic_name
 from .reload import restart_required_fields
 
@@ -238,7 +238,9 @@ class MllpServer:
                     )
                     entry.bind(message.require(h.TB_MSG_ID))  # before the produce: no reply can name it earlier
                     t0 = time.monotonic()
-                    ok = await self.publisher.publish(message, timeout_s=timeout)
+                    published = await publish_outcome(self.publisher, message, timeout_s=timeout)
+                    ok = published == "committed"
+                    entry.produce_code = "PRODUCE_TIMEOUT" if published == "timeout" else "PRODUCE_FAILED"
                     self.metrics.record_ack_latency_ms((time.monotonic() - t0) * 1000)
             except Exception:
                 ok = False
@@ -274,7 +276,7 @@ class MllpServer:
             return build_ack("AE", cid, f"{resolution.code or ''} {msg_id}".strip())
         self.metrics.publish_failures += 1
         self.metrics.nacked_unavailable += 1
-        self.metrics.record_sync_answer("AR", resolution.code or "PRODUCE_FAILED")
+        self.metrics.record_sync_answer("AR", resolution.code or result.produce_code or "PRODUCE_FAILED")
         return build_ack("AR", cid, "unavailable")
 
     def _release_body_when_done(self, task: asyncio.Task[Any]) -> None:

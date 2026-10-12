@@ -125,3 +125,26 @@ def test_a_closed_publisher_refuses_later_publishes_and_never_reports_a_commit()
         return [await publisher.publish(message, timeout_s=0.5)]
 
     assert asyncio.run(go()) == [False]
+
+
+def test_publish_result_tells_a_delivery_timeout_from_a_failure() -> None:
+    """After a timeout librdkafka may still complete the write, so only that `AR` can duplicate on a resend:
+    sync reply mode answers it `PRODUCE_TIMEOUT`, distinct from `PRODUCE_FAILED` (README 3.2.6)."""
+    import asyncio
+
+    from tributary.receivers.mllp.kafka_publisher import RawPublisher
+    from tributary.runtime.clients import KafkaSettings
+
+    publisher = RawPublisher(KafkaSettings(bootstrap_servers="127.0.0.1:19"), "dev.c.raw", topic_defaults=None)
+    message = build_raw_envelope(channel="c", channel_version=0, source="mllp:i@p", payload=b"x", key=None)
+
+    async def go() -> tuple[str, bool, str]:
+        publisher.start(asyncio.get_running_loop())
+        try:
+            timed_out = await publisher.publish_result(message, timeout_s=0.3)  # no broker answers: no report
+            as_bool = await publisher.publish(message, timeout_s=0.3)
+        finally:
+            publisher.close(timeout_s=0.1)
+        return timed_out, as_bool, await publisher.publish_result(message, timeout_s=0.3)
+
+    assert asyncio.run(go()) == ("timeout", False, "failed")  # a closed producer is a failure, not a timeout
