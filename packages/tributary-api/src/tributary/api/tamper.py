@@ -78,8 +78,10 @@ class ClickHouseHttp:
     Built on `http.client`, not `urllib.request.urlopen`, so by construction it never follows a redirect (a 3xx is
     an error, and the credential header goes to the configured host only) and never reads `HTTP_PROXY` or
     `HTTPS_PROXY` (the password is never handed to a proxy). TLS verifies against the system trust store. The
-    timeout is per socket operation; `deadline_s` is the overall wall clock for the whole exchange, enforced by
-    shutting the socket down from a timer thread (a server trickling bytes cannot hold a check open)."""
+    timeout is per socket operation; `deadline_s` is the overall wall clock for the whole exchange: `query` joins
+    a worker thread for at most that long and, on expiry, abandons it (a server trickling bytes, or a black-holed
+    connect, cannot hold a check open). An abandoned worker never sends: it closes as soon as it is connected.
+    A query for which an earlier worker is still alive is refused, so a hostile endpoint cannot pile up threads."""
 
     def __init__(
         self,
@@ -104,17 +106,26 @@ class ClickHouseHttp:
         self._timeout_s = timeout_s
         self._deadline_s = deadline_s
         self._context = ssl.create_default_context()
+        self._workers: dict[str, threading.Thread] = {}  # by SQL text, which names the environment's database
 
     def query(self, sql: str) -> str:
         """The whole exchange, DNS and connect and TLS included, has a hard bound of `deadline_s`: it runs in a
         daemon thread that this call joins for at most that long. On expiry the socket (if there is one yet) is
         shut down and the call fails; an abandoned thread ends at its own per-operation timeouts."""
+        previous = self._workers.get(sql)
+        if previous is not None and previous.is_alive():
+            raise TamperQueryError  # the last attempt for this environment is still stuck: do not add another
         held: dict[str, http.client.HTTPConnection] = {}
         outcome: list[str | None] = []
-        worker = threading.Thread(target=self._exchange, args=(sql, held, outcome), daemon=True, name="tb-tamper-query")
+        abandoned = threading.Event()
+        worker = threading.Thread(
+            target=self._exchange, args=(sql, held, outcome, abandoned), daemon=True, name="tb-tamper-query"
+        )
+        self._workers[sql] = worker
         worker.start()
         worker.join(self._deadline_s)
         if worker.is_alive():
+            abandoned.set()  # before the shutdown below: a worker that connects later sees it and closes
             conn = held.get("conn")
             if conn is not None and conn.sock is not None:
                 _shutdown(conn.sock)
@@ -123,7 +134,13 @@ class ClickHouseHttp:
             raise TamperQueryError
         return outcome[0]
 
-    def _exchange(self, sql: str, held: dict[str, http.client.HTTPConnection], outcome: list[str | None]) -> None:
+    def _exchange(
+        self,
+        sql: str,
+        held: dict[str, http.client.HTTPConnection],
+        outcome: list[str | None],
+        abandoned: threading.Event,
+    ) -> None:
         conn: http.client.HTTPConnection
         if self._https:
             conn = http.client.HTTPSConnection(self._host, self._port, timeout=self._timeout_s, context=self._context)
@@ -131,6 +148,9 @@ class ClickHouseHttp:
             conn = http.client.HTTPConnection(self._host, self._port, timeout=self._timeout_s)
         held["conn"] = conn
         try:
+            conn.connect()
+            if abandoned.is_set():
+                return  # the caller gave up while DNS or connect was pending: send nothing, keep nothing open
             conn.request("POST", self._path, body=sql.encode(), headers=self._headers)
             response = conn.getresponse()
             body = response.read(MAX_RESPONSE_BYTES)

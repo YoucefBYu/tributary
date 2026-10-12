@@ -4,6 +4,7 @@ query, the stored-gauge behaviour on success and failure, configuration, and the
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import http.server
 import json
 import threading
@@ -516,6 +517,49 @@ def test_the_whole_query_is_bounded_even_when_connect_never_completes() -> None:
                 "SELECT 1"
             )
         assert time.monotonic() - started < 4.0  # not the 20 s per-operation connect timeout
+    finally:
+        for c in fillers:
+            c.close()
+        srv.close()
+
+
+def test_a_worker_that_connects_after_the_deadline_sends_nothing_and_a_stuck_environment_is_not_retried() -> None:
+    import socket
+    import time
+
+    # A listener that accepts late: the client's connect completes only once we accept (backlog full first).
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(0)
+    fillers = []
+    received: list[bytes] = []
+    try:
+        for _ in range(4):
+            c = socket.socket()
+            c.setblocking(False)
+            c.connect_ex(srv.getsockname())
+            fillers.append(c)
+        client = ClickHouseHttp(
+            f"http://127.0.0.1:{srv.getsockname()[1]}", "u", "pw-not-real", timeout_s=20, deadline_s=0.5
+        )
+        with pytest.raises(TamperQueryError):
+            client.query("SELECT 1")  # the deadline passes during connect
+        stuck = client._workers["SELECT 1"]
+        started = time.monotonic()
+        with pytest.raises(TamperQueryError):
+            client.query("SELECT 1")  # same environment, worker still alive: refused at once
+        assert time.monotonic() - started < 0.3 and client._workers["SELECT 1"] is stuck  # no second thread
+        for c in fillers:  # free the backlog so the abandoned connect completes
+            c.close()
+        srv.settimeout(5)
+        conn, _ = srv.accept()
+        conn.settimeout(1.5)
+        with contextlib.suppress(TimeoutError):
+            received.append(conn.recv(4096))
+        conn.close()
+        stuck.join(5)
+        assert not stuck.is_alive()
+        assert not any(b"pw-not-real" in r or b"SELECT" in r for r in received)  # nothing was ever sent
     finally:
         for c in fillers:
             c.close()
