@@ -1,13 +1,15 @@
 {
   "marker": "integration",
   "command": "uv run pytest -m integration",
-  "count": 273,
+  "count": 283,
   "modules": {
+    "packages/tributary-api/tests/api/test_audit_integration.py": 6,
     "packages/tributary-api/tests/api/test_db_tls_integration.py": 2,
     "packages/tributary-api/tests/api/test_deploy_kafka_integration.py": 2,
     "packages/tributary-api/tests/api/test_hot_reload_integration.py": 3,
     "packages/tributary-api/tests/api/test_invariant3_integration.py": 1,
-    "packages/tributary-api/tests/api/test_reconciler_integration.py": 7,
+    "packages/tributary-api/tests/api/test_reconciler_integration.py": 8,
+    "packages/tributary-api/tests/api/test_retention_integration.py": 3,
     "packages/tributary-api/tests/api/test_routes_integration.py": 9,
     "packages/tributary-api/tests/api/test_tamper_integration.py": 2,
     "packages/tributary-api/tests/db/test_migrations_integration.py": 4,
