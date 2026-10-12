@@ -261,6 +261,20 @@ The receiver ACKs the sender only from the producer's delivery callback, after a
 commit. On `delivery.timeout.ms` expiry, or when fewer than `min.insync.replicas` replicas are
 available, it NACKs or refuses the connection. It never ACKs optimistically.
 
+#### 3.2.1 Worker producer (set 1.8, W3-24)
+
+`topic-defaults.json` `clients.worker_producer` is the worker's non-transactional producer for
+`out.<dest>`, `dlq` and `reply`. It is the profile above with **`linger.ms` 0**; until set 1.8 the
+worker reused the receiver's block. Evidence (`platform-engineer`, stage-timing run, 2026-10-12):
+sync-reply p50 is about 15 ms, of which about 11 ms is two fixed 5 ms linger waits, one on the
+receiver's `raw` produce and one on the worker's reply produce, which is never flushed. The tail (44-71
+ms) is host CPU scheduling: an asyncio echo control without Kafka shows the same. The worker already
+waits on every record's delivery, so linger buys no batching there. **Give up:** fewer records per
+produce request under burst. **Condition:** the build ships a worker throughput comparison, before and
+after on the same host, with no loss beyond run-to-run noise. The receiver's `linger.ms` (5) is
+unchanged; it remains the S2-curve `TODO` above. The effective-configuration test (3.7) pins the new
+block.
+
 ### 3.3 Worker and loader consumer
 
 | Setting | Value | Why |

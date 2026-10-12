@@ -41,6 +41,11 @@ wave's exit criteria here.
   to `kafka-0` and uses it as `group.instance.id` (sent to `connector-engineer`). **W3-19 ruled:** HTTP
   sync `200`/coded `202`/`503`; `Idempotency-Key` ignored; `body: step` deferred (`channel-spec/v0`
   3.2.6). The connector may build.
+- **W3-24 CLOSED 2026-10-12: host scheduling; no code fix for the tail.** `platform-engineer`'s
+  stage-timing run (coordinator-relayed) found the 44-71 ms sync-reply tail also in an asyncio echo
+  control without Kafka. Separately, p50 drops by an estimated ~5 ms with `clients.worker_producer`
+  `linger.ms` 0 (`topics/v0` 3.2.1; build and throughput check by `platform-engineer`). A per-stage
+  histogram is rejected for now (CHANGELOG).
 - **Architect batch 1, delivered 2026-10-05; closure status 2026-10-12.** The coordinator's run on
   2026-10-12 covered every contract delivered so far: `validate.py` **244 passed / 0 failed**,
   `--check-expectations` **154 invalid / 0 drifted** (exit 0). Its counts include W3-12, W3-1a, W3-17

@@ -3,6 +3,21 @@
 Newest first. Each entry names the contract, the version, whether the change is additive or
 breaking, and the reason. Breaking changes reference an ADR.
 
+## 2026-10-12 (W3-24) — set 1.8: `clients.worker_producer` with `linger.ms` 0
+
+**Additive: a new client profile; no role string, schema or example change. Counts unchanged.**
+
+- **`topic-defaults.json` `clients.worker_producer`** and **`topics/v0` README 3.2.1:** the
+  `receiver_producer` profile with `linger.ms` 0, for the worker's `out`, `dlq` and `reply` produces.
+  Estimated ~5 ms off the sync-reply p50 (W3-24 measurement). Accepted on the condition of a worker
+  throughput comparison before and after. The receiver keeps 5.
+- **Rejected for now:** a per-stage latency histogram in `observability/v0`. The tail is host
+  scheduling, not a stage; `tb_ack_latency_seconds` and `tb_stage_duration_seconds` already give the
+  sender-visible and per-stage numbers; the stage-timing flag stays a diagnostic. Revisit if a stage,
+  rather than the host, is ever shown to own the tail.
+- **Build:** `platform-engineer` (runtime `config.py` reads the block into a worker producer profile;
+  the worker uses it; the effective-config test pins it; plus the throughput comparison).
+
 ## 2026-10-12 (W3-23, W3-37a) — set 1.8: grant notes and the API TLS cipher pin (description only)
 
 - **`topic-defaults.json`:** in `lag_reader_note` and `api_note`, "UNVERIFIED until a W3-23-style test" is

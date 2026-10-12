@@ -221,6 +221,16 @@
       "compression.type": "lz4",
       "compression.type_source": "assumption, unmeasured: cheaper CPU than zstd for small text records"
     },
+    "worker_producer": {
+      "$comment": "Set 1.8 (2026-10-12, W3-24). The pipeline worker's non-transactional producer for out.<dest>, dlq and reply. The invariant 1 profile of receiver_producer, except linger.ms. Until this block existed the worker reused receiver_producer.",
+      "acks": "all",
+      "enable.idempotence": true,
+      "max.in.flight.requests.per.connection": 5,
+      "delivery.timeout.ms": 120000,
+      "linger.ms": 0,
+      "linger.ms_source": "MEASURED (platform-engineer, W3-24 stage timing, 2026-10-12): the worker waits on every record's delivery anyway, so linger only delays it; the reply produce, which is never flushed, waited a fixed 5 ms. Estimated ~5 ms off the sync-reply p50; tail unchanged (host scheduling). Accepted on condition that a worker throughput run before and after shows no loss beyond run-to-run noise",
+      "compression.type": "lz4"
+    },
     "transactional_stage_producer": {
       "acks": "all",
       "enable.idempotence": true,

@@ -67,6 +67,7 @@ from .events import EventEmitter, MessageEvent, PartitionEvent, RecordEvent
 from .executor import PipelineAbort, StepFailure
 from .records import ConsumedRecord, DecodeContext, RecordDecodeError, RecordRejectError, decode_record
 from .spec import RetryPolicy
+from .stage_timing import StageTimer
 from .transactions import Committer, OffsetCommitter, TransactionError
 
 #: librdkafka's "reached the end of this partition" signal. Informational, not an error.
@@ -219,8 +220,11 @@ class ConsumerLoop:
         committer: Committer | None = None,
         on_dead_lettered: DeadLetterObserver | None = None,
         on_tick: Callable[[], None] | None = None,
+        stage_timer: StageTimer | None = None,
     ) -> None:
         self._consumer = consumer
+        #: W3-24 diagnostic stamps (`stage_timing.py`); `None` unless `TB_STAGE_TIMING` is on.
+        self._stage_timer = stage_timer
         #: Called once per iteration, on the loop's thread, after the poll (busy or idle). The worker uses it
         #: to refresh the applied spec while idle, so `tb_spec_version` moves without traffic.
         self._on_tick = on_tick
@@ -281,8 +285,12 @@ class ConsumerLoop:
             while self._running and (max_iterations is None or iterations < max_iterations):
                 iterations += 1
                 self._resume_due_partitions()
+                timer = self._stage_timer
+                poll_started = timer.clock() if timer is not None else 0.0
                 raw = self._consumer.poll(self.poll_timeout())
                 if raw is not None:
+                    if timer is not None:
+                        timer.polled(raw, poll_started=poll_started)
                     self._consume_one(raw)
                 if self._committer.should_commit_now(idle=raw is None):
                     # An open transaction blocks every read_committed reader downstream: never leave one.

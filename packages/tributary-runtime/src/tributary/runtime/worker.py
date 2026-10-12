@@ -42,8 +42,15 @@ from tributary.sdk.projection import Ordering, TopicClass, validate_for_produce
 from tributary.sdk.reply import ReplyBody
 
 from .channels import ChannelsConsumerLike, LiveSpecSource, open_spec_source
-from .clients import KafkaSettings, consumer_config, events_producer_config, max_poll_interval_ms, producer_config
-from .config import TopicDefaults, load_topic_defaults
+from .clients import (
+    KafkaSettings,
+    consumer_config,
+    events_producer_config,
+    max_poll_interval_ms,
+    producer_config,
+    worker_producer_config,
+)
+from .config import TopicDefaults, load_topic_defaults, worker_producer_profile
 from .consumer import ConsumerLoop, KafkaConsumerLike, LoopSettings, LoopStats
 from .context import ContextExtension, WorkerContext
 from .engine_kafka import load_engine_kafka_or_exit
@@ -74,6 +81,7 @@ from .reply import (
     destination_rank,
 )
 from .spec import ChannelSpec, RetryPolicy
+from .stage_timing import StageTimer, enabled_from_env
 from .startup import (
     QuietArgumentParser,
     add_instance_argument,
@@ -124,6 +132,8 @@ class WorkerSettings:
     poll_timeout_s: float = 0.2
     flush_timeout_s: float = 30.0
     shadow: str | None = None
+    #: Per-record stage timestamps (`stage_timing.py`, W3-24), a diagnostic. `main` sets it from `TB_STAGE_TIMING`.
+    stage_timing: bool = False
     #: The ops listener (`/livez`, `/metrics`). `None`: none (an embedded caller or a unit test); `main` always
     #: sets one, and `build()` binds it first, refusing the start if it cannot (O4).
     ops: OpsSettings | None = None
@@ -444,9 +454,11 @@ class PipelineHandler:
         context_resolver: ContextResolver | None = None,
         step_resolver: StepResolver | None = None,
         metrics: WorkerMetrics | None = None,
+        stage_timer: StageTimer | None = None,
     ) -> None:
         self._env = env
         self._metrics = metrics
+        self._stage_timer = stage_timer
         # L7: an explicit tuple replaces discovery (tests only; nothing in `main` sets it).
         self._context_override = tuple(context_extensions) if context_extensions is not None else None
         self._context_resolver = context_resolver if context_resolver is not None else ContextResolver(log=log)
@@ -550,6 +562,8 @@ class PipelineHandler:
 
     def handle(self, record: ConsumedRecord) -> None:
         started = time.perf_counter()
+        if self._stage_timer is not None:
+            self._stage_timer.mark("handle")
         spec, plan = self._current()
         if spec.pipeline.transactional != self._transactional and self._warned_version != spec.version:
             # The producer's transactional identity is fixed at construction: say so, once per version.
@@ -659,6 +673,10 @@ class PipelineHandler:
         # transaction the commit itself flushes and fails - then aborts - if any record did not land.
         if not self._transactional:
             self._producer.flush_pending(self._flush_timeout_s)
+        if self._stage_timer is not None:
+            # Meaningful only when non-transactional. A transactional channel's records are flushed by the
+            # loop's commit; it never answers, so its stamps are never written (no `flushed_ms`, no line).
+            self._stage_timer.mark("flushed")
 
         self.dead_lettered += pending.dead
         self.filtered += pending.filtered
@@ -903,6 +921,8 @@ class PipelineHandler:
         if route is None or self._replies is None:
             return
         self._replies.publish(record, route, outcome, channel=spec.name, channel_version=spec.version, body=used)
+        if self._stage_timer is not None:
+            self._stage_timer.replied(record.msg_id, status=outcome.status)
 
     # -- events and stats ------------------------------------------------------------------------
 
@@ -1128,6 +1148,9 @@ class PipelineWorker:
         # Before any client is built: a warning emitted after a failed connection is a warning nobody
         # sees on the run where it matters most.
         emit_profile_warning(self.log, defaults, profile=self.settings.profile)
+        # The worker's own producer block is validated here, before any client: a contract without it refuses
+        # this worker only (`ConfigError`); receivers and loaders that share the loader never look at it.
+        worker_producer_profile(defaults)
         # Every client below, the `_tb.<env>.channels` reader first, is built from this one link. Its
         # `engine_kafka_link` line was logged once by `load_engine_kafka_or_exit` in `main`.
 
@@ -1151,12 +1174,14 @@ class PipelineWorker:
         spec = self.specs.current()
 
         transactional = spec.pipeline.transactional
-        base_config = producer_config(
-            self.settings.kafka, defaults, client_id=f"tb-{env}-{channel}-{self.settings.instance_id}"
-        )
+        client_id = f"tb-{env}-{channel}-{self.settings.instance_id}"
+        # Non-transactional: `clients.worker_producer` (linger 0, topics README 3.2.1). A transactional channel
+        # keeps the `receiver_producer` base it always had: that ruling covered only the non-transactional
+        # producer, and its records are flushed by the commit, not per record.
+        base_config = worker_producer_config(self.settings.kafka, defaults, client_id=client_id)
         if transactional:
             base_config = transactional_producer_config(
-                base_config,
+                producer_config(self.settings.kafka, defaults, client_id=client_id),
                 transactional_id_value=transactional_id(
                     defaults.transactional_id_template, env=env, channel=channel, instance=self.settings.instance_id
                 ),
@@ -1193,6 +1218,7 @@ class PipelineWorker:
             instance=self.settings.instance,
             partition_count=reply_partitions,
         )
+        stage_timer = StageTimer(self.log) if self.settings.stage_timing else None
         handler = PipelineHandler(
             env=env,
             spec_provider=self._current_spec,
@@ -1208,6 +1234,7 @@ class PipelineWorker:
             replies=replies,
             context_extensions=self.context_extensions,
             metrics=metrics,
+            stage_timer=stage_timer,
         )
         # Resolve and bind every step, and load the declared context extensions, now: a bad `with`, a
         # splitter on a per-key channel or an unresolvable `pipeline.context` stops the worker before it
@@ -1260,6 +1287,7 @@ class PipelineWorker:
             ),
             on_dead_lettered=handler.after_dead_letter,
             on_tick=self._tick,
+            stage_timer=stage_timer,
         )
         self.stale_after_s = max_poll_interval_ms(spec) / 1000.0
         loop, specs = self.loop, self.specs
@@ -1319,7 +1347,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     Flags: `--instance-id` (or `TB_INSTANCE_ID`; **required**, W3-28: `startup_refused` with
     `code: INSTANCE_REQUIRED`, exit 2), `--ops-bind` / `--ops-port` (or `TB_OPS_BIND` / `TB_OPS_PORT`,
     default `127.0.0.1:9180`, O2). Environment: `TB_CHANNEL` (required), `TB_ENV`, `TB_PROFILE`,
-    `TB_CONTRACTS_DIR`.
+    `TB_CONTRACTS_DIR`, and `TB_STAGE_TIMING` (`1`/`true`/`yes`; default off): one `stage_timing` log line
+    per answered synchronous record, ids and epoch-ms stamps only (`stage_timing.py`, W3-24).
     """
     args_list = list(sys.argv[1:] if argv is None else argv)
     log = JsonLogger("worker")
@@ -1348,6 +1377,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             profile=os.environ.get("TB_PROFILE", "lite"),
             contracts_dir=os.environ.get("TB_CONTRACTS_DIR"),
             ops=ops,
+            stage_timing=enabled_from_env(os.environ),
         )
     except RuntimeConfigurationError as exc:
         # A topic-name error can quote the name; the class and code are enough to act on.

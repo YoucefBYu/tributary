@@ -68,6 +68,11 @@ class TopicDefaults:
     profiles: Mapping[str, Mapping[str, Any]]
     #: `clients.transactional_stage_producer.transactional.id`, e.g. `tb.<env>.<channel>.pipeline.<instance>`.
     transactional_id_template: str = ""
+    #: `clients.worker_producer` (set 1.8, README 3.2.1) as written, **unvalidated**, or `None` when absent: the
+    #: worker's non-transactional producer for `out`, `dlq` and `reply`. Only the worker uses it, so only the
+    #: worker validates it (`worker_producer_profile`); a contract without it still loads for every other
+    #: component (re-review MED: `load_topic_defaults` is shared by receivers, the replier and loaders).
+    worker_producer: Mapping[str, Any] | None = None
 
     def startup_warning(self, profile: str) -> str | None:
         """The warning a profile requires at startup, or `None`.
@@ -172,6 +177,7 @@ def load_topic_defaults(contracts_dir: str | Path | None = None) -> TopicDefault
     producer_block = clients.get("receiver_producer")
     if not isinstance(producer_block, dict):
         raise ConfigError("clients.receiver_producer is missing from the topics contract")
+    worker_block = clients.get("worker_producer")
 
     txn_block = clients.get("transactional_stage_producer")
     txn_template = txn_block.get("transactional.id") if isinstance(txn_block, dict) else None
@@ -201,7 +207,48 @@ def load_topic_defaults(contracts_dir: str | Path | None = None) -> TopicDefault
             "linger.ms": producer_block.get("linger.ms", 5),
             "compression.type": producer_block.get("compression.type", "lz4"),
         },
+        worker_producer=dict(worker_block) if isinstance(worker_block, dict) else None,
     )
+
+
+#: The keys of `clients.worker_producer` that reach librdkafka; every one is required (README 3.7).
+_WORKER_PRODUCER_KEYS = (
+    "acks",
+    "enable.idempotence",
+    "max.in.flight.requests.per.connection",
+    "delivery.timeout.ms",
+    "linger.ms",
+    "compression.type",
+)
+
+
+#: librdkafka refuses idempotence above this many in-flight requests per connection.
+MAX_IDEMPOTENT_IN_FLIGHT = 5
+
+
+def worker_producer_profile(defaults: TopicDefaults) -> dict[str, Any]:
+    """`clients.worker_producer`, validated: called on the worker's build path only, never at load.
+
+    No fallback literal: a missing block or key is a contract defect, not a default (README 3.7). Invariant 1
+    is checked here as well as in the contract: this producer writes `out`, `dlq` and `reply`, whose loss
+    after a commit is a lost message. Raises `ConfigError`.
+    """
+    block = defaults.worker_producer
+    if block is None:
+        raise ConfigError("clients.worker_producer is missing from the topics contract")
+    missing = [key for key in _WORKER_PRODUCER_KEYS if key not in block]
+    if missing:
+        raise ConfigError(f"clients.worker_producer is missing {', '.join(missing)}")
+    profile = {key: block[key] for key in _WORKER_PRODUCER_KEYS}
+    if str(profile["acks"]) not in {"all", "-1"} or profile["enable.idempotence"] is not True:
+        raise ConfigError("clients.worker_producer must be acks=all with enable.idempotence (invariant 1)")
+    in_flight = profile["max.in.flight.requests.per.connection"]
+    if isinstance(in_flight, bool) or not isinstance(in_flight, int) or not 1 <= in_flight <= MAX_IDEMPOTENT_IN_FLIGHT:
+        raise ConfigError(
+            f"clients.worker_producer max.in.flight.requests.per.connection must be 1-{MAX_IDEMPOTENT_IN_FLIGHT}"
+            " (idempotence)"
+        )
+    return profile
 
 
 #: `clients.reply_consumer` string values the replier depends on, and what the contract allows for each.
