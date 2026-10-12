@@ -42,6 +42,7 @@ def make_harness(idp: Idp) -> Callable[..., Harness]:
         clock: Callable[[], float] = time.monotonic,
         max_inflight: int = 4,
         inflight_wait_s: float = 5.0,
+        tamper: object | None = None,
     ) -> Harness:
         oidc_cfg = oidc or oidc_settings(idp)
         settings = Settings(database=DatabaseSettings("127.0.0.1", "tb", "u", "ref"), oidc=oidc_cfg)
@@ -64,6 +65,7 @@ def make_harness(idp: Idp) -> Callable[..., Harness]:
             log=JsonLogger("api", level="error"),
             max_inflight_deploys=max_inflight,
             inflight_wait_s=inflight_wait_s,
+            tamper=tamper,  # type: ignore[arg-type]
         )
         return Harness(app, keys, pub)
 

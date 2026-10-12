@@ -1,0 +1,8 @@
+{
+  "type": "https://tributary.dev/problems/ordering-would-break",
+  "title": "Re-publishing would reorder a per-key channel",
+  "status": 409,
+  "code": "ORDERING_WOULD_BREAK",
+  "detail": "The channel orders per key. Repeat with allow_reorder true to accept out-of-order delivery; the choice is audited.",
+  "request_id": "0192f3a4-7400-7abc-8def-0123456789ab"
+}

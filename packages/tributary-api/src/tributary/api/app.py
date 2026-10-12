@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import logging
 import time
@@ -35,17 +34,24 @@ from .problems import ApiProblem, render
 from .publisher import ChannelsPublisher
 from .reconciler import Reconciler, TopicReader
 from .service import _ABSENT, INFLIGHT_WAIT_S, MAX_INFLIGHT_DEPLOYS, ControlPlane
+from .tamper import TamperChecker
 from .validation import control_plane_issues, validate_document
 
 MAX_BODY_BYTES = 262144
+# The path grammar deliberately still admits `tb-*` (ADR-010 section 3 reserves it for creation only): a read of
+# such a name is a harmless 404, and the header, topic and metric-label grammars stay unchanged.
 CHANNEL = r"^[a-z][a-z0-9-]{0,63}$"
 ENVIRONMENT = r"^[a-z][a-z0-9-]{0,15}$"
 CURSOR = r"^[A-Za-z0-9_-]{1,256}$"
+UUID_ANY = r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12}$"
+UUID_V7 = r"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 ChannelPath = Annotated[str, Path(pattern=CHANNEL)]
 EnvPath = Annotated[str, Path(pattern=ENVIRONMENT)]
 VersionPath = Annotated[int, Path(ge=1, le=2147483647)]
 LimitQuery = Annotated[int, Query(ge=1, le=200)]
 CursorQuery = Annotated[str | None, Query(pattern=CURSOR)]
+MessageIdPath = Annotated[str, Path(pattern=UUID_ANY)]
+ReplayIdPath = Annotated[str, Path(pattern=UUID_V7)]
 
 
 def assert_access_log_off() -> None:
@@ -181,6 +187,7 @@ def create_app(
     max_inflight_deploys: int = MAX_INFLIGHT_DEPLOYS,
     inflight_wait_s: float = INFLIGHT_WAIT_S,
     topic_reader: TopicReader | None = None,
+    tamper: TamperChecker | None = None,
 ) -> FastAPI:
     service = ControlPlane(sessions, publisher, log, max_inflight=max_inflight_deploys, inflight_wait_s=inflight_wait_s)
     readiness = Readiness(service.ping_database, keys, publisher)
@@ -201,6 +208,9 @@ def create_app(
         if settings.oidc.jwks_file is not None:
             log.warning("static_jwks_file_in_use", profile=settings.profile)
         keys.start()
+        tamper_task: asyncio.Task[None] | None = None
+        if tamper is not None:  # a failed check never stops the API: `check_once` does not raise
+            tamper_task = asyncio.create_task(tamper.run_forever())
         loop_task: asyncio.Task[None] | None = None
         if reconciler is not None and settings.reconcile_interval_s > 0:
             loop_task = asyncio.create_task(reconciler.run_forever(settings.reconcile_interval_s))
@@ -208,10 +218,15 @@ def create_app(
         try:
             yield
         finally:
-            if loop_task is not None:
-                loop_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await loop_task
+            for task in (loop_task, tamper_task):
+                if task is not None:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception as exc:  # a dead background task must not skip `keys.stop()` and the hooks
+                        log.error("background_task_failed", error_type=type(exc).__name__)
             await keys.stop()
             for hook in on_shutdown or []:
                 await hook()
@@ -323,6 +338,44 @@ def create_app(
         result = await service.undeploy(env, channel, req.expected_current_version, _subject(request))
         return JSONResponse(result, status_code=202)
 
+    # -- part 2 stubs (W3-6 replaces them). Authn and RBAC ran in the global dependency, so only a permitted
+    # caller reaches these. They read no body, query or header and log nothing: the content operations
+    # (x-tributary-phi-content) therefore cannot leak request data, and no content is ever returned. The
+    # answer is the failure the contract declares for the operation.
+
+    async def archive_unavailable() -> JSONResponse:
+        raise ApiProblem("ARCHIVE_UNAVAILABLE")
+
+    async def search_messages(env: EnvPath, channel: ChannelPath) -> JSONResponse:
+        return await archive_unavailable()
+
+    async def get_message(env: EnvPath, channel: ChannelPath, message_id: MessageIdPath) -> JSONResponse:
+        return await archive_unavailable()
+
+    async def get_message_content(env: EnvPath, channel: ChannelPath, message_id: MessageIdPath) -> JSONResponse:
+        return await archive_unavailable()
+
+    async def reprocess_message(env: EnvPath, channel: ChannelPath, message_id: MessageIdPath) -> JSONResponse:
+        return await archive_unavailable()
+
+    async def list_replays(env: EnvPath, channel: ChannelPath) -> JSONResponse:
+        raise ApiProblem("NOT_FOUND")  # the contract declares no 503 here; no replay can exist yet
+
+    async def start_replay(env: EnvPath, channel: ChannelPath) -> JSONResponse:
+        return await archive_unavailable()
+
+    async def get_replay(env: EnvPath, channel: ChannelPath, replay_id: ReplayIdPath) -> JSONResponse:
+        raise ApiProblem("NOT_FOUND")
+
+    async def channel_stats(env: EnvPath, channel: ChannelPath) -> JSONResponse:
+        return await archive_unavailable()
+
+    async def stream_events(env: EnvPath) -> JSONResponse:
+        return await archive_unavailable()
+
+    async def get_retention(env: EnvPath) -> JSONResponse:
+        return await archive_unavailable()
+
     endpoints: dict[str, Callable[..., Any]] = {
         "getLiveness": livez,
         "getReadiness": readyz,
@@ -339,6 +392,16 @@ def create_app(
         "deployChannelVersion": deploy,
         "rollbackChannel": rollback,
         "undeployChannel": undeploy,
+        "searchMessages": search_messages,
+        "getMessage": get_message,
+        "getMessageContent": get_message_content,
+        "reprocessMessage": reprocess_message,
+        "listReplays": list_replays,
+        "startReplay": start_replay,
+        "getReplay": get_replay,
+        "getChannelStats": channel_stats,
+        "streamEvents": stream_events,
+        "getRetention": get_retention,
     }
     for op in OPERATIONS:
         app.add_api_route(

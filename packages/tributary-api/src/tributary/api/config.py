@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
@@ -77,6 +78,75 @@ class DatabaseSettings:
             raise ConfigurationError("PORT_INVALID", "TB_DATABASE_PORT is out of range")
 
 
+_ENV_NAME = re.compile(r"^[a-z][a-z0-9-]{0,15}$")
+_DB_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+TAMPER_INTERVAL_RANGE = (60.0, 86400.0)
+DEFAULT_TAMPER_INTERVAL_S = 900.0
+
+
+@dataclass(frozen=True, slots=True)
+class ArchiveSettings:
+    """Read access to the archive for the `audit_log` tamper check (ADR-004 A5: the API holds SELECT).
+    `targets` maps each environment to the ClickHouse database holding its `audit_log`. The password is a
+    secretRef, never a value."""
+
+    url: str
+    user: str
+    secret_ref: str
+    targets: Mapping[str, str]
+    interval_s: float = DEFAULT_TAMPER_INTERVAL_S
+
+
+def archive_from_env(env: Mapping[str, str]) -> ArchiveSettings | None:
+    """None when nothing is configured (the check is off and its series stay absent). Half a configuration, a
+    bad value or an interval outside 60-86400 refuses to start."""
+    url, user, ref = (
+        env.get("TB_CLICKHOUSE_URL", ""),
+        env.get("TB_CLICKHOUSE_USER", ""),
+        env.get("TB_CLICKHOUSE_SECRET_REF", ""),
+    )
+    raw_targets = env.get("TB_AUDIT_TAMPER_TARGETS", "")
+    interval = _number(
+        env, "TB_AUDIT_TAMPER_CHECK_INTERVAL_S", DEFAULT_TAMPER_INTERVAL_S, "TAMPER_INTERVAL_OUT_OF_RANGE"
+    )
+    if not TAMPER_INTERVAL_RANGE[0] <= interval <= TAMPER_INTERVAL_RANGE[1]:
+        raise ConfigurationError(
+            "TAMPER_INTERVAL_OUT_OF_RANGE", "TB_AUDIT_TAMPER_CHECK_INTERVAL_S must be within 60-86400"
+        )
+    if not (url or user or ref or raw_targets):
+        return None
+    if not (url and user and ref and raw_targets):
+        raise ConfigurationError(
+            "AUDIT_TAMPER_CONFIG_INCOMPLETE",
+            "TB_CLICKHOUSE_URL, _USER, _SECRET_REF and TB_AUDIT_TAMPER_TARGETS go together",
+        )
+    try:
+        parsed = json.loads(raw_targets)
+    except ValueError:
+        raise ConfigurationError("AUDIT_TAMPER_TARGETS_INVALID", "TB_AUDIT_TAMPER_TARGETS is not JSON") from None
+    if (
+        not isinstance(parsed, dict)
+        or not parsed
+        or len(parsed) > 64
+        or not all(
+            isinstance(k, str) and isinstance(v, str) and _ENV_NAME.fullmatch(k) and _DB_NAME.fullmatch(v)
+            for k, v in parsed.items()
+        )
+    ):
+        raise ConfigurationError(
+            "AUDIT_TAMPER_TARGETS_INVALID", "TB_AUDIT_TAMPER_TARGETS must map environment names to database names"
+        )
+    from .tamper import check_url
+
+    try:
+        check_url(url)
+    except ValueError:
+        raise ConfigurationError(
+            "CLICKHOUSE_URL_INVALID", "TB_CLICKHOUSE_URL must be https (http only on loopback)"
+        ) from None
+    return ArchiveSettings(url=url, user=user, secret_ref=ref, targets=parsed, interval_s=interval)
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     database: DatabaseSettings
@@ -89,6 +159,7 @@ class Settings:
     #: Seconds between reconciler passes (W3-5); 0 turns the loop off (`Reconciler.run_once` still works).
     reconcile_interval_s: float = 30.0
     reconcile_pending_grace_s: float = 120.0
+    archive: ArchiveSettings | None = None
 
     def __post_init__(self) -> None:
         if self.profile not in PROFILES:
@@ -251,6 +322,7 @@ def from_env(env: Mapping[str, str]) -> Settings:
         publish_timeout_s=_number(
             env, "TB_PUBLISH_TIMEOUT_S", DEFAULT_PUBLISH_TIMEOUT_S, "PUBLISH_TIMEOUT_OUT_OF_RANGE"
         ),
+        archive=archive_from_env(env),
         reconcile_interval_s=_number(env, "TB_RECONCILE_INTERVAL_S", 30.0, "RECONCILE_INTERVAL_OUT_OF_RANGE"),
         reconcile_pending_grace_s=_number(env, "TB_RECONCILE_PENDING_GRACE_S", 120.0, "RECONCILE_GRACE_OUT_OF_RANGE"),
     )

@@ -1,0 +1,91 @@
+{
+  "environment": "prod",
+  "channel": "adt-fanout",
+  "message_id": "0192f3b0-1a2b-7c3d-8e4f-0123456789ab",
+  "correlation_id": "0192f3b0-1a2b-7c3d-8e4f-0123456789ab",
+  "events": [
+    {
+      "ts": "2026-10-06T08:40:59.010Z",
+      "kind": "message",
+      "channel": "adt-fanout",
+      "channel_version": 3,
+      "stage": "received",
+      "status": "ok",
+      "instance": "tb-receiver-adt-fanout-0",
+      "message_id": "0192f3b0-1a2b-7c3d-8e4f-0123456789ab",
+      "attempt": 0,
+      "content_type": "x-application/hl7-v2+er7",
+      "size_bytes": 412,
+      "topic": "prod.adt-fanout.raw",
+      "partition": 2,
+      "offset": 1041
+    },
+    {
+      "ts": "2026-10-06T08:40:59.031Z",
+      "kind": "message",
+      "channel": "adt-fanout",
+      "channel_version": 3,
+      "stage": "routed",
+      "status": "ok",
+      "instance": "tb-worker-adt-fanout-1",
+      "message_id": "0192f3b0-1a2b-7c3d-8e4f-0123456789ab",
+      "destination": "fhir-store",
+      "attempt": 0,
+      "topic": "prod.adt-fanout.out.fhir-store",
+      "partition": 2,
+      "offset": 977
+    },
+    {
+      "ts": "2026-10-06T08:40:59.032Z",
+      "kind": "message",
+      "channel": "adt-fanout",
+      "channel_version": 3,
+      "stage": "routed",
+      "status": "ok",
+      "instance": "tb-worker-adt-fanout-1",
+      "message_id": "0192f3b0-1a2b-7c3d-8e4f-0123456789ab",
+      "destination": "archive-s3",
+      "attempt": 0,
+      "topic": "prod.adt-fanout.out.archive-s3",
+      "partition": 2,
+      "offset": 980
+    },
+    {
+      "ts": "2026-10-06T08:40:59.120Z",
+      "kind": "message",
+      "channel": "adt-fanout",
+      "channel_version": 3,
+      "stage": "sent",
+      "status": "ok",
+      "instance": "tb-loader-fhir-store-0",
+      "message_id": "0192f3b0-1a2b-7c3d-8e4f-0123456789ab",
+      "destination": "fhir-store",
+      "attempt": 0,
+      "duration_ms": 41.0
+    },
+    {
+      "ts": "2026-10-06T08:41:01.500Z",
+      "kind": "message",
+      "channel": "adt-fanout",
+      "channel_version": 3,
+      "stage": "retrying",
+      "status": "error",
+      "instance": "tb-loader-archive-s3-0",
+      "message_id": "0192f3b0-1a2b-7c3d-8e4f-0123456789ab",
+      "destination": "archive-s3",
+      "attempt": 1,
+      "error_code": "DESTINATION_UNAVAILABLE",
+      "error_message": "Destination did not answer."
+    }
+  ],
+  "truncated": false,
+  "destinations": [
+    { "destination": "fhir-store", "state": "sent", "attempt": 0, "last_ts": "2026-10-06T08:40:59.120Z" },
+    { "destination": "archive-s3", "state": "retrying", "attempt": 1, "last_ts": "2026-10-06T08:41:01.500Z", "error_code": "DESTINATION_UNAVAILABLE" }
+  ],
+  "content": [
+    { "stage": "received", "content_type": "x-application/hl7-v2+er7", "size_bytes": 412, "storage": "inline" },
+    { "stage": "routed", "destination": "fhir-store", "content_type": "application/fhir+json", "size_bytes": 2210, "storage": "inline" },
+    { "stage": "routed", "destination": "archive-s3", "content_type": "x-application/hl7-v2+er7", "size_bytes": 412, "storage": "inline" }
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "ts": "2026-10-06T09:30:02.441Z",
+  "kind": "message",
+  "channel": "adt-fanout",
+  "channel_version": 3,
+  "stage": "sent",
+  "status": "ok",
+  "instance": "tb-loader-fhir-store-0",
+  "message_id": "0192f3e0-7777-7abc-8def-0123456789ab",
+  "destination": "fhir-store",
+  "attempt": 0,
+  "duration_ms": 29.7
+}

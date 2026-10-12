@@ -16,7 +16,10 @@ from fastapi import FastAPI
 from tributary.runtime.clients import consumer_config, producer_config
 from tributary.runtime.config import load_topic_defaults
 from tributary.runtime.engine_kafka import load_engine_kafka_or_exit
+from tributary.runtime.errors import RuntimeConfigurationError
 from tributary.runtime.logs import JsonLogger
+from tributary.runtime.ops import OpsConfigError, OpsServer, resolve_ops_settings, start_ops_or_exit
+from tributary.runtime.secrets import DirSecretResolver
 
 from . import config
 from .app import assert_access_log_off, create_app
@@ -27,6 +30,7 @@ from .errors import ConfigurationError
 from .operations import check_routes
 from .publisher import KafkaChannelsPublisher
 from .reconciler import KafkaTopicReader
+from .tamper import AuditMetrics, ClickHouseHttp, TamperChecker
 
 EXIT_CONFIG_REFUSED = 2
 
@@ -52,6 +56,24 @@ def build_app(environ: dict[str, str] | None = None) -> FastAPI:
     reader = KafkaTopicReader(
         lambda: Consumer(consumer_config(kafka, defaults, group_id="tb-api-reconciler", enable_partition_eof=True))
     )
+    tamper: TamperChecker | None = None
+    app_metrics: AuditMetrics | None = None
+    if settings.archive is not None:
+        archive = settings.archive
+        try:
+            password = DirSecretResolver.from_environ(env).resolve_text(archive.secret_ref, "password")
+        except RuntimeConfigurationError:
+            raise ConfigurationError(
+                "CLICKHOUSE_SECRET_UNRESOLVED", "the ClickHouse secretRef did not resolve"
+            ) from None
+        app_metrics = AuditMetrics()
+        tamper = TamperChecker(
+            archive.targets,
+            ClickHouseHttp(archive.url, archive.user, password).query,
+            app_metrics,
+            log,
+            interval_s=archive.interval_s,
+        )
     oidc = settings.oidc
     fetch: Fetch
     if oidc.jwks_file is not None:
@@ -65,7 +87,7 @@ def build_app(environ: dict[str, str] | None = None) -> FastAPI:
         publisher.close()
 
     hooks: list[Callable[[], Awaitable[None]]] = [engine.dispose, close_publisher]
-    return create_app(
+    app = create_app(
         settings=settings,
         sessions=make_session_factory(engine),
         publisher=publisher,
@@ -73,7 +95,11 @@ def build_app(environ: dict[str, str] | None = None) -> FastAPI:
         log=log,
         on_shutdown=hooks,
         topic_reader=reader,
+        tamper=tamper,
     )
+    app.state.audit_metrics = app_metrics
+    app.state.tamper = tamper
+    return app
 
 
 def main() -> int:
@@ -90,6 +116,18 @@ def main() -> int:
             )
         )
         assert_access_log_off()  # again: `uvicorn.Config` configures logging
+        ops = None
+        metrics: AuditMetrics | None = app.state.audit_metrics
+        if metrics is not None:  # the tamper gauges need a scrape target; loopback by default (ops/v0)
+            try:
+                ops_settings = resolve_ops_settings(bind=None, port=None)
+            except OpsConfigError:
+                raise ConfigurationError("OPS_SETTINGS_INVALID", "TB_OPS_BIND or TB_OPS_PORT is invalid") from None
+            # /livez reflects the event loop and the tamper task (it ticks every few seconds), not just the process.
+            alive = app.state.tamper.alive
+            ops = start_ops_or_exit(
+                OpsServer(ops_settings, component="api", metrics=metrics.render, liveness=alive, log=log), log
+            )
         try:
             server.run()
         except SystemExit:
@@ -98,6 +136,9 @@ def main() -> int:
             if isinstance(refusal, ConfigurationError):
                 raise refusal from None
             raise
+        finally:
+            if ops is not None:
+                ops.close()
     except ConfigurationError as exc:
         log.error("startup_refused", code=exc.code)
         return EXIT_CONFIG_REFUSED

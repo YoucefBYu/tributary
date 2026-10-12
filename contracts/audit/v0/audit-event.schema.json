@@ -1,0 +1,116 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tributary.dev/contracts/audit/v0/audit-event.schema.json",
+  "title": "Tributary audit record on _tb.<env>.audit, v0",
+  "description": "One JSON object per Kafka record value. See README.md. Identifiers, counts and codes only: never payload bytes, a record key, a header value, a token or a claim other than sub (invariant 6). Producers validate strictly; consumers ignore unknown fields and higher 'v' values rather than failing.",
+  "type": "object",
+  "required": ["v", "audit_id", "ts", "environment", "action", "phase", "actor", "actor_roles"],
+  "additionalProperties": false,
+  "properties": {
+    "v": { "const": 0 },
+    "audit_id": { "$ref": "#/$defs/uuid7", "description": "Unique per record, minted by the producer before the first send and reused on every retry of that send. The archive deduplicates on it." },
+    "ts": { "$ref": "#/$defs/timestamp", "description": "When the API decided to perform the action (requested) or observed its end (completed, failed)." },
+    "environment": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,15}$" },
+    "action": {
+      "enum": [
+        "message.content.view",
+        "message.reprocess",
+        "channel.replay",
+        "channel.version.create",
+        "deployment.deploy",
+        "deployment.rollback",
+        "deployment.undeploy"
+      ]
+    },
+    "phase": { "enum": ["requested", "completed", "failed"] },
+    "actor": { "type": "string", "pattern": "^[\\x21-\\x7e]{1,255}$", "description": "The token's sub claim (ADR-009 D7). Staff identity, personal data, not PHI." },
+    "actor_roles": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 5,
+      "uniqueItems": true,
+      "items": { "enum": ["viewer", "developer", "operator", "auditor", "admin"] },
+      "description": "The Tributary roles the token mapped to (ADR-009 D6), never the IdP's raw role names."
+    },
+    "request_id": { "$ref": "#/$defs/uuid", "description": "The HTTP request id (openapi/v0 Problem.request_id), for joining to the API's own log line." },
+    "operation_id": { "$ref": "#/$defs/uuid7", "description": "Joins requested to completed or failed. Reprocess: the request's operation_id. Replay: the replay_id." },
+    "channel": { "$ref": "#/$defs/name" },
+    "message_id": { "$ref": "#/$defs/uuid" },
+    "stage": { "enum": ["received", "routed", "dlq"], "description": "Content view only: which stored stage was read." },
+    "destination": { "$ref": "#/$defs/name" },
+    "deployment_id": { "$ref": "#/$defs/uuid" },
+    "version": { "type": "integer", "minimum": 1, "maximum": 2147483647 },
+    "previous_version": { "type": "integer", "minimum": 1, "maximum": 2147483647 },
+    "allow_reorder": { "type": "boolean" },
+    "target_topic": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{0,15}\\.[a-z][a-z0-9-]{0,63}\\.raw$",
+      "description": "Replay only: always <environment>.<channel>.raw of the same record (README 3 rule 5)."
+    },
+    "range_start": { "$ref": "#/$defs/timestamp" },
+    "range_end": { "$ref": "#/$defs/timestamp" },
+    "count": { "type": "integer", "minimum": 0, "description": "Records the broker acknowledged (reprocess 0 or 1; replay the republished count, partial on failed)." },
+    "error_code": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]{0,63}$" }
+  },
+  "allOf": [
+    {
+      "$comment": "A content view is one record, written before the read, fail closed.",
+      "if": { "properties": { "action": { "const": "message.content.view" } }, "required": ["action"] },
+      "then": { "required": ["channel", "message_id", "stage"], "properties": { "phase": { "const": "requested" } } }
+    },
+    {
+      "if": { "properties": { "action": { "const": "message.reprocess" } }, "required": ["action"] },
+      "then": { "required": ["channel", "message_id", "operation_id"] }
+    },
+    {
+      "if": { "properties": { "action": { "const": "channel.replay" } }, "required": ["action"] },
+      "then": { "required": ["channel", "operation_id", "target_topic", "range_start", "range_end"] }
+    },
+    {
+      "$comment": "Invariant 5: the operator's choice to reorder (or not) is on the record before anything is re-published.",
+      "if": {
+        "properties": { "action": { "enum": ["message.reprocess", "channel.replay"] }, "phase": { "const": "requested" } },
+        "required": ["action", "phase"]
+      },
+      "then": { "required": ["allow_reorder"] }
+    },
+    {
+      "if": {
+        "properties": { "action": { "enum": ["message.reprocess", "channel.replay"] }, "phase": { "enum": ["completed", "failed"] } },
+        "required": ["action", "phase"]
+      },
+      "then": { "required": ["count"] }
+    },
+    {
+      "$comment": "A failure names its machine-readable cause.",
+      "if": { "properties": { "phase": { "const": "failed" } }, "required": ["phase"] },
+      "then": { "required": ["error_code"] }
+    },
+    {
+      "$comment": "Control-plane changes are one requested record each; the outcome is the deployment or version record in PostgreSQL.",
+      "if": {
+        "properties": { "action": { "enum": ["channel.version.create", "deployment.deploy", "deployment.rollback", "deployment.undeploy"] } },
+        "required": ["action"]
+      },
+      "then": { "required": ["channel"], "properties": { "phase": { "const": "requested" } } }
+    },
+    {
+      "if": { "properties": { "action": { "enum": ["deployment.deploy", "deployment.rollback", "deployment.undeploy"] } }, "required": ["action"] },
+      "then": { "required": ["deployment_id"] }
+    },
+    {
+      "if": { "properties": { "action": { "enum": ["channel.version.create", "deployment.deploy", "deployment.rollback"] } }, "required": ["action"] },
+      "then": { "required": ["version"] }
+    },
+    {
+      "if": { "properties": { "action": { "const": "deployment.undeploy" } }, "required": ["action"] },
+      "then": { "not": { "required": ["version"] } }
+    }
+  ],
+  "$defs": {
+    "uuid": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12}$" },
+    "uuid7": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" },
+    "timestamp": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$" },
+    "name": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,63}$" }
+  }
+}

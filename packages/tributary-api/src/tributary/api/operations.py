@@ -2,7 +2,8 @@
 
 Routes are registered from this table, a startup check refuses a route that is not in it, and a contract
 test compares it with `openapi.json`. Roles are global in v0 (ADR-009 D6). Message content operations
-(D14) arrive with W3-6 and must be limited to operator and admin.
+(D14) are limited to operator and admin. The part 2 (archive) operations are answered by stubs until W3-6
+(`app.py`): authn and RBAC are real, the answer is the contract's declared failure.
 """
 
 from __future__ import annotations
@@ -22,6 +23,8 @@ class Operation:
     roles: tuple[str, ...]
     public: bool = False  # `security: []` in the contract (health)
 
+
+_CH = "/v1/environments/{env}/channels/{channel}"
 
 OPERATIONS: tuple[Operation, ...] = (
     Operation("GET", "/livez", "getLiveness", (), public=True),
@@ -46,6 +49,17 @@ OPERATIONS: tuple[Operation, ...] = (
     ),
     Operation("POST", "/v1/environments/{env}/channels/{channel}/rollback", "rollbackChannel", ("operator", "admin")),
     Operation("POST", "/v1/environments/{env}/channels/{channel}/undeploy", "undeployChannel", ("operator", "admin")),
+    # -- part 2 (W3-6): archive operations --------------------------------------------------------
+    Operation("POST", f"{_CH}/messages/search", "searchMessages", ALL_READ),
+    Operation("GET", f"{_CH}/messages/{{message_id}}", "getMessage", ALL_READ),
+    Operation("GET", f"{_CH}/messages/{{message_id}}/content", "getMessageContent", ("operator", "admin")),
+    Operation("POST", f"{_CH}/messages/{{message_id}}/reprocess", "reprocessMessage", ("operator", "admin")),
+    Operation("GET", f"{_CH}/replays", "listReplays", ALL_READ),
+    Operation("POST", f"{_CH}/replays", "startReplay", ("operator", "admin")),
+    Operation("GET", f"{_CH}/replays/{{replay_id}}", "getReplay", ALL_READ),
+    Operation("GET", f"{_CH}/stats", "getChannelStats", ALL_READ),
+    Operation("GET", "/v1/environments/{env}/events", "streamEvents", ALL_READ),
+    Operation("GET", "/v1/environments/{env}/retention", "getRetention", ALL_READ),
 )
 
 TABLE: dict[tuple[str, str], Operation] = {(o.method, o.path): o for o in OPERATIONS}

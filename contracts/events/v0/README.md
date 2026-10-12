@@ -247,7 +247,8 @@ synthetic.
 
 - No aggregate or rollup events (per-channel per-minute counters). Metrics cover that today; the
   browser may want it once the archive is measured.
-- No control-plane events here: those go to `_tb.<env>.audit` with its own contract (shape in W3-1b;
-  retention decided 2026-10-06 as an operator setting, `topics/v0` 2.1).
+- No control-plane events here: those go to `_tb.<env>.audit` with its own contract,
+  [`audit/v0`](../../audit/v0/README.md) (W3-1b; retention decided 2026-10-06 as an operator
+  setting, `topics/v0` 2.1).
 - `duration_ms` versus deriving latency by joining stages: v0 allows both, which risks the two
   disagreeing. Pick one in v1 once the archiver exists.

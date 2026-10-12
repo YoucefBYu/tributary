@@ -1,0 +1,21 @@
+{
+  "environment": "prod",
+  "channel": "adt-fanout",
+  "message_id": "0192f3b0-1a2b-7c3d-8e4f-0123456789ab",
+  "events": [
+    {
+      "ts": "2026-10-06T08:40:59.010Z",
+      "kind": "message",
+      "channel": "adt-fanout",
+      "channel_version": 3,
+      "stage": "received",
+      "status": "ok",
+      "message_id": "0192f3b0-1a2b-7c3d-8e4f-0123456789ab",
+      "attempt": 0
+    }
+  ],
+  "truncated": false,
+  "destinations": [],
+  "content": [],
+  "payload_base64": "VFJJQlVUQVJZLVNZTlRI"
+}

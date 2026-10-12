@@ -187,6 +187,31 @@ buckets alike. `latency` includes 0.05 s, the S2 ACK threshold.
   `outcome="success", code="NONE"`. `circuit-open` maps to the registered `CIRCUIT_OPEN`. A reason
   that is not a registered code is registered first (`envelope/v0` `error-codes.json`).
 
+### 3.4 The `audit_log` tamper check (set 1.8, ADR-004 R7 rev 3)
+
+`tb_audit_tamper_suspect_ids{environment}` and `tb_audit_tamper_check_timestamp_seconds{environment}`.
+
+- **Who runs it: the API**, which already holds SELECT on the archive (ADR-004 A5). **Rejected:** the
+  events archiver. It holds INSERT only, so it would need a new SELECT grant, and it is the writer
+  whose rows are being checked: a compromised writer could forge a row and report 0. **Give up:** the
+  check pauses while the API is down. The staleness alert below catches that.
+- **Refresh:** a background task per environment, every `TB_AUDIT_TAMPER_CHECK_INTERVAL_S` (default
+  900, range 60-86400; outside the range the API refuses to start). The scrape only reads the stored
+  values (O6). Each replica runs its own check; alerts use `max by (environment)`.
+- **Query** (readonly, under the query-library limits):
+  `SELECT count() FROM (SELECT audit_id FROM audit_log GROUP BY audit_id HAVING
+  uniqExact(cityHash64(<every record field>)) > 1)`. "Every record field" means the `audit/v0` fields,
+  **not** `inserted_at`, `source_partition` or `source_offset`. A redelivery can differ in those, and
+  it is not tampering.
+- **On success:** set the count, then set the timestamp to the completion time. **On failure:** change
+  neither, and log `audit_tamper_check_failed` with `error_type` (class name only). Both series are
+  absent until the first check completes.
+- **Labels:** `environment` only. Never an `audit_id`, an actor or a channel. The operator finds the ids
+  with the same query in ClickHouse.
+- **Alerts (W3-8, `devops-engineer`):** `max by (environment) (tb_audit_tamper_suspect_ids) > 0` pages.
+  `time() - max by (environment) (tb_audit_tamper_check_timestamp_seconds) > 3 *
+  interval` warns, and so does `absent(...)` once the API has run for 3 × interval.
+
 ---
 
 ## 4. Log line schema

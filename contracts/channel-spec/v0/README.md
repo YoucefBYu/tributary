@@ -168,7 +168,7 @@ necessary but not the same thing.
 
 | Field | Required | Notes |
 |---|---|---|
-| `name` | R | `^[a-z][a-z0-9-]{0,63}$`. Becomes the `tb-channel` header and the channel segment of every topic name. |
+| `name` | R | `^(?!tb-)[a-z][a-z0-9-]{0,63}$`. Becomes the `tb-channel` header and the channel segment of every topic name. **Set 1.8 (ADR-010):** the prefix `tb-` is reserved for platform stand-ins that occupy the channel position, such as the archiver's `channel="tb-archiver"` metric label, so no channel can collide with one. Only the spec grammar narrows; header, topic and label grammars stay as they are. |
 | `version` | C | Integer, set by the **control plane** at publish time, absent in an authored bundle file. Becomes `tb-channel-version`. See section 6. |
 | `labels` | O | ≤ 16 short codes. No PHI: labels reach metric labels and the UI. |
 | `description` | O | ≤ 512 characters. |

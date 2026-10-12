@@ -54,7 +54,8 @@
         "version",
         "route",
         "method",
-        "http_status"
+        "http_status",
+        "environment"
       ],
       "$comment": "CLOSED. Never: any message, correlation or parent id; the record key or anything derived from it; a partition number or offset; a peer address, host, file name, object key or URL; a user or subject id; free text. Each of those is unbounded cardinality, PHI, or both (README 3.2)."
     },

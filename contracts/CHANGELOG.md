@@ -3,6 +3,76 @@
 Newest first. Each entry names the contract, the version, whether the change is additive or
 breaking, and the reason. Breaking changes reference an ADR.
 
+## 2026-10-12 — set 1.8: `audit_log` tamper-check metrics (`observability/v0` 3.4)
+
+**Additive. No example, manifest or pinned pair changes, so `validate.py` is predicted unchanged at
+244 / 0 and 154 invalid / 0 drifted (the registry file itself is checked; not run by the architect).**
+
+- **`metrics.json`:** new gauges `tb_audit_tamper_suspect_ids{environment}` and
+  `tb_audit_tamper_check_timestamp_seconds{environment}`, emitter `api`. New label `environment`
+  (`^[a-z][a-z0-9-]{0,15}$`). **`metrics.schema.json` `labelName`** gains `environment` (a closed list
+  that grows by one name; nothing previously valid becomes invalid).
+- **README 3.4:** the API runs the check periodically (`TB_AUDIT_TAMPER_CHECK_INTERVAL_S`, default 900),
+  never inside a scrape (O6). The query excludes provenance columns, and a failed check leaves the
+  timestamp stale. Alert expressions are given. Rejected: the archiver as emitter (INSERT-only, and it
+  is the writer being checked).
+- **Coordinated changes:** `control-plane-engineer` registers both gauges in the API's registry in the
+  same push (a two-way registry test goes red otherwise) and builds the task. `devops-engineer` adds
+  the two alerts. `archive-engineer`: no metric change; `audit_log` stays plain `MergeTree` (ADR-004 R7
+  rev 3).
+
+## 2026-10-06 (newest, after W3-1b) — set 1.8: `tb-` channel names reserved (ADR-010), `audit_log` engine, HTTP code ruling
+
+- **`channel-spec/v0` `metadata.name` → `^(?!tb-)[a-z][a-z0-9-]{0,63}$` (ADR-010). NON-ADDITIVE:** a
+  spec named `tb-*` is now refused. It is the one recorded exception to "1.x is additive". Grep shows no
+  such channel anywhere, and nothing is released. Reason: the archiver labels its metrics
+  `channel="tb-archiver"`, and the label grammar equals the channel grammar. The header, topic and
+  metric-label grammars are unchanged. README 3 name row updated. New invalid example
+  `channel-name-reserved-prefix.json`, pinned `$.metadata.name` / `pattern` (predicted).
+- **`audit/v0` README 4 and ADR-004 R7 rev 3:** `audit_log` is plain `MergeTree` with query-time dedup
+  on `audit_id` (earliest copy kept) and a tamper-signal count. Under `ReplacingMergeTree` an INSERT-only
+  user could overwrite a row (security review). Documentation; no schema or example change.
+- **`envelope/v0` README 2.3.2 ruling:** `HTTP_<status>` is the exact status. `HTTP_4XX` and `HTTP_5XX`
+  are not registered; the http loader emits `HTTP_404`, `HTTP_503` and so on (`HTTP_429` already
+  conforms). `error-codes.json` is unchanged, so `test_codes_contract.py` is unaffected.
+- **Predicted totals with W3-1b:** `validate.py` **244 / 0**; `--check-expectations` **154 invalid, 0
+  drifted**.
+
+## 2026-10-06 (newest) — contract set 1.8 part 2 (W3-1b): `openapi/v0` part 2, `audit/v0` (new)
+
+**Additive. No previously valid document becomes invalid and no existing pinned pair moves. No
+invariant changes.** `openapi.json` `info.version` 0.1.0 → 0.2.0.
+
+- **`openapi/v0` part 2** (README 1.1, 3.9-3.17, 4.1), all under
+  `/v1/environments/{env}/channels/{channel}/`: `POST messages/search`, `GET messages/{id}` (timeline,
+  destination statuses, content index; exit criterion 1), `GET messages/{id}/content` (PHI),
+  `POST messages/{id}/reprocess` (PHI, synchronous), `POST/GET replays`, `GET replays/{id}` (PHI on
+  POST; `202` plus a resource), `GET stats`; env-level `GET events` (SSE, archive-tailed) and
+  `GET retention` (read-only, ADR-004 R3). Semantics follow the W3-3 library: channel required,
+  `allow_reorder`, source-channel-only replay (no target field), refusal codes kept by name (4.1).
+- **`x-tributary-phi-content: true`** on content, reprocess and replay POST; roles `operator`, `admin`
+  only (ADR-009 D14). **`x-tributary-audit-action`** on those and on part 1's create, deploy,
+  rollback and undeploy (additive extension).
+- **Problem codes** +21 (closed list grows; no code removed). `Problem.republished` (optional).
+- **Rollback wording (3.3):** the default target is the most recently published version that differs
+  from the current one, so repeated default rollbacks alternate; `RollbackRequest.to_version`
+  description and the `request-rollback` manifest note follow. Wording only.
+- **Reprocess id layout pinned** (3.13), as the W3-3 entry below promised.
+- **`audit/v0` (new):** `audit-event.schema.json`, seven actions, fail-closed `requested`, one record
+  per content view, `allow_reorder` on every reprocess and replay `requested`; `audit_log` row shape,
+  dedup key and TTL (README 4). `validate.py` `FILE_CONTRACTS` gains `audit`.
+- **`topics/v0` 3.4.1 and `topic-defaults.json`:** `archiver` = `READ on _tb.<env>.events,
+  _tb.<env>.audit; READ on group tb.<env>.archiver` (ADR-004 R7), plus `archiver_audit_note`. **3.1:**
+  lite wording now points at 3.8 rules 2 and 4. `events/v0` 6 pointer updated.
+- **ADR-008 D5** reasoning restated to match `topics/v0` 3.8 and ADR-004 C7; decision unchanged.
+- **Examples:** `openapi/v0` +13 valid, +7 invalid; `audit/v0` 5 valid, 5 invalid. **VERIFIED
+  2026-10-12 (coordinator's run, including ADR-010's example):** `validate.py` **244 passed / 0 failed**;
+  `--check-expectations` **154 invalid / 0 drifted**. Code review approved W3-1b.
+- **Coordinated changes requested:** `devops-engineer` regenerates `deploy/helm/tributary/files/acls.json`
+  (`gen_acls.py` pins its SHA-256); `qa-engineer` adds `audit` to `tests/conformance` with
+  `AUDIT_PHI_GUARDS` (1) and grows `OPENAPI_PHI_GUARDS` to 6; `archive-engineer` adds
+  `AuditEvent.error_code` on `failed` and widens `ACTOR` to the `Subject` grammar (`audit/v0` 3.1).
+
 ## 2026-10-06 (latest) — contract set 1.8: `reprocessor` and `lag_reader` roles (W3-29 items 1 and 4)
 
 **Additive. No example or manifest change, so `validate.py` counts and pinned pairs are unchanged

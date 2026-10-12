@@ -182,7 +182,8 @@ Three questions for the human, carried in `docs/agent-team/STATUS.md`:
 2026-10-06** (decision at the top of this section): question 1 is the operator's, through the
 setting. Question 2 is ClickHouse with Kafka as a buffer. Question 3: Kafka retention is unchanged,
 and archived events and content get settings of their own. The `_tb.<env>.audit` record shape is
-published with W3-1b (set 1.8 part 2).
+published with W3-1b (set 1.8 part 2): [`audit/v0`](../../audit/v0/README.md), including the
+`audit_log` row shape.
 
 ### 2.2 Why 3 partitions, not 12 — and the partition budget
 
@@ -239,7 +240,10 @@ correct. The per-class values carry the production floor so that a tool which ap
 and forgets the profile overrides fails safe; only the explicit `lite` profile lowers it.
 
 Lite mode (RF=1) cannot satisfy RPO=0 and must say so in its documentation. It is for development and
-small sites that have accepted the risk, and the distribution should warn at startup.
+small sites that have accepted the risk, and the distribution should warn at startup. **Read with 3.8**
+(2026-10-06): lite is barred from production use (rule 2), and holds synthetic data only unless
+ADR-004's custody rules are met (rule 4, ADR-004 C7). "Accepted risk" covers durability, never those
+two rules.
 
 ### 3.2 Receiver producer (the ACK-after-commit path)
 
@@ -362,7 +366,7 @@ loader path ran end to end. Set 1.4 rebuilds the table from what each role's cod
 | pipeline worker | READ `raw`; WRITE `out.*`, `dlq`, `_tb.<env>.events`; READ `_tb.<env>.channels`; sync-reply only: WRITE `reply` | `tb.<env>.<ch>.pipeline` (literal), `tb.<env>.<ch>.pipeline.shadow-` (prefixed), `tb.<env>.<ch>.channels.` (prefixed) | transactional channels only: WRITE on transactional id prefix `tb.<env>.<ch>.pipeline.` |
 | loader | READ `out.<dest>`; WRITE `dlq`, `_tb.<env>.events`; READ `_tb.<env>.channels` | `tb.<env>.<ch>.loader.<dest>` (literal), `tb.<env>.<ch>.channels.` (prefixed) | none |
 | control plane (channel publisher) | WRITE `_tb.<env>.channels`, `_tb.<env>.audit` | none | DESCRIBE |
-| archiver (set 1.8) | READ `_tb.<env>.events` | `tb.<env>.archiver` (literal) | none |
+| archiver (set 1.8) | READ `_tb.<env>.events`; **part 2:** READ `_tb.<env>.audit` (literal) | `tb.<env>.archiver` (literal) | none |
 | reprocessor (set 1.8, W3-29) | READ, WRITE, DESCRIBE on `<env>.<ch>.raw` (literal, per channel) | DESCRIBE on `tb.<env>.reprocessor` (literal); no group READ | IDEMPOTENT_WRITE |
 | lag_reader (set 1.8, W3-29) | DESCRIBE on `<env>.` (prefixed) and `_tb.<env>.events` (literal) | DESCRIBE on `tb.<env>.` (prefixed) | none |
 
@@ -378,6 +382,11 @@ per-key channel needs an explicit, audited `allow_reorder` (invariant 5; W3-1b r
 read a payload. Both are rendered by the Helm `KafkaUser` generator from `security.acls`. **Unverified
 until the W3-23-style test:** each role works under exactly these grants on a deny-by-default broker.
 Human sign-off folds into ADR-004 H7.
+
+**Set 1.8 part 2 (W3-1b).** The **archiver** gains READ on LITERAL `_tb.<env>.audit` in its existing
+group: it fills ClickHouse `audit_log`, the audit system of record (2.1, ADR-004 R7; record shape
+[`audit/v0`](../../audit/v0/README.md)). It gets no WRITE there, so it cannot forge an audit record;
+only the control-plane publisher writes it.
 
 **Rules the table follows.**
 
@@ -565,5 +574,5 @@ each invalid one breaks. Tests validate each string against `topic-name.schema.j
   requirement itself is not deferred — a v0 deployment with unencrypted broker disks does not
   conform.
 - ~~Audit retention (section 2.1) is an open human decision, and the `_tb.<env>.audit` event contract
-  is unwritten.~~ Retention decided on 2026-10-06 (operator setting, 2.1). The record shape follows
-  in W3-1b.
+  is unwritten.~~ Retention decided on 2026-10-06 (operator setting, 2.1). The record shape is
+  `audit/v0` (W3-1b, 2026-10-06).

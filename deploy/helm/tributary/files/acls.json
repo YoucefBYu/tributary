@@ -13,7 +13,7 @@
     }
   },
   "generatedFrom": "contracts/topics/v0/topic-defaults.json",
-  "sourceSha256": "dc6fcf1bff6698e601bf44d9be4f99e96ea22bb7f7ff7a64b2dfc88d75bb507b",
+  "sourceSha256": "b7f2e13fd2eecebf19c24e52dd0b56c3eed923842a32cf28cc106a180aac0312",
   "lagReaderIsPlaceholder": false,
   "placeholders": {
     "env": "@ENV@",
@@ -166,6 +166,12 @@
       {
         "resourceType": "GROUP",
         "name": "tb.@ENV@.archiver",
+        "patternType": "LITERAL",
+        "operation": "READ"
+      },
+      {
+        "resourceType": "TOPIC",
+        "name": "_tb.@ENV@.audit",
         "patternType": "LITERAL",
         "operation": "READ"
       },
