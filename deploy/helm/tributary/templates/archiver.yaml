@@ -80,15 +80,20 @@ spec:
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ include "tb.name" . }}-archiver-migrate
+  # One name per ClickHouse database (not per release): a second release migrating the same database in this
+  # namespace cannot create its Job while the first exists, so the upgrade fails instead of two migrations
+  # running at once. Deleted on success or failure (never "before-hook-creation", which would kill a live one).
+  name: {{ printf "tb-archiver-migrate-%s" ($ch.database | lower | replace "_" "-") | trunc 63 | trimSuffix "-" }}
   labels:
     {{- include "tb.labels" . | nindent 4 }}
     app.kubernetes.io/component: archiver-migrate
   annotations:
     helm.sh/hook: pre-install,pre-upgrade
     helm.sh/hook-weight: "0"
-    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+    helm.sh/hook-delete-policy: hook-succeeded,hook-failed
 spec:
+  parallelism: 1
+  completions: 1
   backoffLimit: {{ .Values.archiver.migrate.backoffLimit }}
   activeDeadlineSeconds: {{ .Values.archiver.migrate.activeDeadlineSeconds }}
   template:

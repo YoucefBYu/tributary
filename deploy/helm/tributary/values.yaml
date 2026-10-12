@@ -136,6 +136,9 @@ strimzi:
     transaction.state.log.replication.factor: 3
     transaction.state.log.min.isr: 2
     auto.create.topics.enable: false
+    # ADR-004 C3: SASL sessions re-authenticate at least hourly, so a removed ACL or KafkaUser takes effect
+    # on open connections (KIP-368). At most 3600000; helm_check.py enforces it on the rendered Kafka CR.
+    connections.max.reauth.ms: 3600000
   resources: {requests: {cpu: "1", memory: 4Gi}, limits: {memory: 4Gi}}
 
 otel:

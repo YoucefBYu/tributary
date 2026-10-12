@@ -103,6 +103,10 @@ for c in "${COMPONENTS[@]}"; do
 done
 
 install -d -m 0500 -o "$APP_UID" -g "$APP_UID" "$SECRETS/users-init"
+# Flag files for the users-init grant window (W3-16): request/granted, no secret. Written by the
+# 10001 one-shot and the 1000 broker, both with supplementary group 10002 (group_add); sticky, mode 1770,
+# so each side deletes only its own files and no other user can touch it. Nothing else mounts it.
+if [[ -d /grant ]]; then chown root:10002 /grant && chmod 1770 /grant; fi
 install -m 0400 -o "$APP_UID" -g "$APP_UID" "$tmp/users-init.crt" "$SECRETS/users-init/client.crt"
 install -m 0400 -o "$APP_UID" -g "$APP_UID" "$tmp/users-init.key" "$SECRETS/users-init/client.key"
 
@@ -193,6 +197,9 @@ auto.create.topics.enable=false
 offsets.topic.replication.factor=$dflt_rf
 transaction.state.log.replication.factor=$dflt_rf
 transaction.state.log.min.isr=$txisr
+# ADR-004 C4/W3-35: a SASL session is re-authenticated at least hourly, so a revoked SCRAM user or ACL
+# takes effect on an open connection within an hour (the broker closes it if re-auth fails). Max 3600000.
+connections.max.reauth.ms=3600000
 PROPS
   chmod 0400 "$B/server.properties"
   # Healthcheck client: the ACL-less certificate principal over the real (loopback) admin listener, so

@@ -118,7 +118,7 @@ def check(docs: list[dict[str, Any]]) -> list[str]:
         ):
             bad.append(f"{n}: no NetworkPolicy limiting ops port 9180 for the worker")
     arch = [s for n, s in pods(docs) if n.endswith("-archiver")]
-    job = [s for n, s in pods(docs) if n.endswith("-archiver-migrate")]
+    job = [s for n, s in pods(docs) if "archiver-migrate" in n]
     if not arch or "--skip-ddl" not in arch[0]["containers"][0]["args"]:
         bad.append("archiver Deployment does not run --skip-ddl")
     if not job or "--migrate-only" not in job[0]["containers"][0]["args"]:
@@ -146,6 +146,7 @@ def check(docs: list[dict[str, Any]]) -> list[str]:
             if runtime_ref == job_ref:
                 bad.append("runtime and migration secretRef are the same")
 
+    bad += check_adr004_conditions(docs, by_kind)
     bad += check_workloads(docs, by_kind)
     bad += check_retention(docs, by_kind)
     bad += check_acls(by_kind)
@@ -222,13 +223,98 @@ def check_workloads(docs: list[dict[str, Any]], by_kind: dict[str, list[dict[str
     return bad
 
 
+# ClickHouse plaintext HTTP, native, MySQL, PostgreSQL-compat, interserver. 5432 is allowed: PostgreSQL TLS runs on it.
+PLAINTEXT_DB_PORTS = {8123, 9000, 9004, 9005, 9009}
+MAX_REAUTH_MS = 3_600_000
+
+
+def _uses_secret(spec: dict[str, Any], volume: str) -> bool:
+    for v in spec.get("volumes", []):
+        if v["name"] != volume:
+            continue
+        if "secret" in v:
+            return True
+        return any("secret" in src for src in v.get("projected", {}).get("sources", []))
+    return False
+
+
+def check_adr004_conditions(docs: list[dict[str, Any]], by_kind: dict[str, list[dict[str, Any]]]) -> list[str]:
+    """ADR-004 C1 (no plaintext ClickHouse port exposed, TLS on, sslmode verify-full where set), C3 (broker re-authentication), C4 (no subPath Secret mounts).
+
+    A `subPath` mount never receives a rotated Secret, so a revoked or rotated credential would stay in the
+    container until it restarts (C4). Plaintext ClickHouse and PostgreSQL ports must not be published by a
+    Service, a pod port or a NetworkPolicy rule: the chart only ever talks to them over TLS.
+    """
+    bad: list[str] = []
+    named: dict[str, int] = {}  # container port names that resolve to a plaintext database port
+    for _, spec in pods(docs):
+        for c in [*spec["containers"], *spec.get("initContainers", [])]:
+            for p in c.get("ports", []):
+                if p.get("containerPort") in PLAINTEXT_DB_PORTS and "name" in p:
+                    named[p["name"]] = p["containerPort"]
+
+    def plain(port: Any, end: Any = None) -> bool:
+        if isinstance(port, str):
+            return port in named or (port.isdigit() and int(port) in PLAINTEXT_DB_PORTS)
+        if not isinstance(port, int):
+            return False
+        return any(port <= x <= (end if isinstance(end, int) else port) for x in PLAINTEXT_DB_PORTS)
+
+    for name, spec in pods(docs):
+        for c in [*spec["containers"], *spec.get("initContainers", [])]:
+            for m in c.get("volumeMounts", []):
+                if ("subPath" in m or "subPathExpr" in m) and _uses_secret(spec, m["name"]):
+                    bad.append(f"{name}: Secret volume {m['name']} is mounted with subPath (never rotated, C4)")
+            for p in c.get("ports", []):
+                for key in ("containerPort", "hostPort"):
+                    if plain(p.get(key)):
+                        bad.append(f"{name}: pod exposes plaintext database port {p[key]} (C1)")
+            for e in c.get("env", []):
+                val = str(e.get("value", ""))
+                if e["name"].endswith("_PORT") and plain(val):
+                    bad.append(f"{name}: {e['name']} points at plaintext database port {val} (C1)")
+                if e["name"] == "TB_ARCHIVE_CLICKHOUSE_SECURE" and val != "1":
+                    bad.append(f"{name}: ClickHouse TLS is off (TB_ARCHIVE_CLICKHOUSE_SECURE != 1, C1)")
+                if "sslmode" in e["name"].lower() and val != "verify-full":
+                    bad.append(f"{name}: {e['name']} is not verify-full (C1)")
+                if "sslmode=" in val and "sslmode=verify-full" not in val:
+                    bad.append(f"{name}: {e['name']} sets an sslmode other than verify-full (C1)")
+                if val.startswith(("postgresql://", "postgres://", "postgresql+asyncpg://")) and "sslmode=" not in val:
+                    bad.append(f"{name}: {e['name']} is a PostgreSQL URL without sslmode=verify-full (C1)")
+    for svc in by_kind.get("Service", []):
+        for p in svc["spec"].get("ports", []):
+            if plain(p.get("port")) or plain(p.get("targetPort")):
+                bad.append(f"Service {svc['metadata']['name']} exposes plaintext database port (C1)")
+    for np in by_kind.get("NetworkPolicy", []):
+        for rule in [*np["spec"].get("ingress", []), *np["spec"].get("egress", [])]:
+            for p in rule.get("ports", []):
+                if plain(p.get("port"), p.get("endPort")):
+                    bad.append(f"NetworkPolicy {np['metadata']['name']} opens plaintext database port {p['port']} (C1)")
+    for np in by_kind.get("NetworkPolicy", []):
+        for i, rule in enumerate(np["spec"].get("egress", [])):
+            if not rule.get("ports"):
+                bad.append(f"NetworkPolicy {np['metadata']['name']}: egress rule {i} has no ports (opens every port)")
+    for j in by_kind.get("Job", []):
+        spec = j["spec"]
+        if "archiver-migrate" in j["metadata"]["name"]:
+            if spec.get("parallelism") != 1 or spec.get("completions") != 1:
+                bad.append("archiver migrate Job must set parallelism 1 and completions 1")
+            if "before-hook-creation" in j["metadata"].get("annotations", {}).get("helm.sh/hook-delete-policy", ""):
+                bad.append("archiver migrate Job must not use before-hook-creation (it would replace a live migration)")
+    for k in by_kind.get("Kafka", []):
+        v = k["spec"]["kafka"].get("config", {}).get("connections.max.reauth.ms")
+        if not isinstance(v, int) or isinstance(v, bool) or not 0 < v <= MAX_REAUTH_MS:
+            bad.append(f"Kafka {k['metadata']['name']}: connections.max.reauth.ms must be 1..{MAX_REAUTH_MS} (C3)")
+    return bad
+
+
 def check_retention(docs: list[dict[str, Any]], by_kind: dict[str, list[dict[str, Any]]]) -> list[str]:
     """ADR-004 R2/R3: the three TTL vars on archiver and migrate Job with the R2 defaults; the decrease guard
     on the Job only; the audit topic buffer read from the contract."""
     bad: list[str] = []
     want = {"TB_ARCHIVE_TTL_DAYS": "90", "TB_ARCHIVE_CONTENT_TTL_DAYS": "30", "TB_ARCHIVE_AUDIT_TTL_DAYS": "2190"}
     for name, spec in pods(docs):
-        if not name.endswith(("-archiver", "-archiver-migrate")):
+        if not (name.endswith("-archiver") or "archiver-migrate" in name):
             continue
         env = {e["name"]: e.get("value") for c in spec["containers"] for e in c.get("env", [])}
         for k, v in want.items():
@@ -237,7 +323,7 @@ def check_retention(docs: list[dict[str, Any]], by_kind: dict[str, list[dict[str
         guard = env.get("TB_ARCHIVE_ALLOW_TTL_DECREASE")
         if name.endswith("-archiver") and guard is not None:
             bad.append(f"{name}: the decrease guard must reach the migrate Job only")
-        if name.endswith("-archiver-migrate") and guard != "false":
+        if "archiver-migrate" in name and guard != "false":
             bad.append(f"{name}: TB_ARCHIVE_ALLOW_TTL_DECREASE is not 'false' by default")
     topics = by_kind.get("KafkaTopic", [])
     if by_kind.get("KafkaUser"):

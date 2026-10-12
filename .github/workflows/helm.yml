@@ -58,6 +58,26 @@ jobs:
         run: |
           sed 's/--ops-bind=\$(POD_IP)/--ops-bind=127.0.0.1/' rendered.yaml > tampered.yaml
           uv run --no-project --with pyyaml==6.0.3 python .github/scripts/helm_check.py tampered.yaml --negative
+      - name: mutation controls, ADR-004 C1/C3/C4 (subPath Secret, plaintext DB port, missing re-auth) must fail
+        run: |
+          py="uv run --no-project --with pyyaml==6.0.3 python .github/scripts/helm_check.py"
+          # C4: a subPath on the ClickHouse Secret mount
+          sed 's/{name: clickhouse, mountPath: \([^}]*\)}/{name: clickhouse, mountPath: \1, subPath: x}/' rendered.yaml > tampered-subpath.yaml
+          grep -q 'subPath: x' tampered-subpath.yaml
+          $py tampered-subpath.yaml --negative
+          # C1: a plaintext ClickHouse port in the archiver env
+          helm template tb "$CHART" -f "$CHART/ci/values-ci.yaml" --set strimzi.enabled=true --set archiver.clickhouse.port=8123 > tampered-port.yaml
+          $py tampered-port.yaml --negative
+          # C3: re-auth interval above the cap, and removed
+          # (the reauth check applies only to a render with strimzi.enabled=true, which is how rendered.yaml is made)
+          sed 's/connections.max.reauth.ms: 3600000/connections.max.reauth.ms: 7200000/' rendered.yaml > tampered-reauth.yaml
+          grep -q 7200000 tampered-reauth.yaml
+          $py tampered-reauth.yaml --negative
+          grep -v 'connections.max.reauth.ms' rendered.yaml > tampered-reauth-removed.yaml
+          $py tampered-reauth-removed.yaml --negative
+          # C1: ClickHouse TLS off
+          helm template tb "$CHART" -f "$CHART/ci/values-ci.yaml" --set strimzi.enabled=true --set archiver.clickhouse.secure=false > tampered-tls.yaml
+          $py tampered-tls.yaml --negative
       - name: default values refuse to render without a kubelet CIDR
         run: |
           helm template tb "$CHART" 2>&1 | grep -q "networkPolicy.kubeletCIDR is required"

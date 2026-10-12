@@ -42,8 +42,10 @@ broker.
   `down -v` also regenerates the credentials. (Regenerated credentials also force a reformat.)
 - The broker's own identity is a client certificate, not a password: the controller, inter-broker and
   admin listeners are SSL with required client certificates, each on the broker's loopback. The SCRAM
-  users are created after start by `kafka-users-init` (`topic-bootstrap/add_scram_users.py`, granted only ALTER on the cluster, not a super
-  user), which
+  users are created after start by `kafka-users-init` (`topic-bootstrap/add_scram_users.py`, not a super user). It is granted ALTER on the cluster only for
+  the length of the run: it asks the broker wrapper (request file on the secret-free `kafka-grant` volume),
+  provisions, then revokes its own ALTER, so a second `up` provisions again and the ACL list is empty
+  afterwards (W3-16). It
   shares the broker's network namespace to reach the loopback admin listener and reads each password
   from that component's own secret file. No password is ever a process argument (not in a container's
   `ps`, not in the host's), nor in a properties file, and the broker container never has them. The
@@ -116,6 +118,18 @@ mllp-client:
 or run a client as `docker compose exec mllp-receiver python -c '...'` for anything simple enough to
 not need its own image. This is the intended reachability model for the lite profile, not a
 workaround: see `docker-compose.yml`'s `mllp-receiver` comment.
+
+## Synthetic data only (ADR-004 C7, `topics/v0` 3.8 rule 4)
+
+This stack holds **synthetic data only**. It uses provider-default, unmanaged storage keys and tmpfs or local
+volumes. Without a customer-managed key, or on a host without full-disk encryption, never send real PHI
+through it. Real PHI needs the production custody rules (see the chart README). Host-published ports are bound to
+127.0.0.1, including ClickHouse (8123, 9000) and PostgreSQL (5432), but ClickHouse and PostgreSQL speak
+plaintext on the Compose network, so **this stack does not meet ADR-004 C1**. That is why it is synthetic-only
+(C7), not a deployment to copy. The broker sets `connections.max.reauth.ms=3600000`. Every ClickHouse client in this file connects as the
+`default` user without a password, which can ALTER, TRUNCATE and DROP `audit_log`; the lite stack has no
+INSERT-only archiver user. That is accepted only because the data is synthetic (C7). The production
+INSERT-only grants and their verification query are in the chart README.
 
 ## The lite-profile durability warning
 
