@@ -20,6 +20,7 @@ import struct
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
@@ -162,13 +163,16 @@ def test_ttl_and_engine_are_on_the_table(db: tuple[object, ClickhouseSink, str])
     assert "_hmac" not in shown
 
 
-def test_ensure_schema_is_rerunnable_and_applies_a_changed_ttl(db: tuple[object, ClickhouseSink, str]) -> None:
+def test_ensure_schema_is_rerunnable_and_never_alters_an_existing_ttl(
+    db: tuple[object, ClickhouseSink, str],
+) -> None:
+    """ADR-004 R6: the archivers do not apply retention; only the migrate step does."""
     client, sink, name = db
     sink.insert(rows(base()))
     ensure_schema(client, database=name, ttl_days=90)
     assert count(client, final=True) == 1
     ensure_schema(client, database=name, ttl_days=30)
-    assert "toIntervalDay(30)" in str(client.command("SHOW CREATE TABLE message_events"))  # type: ignore[attr-defined]
+    assert "toIntervalDay(90)" in str(client.command("SHOW CREATE TABLE message_events"))  # type: ignore[attr-defined]
     assert count(client, final=True) == 1
 
 
@@ -382,3 +386,446 @@ def test_migrate_only_creates_the_table_with_the_migration_credential_and_needs_
     finally:
         admin.command(f"DROP DATABASE IF EXISTS {name}")
         admin.close()
+
+
+# ---- W3-30: retention applied by the migrate step (ADR-004 R2, R6) -----------------------------------------
+
+
+class Migrator:
+    """A database plus the way to run `--migrate-only` against it as a subprocess (the real entry point)."""
+
+    def __init__(self, clickhouse: ClickHouseContainer, tmp_path: Path) -> None:
+        self.name = f"t_{uuid.uuid4().hex[:12]}"
+        self.admin = connect(
+            ClickhouseTarget(
+                host=clickhouse.get_container_host_ip(),
+                port=int(clickhouse.get_exposed_port(8123)),
+                database=clickhouse.dbname,
+                username=clickhouse.username,
+                password=clickhouse.password,
+                secure=False,
+            )
+        )
+        self.admin.command(f"CREATE DATABASE {self.name}")
+        ref = tmp_path / "ch-migrate"
+        ref.mkdir()
+        (ref / "user").write_text(clickhouse.username)
+        (ref / "password").write_text(clickhouse.password)
+        for f in ref.iterdir():
+            f.chmod(0o600)
+        self.env = {k: v for k, v in os.environ.items() if k.startswith(("PATH", "HOME", "VIRTUAL_ENV", "PYTHON"))}
+        self.env.update(
+            {
+                "TB_ARCHIVE_CLICKHOUSE_HOST": clickhouse.get_container_host_ip(),
+                "TB_ARCHIVE_CLICKHOUSE_PORT": str(clickhouse.get_exposed_port(8123)),
+                "TB_ARCHIVE_CLICKHOUSE_SECURE": "false",
+                "TB_ARCHIVE_CLICKHOUSE_DATABASE": self.name,
+                "TB_ARCHIVE_CLICKHOUSE_MIGRATE_SECRET_REF": "ch-migrate",
+                "TB_SECRETS_DIR": str(tmp_path),
+            }
+        )
+
+    def run(self, **settings: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "tributary.archiver", "--env", "dev", "--migrate-only"],
+            env={**self.env, **settings},
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
+    def show(self, table: str) -> str:
+        return str(self.admin.command(f"SHOW CREATE TABLE {self.name}.{table}"))
+
+    def settings_rows(self) -> list[tuple[str, int, int | None]]:
+        result = self.admin.query(
+            f"SELECT table_name, days, previous_days FROM {self.name}.archive_settings ORDER BY applied_at, table_name"  # noqa: S608
+        )
+        return [(str(r[0]), int(r[1]), None if r[2] is None else int(r[2])) for r in result.result_rows]
+
+    def close(self) -> None:
+        self.admin.command(f"DROP DATABASE IF EXISTS {self.name}")
+        self.admin.close()
+
+
+@pytest.fixture
+def migrator(clickhouse: ClickHouseContainer, tmp_path: Path) -> Iterator[Migrator]:
+    m = Migrator(clickhouse, tmp_path)
+    try:
+        yield m
+    finally:
+        m.close()
+
+
+def refusal_codes(result: subprocess.CompletedProcess[str]) -> list[str]:
+    import json
+
+    lines = [json.loads(x) for x in result.stderr.splitlines() if x.startswith("{")]
+    return [x["code"] for x in lines if x.get("event") == "startup_refused"]
+
+
+def test_migrate_applies_retention_to_events_and_audit_log_and_defaults_match_the_adr(migrator: Migrator) -> None:
+    result = migrator.run()
+    assert result.returncode == 0, result.stderr[-300:]
+    assert "toIntervalDay(90)" in migrator.show("message_events")
+    audit = migrator.show("audit_log")
+    assert "toIntervalDay(2190)" in audit
+    assert "ENGINE = MergeTree" in audit and "ReplacingMergeTree" not in audit, "audit_log is append-only"
+    assert "ttl_only_drop_parts = 1" in audit and "toYYYYMM(ts)" in audit
+    columns = str(
+        migrator.admin.command(
+            "SELECT groupArray(name) FROM system.columns WHERE database = {db:String} AND table = 'archive_settings'",
+            parameters={"db": migrator.name},
+        )
+    )
+    assert "applied_by" in columns and "decrease_allowed" in columns
+    assert "TTL" not in migrator.show("archive_settings")
+
+
+def test_a_ttl_decrease_is_refused_then_allowed_with_the_flag_and_recorded(migrator: Migrator) -> None:
+    assert migrator.run(TB_ARCHIVE_TTL_DAYS="45", TB_ARCHIVE_AUDIT_TTL_DAYS="400").returncode == 0
+    assert "toIntervalDay(45)" in migrator.show("message_events")
+    assert "toIntervalDay(400)" in migrator.show("audit_log")
+    created = migrator.settings_rows()
+    assert sorted(created) == [("audit_log", 400, None), ("message_events", 45, None)]
+    recorded_by = migrator.admin.query(f"SELECT DISTINCT applied_by FROM {migrator.name}.archive_settings").result_rows  # noqa: S608
+    assert recorded_by and recorded_by[0][0], "applied_by defaults to the migrating user"
+
+    # Shorter events, longer audit: refused as a whole, so audit_log is not lengthened either.
+    refused = migrator.run(TB_ARCHIVE_TTL_DAYS="10", TB_ARCHIVE_AUDIT_TTL_DAYS="500")
+    assert refused.returncode == 2
+    assert refusal_codes(refused) == ["RETENTION_DECREASE_REFUSED"], refused.stderr[-500:]
+    assert "toIntervalDay(45)" in migrator.show("message_events")
+    assert "toIntervalDay(400)" in migrator.show("audit_log")
+    assert migrator.settings_rows() == created
+
+    for bad in ("false", "yes"):  # only `true` allows it; an unrecognised value is refused, never read as true
+        again = migrator.run(TB_ARCHIVE_TTL_DAYS="10", TB_ARCHIVE_ALLOW_TTL_DECREASE=bad)
+        assert again.returncode == 2
+        assert "toIntervalDay(45)" in migrator.show("message_events")
+
+    allowed = migrator.run(
+        TB_ARCHIVE_TTL_DAYS="10", TB_ARCHIVE_AUDIT_TTL_DAYS="500", TB_ARCHIVE_ALLOW_TTL_DECREASE="true"
+    )
+    assert allowed.returncode == 0, allowed.stderr[-300:]
+    assert "toIntervalDay(10)" in migrator.show("message_events")
+    assert "toIntervalDay(500)" in migrator.show("audit_log")
+    assert ("message_events", 10, 45) in migrator.settings_rows()
+    assert ("audit_log", 500, 400) in migrator.settings_rows()
+    flags = migrator.admin.query(
+        f"SELECT table_name, decrease_allowed FROM {migrator.name}.archive_settings WHERE days = 10"  # noqa: S608
+    ).result_rows
+    assert flags == [("message_events", True)]
+
+    unchanged = migrator.run(TB_ARCHIVE_TTL_DAYS="10", TB_ARCHIVE_AUDIT_TTL_DAYS="500")
+    assert unchanged.returncode == 0
+    assert len(migrator.settings_rows()) == 4, "an unchanged value writes no settings row"
+
+
+def test_out_of_range_retention_refuses_to_start(migrator: Migrator) -> None:
+    for name, value in (("TB_ARCHIVE_TTL_DAYS", "0"), ("TB_ARCHIVE_AUDIT_TTL_DAYS", "36501")):
+        result = migrator.run(**{name: value})
+        assert result.returncode == 2
+    tables_sql = "SELECT count() FROM system.tables WHERE database = {db:String}"
+    assert migrator.admin.query(tables_sql, parameters={"db": migrator.name}).result_rows == [(0,)]
+
+
+def test_lengthening_reaches_rows_already_stored(migrator: Migrator, clickhouse: ClickHouseContainer) -> None:
+    """ADR-004 R6 (1), the claim that was unverified: MODIFY TTL materialises on existing parts."""
+    assert migrator.run(TB_ARCHIVE_TTL_DAYS="10").returncode == 0
+    client = connect(
+        ClickhouseTarget(
+            host=clickhouse.get_container_host_ip(),
+            port=int(clickhouse.get_exposed_port(8123)),
+            database=migrator.name,
+            username=clickhouse.username,
+            password=clickhouse.password,
+            secure=False,
+        )
+    )
+    try:
+        moment = datetime.now(UTC) - timedelta(days=5)
+        stored = moment.strftime("%Y-%m-%dT%H:%M:%S.") + f"{moment.microsecond // 1000:03d}Z"
+        ClickhouseSink(client).insert(rows(base(ts=stored)))
+        sql = (
+            "SELECT max(delete_ttl_info_max) FROM system.parts "  # noqa: S608
+            f"WHERE database = '{migrator.name}' AND table = 'message_events' AND active"
+        )
+        before = migrator.admin.query(sql).result_rows[0][0]
+        assert before < datetime.now() + timedelta(days=6)
+        assert migrator.run(TB_ARCHIVE_TTL_DAYS="60").returncode == 0
+        deadline = time.monotonic() + 60
+        after = before
+        while time.monotonic() < deadline:
+            after = migrator.admin.query(sql).result_rows[0][0]
+            if after > datetime.now() + timedelta(days=40):
+                break
+            time.sleep(0.5)
+        assert after > datetime.now() + timedelta(days=40), "the longer TTL must reach the part already stored"
+        assert int(client.command("SELECT count() FROM message_events FINAL")) == 1
+    finally:
+        client.close()
+
+
+AUDIT_COLUMNS = [
+    "audit_id",
+    "ts",
+    "environment",
+    "action",
+    "phase",
+    "actor",
+    "actor_roles",
+    "count",
+    "source_partition",
+    "source_offset",
+]
+
+
+def audit_row(audit_id: uuid.UUID, ts: datetime, count: int, offset: int = 0) -> list[object]:
+    return [audit_id, ts, "dev", "message.reprocess", "completed", "SYNTH-actor", ["operator"], count, 0, offset]
+
+
+def make_user(
+    migrator: Migrator, clickhouse: ClickHouseContainer, grants: str, *, profile: bool = True
+) -> tuple[str, str]:
+    """A ClickHouse user with `grants`; `profile` pins insert_allow_materialized_columns = 0 CONST (README)."""
+    user, pw = f"u_{uuid.uuid4().hex[:10]}", secrets.token_hex(16)
+    migrator.admin.command(f"CREATE USER IF NOT EXISTS {user} IDENTIFIED BY '{pw}'")
+    migrator.admin.command(f"GRANT {grants} TO {user}")
+    if profile:
+        migrator.admin.command(
+            f"CREATE SETTINGS PROFILE IF NOT EXISTS p_{user} SETTINGS insert_allow_materialized_columns = 0 CONST TO {user}"
+        )
+    return user, pw
+
+
+def connect_as(clickhouse: ClickHouseContainer, database: str, user: str, pw: str) -> object:
+    return connect(
+        ClickhouseTarget(
+            host=clickhouse.get_container_host_ip(),
+            port=int(clickhouse.get_exposed_port(8123)),
+            database=database,
+            username=user,
+            password=pw,
+            secure=False,
+        )
+    )
+
+
+def test_an_insert_only_user_cannot_overwrite_an_audit_row_and_a_same_ts_injection_is_a_tamper_signal(
+    migrator: Migrator, clickhouse: ClickHouseContainer
+) -> None:
+    """ADR-004 R7 rev 3 / audit/v0 4: append-only, dedup on audit_id keeping the earliest-archived copy."""
+    from tributary.archiver.schema import audit_dedup_sql, audit_tamper_sql
+
+    assert migrator.run().returncode == 0
+    user, pw = make_user(migrator, clickhouse, f"INSERT ON {migrator.name}.audit_log")
+    writer = connect_as(clickhouse, migrator.name, user, pw)
+    db = migrator.name
+    when = datetime.now(UTC).replace(microsecond=0) - timedelta(minutes=3)
+    original, honest, forged = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    try:
+        writer.insert("audit_log", [audit_row(original, when, 1, 7)], column_names=AUDIT_COLUMNS)  # type: ignore[attr-defined]
+        # Same audit_id, SAME ts, different content: what a merge-collapsing engine would have replaced.
+        time.sleep(0.01)
+        writer.insert("audit_log", [audit_row(original, when, 999, 8)], column_names=AUDIT_COLUMNS)  # type: ignore[attr-defined]
+        # An honest at-least-once redelivery: identical content, new offset.
+        writer.insert("audit_log", [audit_row(honest, when, 5, 1)], column_names=AUDIT_COLUMNS)  # type: ignore[attr-defined]
+        writer.insert("audit_log", [audit_row(honest, when, 5, 2)], column_names=AUDIT_COLUMNS)  # type: ignore[attr-defined]
+        assert forged  # (kept for readability of the three ids)
+        migrator.admin.command(f"OPTIMIZE TABLE {db}.audit_log FINAL")
+        stored = migrator.admin.query(f"SELECT count() FROM {db}.audit_log").result_rows  # noqa: S608
+        assert stored == [(4,)], "every INSERT is kept: an INSERT can only add a row"
+        deduped = migrator.admin.query(
+            f"SELECT audit_id, `count` FROM {audit_dedup_sql(database=db)} ORDER BY audit_id"  # noqa: S608
+        ).result_rows
+        assert dict(deduped) == {original: 1, honest: 5}, "the earliest-archived copy wins; no FINAL"
+        assert migrator.admin.query(audit_tamper_sql(database=db)).result_rows == [(1,)]
+        with pytest.raises(Exception):  # noqa: B017
+            writer.command("ALTER TABLE audit_log UPDATE `count` = 0 WHERE 1")  # type: ignore[attr-defined]
+    finally:
+        writer.close()  # type: ignore[attr-defined]
+        migrator.admin.command(f"DROP USER IF EXISTS {user}")
+
+
+def test_an_insert_only_user_cannot_backdate_inserted_at_to_win_the_dedup(
+    migrator: Migrator, clickhouse: ClickHouseContainer
+) -> None:
+    """`inserted_at` is MATERIALIZED: an explicit early value is refused (or ignored), so the original still wins."""
+    from tributary.archiver.schema import audit_dedup_sql
+
+    assert migrator.run().returncode == 0
+    db = migrator.name
+    assert "MATERIALIZED now64(3)" in migrator.show("audit_log")
+    user, pw = make_user(migrator, clickhouse, f"INSERT ON {db}.audit_log")
+    writer = connect_as(clickhouse, db, user, pw)
+    when = datetime.now(UTC).replace(microsecond=0) - timedelta(minutes=3)
+    audit_id = uuid.uuid4()
+    try:
+        writer.insert("audit_log", [audit_row(audit_id, when, 1, 5)], column_names=AUDIT_COLUMNS)  # type: ignore[attr-defined]
+        forged = [*audit_row(audit_id, when, 999, 0), datetime(1970, 1, 2, tzinfo=UTC)]
+        try:
+            writer.insert("audit_log", [forged], column_names=[*AUDIT_COLUMNS, "inserted_at"])  # type: ignore[attr-defined]
+        except Exception:
+            refused = True
+        else:
+            refused = False
+        for form in (
+            "INSERT INTO audit_log (audit_id, ts, actor, inserted_at) VALUES (generateUUIDv4(), now(), 'x', '1970-01-02')",
+            # The reviewer's bypass: the INSERT overrides the MATERIALIZED column by setting; the CONST profile refuses.
+            "INSERT INTO audit_log (audit_id, ts, actor, inserted_at) SETTINGS insert_allow_materialized_columns = 1 "
+            "VALUES (generateUUIDv4(), now(), 'x', '1970-01-02')",
+        ):
+            with pytest.raises(Exception):  # noqa: B017
+                writer.command(form)  # type: ignore[attr-defined]
+        with pytest.raises(Exception):  # noqa: B017
+            writer.command("SET insert_allow_materialized_columns = 1")  # type: ignore[attr-defined]
+        # Whatever happened, no stored row may carry a client-chosen time, and the original wins.
+        assert refused, "24.8 refuses an explicit value for a MATERIALIZED column"
+        oldest = migrator.admin.query(f"SELECT min(inserted_at) FROM {db}.audit_log").result_rows[0][0]  # noqa: S608
+        assert oldest.year >= 2026, f"a client-set inserted_at was stored (refused={refused})"
+        # Same-ms race: the archiver row is first; even if the forged copy was stored, it is later, so it loses.
+        if not refused:
+            migrator.admin.command(f"OPTIMIZE TABLE {db}.audit_log FINAL")
+        winners = migrator.admin.query(f"SELECT `count` FROM {audit_dedup_sql(database=db)}").result_rows  # noqa: S608
+        assert winners == [(1,)]
+    finally:
+        writer.close()  # type: ignore[attr-defined]
+        migrator.admin.command(f"DROP USER IF EXISTS {user}")
+
+
+def archiver_refusal(migrator: Migrator, user: str, pw: str, tmp_path: Path) -> subprocess.CompletedProcess[str]:
+    """Run the real archiver entry point (no `--migrate-only`) as `user`; no Kafka broker is needed to be refused."""
+    from tests.support.engine_kafka import engine_kafka_env
+
+    ref = tmp_path / "ch-runtime"
+    ref.mkdir()
+    (ref / "user").write_text(user)
+    (ref / "password").write_text(pw)
+    for f in ref.iterdir():
+        f.chmod(0o600)
+    env = engine_kafka_env("127.0.0.1:9092", migrator.env)
+    env.update(
+        {"TB_ARCHIVE_CLICKHOUSE_SECRET_REF": "ch-runtime", "TB_OPS_PORT": "0", "TB_INSTANCE_ID": "archiver-grants"}
+    )
+    return subprocess.run(
+        [sys.executable, "-m", "tributary.archiver", "--env", "dev", "--skip-ddl"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+
+def refusal_line(result: subprocess.CompletedProcess[str]) -> dict[str, object]:
+    import json
+
+    lines = [json.loads(x) for x in result.stderr.splitlines() if x.startswith("{")]
+    return next(x for x in lines if x.get("event") == "startup_refused")
+
+
+@pytest.mark.parametrize("extra", ["ALTER", "TRUNCATE", "DROP TABLE", "ALTER DELETE"])
+def test_archiver_refuses_to_start_when_its_user_exceeds_insert_and_select_on_audit_log(
+    migrator: Migrator, clickhouse: ClickHouseContainer, tmp_path: Path, extra: str
+) -> None:
+    assert migrator.run().returncode == 0
+    user, pw = make_user(migrator, clickhouse, f"INSERT, SELECT, {extra} ON {migrator.name}.audit_log")
+    try:
+        result = archiver_refusal(migrator, user, pw, tmp_path)
+    finally:
+        migrator.admin.command(f"DROP USER IF EXISTS {user}")
+    assert result.returncode == 2
+    line = refusal_line(result)
+    assert line["code"] == "ARCHIVER_GRANTS_EXCESSIVE"
+    # ClickHouse reports the ALTER group as its expansion, ALTER TABLE.
+    assert line["privilege"] == {"ALTER": "ALTER TABLE"}.get(extra, extra) and line["table"] == "audit_log"
+    assert pw not in result.stderr and user not in result.stderr
+
+
+def test_archiver_refuses_a_user_with_all_on_the_database(
+    migrator: Migrator, clickhouse: ClickHouseContainer, tmp_path: Path
+) -> None:
+    assert migrator.run().returncode == 0
+    user, pw = make_user(migrator, clickhouse, f"ALL ON {migrator.name}.*")
+    try:
+        result = archiver_refusal(migrator, user, pw, tmp_path)
+    finally:
+        migrator.admin.command(f"DROP USER IF EXISTS {user}")
+    assert result.returncode == 2 and refusal_line(result)["code"] == "ARCHIVER_GRANTS_EXCESSIVE"
+
+
+def test_archiver_refuses_to_start_without_the_settings_profile(
+    migrator: Migrator, clickhouse: ClickHouseContainer, tmp_path: Path
+) -> None:
+    assert migrator.run().returncode == 0
+    user, pw = make_user(migrator, clickhouse, f"INSERT, SELECT ON {migrator.name}.*", profile=False)
+    try:
+        result = archiver_refusal(migrator, user, pw, tmp_path)
+    finally:
+        migrator.admin.command(f"DROP USER IF EXISTS {user}")
+    assert result.returncode == 2
+    line = refusal_line(result)
+    assert line["code"] == "ARCHIVER_SETTINGS_UNSAFE" and line["setting"] == "insert_allow_materialized_columns"
+
+
+def test_migrate_refuses_an_audit_log_whose_inserted_at_is_writable(migrator: Migrator) -> None:
+    from tributary.archiver.schema import audit_ddl
+
+    ddl_text = audit_ddl(database=migrator.name).replace("MATERIALIZED now64(3)", "DEFAULT now64(3)")
+    migrator.admin.command(ddl_text)
+    result = migrator.run()
+    assert result.returncode == 2 and refusal_line(result)["code"] == "AUDIT_LOG_ENGINE_INVALID"
+
+
+def test_migrate_is_exempt_from_the_grant_check(migrator: Migrator) -> None:
+    """The migrate credential is a full-access user (it needs ALTER) and `--migrate-only` must still work."""
+    assert migrator.run().returncode == 0
+
+
+def test_an_existing_audit_log_that_is_not_a_plain_mergetree_stops_migrate_and_start(
+    migrator: Migrator, clickhouse: ClickHouseContainer, tmp_path: Path
+) -> None:
+    migrator.admin.command(
+        f"CREATE TABLE {migrator.name}.audit_log (ts DateTime64(3, 'UTC'), audit_id UUID) "
+        "ENGINE = ReplacingMergeTree(ts) ORDER BY audit_id"
+    )
+    result = migrator.run()
+    assert result.returncode == 2 and refusal_line(result)["code"] == "AUDIT_LOG_ENGINE_INVALID"
+    user, pw = make_user(migrator, clickhouse, f"INSERT, SELECT ON {migrator.name}.*")
+    try:
+        started = archiver_refusal(migrator, user, pw, tmp_path)
+    finally:
+        migrator.admin.command(f"DROP USER IF EXISTS {user}")
+    assert started.returncode == 2 and refusal_line(started)["code"] == "AUDIT_LOG_ENGINE_INVALID"
+
+
+def test_a_pre_existing_settings_table_gets_applied_by_without_stamping_old_rows(migrator: Migrator) -> None:
+    name = migrator.name
+    migrator.admin.command(
+        f"CREATE TABLE {name}.archive_settings (table_name LowCardinality(String), days UInt32, "
+        "previous_days Nullable(UInt32), applied_at DateTime64(3, 'UTC') DEFAULT now64(3), release String) "
+        "ENGINE = MergeTree ORDER BY (table_name, applied_at)"
+    )
+    migrator.admin.command(
+        f"INSERT INTO {name}.archive_settings (table_name, days, release) VALUES ('message_events', 90, 'old')"  # noqa: S608
+    )
+    assert migrator.run().returncode == 0
+    old = migrator.admin.query(
+        f"SELECT applied_by, source FROM {name}.archive_settings WHERE release = 'old'"  # noqa: S608
+    ).result_rows
+    assert old == [("", "applied")], "a row written before the column existed is not attributed to the migrating user"
+    new = migrator.admin.query(f"SELECT applied_by FROM {name}.archive_settings WHERE release != 'old'").result_rows  # noqa: S608
+    assert new and all(row[0] for row in new), "new rows carry the migrating user"
+    assert "currentUser()" in migrator.show("archive_settings")
+
+
+def test_a_lost_settings_row_is_backfilled_and_marked(migrator: Migrator) -> None:
+    name = migrator.name
+    assert migrator.run(TB_ARCHIVE_TTL_DAYS="45").returncode == 0
+    # An earlier run altered the TTL but died before writing its row.
+    migrator.admin.command(f"ALTER TABLE {name}.message_events MODIFY TTL toDateTime(ts) + INTERVAL 50 DAY")
+    assert migrator.run(TB_ARCHIVE_TTL_DAYS="50").returncode == 0
+    rows = migrator.admin.query(
+        f"SELECT days, previous_days, source FROM {name}.archive_settings WHERE table_name = 'message_events' ORDER BY applied_at"  # noqa: S608
+    ).result_rows
+    assert rows == [(45, None, "applied"), (50, 45, "backfilled")]

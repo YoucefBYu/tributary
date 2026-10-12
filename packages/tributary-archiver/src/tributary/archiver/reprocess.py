@@ -42,7 +42,7 @@ from tributary.runtime.logs import JsonLogger
 from tributary.runtime.topics import raw_topic
 from tributary.sdk import headers as h
 
-from .audit import ACTOR, AuditEvent, AuditHook
+from .audit import ACTOR, AuditEvent, AuditHook, error_code_of
 from .errors import ArchiverError, MessageNotFound, PayloadUnavailable, PublishError, ReprocessRefused
 from .ordering import ORDERING_WOULD_BREAK, TraitsLookup, order_safe
 from .payload_source import PayloadRef, PayloadSource
@@ -141,12 +141,19 @@ class ReprocessService:
                 "message_reprocess_failed",
                 channel=found_channel,
                 message_id=original,
-                error_code=getattr(exc, "code", "ERROR"),
+                error_code=error_code_of(exc),
                 republished=done,
             )
             self._audit_followup(
                 AuditEvent(
-                    "message.reprocess", "failed", actor, found_channel, original, request_id=request_id, count=done
+                    "message.reprocess",
+                    "failed",
+                    actor,
+                    found_channel,
+                    original,
+                    request_id=request_id,
+                    count=done,
+                    error_code=error_code_of(exc),
                 )
             )
             raise

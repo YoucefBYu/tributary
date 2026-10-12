@@ -65,7 +65,7 @@ from tributary.sdk import Message
 from tributary.sdk import headers as h
 from tributary.sdk.errors import HeaderError
 
-from .audit import ACTOR, AuditEvent, AuditHook, Phase
+from .audit import ACTOR, AuditEvent, AuditHook, Phase, error_code_of
 from .errors import ArchiverError, PublishError, ReplayRefused
 from .ordering import ORDERING_WOULD_BREAK, TraitsLookup, order_safe
 from .payload_source import reprocessor_group
@@ -162,7 +162,7 @@ class ReplayService:
         if not order_safe(self._traits, channel=channel, allow_reorder=allow_reorder):
             raise ReplayRefused(ORDERING_WOULD_BREAK)
 
-        def event(phase: Phase, count: int | None = None) -> AuditEvent:
+        def event(phase: Phase, count: int | None = None, error_code: str | None = None) -> AuditEvent:
             return AuditEvent(
                 "channel.replay",
                 phase,
@@ -175,6 +175,7 @@ class ReplayService:
                 target_topic=topic,
                 range_start=start,
                 range_end=end,
+                error_code=error_code,
             )
 
         self._audit(event("requested"))  # fails closed
@@ -222,10 +223,10 @@ class ReplayService:
         self._log.warning(
             "channel_replay_failed",
             channel=channel,
-            error_code=getattr(exc, "code", type(exc).__name__),
+            error_code=error_code_of(exc),
             republished=done,
         )
-        self._audit_best_effort(event("failed", done))
+        self._audit_best_effort(event("failed", done, error_code_of(exc)))
         raise exc
 
     def _audit_best_effort(self, event: AuditEvent) -> None:

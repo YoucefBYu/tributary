@@ -19,7 +19,10 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Final, Literal, Protocol
 
-ACTOR: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@/=-]{0,127}")
+#: `tributary.audit/v0` `actor` is the token's `sub`: printable ASCII, 1-255 (ADR-009 D7). The grammar of the
+#: audit schema and `openapi/v0`, so a valid subject such as `idp|1234` is accepted.
+ACTOR: Final = re.compile(r"[\x21-\x7e]{1,255}")
+_ERROR_CODE: Final = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
 Action = Literal["message.reprocess", "channel.replay"]
 Phase = Literal["requested", "completed", "failed"]
 
@@ -41,7 +44,16 @@ class AuditEvent:
     target_topic: str | None = None
     range_start: datetime | None = None
     range_end: datetime | None = None
+    #: `failed` only: the raised error's stable `code` (`error_code_of`), never its message.
+    error_code: str | None = None
     ts: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+
+def error_code_of(exc: BaseException) -> str:
+    """The stable code for an audit `failed` record: the error's own `code` when it fits `audit/v0`'s pattern,
+    else `INTERNAL_ERROR`. Never the exception message (invariant 6)."""
+    code = getattr(exc, "code", None)
+    return code if isinstance(code, str) and _ERROR_CODE.fullmatch(code) else "INTERNAL_ERROR"
 
 
 class AuditHook(Protocol):

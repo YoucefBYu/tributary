@@ -91,6 +91,7 @@ class Archiver:
         log: Logger,
         settings: ArchiverSettings | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        metrics: ArchiverMetrics | None = None,
     ) -> None:
         self._consumer = consumer
         self._sink = sink
@@ -99,11 +100,17 @@ class Archiver:
         self._sleep = sleep
         self._stop = False
         self._last_stats = time.monotonic()
-        self.metrics = ArchiverMetrics()
+        self.metrics = metrics if metrics is not None else ArchiverMetrics()
+        self._ticked = time.monotonic()
 
     def stop(self) -> None:
         """Safe from a signal handler: the loop notices at its next poll or backoff slice."""
         self._stop = True
+
+    def seconds_since_tick(self) -> float:
+        """Seconds since the loop last made progress (a consume, or a backoff slice during an outage). For
+        `/livez`: a wedged loop stops ticking. A slow or down ClickHouse does not, because backoff ticks."""
+        return time.monotonic() - self._ticked
 
     def run(self) -> None:
         try:
@@ -114,6 +121,7 @@ class Archiver:
 
     def run_once(self) -> int:
         """Consume up to one batch, write it, commit it. Returns records consumed (0 when idle)."""
+        self._ticked = time.monotonic()
         messages = self._consumer.consume(
             num_messages=self._settings.max_batch, timeout=self._settings.flush_interval_s
         )
@@ -184,10 +192,14 @@ class Archiver:
                     if exc.transient:
                         delay = min(delay * 2, self._settings.backoff_max_s)
                     continue
-                self.metrics.last_insert_ms = (time.monotonic() - started) * 1000.0
+                elapsed = time.monotonic() - started
+                self.metrics.last_insert_ms = elapsed * 1000.0
+                if self.metrics.observe_insert is not None:
+                    self.metrics.observe_insert(elapsed)
                 self.metrics.rows_written += len(rows)
                 self.metrics.batches_written += 1
                 self.metrics.attrs_dropped += sum(row.attrs_dropped for row in rows)
+                self.metrics.attrs_dropped_hmac += sum(row.attrs_dropped_hmac for row in rows)
                 self.metrics.fields_blanked += sum(row.fields_blanked for row in rows)
                 newest = max(row.ts for row in rows)
                 self.metrics.ingest_lag_ms = max(0.0, now_ms() - newest.timestamp() * 1000.0)
@@ -213,6 +225,7 @@ class Archiver:
         while time.monotonic() < deadline:
             if self._stop:
                 return False
+            self._ticked = time.monotonic()
             self._pause(paused)  # a partition gained by an incremental assign is paused before the next poll
             stray = self._consumer.poll(0)
             if stray is not None and stray.error() is None:
@@ -228,6 +241,7 @@ class Archiver:
             self._consumer.commit(
                 offsets=[TopicPartition(t, p, o + 1) for (t, p), o in offsets.items()], asynchronous=False
             )
+            self.metrics.commits_ok += 1
         except KafkaException as exc:
             # Not fatal: the batch is already stored, and a redelivery collapses (at-least-once).
             self.metrics.commit_failures += 1

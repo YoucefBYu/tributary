@@ -2,7 +2,7 @@
 
 `python -m tributary.archiver --env <env>` consumes `_tb.<env>.events` (group `tb.<env>.archiver`) into ClickHouse `message_events`.
 
-- Config: Kafka from `TB_ENGINE_KAFKA_FILE`; ClickHouse from `TB_ARCHIVE_CLICKHOUSE_HOST|PORT|DATABASE|SECURE|CA_CERT|SECRET_REF` (secret dir holds `user`, `password`); `TB_ARCHIVE_TTL_DAYS` (default 90, a placeholder, not policy).
+- Config: Kafka from `TB_ENGINE_KAFKA_FILE`; ClickHouse from `TB_ARCHIVE_CLICKHOUSE_HOST|PORT|DATABASE|SECURE|CA_CERT|SECRET_REF` (secret dir holds `user`, `password`); retention (ADR-004 R2, 1-36500 days): `TB_ARCHIVE_TTL_DAYS` 90, `TB_ARCHIVE_CONTENT_TTL_DAYS` 30 (only with `TB_ARCHIVE_CONTENT=true`), `TB_ARCHIVE_AUDIT_TTL_DAYS` 2190, applied by `--migrate-only` only; a decrease is refused unless `TB_ARCHIVE_ALLOW_TTL_DECREASE=true`. The migrate Job must run serialized (concurrency 1). Ops: `--ops-bind/--ops-port` (`TB_OPS_*`), `/livez` and `/metrics`; `--instance-id` or `TB_INSTANCE_ID` is required.
 - Idempotency: `ReplacingMergeTree(ts)` keyed `(channel, message_id, stage, destination, attempt, scope)`. Count with `FINAL`. A re-emit landing in a different calendar month is not collapsed (partition is `toYYYYMM(ts)`).
 - Consistency: the browser is eventually consistent. Steady-state lag is about `flush_interval` (1 s) plus event linger (50 ms); exposed as `ingest_lag_ms` and `kafka_lag_messages` in the `archiver_stats` log line (no metrics endpoint until `contracts/observability/v0`).
 - ClickHouse down: partitions are paused, the same batch is retried with capped backoff, nothing is committed. Message flow is unaffected (invariant 9).
@@ -11,3 +11,14 @@
 - Transport: TLS on by default (`TB_ARCHIVE_CLICKHOUSE_SECURE` is `true` or `false`, anything else is refused); plain HTTP only to loopback; proxy environment variables are ignored. Driver resend-once is blocked by a custom pool manager plus `Connection: close` (see `sink.py`).
 - Known follow-up (W3-10): the runtime credential needs CREATE and ALTER because the archiver owns its schema. A separate migration credential would let the runtime one be INSERT-only.
 - Insert failures that cannot succeed on retry (unknown table, access refused) halt the batch without dropping or committing it; alert on `insert_failures_permanent` and `batches_halted`.
+- **`audit_log`** (`contracts/audit/v0` 4, ADR-004 R7 rev 3) is a plain append-only `MergeTree`. Every read dedups with `schema.audit_dedup_sql` (`ORDER BY inserted_at, source_partition, source_offset LIMIT 1 BY audit_id`; never `FINAL`). `schema.audit_tamper_sql` counts `audit_id`s with differing copies: a tamper signal, not a redelivery. The archiver refuses to start if its ClickHouse user holds more than INSERT and SELECT on `audit_log` (`ARCHIVER_GRANTS_EXCESSIVE`) or if `audit_log` is not a plain `MergeTree` (`AUDIT_LOG_ENGINE_INVALID`). `--migrate-only` is exempt from the grant check.
+- The grant check runs **at startup only**: privileges granted to the archiver user afterwards are not noticed until the next start. Re-check on every deploy or restart; an operator who widens the grant at runtime is outside what the archiver can detect. `inserted_at` is MATERIALIZED (server time) so a writer cannot backdate a forged copy; `source_partition`/`source_offset` only break same-millisecond ties and are client-set. The API reuses the same tamper query: `from tributary.archiver.schema import audit_tamper_sql` (the count of `audit_id`s with differing copies).
+- **Settings profile (required).** ClickHouse lets an INSERT override a MATERIALIZED column with `SETTINGS insert_allow_materialized_columns=1`, which would let an INSERT-only user backdate `audit_log.inserted_at`. The archiver refuses to start (`ARCHIVER_SETTINGS_UNSAFE`) unless `system.settings` shows that setting as `0` and read-only for its user. Create the user like this (migration credential), once per environment:
+
+  ```sql
+  CREATE SETTINGS PROFILE IF NOT EXISTS tb_archiver_profile
+      SETTINGS insert_allow_materialized_columns = 0 CONST TO tb_archiver;
+  GRANT INSERT, SELECT ON tributary.* TO tb_archiver;
+  ```
+
+  The migrate step also refuses an existing `audit_log` whose `inserted_at` is not MATERIALIZED (`AUDIT_LOG_ENGINE_INVALID`). Residual: ties inside one millisecond and the client-set `source_*` columns are flagged by the tamper count, not prevented.

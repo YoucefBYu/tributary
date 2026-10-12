@@ -1,8 +1,7 @@
 """Archiver counters and the lag figures the message browser needs (names and meaning, not an exporter).
 
-There is no metrics endpoint yet: `contracts/observability/v0` (W3-12) is not published. Until it is,
-`snapshot()` is logged as the `archiver_stats` line. Names below are the ones to map. No label carries
-a message id, channel or any event field.
+`exposition.py` serves these on the ops listener (`contracts/observability/v0`); `snapshot()` is also logged
+as the `archiver_stats` line. No label carries a message id or any event field.
 
 Lag, two figures with different meanings:
 * `ingest_lag_ms`: wall clock minus the `ts` of the newest event in the last written batch. This is how
@@ -14,6 +13,7 @@ Lag, two figures with different meanings:
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 
@@ -33,6 +33,10 @@ class ArchiverMetrics:
     ingest_lag_ms: float = 0.0
     kafka_lag_messages: int = 0
     last_insert_ms: float = 0.0
+    commits_ok: int = 0
+    attrs_dropped_hmac: int = 0
+    #: Called with the seconds one successful insert batch took (the ops histogram); None when no listener.
+    observe_insert: Callable[[float], None] | None = None
 
     def snapshot(self) -> dict[str, int | float]:
         return {

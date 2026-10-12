@@ -89,6 +89,8 @@ class EventRow:
     ts: datetime
     attrs_dropped: int
     fields_blanked: int = 0
+    #: Of `attrs_dropped`, the entries whose name ends `_hmac` (`tb_archiver_attrs_dropped_total{reason="hmac"}`).
+    attrs_dropped_hmac: int = 0
 
 
 def _uuid(value: Any) -> uuid.UUID:
@@ -244,4 +246,12 @@ def parse_event(record_value: bytes) -> EventRow:
         attrs,
         scope,
     )
-    return EventRow(values=values, ts=ts, attrs_dropped=dropped, fields_blanked=b1 + b2 + b3)
+    raw_attrs = raw.get("attrs")
+    hmac_dropped = (
+        sum(1 for name in raw_attrs if isinstance(name, str) and name.endswith("_hmac"))
+        if isinstance(raw_attrs, dict)
+        else 0
+    )
+    return EventRow(
+        values=values, ts=ts, attrs_dropped=dropped, fields_blanked=b1 + b2 + b3, attrs_dropped_hmac=hmac_dropped
+    )

@@ -45,6 +45,59 @@ class SinkError(ArchiverError):
         self.code = code
 
 
+class RetentionDecreaseRefused(ArchiverError):
+    """The migrate step will not shorten a table's TTL without `TB_ARCHIVE_ALLOW_TTL_DECREASE=true` (ADR-004 R6).
+
+    Rows past the new TTL are deleted irreversibly at the next TTL merge, so a decrease needs the operator's
+    explicit flag. Nothing was changed when this is raised. The message names tables, never row data.
+    """
+
+    code = "RETENTION_DECREASE_REFUSED"
+
+    def __init__(self, tables: list[str]) -> None:
+        super().__init__(
+            "retention would shorten " + ", ".join(tables) + "; TB_ARCHIVE_ALLOW_TTL_DECREASE=true allows it"
+        )
+        self.tables = tables
+
+
+class RetentionChanged(ArchiverError):
+    """A table's TTL changed between planning and the ALTER (a concurrent migrate run). Nothing more is altered."""
+
+    code = "RETENTION_CHANGED_CONCURRENTLY"
+
+    def __init__(self, table: str) -> None:
+        super().__init__(f"the TTL of {table} changed during the migration; run the migrate step again")
+        self.table = table
+
+
+class ArchiverGrantsExcessive(ArchiverConfigError):
+    """The archiver's ClickHouse user holds more than INSERT and SELECT on `audit_log` (`grants.py`)."""
+
+    code = "ARCHIVER_GRANTS_EXCESSIVE"
+
+    def __init__(self, privilege: str, table: str) -> None:
+        super().__init__(f"the archiver user holds {privilege} on {table}")
+        self.privilege = privilege
+        self.table = table
+
+
+class ArchiverSettingsUnsafe(ArchiverConfigError):
+    """The archiver's ClickHouse session can set `insert_allow_materialized_columns` (`grants.py`)."""
+
+    code = "ARCHIVER_SETTINGS_UNSAFE"
+
+    def __init__(self, setting: str) -> None:
+        super().__init__(f"{setting} must be 0 and read-only (CONST) for the archiver user")
+        self.setting = setting
+
+
+class AuditLogEngineInvalid(ArchiverConfigError):
+    """An existing `audit_log` is not a plain `MergeTree` (a `ReplacingMergeTree` would let INSERT overwrite)."""
+
+    code = "AUDIT_LOG_ENGINE_INVALID"
+
+
 class QueryError(ArchiverError):
     """A query was refused before it ran, or ClickHouse did not answer it.
 

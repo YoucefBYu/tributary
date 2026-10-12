@@ -10,7 +10,7 @@ from typing import Final
 from tributary.runtime.secrets import SecretResolver
 
 from .errors import ArchiverConfigError
-from .schema import DEFAULT_TTL_DAYS, MAX_TTL_DAYS
+from .schema import DEFAULT_AUDIT_TTL_DAYS, DEFAULT_CONTENT_TTL_DAYS, DEFAULT_TTL_DAYS, MAX_TTL_DAYS
 from .sink import ClickhouseTarget
 
 ENV_NAME: Final = re.compile(r"^[a-z][a-z0-9-]{0,15}$")
@@ -25,6 +25,12 @@ class ArchiverConfig:
     target: ClickhouseTarget
     ttl_days: int
     group_id: str
+    #: ADR-004 R2: `TB_ARCHIVE_AUDIT_TTL_DAYS`, default 2190.
+    audit_ttl_days: int = DEFAULT_AUDIT_TTL_DAYS
+    #: `TB_ARCHIVE_CONTENT_TTL_DAYS` (default 30), read only when `TB_ARCHIVE_CONTENT=true` (W3-2b); else None.
+    content_ttl_days: int | None = None
+    #: `TB_ARCHIVE_ALLOW_TTL_DECREASE`: read by the migrate step only (R6).
+    allow_ttl_decrease: bool = False
 
 
 def archiver_group(env: str) -> str:
@@ -97,4 +103,11 @@ def load_config(
         target=target,
         ttl_days=_int(environ, "TB_ARCHIVE_TTL_DAYS", DEFAULT_TTL_DAYS, 1, MAX_TTL_DAYS),
         group_id=archiver_group(env),
+        audit_ttl_days=_int(environ, "TB_ARCHIVE_AUDIT_TTL_DAYS", DEFAULT_AUDIT_TTL_DAYS, 1, MAX_TTL_DAYS),
+        content_ttl_days=(
+            _int(environ, "TB_ARCHIVE_CONTENT_TTL_DAYS", DEFAULT_CONTENT_TTL_DAYS, 1, MAX_TTL_DAYS)
+            if _bool(environ, "TB_ARCHIVE_CONTENT", default=False)
+            else None
+        ),
+        allow_ttl_decrease=_bool(environ, "TB_ARCHIVE_ALLOW_TTL_DECREASE", default=False),
     )
