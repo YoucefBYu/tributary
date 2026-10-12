@@ -3,7 +3,6 @@ reads `_tb.<env>.channels`, and the signal-aware run loop. Operator input is nev
 
 from __future__ import annotations
 
-import argparse
 import asyncio
 import signal
 from collections.abc import Callable
@@ -21,42 +20,6 @@ from .errors import (
     spec_unavailable_error,
 )
 from .lifecycle import LiveSpecFeed, ReceiverLifecycle, SpecFeed
-from .ops import DEFAULT_BIND, DEFAULT_PORT, OpsConfigError, OpsSettings, resolve_ops_settings
-from .startup import refuse
-
-
-class QuietArgumentParser(argparse.ArgumentParser):
-    """argparse echoes an unknown flag, a bad `choices` value or a missing argument's name to stderr.
-    Operator input is never echoed: one `startup_refused` line, exit 2."""
-
-    def __init__(self, log: Logger, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
-        self._tb_log = log
-
-    def error(self, message: str) -> NoReturn:
-        refuse(
-            self._tb_log,
-            error="UsageError",
-            code="ARGUMENTS_INVALID",
-            reason="invalid command-line arguments; run with --help for the accepted flags",
-        )
-
-
-def add_ops_arguments(p: argparse.ArgumentParser) -> None:
-    """`--ops-bind` and `--ops-port` (`contracts/observability/v0` O2). Defaults come from `TB_OPS_BIND` and
-    `TB_OPS_PORT`, then `127.0.0.1:9180`; they are resolved in `ops_settings_or_exit`, so the flag wins."""
-    p.add_argument("--ops-bind", default=None, help=f"ops listener address (default {DEFAULT_BIND}; TB_OPS_BIND)")
-    p.add_argument(
-        "--ops-port", default=None, help=f"ops listener port, 0 = ephemeral (default {DEFAULT_PORT}; TB_OPS_PORT)"
-    )
-
-
-def ops_settings_or_exit(a: argparse.Namespace, log: Logger) -> OpsSettings:
-    try:
-        return resolve_ops_settings(bind=a.ops_bind, port=a.ops_port)
-    except OpsConfigError:
-        refuse(log, error="UsageError", code="ARGUMENTS_INVALID", reason="invalid --ops-bind or --ops-port")
-
 
 _AUTH_NAMES = frozenset({"TOPIC_AUTHORIZATION_FAILED", "CLUSTER_AUTHORIZATION_FAILED", "GROUP_AUTHORIZATION_FAILED"})
 

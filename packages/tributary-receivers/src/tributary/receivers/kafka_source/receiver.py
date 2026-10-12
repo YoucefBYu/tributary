@@ -356,8 +356,10 @@ def main() -> None:
     read. Exit codes: 0 after SIGTERM/SIGINT or after a spec change that needs a restart (the supervisor
     restarts on 0), 2 for a refused startup configuration."""
     from tributary.runtime.errors import RuntimeConfigurationError
+    from tributary.runtime.ops import add_ops_arguments, ops_settings_or_exit
+    from tributary.runtime.startup import QuietArgumentParser
 
-    from ..cli import QuietArgumentParser, add_ops_arguments, ops_settings_or_exit, run_until_stopped, spec_feed_opener
+    from ..cli import run_until_stopped, spec_feed_opener
     from ..startup import refuse, refuse_retired_channel_spec_flag, spec_reader_group_or_exit
     from .runner import KafkaSourceRunner, RunnerOptions
     from .service import KafkaSourceService

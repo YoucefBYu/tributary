@@ -28,13 +28,16 @@ from tributary.runtime.clients import (
 from tributary.runtime.config import TopicDefaults, load_topic_defaults
 from tributary.runtime.consumer import ConsumerLoop, KafkaConsumerLike, LoopSettings
 from tributary.runtime.logs import JsonLogger
+from tributary.runtime.ops import add_ops_arguments
 from tributary.runtime.producer import KafkaEventEmitter, KafkaProducerLike, RecordProducer
+from tributary.runtime.startup import QuietArgumentParser, add_instance_argument
 from tributary.runtime.topics import channels_topic, consumer_group, dlq_topic, events_topic, out_topic
 from tributary.runtime.worker import KafkaDlqWriter
 from tributary.sdk.context import Logger
 
+from ..ops import LoaderOps, start_loader_ops
 from ..secrets import DirSecretResolver
-from ..startup import spec_reader_group_or_exit
+from ..startup import instance_or_exit, spec_reader_group_or_exit
 from .config import sftp_destination_config_from_destination
 from .handler import SftpRecordHandler
 from .loader import SftpLoader
@@ -53,11 +56,13 @@ def emit_lite_profile_warning(log: Logger, *, profile: str) -> None:
     )
 
 
-def build_loop(a: argparse.Namespace, kafka_settings: KafkaSettings) -> tuple[ConsumerLoop, SftpRecordHandler]:
+def build_loop(
+    a: argparse.Namespace, kafka_settings: KafkaSettings, ops: LoaderOps
+) -> tuple[ConsumerLoop, SftpRecordHandler]:
     from confluent_kafka import Consumer, Producer
 
     defaults: TopicDefaults = load_topic_defaults(a.contracts_dir)
-    instance = a.instance_id or f"loader-{a.destination}-{os.getpid()}"
+    instance = a.instance_id  # resolved and validated in main(): required, unique per replica
     log = JsonLogger("loader-sftp", base={"channel": a.channel, "destination": a.destination})
     emit_lite_profile_warning(log, profile=a.profile)
 
@@ -128,6 +133,9 @@ def build_loop(a: argparse.Namespace, kafka_settings: KafkaSettings) -> tuple[Co
         destination=a.destination,
         read_stage="pending",
     )
+    ops.bind_runtime(
+        handler=handler, spec_source=spec_source, loop=loop, stale_after_s=max_poll_interval_ms(spec) / 1000.0
+    )
     loop.start()
     log.info("loader_started", channel=a.channel, destination=a.destination, channel_version=spec.version)
     return loop, handler
@@ -137,11 +145,12 @@ def main() -> None:
     # Before parse_args: argparse echoes an unknown flag's value to stderr, so a retired
     # --bootstrap / --engine-security must reach the ENGINE_KAFKA_RETIRED_INPUT refusal first.
     kafka_settings = load_engine_kafka_or_exit(argv=sys.argv[1:], log=JsonLogger("loader-sftp"))
-    p = argparse.ArgumentParser(description=__doc__)
+    p = QuietArgumentParser(JsonLogger("loader-sftp"), description=__doc__)
     p.add_argument("--channel", required=True, help="the deployed channel name (spec.metadata.name)")
     p.add_argument("--destination", required=True, help="the spec.destinations[].name to load")
     p.add_argument("--env", required=True, help="the topic-name env segment, e.g. 'dev' or 'prod'")
-    p.add_argument("--instance-id", help="defaults to loader-<destination>-<pid>")
+    add_instance_argument(p)
+    add_ops_arguments(p)
     p.add_argument("--secrets-dir", help="overrides TB_SECRETS_DIR / the default secrets mount")
     p.add_argument("--contracts-dir", help="overrides TB_CONTRACTS_DIR / the default contracts/ search")
     p.add_argument(
@@ -151,7 +160,10 @@ def main() -> None:
         help="topic-defaults.json profile in use; 'lite' emits the mandatory RF=1 startup warning",
     )
     a = p.parse_args()
-    loop, handler = build_loop(a, kafka_settings)
+    log = JsonLogger("loader-sftp", base={"channel": a.channel, "destination": a.destination})
+    a.instance_id = instance_or_exit(a.instance_id, log)
+    ops, ops_thread = start_loader_ops(a, log, channel=a.channel, destination=a.destination, destination_type="sftp")
+    loop, handler = build_loop(a, kafka_settings, ops)
 
     def _shutdown(signum: int, _frame: object) -> None:
         loop.stop()
@@ -166,6 +178,7 @@ def main() -> None:
     finally:
         metrics = handler.metrics_snapshot()
         handler.close()
+        ops_thread.close()
     print(
         json.dumps(
             {

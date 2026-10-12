@@ -452,7 +452,7 @@ class HttpServer:
         remote = f"{peer[0]}:{peer[1]}" if peer else "unknown"
         cfg = self.cfg
         if self._refusal is not None or self.metrics.connections_open >= cfg.max_conns:
-            self.metrics.connections_refused += 1
+            self.metrics.refuse_connection("not_accepting" if self._refusal is not None else "max_conns")
             w.close()
             return
         if cfg.tls is not None and cfg.tls.allowed_client_sans:
@@ -531,8 +531,10 @@ def main() -> None:
     supervisor restarts on 0), 2 for a refused startup configuration."""
     from tributary.runtime.config import load_topic_defaults
     from tributary.runtime.errors import RuntimeConfigurationError
+    from tributary.runtime.ops import add_ops_arguments, ops_settings_or_exit
+    from tributary.runtime.startup import QuietArgumentParser
 
-    from ..cli import QuietArgumentParser, add_ops_arguments, ops_settings_or_exit, run_until_stopped, spec_feed_opener
+    from ..cli import run_until_stopped, spec_feed_opener
     from ..startup import refuse, refuse_retired_channel_spec_flag, spec_reader_group_or_exit
     from .runner import HttpRunner, RunnerOptions
 

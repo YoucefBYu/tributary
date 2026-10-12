@@ -38,15 +38,13 @@ from tributary.runtime.records import ConsumedRecord
 from .config import http_destination_config_from_destination
 from .loader import HttpLoader, Reason
 
+#: Fixed reasons to their registered code; an `HTTP_<status>` or `HTTP_REDIRECT_REFUSED` reason is its own code, so
+#: the metric code (`tb_deliveries_total`) and the DLQ code agree.
 ERROR_CODES: dict[Reason, str] = {
     "circuit-open": "CIRCUIT_OPEN",
     "timeout": "TIMEOUT",
     "transport-error": "TRANSPORT_ERROR",
     "tls-verify-failed": "TLS_VERIFY_FAILED",
-    "http-5xx": "HTTP_5XX",
-    "http-429": "HTTP_429",
-    "http-4xx": "HTTP_4XX",
-    "http-3xx": "HTTP_3XX",
 }
 
 
@@ -64,7 +62,7 @@ class HttpRecordHandler:
         outcome = self._loop.run_until_complete(self._http_loader.deliver(record.message))
         if outcome.success:
             return
-        raise DeliveryError(ERROR_CODES[outcome.reason], retryable=outcome.retryable)
+        raise DeliveryError(ERROR_CODES.get(outcome.reason, outcome.reason), retryable=outcome.retryable)
 
     def metrics_snapshot(self) -> dict[str, int]:
         return self._http_loader.metrics.snapshot()

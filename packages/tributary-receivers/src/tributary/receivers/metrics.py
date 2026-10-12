@@ -14,7 +14,10 @@ record key or payload bytes as an argument — only counts and durations.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
+
+from tributary.sdk.codes import ENGINE_CODES
 
 #: Latency samples kept per histogram-ish counter. Bounded so a long-running process cannot grow this
 #: without limit; a real exporter (Prometheus, OTel) replaces this with proper bucketing.
@@ -55,9 +58,27 @@ class Metrics:
     replies_unreadable: int = 0  # a reply record the consumer could not parse, dropped
     reply_pending: int = 0  # gauge: entries in the pending map now
     reply_ready: int = 0  # gauge: 1 while this process holds a reply partition and its consumer is connected
+    #: `connections_refused` split by the `observability/v0` reason (`max_conns`, `not_accepting`, `connect_failed`;
+    #: `peer_not_allowed` is `rejected_peer_not_allowed`). Names only.
+    refused_by_reason: dict[str, int] = field(default_factory=dict, repr=False)
+    #: Synchronous answers by `(answer, code)`; `code` is a registered code or `NONE`. Names only.
+    sync_answers: dict[tuple[str, str], int] = field(default_factory=dict, repr=False)
+    #: Called with each ACK latency in seconds (the Prometheus histogram observes it). `None`: samples only.
+    latency_sink: Callable[[float], None] | None = field(default=None, repr=False)
     _ack_latency_ms: list[float] = field(default_factory=list, repr=False)
 
+    def refuse_connection(self, reason: str) -> None:
+        self.connections_refused += 1
+        self.refused_by_reason[reason] = self.refused_by_reason.get(reason, 0) + 1
+
+    def record_sync_answer(self, answer: str, code: str | None) -> None:
+        # The code can come from a reply record (untrusted, envelope 2.3.3): only a registered code is a label.
+        key = (answer, code if code in ENGINE_CODES else "NONE" if not code else "UNKNOWN")
+        self.sync_answers[key] = self.sync_answers.get(key, 0) + 1
+
     def record_ack_latency_ms(self, value: float) -> None:
+        if self.latency_sink is not None:
+            self.latency_sink(value / 1000.0)
         if len(self._ack_latency_ms) >= MAX_SAMPLES:
             self._ack_latency_ms.pop(0)
         self._ack_latency_ms.append(value)
