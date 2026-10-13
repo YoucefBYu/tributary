@@ -56,6 +56,10 @@ def check(docs: list[dict[str, Any]]) -> list[str]:
     rules = [r for rule in by_kind.get("PrometheusRule", []) for g in rule["spec"]["groups"] for r in g["rules"]]
     if not any("tb_partitions_halted" in r["expr"] and r.get("alert") for r in rules):
         bad.append("no alert on partition_halted (tb_partitions_halted)")
+    for outcome in ("unsupported_version", "invalid"):  # observability README 3.5: a dropped audit record pages
+        want = f'sum by (namespace) (increase(tb_archiver_audit_records_total{{outcome="{outcome}"}}[15m])) > 0'
+        if not any(r.get("alert") and r["expr"] == want and r["labels"].get("severity") == "critical" for r in rules):
+            bad.append(f"no critical alert on audit records with outcome={outcome}")
 
     for name, spec in pods(docs):
         for c in spec["containers"]:

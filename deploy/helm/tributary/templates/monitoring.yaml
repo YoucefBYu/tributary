@@ -36,6 +36,19 @@ spec:
           labels: {severity: warning}
           annotations:
             summary: The audit tamper check has not completed for 3 intervals, or never ran (failing check or stopped API).
+        # observability README 3.5: neither outcome is stored, so any increase is an audit record lost from audit_log.
+        - alert: TributaryAuditRecordUnsupportedVersion
+          expr: sum by (namespace) (increase(tb_archiver_audit_records_total{outcome="unsupported_version"}[15m])) > 0
+          for: 0m
+          labels: {severity: critical}
+          annotations:
+            summary: The archiver dropped audit records with an unsupported version; they are not in audit_log.
+        - alert: TributaryAuditRecordInvalid
+          expr: sum by (namespace) (increase(tb_archiver_audit_records_total{outcome="invalid"}[15m])) > 0
+          for: 0m
+          labels: {severity: critical}
+          annotations:
+            summary: The archiver dropped invalid audit records; they are not in audit_log.
         - alert: TributaryReceiverNotReady
           expr: max by (component, channel) (tb_ready{component="receiver"}) == 0
           for: 5m
