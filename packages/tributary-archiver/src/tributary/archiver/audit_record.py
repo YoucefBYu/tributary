@@ -4,13 +4,19 @@ The events archiver consumes the audit topic in the same loop as `_tb.<env>.even
 READ LITERAL on the topic: no grant beyond `topics/v0`). Off the critical path (invariant 9): the API produced
 and acknowledged the record before it acted; nothing waits on this consumer.
 
-**Validation is the schema's, by hand** (no JSON Schema dependency in the archiver runtime): `v` 0, every
+**Validation is the schema's, by hand** (no JSON Schema dependency in the archiver runtime): `v` exactly 0, every
 required field, the closed enums, the patterns, and the per-action conditionals (what each action requires, the
 `allow_reorder` rule of invariant 5, `error_code` on `failed`, no `version` on undeploy). **A record that does
 not parse or fails the schema is not stored** (README 4): it is rejected with a fixed code, counted, and logged
 with topic, partition and offset only, so an operator can inspect it with Kafka tools inside the 30 d buffer.
-That includes a record with a field the schema does not list (`content-view-with-payload`: an audit record
-never carries content), a different `environment` than the topic's, and a `v` above 0.
+That includes a different `environment` than the topic's.
+
+**Lenient consumer (audit/v0 README 4, ruled 2026-10-13).** A top-level field the contract does not list is
+dropped and the known fields are stored (`unknown_fields` counts them; the loop logs
+`audit_unknown_fields_ignored` with the count and topic/partition/offset, never a field name or value), so an
+additive audit field is not lost records before every archiver upgrades. A record with `v` other than 0 is not
+stored at all (`UnsupportedVersion`): counted as `unsupported_version`, logged by offset, committed past,
+because a breaking change could alter what the known fields mean.
 
 **Append-only, dedup at read.** Each accepted record is one new row in a plain `MergeTree`. A redelivery
 is a second identical row; reads collapse on `audit_id` keeping the earliest-archived copy
@@ -31,7 +37,7 @@ from typing import Any, Final
 
 import orjson
 
-from .errors import EventRejected
+from .errors import AuditRejected, UnsupportedVersion
 
 TABLE: Final = "audit_log"
 MAX_RECORD_BYTES: Final = 8192
@@ -108,6 +114,7 @@ _OPTIONAL: Final = frozenset(
 _REQUIRED: Final = frozenset({"v", "audit_id", "ts", "environment", "action", "phase", "actor", "actor_roles"})
 _KNOWN: Final = _REQUIRED | _OPTIONAL
 _MAX_VERSION: Final = 2_147_483_647
+_MAX_COUNT: Final = 2**64 - 1  # UInt64: a larger value would make the whole insert fail
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,26 +127,41 @@ class AuditRow:
     attrs_dropped: int = 0
     attrs_dropped_hmac: int = 0
     fields_blanked: int = 0
+    #: Top-level fields the contract does not list: dropped, never stored; the loop logs the count only.
+    unknown_fields: int = 0
 
 
-def _bad(code: str) -> EventRejected:
-    return EventRejected(code)
+def _bad(code: str) -> AuditRejected:
+    return AuditRejected(code)
 
 
 def _match(record: dict[str, Any], name: str, pattern: re.Pattern[str]) -> str | None:
-    value = record.get(name)
-    if value is None:
+    """A field that is absent is None; a field that is PRESENT must be valid (a JSON null is not absent: the
+    schema has no nullable field)."""
+    if name not in record:
         return None
+    value = record[name]
     if not isinstance(value, str) or pattern.fullmatch(value) is None:
         raise _bad("AUDIT_FIELD_INVALID")  # the field name stays out of logs: the code is fixed
     return value
 
 
-def _int(record: dict[str, Any], name: str, low: int, high: int | None = None) -> int | None:
-    value = record.get(name)
-    if value is None:
+def _number(value: Any) -> int | None:
+    """JSON Schema `integer`: an int, or a float with an integral value (`1.0`); never a bool."""
+    if isinstance(value, bool):
         return None
-    if isinstance(value, bool) or not isinstance(value, int) or value < low or (high is not None and value > high):
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return None
+
+
+def _int(record: dict[str, Any], name: str, low: int, high: int | None = None) -> int | None:
+    if name not in record:
+        return None
+    value = _number(record[name])
+    if value is None or value < low or (high is not None and value > high):
         raise _bad("AUDIT_FIELD_INVALID")
     return value
 
@@ -171,26 +193,30 @@ def parse_audit_record(value: bytes | None, *, env: str, partition: int, offset:
         raise _bad("AUDIT_NOT_JSON") from None
     if not isinstance(record, dict):
         raise _bad("AUDIT_NOT_OBJECT")
-    if record.get("v") != 0 or isinstance(record.get("v"), bool):
-        raise _bad("AUDIT_VERSION_UNSUPPORTED")
-    if any(name not in _KNOWN for name in record):
-        raise _bad("AUDIT_UNKNOWN_FIELD")  # an audit record never carries anything the contract does not list
-    if any(record.get(name) is None for name in _REQUIRED):
+    if "v" not in record:
+        raise _bad("AUDIT_FIELD_MISSING")
+    version_field = _number(record["v"])
+    if version_field is None:
+        raise _bad("AUDIT_FIELD_INVALID")
+    if version_field != 0:
+        raise UnsupportedVersion  # any other v is not stored: it could change what the known fields mean
+    unknown = sum(1 for name in record if name not in _KNOWN)  # lenient consumer (README 4): drop, never store
+    if any(name not in record for name in _REQUIRED):
         raise _bad("AUDIT_FIELD_MISSING")
 
     audit_id = _match(record, "audit_id", _UUID7)
     ts = _when(_match(record, "ts", _TIMESTAMP))
     environment = _match(record, "environment", _ENV)
     action, phase = record["action"], record["phase"]
-    if action not in ACTIONS or phase not in PHASES:
-        raise _bad("AUDIT_FIELD_INVALID")
+    if not (isinstance(action, str) and action in ACTIONS and isinstance(phase, str) and phase in PHASES):
+        raise _bad("AUDIT_FIELD_INVALID")  # a list or dict is unhashable: check the type before the membership
     actor = _match(record, "actor", _ACTOR)
     roles = record["actor_roles"]
     if (
         not isinstance(roles, list)
         or not 1 <= len(roles) <= 5
-        or len(set(map(str, roles))) != len(roles)
-        or any(r not in ROLES for r in roles)
+        or not all(isinstance(r, str) and r in ROLES for r in roles)
+        or len(set(roles)) != len(roles)
     ):
         raise _bad("AUDIT_FIELD_INVALID")
     if environment != env:
@@ -201,19 +227,19 @@ def parse_audit_record(value: bytes | None, *, env: str, partition: int, offset:
     channel = _match(record, "channel", _NAME)
     message_id = _match(record, "message_id", _UUID)
     stage = record.get("stage")
-    if stage is not None and stage not in STAGES:
+    if "stage" in record and not (isinstance(stage, str) and stage in STAGES):
         raise _bad("AUDIT_FIELD_INVALID")
     destination = _match(record, "destination", _NAME)
     deployment_id = _match(record, "deployment_id", _UUID)
     version = _int(record, "version", 1, _MAX_VERSION)
     previous_version = _int(record, "previous_version", 1, _MAX_VERSION)
     allow_reorder = record.get("allow_reorder")
-    if allow_reorder is not None and not isinstance(allow_reorder, bool):
+    if "allow_reorder" in record and not isinstance(allow_reorder, bool):
         raise _bad("AUDIT_FIELD_INVALID")
     target_topic = _match(record, "target_topic", _TARGET)
     range_start = _when(_match(record, "range_start", _TIMESTAMP))
     range_end = _when(_match(record, "range_end", _TIMESTAMP))
-    count = _int(record, "count", 0)
+    count = _int(record, "count", 0, _MAX_COUNT)
     error_code = _match(record, "error_code", _ERROR_CODE)
 
     _conditionals(
@@ -262,7 +288,7 @@ def parse_audit_record(value: bytes | None, *, env: str, partition: int, offset:
         partition,
         offset,
     )
-    return AuditRow(values=values, ts=ts)
+    return AuditRow(values=values, ts=ts, unknown_fields=unknown)
 
 
 def _conditionals(action: str, phase: str, f: dict[str, Any]) -> None:

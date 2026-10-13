@@ -23,6 +23,11 @@ committed: the archiver logs `insert_halted` once (fixed reason), counts `insert
 `batches_halted` (alert on both), and keeps its partitions paused, retrying at the maximum backoff so it
 recovers by itself once an operator fixes the table or credentials. Events wait in Kafka meanwhile.
 
+**One sink loop, two tables (events archiver).** The events archiver also writes `audit_log` in this loop, so a
+permanent error on EITHER table (a column mismatch, a revoked grant) halts the whole batch and therefore both
+topics' commits until an operator fixes it. `insert_halted` and `insert_failed` carry `table` so the alert
+names the culprit. Both topics wait in Kafka meanwhile (events 3 d, audit 30 d).
+
 **PHI (invariant 6).** Log lines carry counts, stable codes, topic/partition/offset and exception CLASS
 names. Never an event field, a record value or an exception message.
 """
@@ -36,11 +41,12 @@ from typing import Any, Final, Protocol
 from confluent_kafka import KafkaException, TopicPartition
 from tributary.sdk.context import Logger
 
-from .errors import EventRejected, SinkError
+from .errors import AuditRejected, EventRejected, SinkError, UnsupportedVersion
 from .event import parse_event
 from .metrics import ArchiverMetrics, now_ms
 from .sink import Sink
 
+KAFKA_ERROR_LOG_INTERVAL_S: Final = 60.0
 _PARTITION_EOF: Final = -191  # confluent_kafka.KafkaError._PARTITION_EOF
 
 
@@ -156,6 +162,7 @@ class Archiver:
         self._last_stats = time.monotonic()
         self.metrics = metrics if metrics is not None else ArchiverMetrics()
         self._ticked = time.monotonic()
+        self._kafka_error_seen: dict[str, tuple[float | None, int]] = {}
 
     def stop(self) -> None:
         """Safe from a signal handler: the loop notices at its next poll or backoff slice."""
@@ -191,9 +198,29 @@ class Archiver:
             value = message.value()
             self.metrics.bytes_consumed += len(value) if value is not None else 0
             try:
-                rows.append(self._parse(message))
+                try:
+                    row = self._parse(message)
+                except EventRejected:
+                    raise
+                except Exception:  # a parser bug must not kill the loop: this record is skipped, never retried
+                    raise EventRejected("RECORD_UNPARSEABLE") from None
+                rows.append(row)
+                unknown = getattr(row, "unknown_fields", 0)
+                if unknown:  # a count and a position, never a field name or value
+                    self._log.warning(
+                        "audit_unknown_fields_ignored",
+                        count=unknown,
+                        topic=key[0],
+                        partition=key[1],
+                        offset=message.offset(),
+                    )
             except EventRejected as rejected:
-                self.metrics.events_rejected += 1
+                if isinstance(rejected, UnsupportedVersion):
+                    self.metrics.audit_unsupported_version += 1
+                elif isinstance(rejected, AuditRejected):
+                    self.metrics.audit_rejected += 1
+                else:
+                    self.metrics.events_rejected += 1
                 self._log.warning(
                     "event_rejected",
                     code=rejected.code,
@@ -237,12 +264,14 @@ class Archiver:
             table = getattr(row, "table", "")
             groups.setdefault(table if table in self._side_sinks else "", []).append(row.values)
         done: set[str] = set()  # a group already inserted is not inserted again on a retry of the batch
+        failing = "events"  # the table of the insert that raised, for the log (a name, never a value)
         try:
             while True:
                 started = time.monotonic()
                 try:
                     for key, values in groups.items():
                         if key not in done:
+                            failing = key or "events"
                             (self._side_sinks[key] if key else self._sink).insert(values)
                             done.add(key)
                 except SinkError as exc:
@@ -254,11 +283,16 @@ class Archiver:
                             halted = True
                             self.metrics.batches_halted += 1
                             self._log.error(
-                                "insert_halted", error=type(exc).__name__, error_code=exc.code, rows=len(rows)
+                                "insert_halted",
+                                error=type(exc).__name__,
+                                error_code=exc.code,
+                                rows=len(rows),
+                                table=failing,
                             )
                     else:
                         self._log.warning(
                             "insert_failed",
+                            table=failing,
                             error=type(exc).__name__,
                             error_code=exc.code,
                             retry_in_s=delay,
@@ -331,7 +365,16 @@ class Archiver:
         if error.fatal():
             self._log.error("kafka_fatal", code=str(error.name()))
             raise KafkaException(error)
-        self._log.warning("kafka_error", code=str(error.name()))
+        # An absent or unauthorised topic (UNKNOWN_TOPIC_OR_PART, TOPIC_AUTHORIZATION_FAILED) repeats at every
+        # metadata refresh: log each code at most once a minute and say how many were held back.
+        code = str(error.name())
+        now = time.monotonic()
+        last, held = self._kafka_error_seen.get(code, (None, 0))
+        if last is not None and now - last < KAFKA_ERROR_LOG_INTERVAL_S:
+            self._kafka_error_seen[code] = (last, held + 1)
+            return
+        self._kafka_error_seen[code] = (now, 0)
+        self._log.warning("kafka_error", code=code, suppressed=held)
 
     def _maybe_stats(self) -> None:
         if time.monotonic() - self._last_stats < self._settings.stats_interval_s:

@@ -180,15 +180,23 @@ def scrape(proc: ManagedProcess) -> str:
 
 
 def test_a_published_record_lands_once_a_redelivery_does_not_duplicate_it_and_poison_is_skipped(rig: Rig) -> None:
+    import orjson
+    from tributary.archiver.testing import sample_event
+
     first = rig.record()
     first_bytes = json.dumps(first).encode()
-    rig.publish(first_bytes)
-    rig.publish(first_bytes)  # the producer's retry of the same send: same bytes, same audit_id
-    rig.publish(b"{this is not json")
-    rig.publish(json.dumps({**rig.record(), "payload": "SYNTH-CONTENT-MUST-NOT-LAND"}).encode())  # carries content
-    rig.publish(json.dumps(rig.record(environment="other")).encode())  # another environment's record
+    rig.publish(first_bytes)  # offset 0
+    rig.publish(first_bytes)  # 1: the producer's retry of the same send: same bytes, same audit_id
+    rig.publish(b"{this is not json")  # 2: rejected
+    carrying = rig.record(payload="SYNTH-CONTENT-MUST-NOT-LAND", future_field=7)
+    rig.publish(json.dumps(carrying).encode())  # 3: unknown fields are dropped, the known ones stored
+    rig.publish(json.dumps(rig.record(environment="other")).encode())  # 4: another environment: rejected
+    rig.publish(json.dumps({**rig.record(), "v": 1}).encode())  # 5: v other than 0: not stored, counted apart
     second = rig.record("reprocess-requested.json")
-    rig.publish(json.dumps(second).encode())
+    rig.publish(json.dumps(second).encode())  # 6
+    event = sample_event(ts=datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.123Z"), message_id=uuid7(), channel="c")
+    rig.producer.produce(rig.events_topic, value=orjson.dumps(event), key=event["message_id"].encode())
+    assert rig.producer.flush(30) == 0
     proc = rig.spawn()
     try:
         rig.wait_committed()
@@ -206,15 +214,31 @@ def test_a_published_record_lands_once_a_redelivery_does_not_duplicate_it_and_po
         assert rig.rows(f"SELECT count() FROM {rig.database}.audit_log WHERE audit_id = {a}") == [(2,)]
         assert rig.rows(f"SELECT count() FROM {audit_dedup_sql(database=rig.database)} WHERE audit_id = {a}") == [(1,)]
         assert rig.rows(audit_tamper_sql(database=rig.database)) == [(0,)]
-        # Poison skipped and counted; the record after it landed; nothing of the rejected ones is stored.
-        total = rig.rows(f"SELECT count(), uniqExact(audit_id) FROM {rig.database}.audit_log")
-        assert total == [(3, 2)], "first (x2) + second; the three rejected records were not stored"
-        assert rig.rows(f"SELECT count() FROM {rig.database}.audit_log WHERE environment != '{rig.env}'") == [(0,)]
-        assert 'tb_archiver_events_total{outcome="invalid"} 3' in scrape(proc)
+        # first (x2) + the record with unknown fields + second; poison, other-env and v=1 were not stored.
+        assert rig.rows(f"SELECT count(), uniqExact(audit_id) FROM {rig.database}.audit_log") == [(4, 3)]
+        everything = repr(rig.rows(f"SELECT * FROM {rig.database}.audit_log"))
+        assert "SYNTH-CONTENT-MUST-NOT-LAND" not in everything
+        assert rig.rows(
+            f"SELECT count() FROM {rig.database}.audit_log WHERE audit_id = toUUID('{carrying['audit_id']}')"
+        ) == [(1,)], "the record with unknown fields is stored (known fields only)"
+        # The same loop, one commit: the event on the events topic landed too.
+        assert rig.rows(f"SELECT count() FROM {rig.database}.message_events FINAL") == [(1,)]
+        # Logs: unknown fields by count and offset only, rejections by code and offset, never a field name or value.
+        time.sleep(1.0)  # let the pump thread drain the last log lines
+        proc.collect_pending()
+        logged = list(proc.lines)
+        output = json.dumps(logged)
+        assert "SYNTH-CONTENT-MUST-NOT-LAND" not in output and "future_field" not in output
+        (unknown,) = [x for x in logged if x.get("event") == "audit_unknown_fields_ignored"]
+        assert (unknown["count"], unknown["offset"]) == (2, 3)
+        rejected = sorted((x["code"], x["offset"]) for x in logged if x.get("event") == "event_rejected")
+        assert rejected == [("AUDIT_ENVIRONMENT_MISMATCH", 4), ("AUDIT_NOT_JSON", 2), ("AUDIT_VERSION_UNSUPPORTED", 5)]
+        assert 'tb_archiver_events_total{outcome="invalid"} 0' in scrape(proc)
         (src,) = rig.rows(
-            f"SELECT source_partition, source_offset FROM {rig.database}.audit_log WHERE audit_id = toUUID('{second['audit_id']}')"
+            f"SELECT source_partition, source_offset FROM {rig.database}.audit_log "
+            f"WHERE audit_id = toUUID('{second['audit_id']}')"
         )
-        assert src == (0, 5), "provenance: the second valid record sat at offset 5 of the audit topic"
+        assert src == (0, 6), "provenance: the second valid record sat at offset 6 of the audit topic"
         stamp = rig.rows(f"SELECT inserted_at FROM {rig.database}.audit_log LIMIT 1")[0][0]
         assert stamp.year >= datetime.now(UTC).year, "inserted_at is the server's time"
     finally:

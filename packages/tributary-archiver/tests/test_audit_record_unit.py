@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import io
 import json
@@ -13,9 +14,14 @@ from typing import Any
 
 import orjson
 import pytest
+from hypothesis import HealthCheck, given, settings
+from hypothesis import strategies as st
+from jsonschema import Draft202012Validator
 from tributary.archiver.archiver import Archiver, ArchiverSettings, parse_event_record
+from tributary.archiver.audit_record import _KNOWN as KNOWN_FIELDS
 from tributary.archiver.audit_record import COLUMNS, MAX_RECORD_BYTES, AuditRow, parse_audit_record
-from tributary.archiver.errors import EventRejected, SinkError
+from tributary.archiver.errors import AuditRejected, EventRejected, SinkError, UnsupportedVersion
+from tributary.archiver.main import build_record_parser, subscription_topics
 from tributary.archiver.schema import audit_ddl
 from tributary.runtime.logs import JsonLogger
 
@@ -43,7 +49,9 @@ FakeConsumer, FakeKafkaError, FakeMessage, FakeSink, base = (
 EXAMPLES = Path(__file__).resolve().parents[3] / "contracts" / "audit" / "v0" / "examples"
 MANIFEST = json.loads((EXAMPLES / "manifest.json").read_text())
 VALID = [e["file"] for e in MANIFEST["valid"]]
-INVALID = [e["file"] for e in MANIFEST["invalid"]]
+#: Under the lenient consumer (audit/v0 README 4) an unlisted field is dropped, so the one example that is invalid
+#: only by `additionalProperties` is accepted by the archiver (and tested as such below).
+INVALID = [e["file"] for e in MANIFEST["invalid"] if e["file"] != "invalid/content-view-with-payload.json"]
 
 
 def load(name: str) -> dict[str, Any]:
@@ -97,17 +105,33 @@ def test_every_invalid_example_is_rejected_with_a_fixed_code_and_not_quoted(name
     assert "synth" not in str(raised.value)
 
 
-def test_a_record_that_carries_content_is_rejected_not_stored_without_it() -> None:
-    record = {**load("valid/content-view-requested.json"), "payload": "SYNTH-PAYLOAD-BYTES"}
-    with pytest.raises(EventRejected) as raised:
-        parse(record)
-    assert raised.value.code == "AUDIT_UNKNOWN_FIELD"
+def test_unknown_fields_are_dropped_and_counted_and_the_known_fields_are_stored() -> None:
+    """audit/v0 README 4: lenient consumer. The example that carries content is stored WITHOUT it."""
+    record = {**load("invalid/content-view-with-payload.json"), "future_field": "SYNTH-NEW-FIELD-VALUE"}
+    row = parse(record)
+    assert row.unknown_fields == len(set(record) - set(load("valid/content-view-requested.json"))) >= 1
+    flattened = repr(row.values)
+    assert "SYNTH-NEW-FIELD-VALUE" not in flattened and record["action"] in flattened
+    assert named(row)["action"] == "message.content.view"
+
+
+@pytest.mark.parametrize("version", [1, 2, 99, -1, 1.0])
+def test_a_version_other_than_zero_is_not_stored_and_is_its_own_rejection(version: Any) -> None:
+    with pytest.raises(UnsupportedVersion) as raised:
+        parse({**load("valid/content-view-requested.json"), "v": version})
+    assert raised.value.code == "AUDIT_VERSION_UNSUPPORTED" and isinstance(raised.value, AuditRejected)
+
+
+@pytest.mark.parametrize("version", ["0", True, False, None, [], {}])
+def test_a_version_that_is_not_a_number_is_an_ordinary_rejection(version: Any) -> None:
+    with pytest.raises(AuditRejected) as raised:
+        parse({**load("valid/content-view-requested.json"), "v": version})
+    assert not isinstance(raised.value, UnsupportedVersion) and raised.value.code == "AUDIT_FIELD_INVALID"
 
 
 @pytest.mark.parametrize(
     ("mutation", "code"),
     [
-        ({"v": 1}, "AUDIT_VERSION_UNSUPPORTED"),
         ({"environment": "dev"}, "AUDIT_ENVIRONMENT_MISMATCH"),
         ({"audit_id": "not-a-uuid"}, "AUDIT_FIELD_INVALID"),
         ({"audit_id": str(uuid.uuid4())}, "AUDIT_FIELD_INVALID"),  # the contract wants a UUIDv7
@@ -119,7 +143,7 @@ def test_a_record_that_carries_content_is_rejected_not_stored_without_it() -> No
         ({"actor_roles": ["root"]}, "AUDIT_FIELD_INVALID"),
         ({"stage": "transformed"}, "AUDIT_FIELD_INVALID"),
         ({"phase": "completed"}, "AUDIT_FIELD_INVALID"),  # a content view is `requested` only
-        ({"message_id": None}, "AUDIT_FIELD_MISSING"),
+        ({"message_id": None}, "AUDIT_FIELD_INVALID"),  # present but null: the schema has no nullable field
     ],
 )
 def test_schema_violations_are_rejected_by_code(mutation: dict[str, Any], code: str) -> None:
@@ -211,7 +235,7 @@ def test_a_malformed_audit_record_is_skipped_counted_and_committed_while_the_res
     archiver = build(consumer, sink, audit)
     archiver.run_once()
     assert len(audit.inserted) == 2 and sink.inserted == []
-    assert archiver.metrics.events_rejected == 1
+    assert archiver.metrics.audit_rejected == 1 and archiver.metrics.events_rejected == 0
     assert consumer.commits[-1] == [(0, 3)], "the poison record is committed past, not retried"
 
 
@@ -231,3 +255,275 @@ def test_an_audit_insert_failure_commits_nothing_until_it_succeeds() -> None:
     archiver.run_once()
     assert audit.calls == 2 and len(audit.inserted) == 1 and consumer.commits
     assert SinkError and FakeKafkaError
+
+
+# ---- robustness: whatever a record holds, the parser returns a row or raises AuditRejected --------------------
+
+UNHASHABLE = [[], ["x"], {}, {"k": "v"}, [[]], 1.5, True, None, "", 0]
+
+
+@pytest.mark.parametrize("field", ["action", "phase", "stage", "actor_roles"])
+@pytest.mark.parametrize("bad", [[], ["x"], {}, {"k": "v"}, [[]], [{}]])
+def test_a_list_or_dict_in_a_membership_checked_field_is_a_rejection_not_a_crash(field: str, bad: Any) -> None:
+    """Regression (security review H1): an unhashable value made `value in frozenset` raise TypeError and the
+    archiver crash-loop on the record."""
+    record = {**load("valid/content-view-requested.json"), field: bad}
+    with pytest.raises(AuditRejected) as raised:
+        parse(record)
+    assert raised.value.code == "AUDIT_FIELD_INVALID"
+
+
+def test_a_list_or_dict_inside_actor_roles_is_a_rejection() -> None:
+    for roles in ([[]], [{}], ["operator", []], [["operator"]]):
+        with pytest.raises(AuditRejected):
+            parse({**load("valid/content-view-requested.json"), "actor_roles": roles})
+
+
+json_values = st.recursive(
+    st.none() | st.booleans() | st.integers(-(2**70), 2**70) | st.floats() | st.text(max_size=20),
+    lambda children: st.lists(children, max_size=3) | st.dictionaries(st.text(max_size=8), children, max_size=3),
+    max_leaves=6,
+)
+
+
+@settings(max_examples=300, suppress_health_check=[HealthCheck.too_slow])
+@given(
+    field=st.sampled_from(sorted({*KNOWN_FIELDS, "extra"})),
+    value=json_values,
+    example=st.sampled_from(VALID),
+    drop=st.sets(st.sampled_from(sorted(KNOWN_FIELDS)), max_size=3),
+)
+def test_arbitrary_json_in_any_field_never_escapes_as_anything_but_a_rejection(
+    field: str, value: Any, example: str, drop: set[str]
+) -> None:
+    record = {k: v for k, v in load(example).items() if k not in drop}
+    record[field] = value
+    try:
+        row = parse(orjson_safe(record))
+    except AuditRejected:
+        return
+    assert len(row.values) == len(COLUMNS)
+
+
+@settings(max_examples=200, suppress_health_check=[HealthCheck.too_slow])
+@given(blob=st.binary(max_size=300) | json_values.map(lambda v: json.dumps(v, allow_nan=True).encode()))
+def test_arbitrary_bytes_and_json_documents_are_rejected_or_parsed_never_raised(blob: bytes) -> None:
+    with contextlib.suppress(AuditRejected):
+        parse_audit_record(blob, env="prod", partition=0, offset=0)
+
+
+def orjson_safe(record: dict[str, Any]) -> bytes:
+    """Serialise with the stdlib (NaN and huge ints are legal inputs for the property, orjson refuses them)."""
+    return json.dumps(record, allow_nan=True).encode()
+
+
+# ---- differential: the hand validator and the contract's schema agree --------------------------------------
+
+SCHEMA = json.loads((EXAMPLES.parent / "audit-event.schema.json").read_text())
+LENIENT = {k: v for k, v in SCHEMA.items() if k != "additionalProperties"}  # README 4: unknown fields are dropped
+VALIDATOR = Draft202012Validator(LENIENT, format_checker=None)
+
+#: Per field: values that mix the valid and the invalid, drawn from what a producer bug could plausibly emit.
+POOL: dict[str, list[Any]] = {
+    "v": [0, 0.0, "0", True, None],
+    "audit_id": ["0192f3f0-0005-7abc-8def-0123456789ab", "0192f3f0-0005-4abc-8def-0123456789ab", "x", 1, None, []],
+    "ts": ["2026-10-06T09:34:10.000Z", "2026-10-06T09:34:10Z", "2026-10-06T09:34:10.000+00:00", "", 5, None, {}],
+    "environment": ["prod", "PROD", "", 5, None],
+    "action": [
+        "message.content.view",
+        "message.reprocess",
+        "channel.replay",
+        "channel.version.create",
+        "deployment.deploy",
+        "deployment.rollback",
+        "deployment.undeploy",
+        "other",
+        "",
+        5,
+        None,
+        [],
+        {},
+    ],
+    "phase": ["requested", "completed", "failed", "done", 5, None, []],
+    "actor": ["synth-operator-0002", "idp|1234", "has space", "", "a" * 256, 5, None, []],
+    "actor_roles": [["operator"], ["admin", "viewer"], [], ["operator", "operator"], ["root"], "operator", None, [[]]],
+    "request_id": ["0192f3f0-0000-7abc-8def-0123456789ab", "x", 5, None],
+    "operation_id": ["0192f3d2-5555-7abc-8def-0123456789ab", "0192f3d2-5555-4abc-8def-0123456789ab", "x", None],
+    "channel": ["adt-fanout", "Bad", "", 5, None],
+    "message_id": ["0192f3b0-1a2b-7c3d-8e4f-0123456789ab", "x", 5, None],
+    "stage": ["received", "routed", "dlq", "transformed", 5, None, []],
+    "destination": ["fhir-store", "Bad", 5, None],
+    "deployment_id": ["0192f3b0-1a2b-7c3d-8e4f-0123456789ab", "x", None],
+    "version": [1, 7, 0, -1, 2**31, 1.0, 1.5, "1", True, None],
+    "previous_version": [1, 0, True, None],
+    "allow_reorder": [True, False, 1, "true", None],
+    "target_topic": ["prod.adt-fanout.raw", "prod.adt-fanout.out.x", "x", None],
+    "range_start": ["2026-10-06T06:00:00.000Z", "2026-10-06T06:00:00Z", None],
+    "range_end": ["2026-10-06T07:00:00.000Z", "x", None],
+    "count": [0, 5, -1, 1.0, 2.5, True, "5", None],
+    "error_code": ["NO_PAYLOAD_COORDINATES", "lower", "", 5, None],
+}
+
+
+@settings(max_examples=600, suppress_health_check=[HealthCheck.too_slow])
+@given(
+    example=st.sampled_from(VALID),
+    picks=st.dictionaries(st.sampled_from(sorted(POOL)), st.integers(0, 20), max_size=4),
+    drop=st.sets(st.sampled_from(sorted(POOL)), max_size=3),
+    unknown=st.booleans(),
+)
+def test_the_hand_validator_agrees_with_the_contracts_schema(
+    example: str, picks: dict[str, int], drop: set[str], unknown: bool
+) -> None:
+    record = {k: v for k, v in load(example).items() if k not in drop}
+    for field, pick in picks.items():
+        record[field] = POOL[field][pick % len(POOL[field])]
+    if unknown:
+        record["future_field"] = {"nested": ["SYNTH"]}
+    schema_ok = VALIDATOR.is_valid(record)
+    try:
+        parse(orjson_safe(record))
+        mine_ok = True
+    except AuditRejected:
+        mine_ok = False
+    assert mine_ok == schema_ok, "the hand validator and audit-event.schema.json disagree"
+
+
+def test_a_missing_required_or_conditional_field_is_a_rejection_by_code() -> None:
+    record = load("valid/content-view-requested.json")
+    for name in ("audit_id", "ts", "actor", "message_id", "stage"):
+        with pytest.raises(AuditRejected) as raised:
+            parse({k: v for k, v in record.items() if k != name})
+        assert raised.value.code == "AUDIT_FIELD_MISSING"
+
+
+# ---- the loop around the parser ------------------------------------------------------------------------------
+
+
+def lines(stream: io.StringIO, event_name: str) -> list[dict[str, Any]]:
+    return [json.loads(x) for x in stream.getvalue().splitlines() if f'"{event_name}"' in x]
+
+
+def build_logged(consumer: Any, sink: Any, audit: Any, stream: io.StringIO, parser: Any = None) -> Archiver:
+    archiver = build(consumer, sink, audit)
+    archiver._log = JsonLogger("archiver-test", stream=stream)  # type: ignore[attr-defined]
+    if parser is not None:
+        archiver._parse = parser  # type: ignore[attr-defined]
+    return archiver
+
+
+def test_unknown_fields_are_logged_by_count_and_offset_never_by_name_or_value() -> None:
+    record = {**load("valid/content-view-requested.json"), "payload": "SYNTH-PAYLOAD-VALUE"}
+    consumer = FakeConsumer([[Topic("_tb.prod.audit", 4, orjson.dumps(record))]])
+    stream = io.StringIO()
+    archiver = build_logged(consumer, FakeSink(), audit := FakeSink(), stream)
+    archiver.run_once()
+    (entry,) = lines(stream, "audit_unknown_fields_ignored")
+    assert (entry["count"], entry["offset"], entry["topic"]) == (1, 4, "_tb.prod.audit")
+    assert "payload" not in json.dumps(entry) and "SYNTH-PAYLOAD-VALUE" not in stream.getvalue()
+    assert len(audit.inserted) == 1 and "SYNTH-PAYLOAD-VALUE" not in repr(audit.inserted)
+
+
+def test_a_version_above_zero_is_counted_apart_logged_by_offset_and_committed_past() -> None:
+    v1 = {**load("valid/content-view-requested.json"), "v": 1}
+    consumer = FakeConsumer([[Topic("_tb.prod.audit", 0, orjson.dumps(v1)), audit_msg(1)]])
+    stream = io.StringIO()
+    archiver = build_logged(consumer, FakeSink(), audit := FakeSink(), stream)
+    archiver.run_once()
+    assert archiver.metrics.audit_unsupported_version == 1 and archiver.metrics.audit_rejected == 0
+    assert archiver.metrics.events_rejected == 0 and len(audit.inserted) == 1
+    (entry,) = lines(stream, "event_rejected")
+    assert (entry["code"], entry["offset"]) == ("AUDIT_VERSION_UNSUPPORTED", 0)
+    assert consumer.commits[-1] == [(0, 2)], "committed past the record"
+
+
+def test_a_parser_bug_is_one_skipped_record_not_a_dead_loop() -> None:
+    def broken(message: Any) -> Any:
+        if message.offset() == 0:
+            raise TypeError("unhashable type: 'list'")  # what the H1 bug looked like
+        return parse_audit_record(message.value(), env="prod", partition=0, offset=message.offset())
+
+    consumer = FakeConsumer([[audit_msg(0), audit_msg(1)]])
+    stream = io.StringIO()
+    archiver = build_logged(consumer, FakeSink(), audit := FakeSink(), stream, parser=broken)
+    archiver.run_once()
+    assert len(audit.inserted) == 1 and consumer.commits[-1] == [(0, 2)]
+    (entry,) = lines(stream, "event_rejected")
+    assert entry["code"] == "RECORD_UNPARSEABLE" and entry["offset"] == 0 and "unhashable" not in stream.getvalue()
+
+
+def test_the_topic_routing_parser_handles_a_mixed_batch_and_turns_any_audit_crash_into_a_rejection() -> None:
+    parse_record = build_record_parser("prod")
+    event_row = parse_record(Topic("_tb.prod.events", 0, orjson.dumps(base())))
+    audit_row = parse_record(audit_msg(1))
+    assert getattr(event_row, "table", "events") != "audit_log" and audit_row.table == "audit_log"  # type: ignore[attr-defined]
+    with pytest.raises(AuditRejected):
+        parse_record(Topic("_tb.prod.audit", 2, b"{broken"))
+    with pytest.raises(EventRejected) as event_error:
+        parse_record(Topic("_tb.prod.events", 3, b"{broken"))
+    assert not isinstance(event_error.value, AuditRejected), "an event rejection stays an event rejection"
+    # An audit record on the events topic is just a (bad) event; an event on the audit topic is a bad audit record.
+    with pytest.raises(AuditRejected):
+        parse_record(Topic("_tb.prod.audit", 4, orjson.dumps(base())))
+
+
+def test_the_audit_flag_restricts_the_subscription_to_events() -> None:
+    from tributary.archiver.config import load_config
+
+    class Resolver:
+        def resolve_text(self, ref: str, key: str) -> str:
+            return "x"
+
+    environ = {"TB_ARCHIVE_CLICKHOUSE_HOST": "ch.internal", "TB_ARCHIVE_CLICKHOUSE_SECRET_REF": "ch-creds"}
+    assert subscription_topics(load_config("prod", environ, Resolver())) == ["_tb.prod.events", "_tb.prod.audit"]  # type: ignore[arg-type]
+    off = load_config("prod", {**environ, "TB_ARCHIVE_AUDIT_CONSUME": "false"}, Resolver())  # type: ignore[arg-type]
+    assert subscription_topics(off) == ["_tb.prod.events"]
+
+
+def test_an_unknown_or_unauthorised_audit_topic_logs_once_a_minute_not_at_every_refresh(monkeypatch: Any) -> None:
+    import tributary.archiver.archiver as module
+
+    clock = [1000.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    messages = [FakeMessage(i, None, error=_NamedError(-190, "UNKNOWN_TOPIC_OR_PART")) for i in range(5)]
+    consumer = FakeConsumer([messages])
+    stream = io.StringIO()
+    archiver = build_logged(consumer, FakeSink(), FakeSink(), stream)
+    archiver.run_once()
+    assert len(lines(stream, "kafka_error")) == 1, "five repeats inside a minute: one line"
+    clock[0] += 61.0
+    consumer.batches.append([FakeMessage(9, None, error=_NamedError(-190, "UNKNOWN_TOPIC_OR_PART"))])
+    archiver.run_once()
+    again = lines(stream, "kafka_error")
+    assert len(again) == 2 and again[1]["suppressed"] == 4
+    consumer.batches.append([FakeMessage(10, None, error=_NamedError(29, "TOPIC_AUTHORIZATION_FAILED"))])
+    archiver.run_once()
+    assert len(lines(stream, "kafka_error")) == 3, "each code has its own interval"
+
+
+class _NamedError(FakeKafkaError):
+    def __init__(self, code: int, name: str) -> None:
+        super().__init__(code)
+        self._name = name
+
+    def name(self) -> str:
+        return self._name
+
+
+def test_a_permanent_audit_failure_names_its_table_and_halts_events_too() -> None:
+    consumer = FakeConsumer([[Topic("_tb.prod.events", 0, orjson.dumps(base())), audit_msg(1)]])
+    stream = io.StringIO()
+    archiver = build_logged(consumer, sink := FakeSink(), FakeSink(fail_times=3, transient=False), stream)
+    archiver.run_once()
+    (halted,) = lines(stream, "insert_halted")
+    assert halted["table"] == "audit_log"
+    assert len(sink.inserted) == 1 and len(consumer.commits) == 1, "committed once, after the audit insert recovered"
+    assert sorted(consumer.commits[0]) == [(0, 1), (0, 2)], "both topics' offsets in the one commit"
+
+
+def test_a_permanent_events_failure_names_the_events_table() -> None:
+    consumer = FakeConsumer([[Topic("_tb.prod.events", 0, orjson.dumps(base())), audit_msg(1)]])
+    stream = io.StringIO()
+    archiver = build_logged(consumer, FakeSink(fail_times=2, transient=False), audit := FakeSink(), stream)
+    archiver.run_once()
+    assert lines(stream, "insert_halted")[0]["table"] == "events" and len(audit.inserted) == 1

@@ -34,6 +34,10 @@ class ArchiverMetrics:
     kafka_lag_messages: int = 0
     last_insert_ms: float = 0.0
     commits_ok: int = 0
+    #: Audit records with `v` other than 0 (`audit/v0` README 4): alert above 0. Not in `observability/v0` yet.
+    audit_unsupported_version: int = 0
+    #: Audit records not stored for any other reason (`AuditRejected`): alert on any increase.
+    audit_rejected: int = 0
     attrs_dropped_hmac: int = 0
     #: Called with the seconds one successful insert batch took (the ops histogram); None when no listener.
     observe_insert: Callable[[float], None] | None = None
@@ -51,6 +55,8 @@ class ArchiverMetrics:
             "attrs_dropped": self.attrs_dropped,
             "fields_blanked": self.fields_blanked,
             "commit_failures": self.commit_failures,
+            "audit_unsupported_version": self.audit_unsupported_version,
+            "audit_rejected": self.audit_rejected,
             "ingest_lag_ms": round(self.ingest_lag_ms, 1),
             "kafka_lag_messages": self.kafka_lag_messages,
             "last_insert_ms": round(self.last_insert_ms, 1),

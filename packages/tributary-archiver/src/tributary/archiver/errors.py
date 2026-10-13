@@ -30,6 +30,19 @@ class EventRejected(ArchiverError):
         self.code = code
 
 
+class AuditRejected(EventRejected):
+    """An audit record the archiver will not store (`audit_record.py`). Counted as `audit_rejected`, apart from
+    ordinary event rejections, because a lost audit record is an incident, not noise."""
+
+
+class UnsupportedVersion(AuditRejected):
+    """An audit record whose `v` is not 0 (`audit/v0` README 4). Not stored, counted as `unsupported_version`
+    (not as an ordinary rejection), logged by offset only, committed past."""
+
+    def __init__(self) -> None:
+        super().__init__("AUDIT_VERSION_UNSUPPORTED")
+
+
 class SinkError(ArchiverError):
     """ClickHouse did not take a batch. The batch is not committed and is retried (idempotent).
 

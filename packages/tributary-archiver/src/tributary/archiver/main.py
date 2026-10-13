@@ -17,6 +17,7 @@ import argparse
 import os
 import signal
 import sys
+from collections.abc import Callable
 from typing import Any, cast
 
 from tributary.runtime import DirSecretResolver, RuntimeConfigurationError, load_engine_kafka_or_exit
@@ -43,6 +44,7 @@ from .errors import (
     ArchiverGrantsExcessive,
     ArchiverSettingsUnsafe,
     AuditLogEngineInvalid,
+    AuditRejected,
     RetentionChanged,
     RetentionDecreaseRefused,
     SinkError,
@@ -56,6 +58,33 @@ from .sink import ClickhouseSink, connect
 
 #: `/livez` fails when the loop has made no progress for this long (a consume, or a backoff slice).
 LIVENESS_STALE_S = 60.0
+
+
+def subscription_topics(config: ArchiverConfig) -> list[str]:
+    """`_tb.<env>.events`, plus `_tb.<env>.audit` unless `TB_ARCHIVE_AUDIT_CONSUME=false`."""
+    topics = [events_topic(config.env)]
+    if config.audit_consume:
+        topics.append(platform_topic(config.env, "audit"))
+    return topics
+
+
+def build_record_parser(env: str) -> Callable[[Any], RowLike]:
+    """Events and audit records share one consumer (one group, one commit); the topic picks the parser."""
+    audit = platform_topic(env, "audit")
+
+    def parse_record(message: Any) -> RowLike:
+        if message.topic() == audit:
+            try:
+                return parse_audit_record(
+                    message.value(), env=env, partition=message.partition(), offset=message.offset()
+                )
+            except AuditRejected:
+                raise
+            except Exception:  # whatever the record held, it is an audit rejection, counted as one
+                raise AuditRejected("RECORD_UNPARSEABLE") from None
+        return parse_event_record(message)
+
+    return parse_record
 
 
 def extra_tables(config: ArchiverConfig) -> tuple[TableSpec, ...]:
@@ -190,18 +219,10 @@ def main() -> None:
     from confluent_kafka import Consumer
 
     consumer = Consumer(consumer_config(kafka, defaults, group_id=config.group_id, group_instance_id=instance))
-    events, audit = events_topic(config.env), platform_topic(config.env, "audit")
-    consumer.subscribe([events, audit] if config.audit_consume else [events])
+    consumer.subscribe(subscription_topics(config))
     sink = ClickhouseSink(client)
     audit_sink = ClickhouseSink(client, table=AUDIT_TABLE, columns=AUDIT_COLUMNS)
-
-    def parse_record(message: Any) -> RowLike:
-        """Events and audit records share one consumer (one group, one commit); the topic picks the parser."""
-        if message.topic() == audit:
-            return parse_audit_record(
-                message.value(), env=config.env, partition=message.partition(), offset=message.offset()
-            )
-        return parse_event_record(message)
+    parse_record = build_record_parser(config.env)
 
     archiver = Archiver(
         cast("ConsumerLike", consumer),
