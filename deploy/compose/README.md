@@ -167,8 +167,10 @@ variable defaulting to a warning is not.
   read-only), not a copy baked into the image, so a contract change or the scheduled Linux
   re-measurement of `session.timeout.ms`/partition defaults reaches this stack without a rebuild —
   see the file's own `must_not_hardcode` block and `topic-bootstrap/bootstrap_topics.py`'s docstring.
-  `_tb.<env>.audit` and `<channel>.reply` are deliberately never created here; both reasons are in
-  that docstring. `worker`, `mllp-receiver` and `loader` mount the same file (via `TB_CONTRACTS_DIR`)
+  `_tb.<env>.audit` IS created (a 30 d buffer, ADR-004 R7; settings from `classes.audit`), so an events
+  archiver added to this stack, which consumes it by default (`TB_ARCHIVE_AUDIT_CONSUME`), finds it.
+  Compose has no archiver or API service today. `<channel>.reply` is deliberately never created here
+  (the demo channel is not sync-reply); the reason is in that docstring. `worker`, `mllp-receiver` and `loader` mount the same file (via `TB_CONTRACTS_DIR`)
   for the same reason: `tributary-runtime`'s producer/consumer settings and
   `tributary-receivers`' Kafka producer config both read it rather than hardcode it.
 - **`channel-publish`'s record shape is a contract with `ChannelCache`, not just an implementation
