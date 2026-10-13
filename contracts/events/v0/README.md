@@ -79,6 +79,11 @@ events; that made `message_id` meaninglessly non-null.
 **Emitter of `received` and `queued` (set 1.8, 2026-10-13):** the pipeline worker, when it consumes the
 `raw` record, carrying that record's `topic`, `partition` and `offset`. Receivers hold no WRITE on
 `_tb.<env>.events` (`topics/v0` 3.4.1), and no extra produce sits on the ACK path (invariants 1 and 9).
+**`ts` of `received` (ruled 2026-10-13):** the consumed record's `tb-received-at`, the receiver's
+commit time, rendered in UTC with milliseconds. Exception: a record carrying `tb-parent-id` is a
+reprocess or replay re-injection, and on `raw` it carries the original's `tb-received-at`
+(`envelope/v0` 6 rule 5), so its `received` event uses the worker's consume time. `queued` uses the
+consume time.
 
 `kind=partition`: `partition_paused`, `partition_resumed`, `partition_halted`.
 

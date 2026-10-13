@@ -3,6 +3,14 @@
 Newest first. Each entry names the contract, the version, whether the change is additive or
 breaking, and the reason. Breaking changes reference an ADR.
 
+## 2026-10-13 (exit review) — set 1.8: `ts` of the `received` event (README only)
+
+- **`events/v0` 2.1:** `received.ts` = `tb-received-at` of the consumed record; for a re-injected
+  record (`tb-parent-id` present), the worker's consume time instead; `queued` = consume time. Reason:
+  the stage records when the receiver committed the message, not when the worker reached it, and the
+  copied `tb-received-at` of a re-injection would date a new message's first event in the past.
+  Counts unchanged. Build: `platform-engineer`.
+
 ## 2026-10-13 (latest) — set 1.8: emitter of `received` and `queued` (README only)
 
 **Documentation only; no schema or example change, counts unchanged.**

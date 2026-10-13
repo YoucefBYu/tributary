@@ -327,6 +327,36 @@ Verbatim from `phase-1.md`, with the reading this wave is gated on.
 | 3 | Deploy and rollback of a channel version works through the API and CLI | W3-4b, W3-5, W3-7: deploy v2, observe the worker on v2 with no restart, roll back, observe v1. Once through the API and once through the CLI |
 | 4 | `security-reviewer` clean on authn, audit and PHI handling of the API | No unresolved Critical or High. The audit retention answer arrived on 2026-10-06 (2.7 D3). The reviewer closes audit against W3-30 (2) and W3-32 |
 
+### 4.1 Exit review at `wave/1-3` `f52644f` (architect, 2026-10-13; CI green per the coordinator)
+
+The architect read the tree; nothing was run. Commit ids and CI state are coordinator-relayed.
+
+| # | State | Evidence | Missing |
+|---|---|---|---|
+| 1 | **PARTIAL** | `tests/e2e/test_archive_search_reprocess_replay_e2e.py` (4 passed twice, `docs/spikes/wave-3-archive-search-replay.md`). Real ClickHouse; search, detail (`transformed`, `routed`), `received` content by SHA-256, audit record on the topic, reprocess, replay | The criterion's reading is "every stage's content and each destination's status, responses validated against `openapi/v0`". The test asserts neither `destinations[]` states nor `routed` content per destination, and validates no response against `openapi.json` components (`qa-engineer`, W3-9b). Re-run with the worker's new `received` event in the timeline |
+| 2 | **MET** (lead's one-sided rule) | `docs/spikes/wave-3-outage-control-plane.md`, `ec7a3ec` | none (STATUS caveat on set 3's outlier control minimum) |
+| 3 | **PARTIAL** | API: `test_hot_reload_integration.py` (v1 to v2 on a running worker, same PID, through the reconciler). CLI: `test_smoke_integration.py` (deploy and rollback reach `published`) | Rollback is never observed on a worker, and the CLI path is never observed on a worker. Needed: one integration test, API and CLI variants, of deploy v2, worker applies 2 with the same PID, then rollback, worker applies 1 with the same PID (`control-plane-engineer`) |
+| 4 | **NOT MET** | W3-32 audit producer, W3-37a TLS listener and pin, and W3-6 are in the tree | The `security-reviewer` pass on API authn, audit and PHI. Audit closes against W3-30 (2), which has no `audit_log` writer yet |
+
+**Open tasks.**
+
+| Task | Owner | Blocks |
+|---|---|---|
+| W3-30 (2): the events archiver consumes `_tb.<env>.audit` into `audit_log` (plain `MergeTree`, R7 rev 3) | `archive-engineer` | Criterion 4 |
+| `queued` emission by the worker (`events/v0` 2.1; `received` is in) | `platform-engineer` | none (completeness) |
+| Criterion 1 test gaps (above) | `qa-engineer` | Criterion 1 |
+| Rollback-on-worker test, API and CLI (above) | `control-plane-engineer` | Criterion 3 |
+| `security-reviewer` pass on the API, including W3-37a/b | `security-reviewer` | Criterion 4 |
+| `received` `ts` rule (`events/v0` 2.1, ruled 2026-10-13) | `platform-engineer` | none |
+| Reprocessor grants under deny-by-default (only `lag_reader` and `api` are verified) | `qa-engineer` | none (W3-29 verify) |
+| K2 / H7 role-model sign-off (ADR-004 section 5) | **human** | Not a wave 3 criterion; recorded as open |
+
+The following were found done in the tree: `AuditEvent.error_code` and the widened `ACTOR`; the
+archive SQL moved into the query library (`channel_stats`, `read_content`); the
+`archive_settings` content flag; `PRODUCE_TIMEOUT` distinct from `PRODUCE_FAILED`; no `kafka-0`
+default. Gate-tracked items (W3-13 image check, `partition_halted` alert firing) were **not
+re-checked** in this review.
+
 **Also gate-tracked (not phase-1 criteria):** no image published before W3-13 is green;
 `tb_partitions_halted` exported and the `partition_halted` alert shown firing on a forced halt (2.5 H1,
 added 2026-10-06); ADR-004
