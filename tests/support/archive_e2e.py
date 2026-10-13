@@ -34,7 +34,13 @@ from tests.support.channel_spec import ordered_document
 from tests.support.control_plane_stack import ClickHouse, TlsPostgres
 from tests.support.engine_kafka import engine_kafka_env
 from tests.support.kafka_helpers import free_port
-from tests.support.processes import ManagedProcess, spawn_mllp_receiver_from_topic, spawn_pipeline_worker
+from tests.support.openapi_contract import CheckedClient
+from tests.support.processes import (
+    ManagedProcess,
+    spawn_http_loader,
+    spawn_mllp_receiver_from_topic,
+    spawn_pipeline_worker,
+)
 
 DATABASE = "test"
 AUDIENCE = "tb-api"
@@ -249,13 +255,17 @@ class ArchiveStack:
     def base(self) -> str:
         return f"http://127.0.0.1:{self.api_port}"
 
-    def client(self, role: str = "tb-admin") -> httpx.Client:
-        return httpx.Client(base_url=self.base, headers=self.tokens.bearer(role), timeout=60)
+    def client(self, role: str = "tb-admin", *, checked: bool = True) -> CheckedClient:
+        """A client whose every response is validated against `openapi.json` (declared status, content type and
+        schema) unless `checked=False` (the benchmark, which must not time the validation)."""
+        return CheckedClient(
+            httpx.Client(base_url=self.base, headers=self.tokens.bearer(role), timeout=60), validate=checked
+        )
 
-    def deploy_channel(self) -> None:
+    def deploy_channel(self, http_url: str = "http://127.0.0.1:18080/never-dialled") -> None:
         document = ordered_document(
             mllp_port=free_port(),
-            http_url="http://127.0.0.1:18080/never-dialled",
+            http_url=http_url,
             channel=self.channel,
             destination="stub",
         )
@@ -315,12 +325,28 @@ class ArchiveStack:
             self.procs["content_archiver"] = content
             content.wait_for_event("content_archiver_started", timeout_s=90)
 
-    def start_all(self) -> None:
+    def start_loader(self) -> None:
+        self.procs["loader"] = spawn_http_loader(
+            channel=self.channel,
+            destination="stub",
+            env=self.env,
+            bootstrap=self.kafka,
+            instance_id=f"{self.run}-ld",
+            timeout_s=60,
+        )
+
+    def start_all(self, *, http_url: str | None = None) -> None:
+        """`http_url` set: the destination is a real stub and a real HTTP loader delivers to it (stage `sent`)."""
         self.start_stores()
         self.start_api()
-        self.deploy_channel()
+        if http_url is None:
+            self.deploy_channel()
+        else:
+            self.deploy_channel(http_url)
         self.start_archivers()
         self.start_pipeline()
+        if http_url is not None:
+            self.start_loader()
 
     def teardown(self) -> None:
         for proc in self.procs.values():

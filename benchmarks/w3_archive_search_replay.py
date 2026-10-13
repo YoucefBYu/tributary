@@ -112,7 +112,7 @@ def bench_search(stack: ArchiveStack, rows: int, requests: int) -> dict[str, Any
         },
     }
     out: dict[str, Any] = {}
-    with stack.client() as http:
+    with stack.client(checked=False) as http:
         for name, body in cases.items():
             samples: list[float] = []
             returned = 0
@@ -166,7 +166,7 @@ def bench_replay(stack: ArchiveStack, kafka: str, count: int) -> dict[str, Any]:
     assert producer.flush(120) == 0
     end = datetime.now(UTC) + timedelta(milliseconds=50)
     replay_id = uuid7()
-    with stack.client() as http:
+    with stack.client(checked=False) as http:
         began = time.perf_counter()
         started = http.post(
             f"{BASE}/replays",

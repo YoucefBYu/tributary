@@ -16,7 +16,10 @@ Both roles were marked UNVERIFIED in the contract until this test.
   reconciler group id, no commit) returns the seeded spec, an idempotent `acks=all` publish to `channels` and to
   `audit` is delivered, and the authorizer log has no denial for the principal so far. Negative: READ on `audit`
   and READ and WRITE on an `out` topic are refused and logged.
-* `reprocessor`: the archiver's deny-by-default test
+* `reprocessor` (the Kafka principal behind reprocess and replay): reads and publishes only on its own channel's `raw`
+  (assign, DESCRIBE on its LITERAL group); every other read and write, group membership and commits are refused, and a
+  widened principal passes the same probes (control).
+* `reprocessor`, library side: the archiver's deny-by-default test
   (`packages/tributary-archiver/tests/test_integration_reprocessor_acls.py`) runs reprocess and replay under a hand
   written grant set; `test_reprocessor_contract_grants_are_the_set_the_archiver_test_runs_under` pins that the
   contract parses to exactly that set, so the archiver test is a test of the contract's role.
@@ -32,12 +35,12 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from confluent_kafka import Consumer, KafkaError, Producer, TopicPartition
+from confluent_kafka import Consumer, KafkaError, KafkaException, Producer, TopicPartition
 from confluent_kafka.admin import AdminClient, NewTopic
 from tributary.runtime.clients import consumer_config, producer_config
 from tributary.runtime.config import load_topic_defaults
 from tributary.runtime.engine_kafka import load_engine_kafka
-from tributary.runtime.topics import channels_topic, events_topic, out_topic, platform_topic, raw_topic
+from tributary.runtime.topics import channels_topic, dlq_topic, events_topic, out_topic, platform_topic, raw_topic
 
 from tests.support.secure_broker import Grant, SecureBroker, contract_grants, secure_broker
 
@@ -53,6 +56,10 @@ RAW = raw_topic(ENV, CHANNEL)
 OUT = out_topic(ENV, CHANNEL, DESTINATION)
 OUT_WRITE = out_topic(ENV, CHANNEL, "stub-w")  # a topic only the WRITE negative touches (no earlier denial on it)
 SENTINEL = "tb-plat-sentinel"
+DLQ = dlq_topic(ENV, CHANNEL)
+OTHER_RAW = raw_topic(ENV, "other-adt")  # another channel's raw: not the reprocessor's to touch
+EVENTS = events_topic(ENV)
+REPROCESSOR_GROUP = f"tb.{ENV}.reprocessor"
 CHANNELS = channels_topic(ENV)
 AUDIT = platform_topic(ENV, "audit")
 WORKER_GROUP = f"tb.{ENV}.{CHANNEL}.worker"
@@ -70,6 +77,8 @@ def broker(tmp_path_factory: pytest.TempPathFactory) -> Iterator[SecureBroker]:
                 NewTopic(RAW, 1, 1),
                 NewTopic(OUT, 1, 1),
                 NewTopic(OUT_WRITE, 1, 1),
+                NewTopic(DLQ, 1, 1),
+                NewTopic(OTHER_RAW, 1, 1),
             ]
         )
         seed = Producer({"bootstrap.servers": running.admin, "acks": "all"})
@@ -77,6 +86,8 @@ def broker(tmp_path_factory: pytest.TempPathFactory) -> Iterator[SecureBroker]:
             seed.produce(RAW, key=b"SYNTH-K", value=f"synthetic-{index}".encode())
         seed.produce(CHANNELS, key=CHANNEL.encode(), value=b'{"synthetic": "spec"}')
         seed.produce(AUDIT, key=b"SYNTH-A", value=b"synthetic-audit")
+        for topic in (OUT, DLQ, EVENTS, OTHER_RAW):  # one record each, so a read that is allowed returns something
+            seed.produce(topic, key=b"SYNTH-K", value=b"synthetic")
         assert seed.flush(30) == 0
         # A worker group with a committed offset, written by the set-up super user.
         reader = Consumer(
@@ -330,6 +341,108 @@ def test_controls_each_over_wide_grant_is_seen_by_the_same_probes(
         finally:
             reader.close()
     _assert_no_denials(broker, tmp_path, sentinel, api, "the widened api principal was denied something")
+
+
+def _no_record_arrives(consumer: Consumer, topic: str, *, polls: int = 5) -> bool:
+    consumer.assign([TopicPartition(topic, 0, 0)])
+    return not any(m is not None and m.error() is None for m in (consumer.poll(1.0) for _ in range(polls)))
+
+
+def test_reprocessor_does_exactly_what_it_is_granted_and_nothing_else(
+    broker: SecureBroker, tmp_path: Path, sentinel: str
+) -> None:
+    """Replay and reprocess fetch from the channel's `raw` (assign, never join or commit) and publish back to it, and
+    that is all: no read of any other topic, no write anywhere else, no group membership."""
+    principal = "tb-plat-reprocessor"
+    grants = contract_grants("reprocessor", env=ENV, channel=CHANNEL)
+    broker.provision(principal, grants)
+
+    # Positive: what the library does. Assign-read of raw under the reprocessor group id (DESCRIBE on the group only),
+    # watermarks and offsetsForTimes (DESCRIBE on the topic), an idempotent acks=all publish to raw.
+    reader = _consumer(broker, tmp_path, principal, REPROCESSOR_GROUP)
+    try:
+        reader.assign([TopicPartition(RAW, 0, 0)])
+        records = []
+        deadline = time.monotonic() + 30
+        while len(records) < SEEDED and time.monotonic() < deadline:
+            message = reader.poll(1.0)
+            if message is not None and message.error() is None:
+                records.append(message)
+        assert len(records) >= SEEDED, f"read {len(records)} of {SEEDED} records from raw"
+        low, high = reader.get_watermark_offsets(TopicPartition(RAW, 0), timeout=30, cached=False)
+        assert low == 0 and high >= SEEDED
+        times = reader.offsets_for_times([TopicPartition(RAW, 0, 0)], timeout=30)
+        assert times[0].error is None
+    finally:
+        reader.close()
+    producer = _producer(broker, tmp_path, principal)
+    assert _produce_outcome(producer, RAW) is None
+    _assert_no_denials(broker, tmp_path, sentinel, principal, "the reprocessor needed a grant the contract withholds")
+
+    # Negative: no read of any other topic (out, dlq, events, channels, audit, another channel's raw).
+    for topic in (OUT, DLQ, EVENTS, CHANNELS, AUDIT, OTHER_RAW):
+        probe = _consumer(broker, tmp_path, principal, REPROCESSOR_GROUP)
+        try:
+            assert _no_record_arrives(probe, topic), f"the reprocessor read a record from {topic}"
+        finally:
+            probe.close()
+        assert _denied_any(broker, principal, ("DESCRIBE", "READ"), f"Topic:LITERAL:{topic}"), f"no denial for {topic}"
+
+    # Negative: no write anywhere but the channel's raw. The delivery error is the broker's authorization refusal.
+    for topic in (OUT, DLQ, EVENTS, CHANNELS, AUDIT, OTHER_RAW):
+        refused = _produce_outcome(producer, topic)
+        assert refused is not None and refused.code() == AUTH, (
+            f"WRITE {topic}: expected authorization failure, got {refused}"
+        )
+        assert _denied_any(broker, principal, ("DESCRIBE", "WRITE"), f"Topic:LITERAL:{topic}")
+
+    # Negative: DESCRIBE on its group is not membership. It cannot commit, and cannot join (subscribe).
+    committer = _consumer(broker, tmp_path, principal, REPROCESSOR_GROUP)
+    try:
+        committer.assign([TopicPartition(RAW, 0, 0)])
+        with pytest.raises(KafkaException) as refused_commit:
+            committer.commit(offsets=[TopicPartition(RAW, 0, 1)], asynchronous=False)
+        assert refused_commit.value.args[0].code() == KafkaError.GROUP_AUTHORIZATION_FAILED
+    finally:
+        committer.close()
+    joiner = _consumer(broker, tmp_path, principal, REPROCESSOR_GROUP)
+    try:
+        joiner.subscribe([RAW])
+        errors = [m.error().code() for m in (joiner.poll(1.0) for _ in range(10)) if m is not None and m.error()]
+        assert KafkaError.GROUP_AUTHORIZATION_FAILED in errors, f"joining the group was not refused: {errors}"
+    finally:
+        joiner.close()
+    assert _denied(broker, principal, "READ", f"Group:LITERAL:{REPROCESSOR_GROUP}")
+
+
+def test_controls_a_wider_reprocessor_is_seen_by_the_same_probes(
+    broker: SecureBroker, tmp_path: Path, sentinel: str
+) -> None:
+    """One extra READ (out), one extra WRITE (dlq) and group READ: the reads, writes and commit that the test above
+    expects to be refused now succeed, and the widened principal records no denial."""
+    principal = "tb-plat-reprocessor-wide"
+    broker.provision(
+        principal,
+        [
+            *contract_grants("reprocessor", env=ENV, channel=CHANNEL),
+            Grant("TOPIC", OUT, "LITERAL", "READ"),
+            Grant("TOPIC", DLQ, "LITERAL", "WRITE"),
+            Grant("GROUP", REPROCESSOR_GROUP, "LITERAL", "READ"),
+        ],
+    )
+    probe = _consumer(broker, tmp_path, principal, REPROCESSOR_GROUP)
+    try:
+        assert not _no_record_arrives(probe, OUT), "READ on out should have returned the seeded record"
+    finally:
+        probe.close()
+    assert _produce_outcome(_producer(broker, tmp_path, principal), DLQ) is None, "WRITE on dlq should be accepted"
+    committer = _consumer(broker, tmp_path, principal, REPROCESSOR_GROUP)
+    try:
+        committer.assign([TopicPartition(RAW, 0, 0)])
+        committer.commit(offsets=[TopicPartition(RAW, 0, 1)], asynchronous=False)
+    finally:
+        committer.close()
+    _assert_no_denials(broker, tmp_path, sentinel, principal, "the widened reprocessor was denied something")
 
 
 # ---------------------------------------------------------------------------------------------------

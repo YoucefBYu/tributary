@@ -5,8 +5,11 @@ content are archived into ClickHouse by the real events archiver and the real co
 process then answers from that archive, authenticated with a signed bearer token:
 
 * **Search** finds the message by `tb-msg-id` (the id the receiver put on `raw`), and the message detail shows its
-  stages (`transformed`, `routed`: the receiver emits no `received` event today, so that stage exists only as stored
-  content, from `raw`).
+  stages (`received`, `transformed`, `queued`, `routed`; `sent` is never emitted today, see the strict xfail).
+* **Destinations and routed content** (criterion 1): the detail lists each destination's status and the content index; the
+  routed content of a destination is readable per destination, audited, and equals what a real HTTP loader delivered to the
+  stub destination. Every API response in this module (and every SSE `message` and `heartbeat` event) is validated against
+  `contracts/openapi/v0/openapi.json` (`tests/support/openapi_contract.py`).
 * **Content view** (content storage on for the channel) returns the stored bytes (compared by SHA-256, never by
   text) and emits a `message.content.view` audit record on `_tb.<env>.audit` that names the actor, the roles and the
   message and carries no payload bytes. Note: no process yet moves `_tb.<env>.audit` into ClickHouse `audit_log`
@@ -28,6 +31,7 @@ The tests share one stack and run in file order (reprocess and replay add record
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import json
 import os
@@ -45,6 +49,7 @@ from tributary.runtime.topics import channels_topic, dlq_topic, events_topic, ou
 from tributary.sdk.ids import uuid7
 
 from tests.support.archive_e2e import ArchiveStack, Sse, wait_until
+from tests.support.http_stub import StubHttpServer
 from tests.support.kafka_helpers import await_broker, create_topics_with_retry, drain_topic, free_port, header_map
 
 pytestmark = pytest.mark.integration
@@ -96,6 +101,18 @@ def _strings(value: object) -> Iterator[str]:
             yield from _strings(item)
 
 
+def validate_events(http: object, sse: Sse) -> None:
+    """Every `message` and `heartbeat` event the stream carried is valid against its OpenAPI schema."""
+    contract = http.contract  # type: ignore[attr-defined]
+    seen = list(sse.events)
+    assert any(e == "message" for e, _ in seen)
+    for event, data in seen:
+        if event == "message":
+            contract.check_event("MessageEvent", data)
+        elif event == "heartbeat":
+            contract.check_event("StreamHeartbeat", data)
+
+
 def control_id_of(payload: bytes) -> str:
     return payload.split(b"\r")[0].split(b"|")[9].decode()
 
@@ -106,6 +123,7 @@ class Journey:
     kafka: str
     started_at: datetime
     originals_end: datetime
+    stub: StubHttpServer
     sent: dict[str, bytes] = field(default_factory=dict)  # control id -> payload
     ids: dict[str, str] = field(default_factory=dict)  # control id -> tb-msg-id
     key_of: dict[str, str] = field(default_factory=dict)  # tb-msg-id -> key
@@ -167,8 +185,10 @@ def journey(kafka: str, tmp_path_factory: pytest.TempPathFactory) -> Iterator[Jo
         ],
     )
     stack = ArchiveStack(tmp_path_factory.mktemp("w9b"), kafka, env=ENV, channel=CHANNEL, run="w9b")
+    stub = StubHttpServer()
+    stub.start()
     try:
-        stack.start_all()
+        stack.start_all(http_url=stub.url("/ingest"))
         started_at = datetime.now(UTC) - timedelta(seconds=2)
         sent: dict[str, bytes] = {}
         key_seq: dict[str, tuple[str, int]] = {}
@@ -183,7 +203,7 @@ def journey(kafka: str, tmp_path_factory: pytest.TempPathFactory) -> Iterator[Jo
         total = len(sent)
         records = drain_topic(kafka, RAW, partitions=PARTITIONS, expected=total, timeout_s=60)
         assert len(records) == total
-        j = Journey(stack, kafka, started_at, originals_end, sent=sent)
+        j = Journey(stack, kafka, started_at, originals_end, stub=stub, sent=sent)
         for record in records:
             control = control_id_of(record.value())
             msg_id = header_map(record)["tb-msg-id"]
@@ -197,7 +217,9 @@ def journey(kafka: str, tmp_path_factory: pytest.TempPathFactory) -> Iterator[Jo
                 if page.status_code != 200:
                     return False
                 seen = {(i["message_id"], i["stage"]) for i in page.json()["items"]}
-                return all((m, s) in seen for m in j.ids.values() for s in ("transformed", "routed"))
+                return all(
+                    (m, s) in seen for m in j.ids.values() for s in ("received", "transformed", "queued", "routed")
+                )
 
             try:
                 wait_until(archived, "every message's events in the archive", timeout_s=90, every_s=1.0)
@@ -213,8 +235,18 @@ def journey(kafka: str, tmp_path_factory: pytest.TempPathFactory) -> Iterator[Jo
                     for line in proc.collect_pending()
                     if line.get("level") in ("error", "warning")
                 ]
+                loader = [
+                    (line.get("event"), line.get("code") or line.get("error"))
+                    for line in stack.procs["loader"].collect_pending()
+                ][-6:]
+                topic_stages: dict[str, int] = {}
+                for record in drain_topic(kafka, events_topic(ENV), partitions=1, timeout_s=10):
+                    with contextlib.suppress(ValueError, TypeError):
+                        stage = str(json.loads(record.value()).get("stage"))
+                        topic_stages[stage] = topic_stages.get(stage, 0) + 1
                 pytest.fail(
-                    f"archive incomplete: stages {counts!r}; search {last.status_code}; process errors {events[:8]}"
+                    f"archive incomplete: events topic {topic_stages}; loader {loader}; stub saw {len(stub.requests)}; stages {counts!r}; "
+                    f"search {last.status_code}; process errors {events[:8]}"
                 )
         assert stack.clickhouse is not None
         wait_until(
@@ -227,6 +259,7 @@ def journey(kafka: str, tmp_path_factory: pytest.TempPathFactory) -> Iterator[Jo
         yield j
     finally:
         stack.teardown()
+        stub.stop()
 
 
 def test_search_finds_every_message_by_its_tb_msg_id_and_the_detail_shows_its_stages(journey: Journey) -> None:
@@ -255,6 +288,66 @@ def test_search_finds_every_message_by_its_tb_msg_id_and_the_detail_shows_its_st
         assert http.get(f"{BASE}/messages/{uuid.uuid4()}").status_code == 404
 
 
+def test_every_destination_has_a_status_and_the_routed_content_per_destination_is_what_was_delivered(
+    journey: Journey,
+) -> None:
+    """Criterion 1: the detail carries each destination's status and the content index, and the routed content of a
+    destination is readable per destination and equals what the loader delivered to it."""
+    digest = hashlib.sha256
+    states: set[str] = set()
+    with journey.stack.client() as http:
+        for control, message_id in journey.ids.items():
+            detail = http.get(f"{BASE}/messages/{message_id}")
+            assert detail.status_code == 200
+            body = detail.json()
+            destinations = {d["destination"]: d for d in body["destinations"]}
+            assert set(destinations) == {"stub"}, f"destinations of {message_id}: {sorted(destinations)}"
+            assert destinations["stub"]["attempt"] == 0
+            states.add(destinations["stub"]["state"])
+            index = {(c["stage"], c.get("destination", "")): c for c in body["content"]}
+            assert ("received", "") in index and ("routed", "stub") in index, f"content index {sorted(index)}"
+            assert index[("routed", "stub")]["storage"] == "inline"
+            assert index[("routed", "stub")]["size_bytes"] == len(journey.sent[control])
+        print(f"DESTINATION_STATES {sorted(states)}")
+        one = next(iter(journey.ids.items()))
+        routed = http.get(f"{BASE}/messages/{one[1]}/content", params={"stage": "routed", "destination": "stub"})
+        assert routed.status_code == 200 and routed.json()["destination"] == "stub"
+        stored = base64.b64decode(routed.json()["payload_base64"])
+        assert digest(stored).hexdigest() == digest(journey.sent[one[0]]).hexdigest()
+        # A destination the message was never routed to has no content.
+        assert (
+            http.get(f"{BASE}/messages/{one[1]}/content", params={"stage": "routed", "destination": "nope"}).status_code
+            == 404
+        )
+    # Viewing the routed content is its own audited action, naming the destination.
+    audit = [
+        json.loads(r.value())
+        for r in drain_topic(journey.kafka, AUDIT, partitions=1, timeout_s=3)
+        if r.value() and b"message.content.view" in r.value()
+    ]
+    assert any(
+        a.get("message_id") == one[1] and a.get("stage") == "routed" and a.get("destination") == "stub" for a in audit
+    )
+    # What the loader delivered to the destination is exactly the routed content: same bodies, one per message.
+    wait_until(lambda: len(journey.stub.requests) >= len(journey.ids), "the stub to hold every delivery", timeout_s=30)
+    delivered = [digest(r.body).hexdigest() for r in journey.stub.requests]
+    expected = sorted(digest(p).hexdigest() for p in journey.sent.values())
+    assert sorted(delivered) == expected, f"{len(delivered)} deliveries for {len(expected)} messages"
+    assert states == {"routed"}  # today's truth; the next test is the expectation that it becomes `sent`
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="GAP: no loader emits a `sent` event on a successful delivery (only dlq and error), so a delivered message's "
+    "destination status stays `routed` (state = the newest event's stage). Delete this xfail when it is fixed.",
+)
+def test_a_delivered_destination_reaches_the_sent_state(journey: Journey) -> None:
+    with journey.stack.client() as http:
+        for message_id in journey.ids.values():
+            body = http.get(f"{BASE}/messages/{message_id}").json()
+            assert {d["destination"]: d["state"] for d in body["destinations"]} == {"stub": "sent"}
+
+
 def test_content_view_returns_the_stored_bytes_and_writes_an_audit_record(journey: Journey) -> None:
     control, message_id = next(iter(journey.ids.items()))
     with journey.stack.client() as http:
@@ -273,8 +366,12 @@ def test_content_view_returns_the_stored_bytes_and_writes_an_audit_record(journe
             if r.value() and b"message.content.view" in r.value()
         ]
 
-    wait_until(lambda: any(r.get("message_id") == message_id for r in audit_records()), "the content-view audit record")
-    record = next(r for r in audit_records() if r.get("message_id") == message_id)
+    def view_record(stage: str) -> dict[str, object] | None:
+        return next((r for r in audit_records() if r.get("message_id") == message_id and r.get("stage") == stage), None)
+
+    wait_until(lambda: view_record("received") is not None, "the content-view audit record")
+    record = view_record("received")
+    assert record is not None
     assert record["action"] == "message.content.view" and record["phase"] == "requested"
     assert record["actor"] == "synth-operator-w9b" and "admin" in record["actor_roles"]  # type: ignore[operator]
     assert record["channel"] == CHANNEL and record["stage"] == "received" and record["environment"] == ENV
@@ -306,6 +403,7 @@ def test_reprocess_reingests_under_a_new_id_linked_to_the_original_and_the_strea
             assert result["original_message_id"] == original and new_id != original
             journey.reprocessed = new_id
             wait_until(lambda: new_id in sse.message_ids(), "the reprocessed message on the event stream", timeout_s=60)
+            validate_events(http, sse)
             event = next(d for e, d in list(sse.events) if e == "message" and d["message_id"] == new_id)
             assert event.get("parent_id") == original
         # The record on raw carries the link in its headers, and the same operation id yields the same new id.
@@ -385,6 +483,7 @@ def test_replay_over_a_window_reemits_exactly_the_window_and_keeps_each_keys_ord
             wait_until(
                 lambda: len(replayed_ids()) == len(originals), "nine replayed messages on the stream", timeout_s=90
             )
+            validate_events(http, sse)
 
     after = journey.settled_raw_records()  # after the repeated POST too: a late duplicate would be counted
     assert len(after) == len(before_records) + len(originals), f"{len(after)} records on raw after the replay"
