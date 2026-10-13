@@ -23,12 +23,14 @@ from archive_kit import (
     minutes_ago,
     msg_id,
     now,
+    set_content_flag,
 )
 from test_audit_integration import Recorder, build_with
 from test_deploy_kafka_integration import seed
 from test_routes_integration import Api
 from tributary.api.archive import ArchiveBackend
 from tributary.api.audit import AuditSendError, _validator
+from tributary.api.chclient import ArchiveClientError
 from tributary.runtime.clients import KafkaSettings
 from tributary.runtime.config import load_topic_defaults
 
@@ -59,6 +61,7 @@ class Rig:
         self.queries: list[str] = []
         self.read_delay = 0.0  # seconds each statement on the reads client takes (flood tests)
         self.content_delay = 0.0
+        self.content_fail = False  # the content client cannot reach the archive
 
         def counting(delay_of: str) -> Any:
             client = admin.client()
@@ -68,6 +71,8 @@ class Rig:
                 self.queries.append(sql)
                 if (d := getattr(self, delay_of)) > 0:
                     time.sleep(d)
+                if delay_of == "content_delay" and self.content_fail:
+                    raise ArchiveClientError
                 return original(sql, parameters, settings)
 
             client.query = query  # type: ignore[method-assign]
@@ -433,3 +438,60 @@ def test_a_flood_of_reads_cannot_delay_or_pre_audit_a_content_view_and_a_full_ga
         assert len(rig.sender.sent) - audits_before == len(ok)  # a refused view wrote nothing
 
     run(rig.session(work))
+
+
+def test_content_follows_the_archivers_storage_flag_off_is_409_unreadable_or_missing_while_on_is_503(
+    tls_pg: TlsPg, idp: Idp, contract: Contract, clickhouse_admin: Admin
+) -> None:
+    url = "/messages/{message_id}/content"
+
+    # flag false (storage off): 409 CONTENT_STORAGE_OFF, though the table exists
+    off = Rig(tls_pg, idp, contract, clickhouse_admin)
+    ids = populate(off)
+    set_content_flag(off.admin, off.db, False)
+
+    async def storage_off(api: Api, c: httpx.AsyncClient) -> None:
+        body = await off.call(
+            api, "GET", url, message_id=str(ids["a"]), params={"stage": "received"}, expect=409, role="tb-operator"
+        )
+        assert body["code"] == "CONTENT_STORAGE_OFF"
+
+    run(off.session(storage_off))
+
+    # flag true, table there: served (and a later `false` flips it back, the newest row wins)
+    on = Rig(tls_pg, idp, contract, clickhouse_admin)
+    ids = populate(on)
+    set_content_flag(on.admin, on.db, True)
+
+    async def storage_on(api: Api, c: httpx.AsyncClient) -> None:
+        got = await on.call(api, "GET", url, message_id=str(ids["a"]), params={"stage": "received"}, role="tb-operator")
+        assert base64.b64decode(got["payload_base64"]) == PAYLOAD
+
+    run(on.session(storage_on))
+
+    # flag true but the table is missing: a fault (503), not "off"
+    broken = Rig(tls_pg, idp, contract, clickhouse_admin)
+    ids = populate(broken)
+    set_content_flag(broken.admin, broken.db, True)
+    broken.admin.run(f"DROP TABLE `{broken.db}`.message_content")
+
+    async def enabled_but_missing(api: Api, c: httpx.AsyncClient) -> None:
+        body = await broken.call(
+            api, "GET", url, message_id=str(ids["a"]), params={"stage": "received"}, expect=503, role="tb-operator"
+        )
+        assert body["code"] == "ARCHIVE_UNAVAILABLE"
+
+    run(broken.session(enabled_but_missing))
+
+    # the flag cannot be read (the archive does not answer): 503, never a guess
+    down = Rig(tls_pg, idp, contract, clickhouse_admin)
+    ids = populate(down)
+
+    async def unreadable(api: Api, c: httpx.AsyncClient) -> None:
+        down.content_fail = True
+        body = await down.call(
+            api, "GET", url, message_id=str(ids["a"]), params={"stage": "received"}, expect=503, role="tb-operator"
+        )
+        assert body["code"] == "ARCHIVE_UNAVAILABLE"
+
+    run(down.session(unreadable))

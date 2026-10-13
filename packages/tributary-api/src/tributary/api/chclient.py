@@ -25,7 +25,6 @@ from .tamper import ClickHouseHttp, TamperQueryError
 
 #: Largest answer accepted: a content row can be 1 MiB of payload, which is ~1.4 MiB as base64.
 MAX_RESULT_BYTES: Final = 8 * 1024 * 1024
-UNKNOWN_TABLE: Final = 60  # ClickHouse error code
 
 
 class ArchiveClientError(Exception):

@@ -215,3 +215,11 @@ def restore_uvicorn_logging() -> None:
     logger = logging.getLogger("uvicorn.access")
     logger.handlers = []
     logger.propagate = True
+
+
+def set_content_flag(admin: Admin, database: str, enabled: bool) -> None:
+    """The row the archiver's migrate step writes: `archive_settings` pseudo-table `content_storage`."""
+    admin.run(
+        f"INSERT INTO `{database}`.archive_settings (table_name, days, previous_days, release, decrease_allowed, "  # noqa: S608
+        f"source, enabled) VALUES ('content_storage', 0, NULL, 'test', false, 'applied', {1 if enabled else 0})"
+    )

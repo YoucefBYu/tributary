@@ -24,7 +24,6 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Final
 
-from tributary.archiver.content import CONTENT_TABLE
 from tributary.archiver.errors import (
     MessageNotFound,
     PayloadUnavailable,
@@ -33,14 +32,22 @@ from tributary.archiver.errors import (
     ReplayRefused,
     ReprocessRefused,
 )
-from tributary.archiver.query import ArchiveQueries, EventView, Page, QueryLimits, SearchFilter
-from tributary.archiver.schema import TABLE, qualified
+from tributary.archiver.query import (
+    ArchiveQueries,
+    ChannelStats,
+    ContentIndexItem,
+    ContentView,
+    EventView,
+    Page,
+    QueryLimits,
+    SearchFilter,
+)
 from tributary.runtime.clients import KafkaSettings
 from tributary.runtime.config import TopicDefaults
 from tributary.sdk.context import Logger
 
 from .audit import Actor, AuditHook
-from .chclient import UNKNOWN_TABLE, ArchiveClient, ArchiveClientError
+from .chclient import ArchiveClient, ArchiveClientError
 from .pools import Pools, submit_gated
 from .problems import ApiProblem
 from .service import ControlPlane
@@ -162,6 +169,97 @@ def destination_statuses(events: tuple[EventView, ...]) -> list[dict[str, Any]]:
     return out
 
 
+def content_index_json(items: tuple[ContentIndexItem, ...]) -> list[dict[str, Any]]:
+    """`ContentRef`s: what is stored, without bytes."""
+    out = []
+    for item in items:
+        ref: dict[str, Any] = {
+            "stage": item.stage,
+            "content_type": item.content_type,
+            "size_bytes": item.size_bytes,
+            "storage": "claim_check" if item.is_claim else "inline",
+        }
+        if item.destination:
+            ref["destination"] = item.destination
+        out.append(ref)
+    return out
+
+
+def read_content(
+    queries: ArchiveQueries, channel: str, message_id: str, stage: str, destination: str
+) -> ContentView | None:
+    """The stored content, honouring the archiver's content-storage flag (`archive_settings`, written by migrate).
+
+    * flag false: `409 CONTENT_STORAGE_OFF`;
+    * flag unreadable (the archive is down): 503 `ARCHIVE_UNAVAILABLE`, the library's `QUERY_FAILED`;
+    * flag true but the table missing: 503 `ARCHIVE_UNAVAILABLE` (enabled and not there is a fault, not "off");
+    * no flag ever written (a migrate step that predates it): a missing table reads as off, the interim rule.
+    """
+    enabled = queries.content_storage_enabled()
+    if enabled is False:
+        raise ApiProblem("CONTENT_STORAGE_OFF")
+    try:
+        return queries.read_content(channel, message_id, stage, destination)
+    except QueryError as exc:
+        if exc.code != "CONTENT_TABLE_MISSING":
+            raise
+        raise ApiProblem("ARCHIVE_UNAVAILABLE" if enabled else "CONTENT_STORAGE_OFF") from None
+
+
+def content_json(view: ContentView, channel: str, message_id: str) -> dict[str, Any]:
+    """`MessageContent`. A claim-checked row carries the locator and no bytes; headers come from the stored columns."""
+    body: dict[str, Any] = {
+        "channel": channel,
+        "message_id": message_id,
+        "stage": view.stage,
+        "content_type": view.content_type,
+        "size_bytes": view.size_bytes,
+        "archived_at": stamp(view.archived_at),
+    }
+    if view.destination:
+        body["destination"] = view.destination
+    if view.claim_ref:
+        body["storage"] = "claim_check"
+        body["claim_check"] = view.claim_ref
+    else:
+        body["storage"] = "inline"
+        body["payload_base64"] = view.payload_base64
+    headers = {
+        "tb-channel": channel,
+        "tb-channel-version": str(view.channel_version),
+        "tb-msg-id": message_id,
+        "tb-attempt": str(view.attempt),
+        "tb-content-type": view.content_type,
+        "tb-parent-id": None if view.parent_id is None else str(view.parent_id),
+        "tb-correlation-id": None if view.correlation_id is None else str(view.correlation_id),
+        "tb-error-code": view.error_code,
+    }
+    body["headers"] = {k: v for k, v in headers.items() if v}
+    return body
+
+
+def stats_json(stats: ChannelStats) -> dict[str, Any]:
+    return {
+        "counts": dict(stats.counts),
+        "destinations": [
+            {
+                "destination": d.destination,
+                "sent": d.sent,
+                "retrying": d.retrying,
+                "error": d.error,
+                "dlq": d.dlq,
+                "duration_ms_p50": d.duration_ms_p50,
+                "duration_ms_p95": d.duration_ms_p95,
+            }
+            for d in stats.destinations
+        ],
+        "errors": [{"error_code": code, "count": n} for code, n in stats.errors],
+        "versions": [
+            {"version": v.version, "instances": v.instances, "last_seen": stamp(v.last_seen)} for v in stats.versions
+        ],
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class ArchiveBackend:
     """What the archive endpoints need beyond the control plane: the ClickHouse client and each environment's
@@ -217,6 +315,10 @@ class ArchiveReader:
             raise ApiProblem("ARCHIVE_UNAVAILABLE")
         return db
 
+    def content_queries(self, env: str) -> ArchiveQueries:
+        """The library's queries on the content client (its own cap on stuck connections)."""
+        return ArchiveQueries(self._content_client, database=self.database(env), limits=self._limits)
+
     async def require(self, env: str, channel: str) -> None:
         await self._control.require_channel(env, channel)
 
@@ -264,13 +366,14 @@ class ArchiveReader:
 
     async def detail(self, env: str, channel: str, message_id: str) -> dict[str, Any]:
         await self._control.require_channel(env, channel)
-        queries, database = self.queries(env), self.database(env)
+        queries, content_queries = self.queries(env), self.content_queries(env)
 
         def work() -> dict[str, Any]:
             events = queries.timeline(message_id, channel=channel)
             if not events:
                 raise MessageNotFound(message_id)
-            return {"events": events, "content": self._content_index(database, channel, message_id)}
+            # Content storage off (no table) is an empty index, not an error: the library says so itself.
+            return {"events": events, "content": content_index_json(content_queries.content_index(channel, message_id))}
 
         got = await self._blocking(work)
         events: tuple[EventView, ...] = got["events"]
@@ -290,37 +393,6 @@ class ArchiveReader:
                 body["correlation_id"] = str(e.correlation_id)
         return body
 
-    def _content_index(self, database: str, channel: str, message_id: str) -> list[dict[str, Any]]:
-        """What is stored, without bytes. Content storage off (no table) is an empty index, not an error."""
-        table = qualified(CONTENT_TABLE, database)
-        sql = (
-            "SELECT stage, destination, content_type, size_bytes, claim_ref != '' AS is_claim FROM ("  # noqa: S608
-            f"SELECT stage, destination, content_type, size_bytes, claim_ref FROM {table} "
-            "WHERE channel = {channel:String} AND message_id = {message_id:UUID} "
-            "ORDER BY stage, destination, ts DESC LIMIT 1 BY stage, destination) "
-            "ORDER BY stage, destination LIMIT 130"
-        )
-        try:
-            rows = self._client.query(
-                sql, {"channel": channel, "message_id": message_id}, self._limits.settings()
-            ).result_rows
-        except ArchiveClientError as exc:
-            if exc.ch_code == UNKNOWN_TABLE:
-                return []
-            raise
-        out = []
-        for stage, destination, content_type, size_bytes, is_claim in rows:
-            item: dict[str, Any] = {
-                "stage": stage,
-                "content_type": content_type,
-                "size_bytes": int(size_bytes),
-                "storage": "claim_check" if is_claim else "inline",
-            }
-            if destination:
-                item["destination"] = destination
-            out.append(item)
-        return out
-
     # -- content (PHI) -------------------------------------------------------------------------------
 
     async def content(
@@ -334,7 +406,7 @@ class ArchiveReader:
         if (stage == "received" and destination is not None) or (stage == "routed" and destination is None):
             raise ApiProblem("REQUEST_INVALID", status=422)  # well formed, but not a combination that exists
         await self._control.require_channel(env, channel)
-        database = self.database(env)  # configuration problems surface before an audit record is spent
+        queries = self.content_queries(env)  # configuration problems surface before an audit record is spent
         leave = self._pools.content_gate.enter()  # a full gate refuses here, BEFORE any audit record is written
         try:
             await self._audit.requested(
@@ -349,68 +421,12 @@ class ArchiveReader:
         except BaseException:
             leave()
             raise
-        row = await self._run_gated(
-            self._pools.content,
-            lambda: self._content_row(database, channel, message_id, stage, destination or ""),
-            leave,
+        view = await self._run_gated(
+            self._pools.content, lambda: read_content(queries, channel, message_id, stage, destination or ""), leave
         )
-        if row is None:
+        if view is None:
             raise ApiProblem("CONTENT_NOT_FOUND")
-        return row
-
-    def _content_row(
-        self, database: str, channel: str, message_id: str, stage: str, destination: str
-    ) -> dict[str, Any] | None:
-        table = qualified(CONTENT_TABLE, database)
-        sql = (
-            "SELECT channel_version, stage, destination, content_type, size_bytes, base64Encode(payload) AS payload_b64, "  # noqa: S608
-            "claim_ref, parent_id, correlation_id, attempt, error_code, ts "
-            f"FROM {table} WHERE channel = {{channel:String}} AND message_id = {{message_id:UUID}} "
-            "AND stage = {stage:String} AND destination = {destination:String} ORDER BY ts DESC LIMIT 1"
-        )
-        try:
-            rows = self._content_client.query(
-                sql,
-                {"channel": channel, "message_id": message_id, "stage": stage, "destination": destination},
-                self._limits.settings(),
-            ).result_rows
-        except ArchiveClientError as exc:
-            if exc.ch_code == UNKNOWN_TABLE:
-                raise ApiProblem("CONTENT_STORAGE_OFF") from None
-            raise
-        if not rows:
-            return None
-        (version, st, dest, ctype, size, b64, claim, parent, corr, attempt, error_code, archived) = rows[0]
-        body: dict[str, Any] = {
-            "channel": channel,
-            "message_id": message_id,
-            "stage": st,
-            "content_type": ctype,
-            "size_bytes": int(size),
-            "archived_at": stamp(archived),
-        }
-        if dest:
-            body["destination"] = dest
-        if claim:
-            if not _LOCATOR.fullmatch(claim):
-                raise ArchiveClientError  # a stored locator the grammar refuses is never shown
-            body["storage"] = "claim_check"
-            body["claim_check"] = claim
-        else:
-            body["storage"] = "inline"
-            body["payload_base64"] = b64
-        headers = {
-            "tb-channel": channel,
-            "tb-channel-version": str(version),
-            "tb-msg-id": message_id,
-            "tb-attempt": str(attempt),
-            "tb-content-type": ctype,
-            "tb-parent-id": None if parent is None else str(parent),
-            "tb-correlation-id": None if corr is None else str(corr),
-            "tb-error-code": error_code,
-        }
-        body["headers"] = {k: v for k, v in headers.items() if v}
-        return body
+        return content_json(view, channel, message_id)
 
     # -- stats ---------------------------------------------------------------------------------------
 
@@ -418,10 +434,10 @@ class ArchiveReader:
         if window not in _WINDOWS:
             raise ApiProblem("REQUEST_INVALID")
         await self._control.require_channel(env, channel)
-        database = self.database(env)
+        queries = self.queries(env)
         now = self._clock().replace(microsecond=0)
         since = now - timedelta(minutes=_WINDOWS[window])
-        body = await self._blocking(lambda: self._stats(database, channel, since))
+        stats: ChannelStats = await self._blocking(lambda: queries.channel_stats(channel, since))
         return {
             "environment": env,
             "channel": channel,
@@ -429,56 +445,5 @@ class ArchiveReader:
             "since": stamp(since),
             "until": stamp(now),
             "generated_at": stamp(self._clock()),
-            **body,
+            **stats_json(stats),
         }
-
-    def _stats(self, database: str, channel: str, since: datetime) -> dict[str, Any]:
-        table = qualified(TABLE, database)
-        params = {"channel": channel, "since_ms": int(since.timestamp() * 1000)}
-        dedup = (
-            "(SELECT stage, destination, instance, channel_version, error_code, duration_ms, ts, "  # noqa: S608
-            f"{_KEY} FROM {table} WHERE kind = 'message' AND channel = {{channel:String}} "
-            "AND ts >= fromUnixTimestamp64Milli({since_ms:Int64}, 'UTC') "
-            f"ORDER BY {_KEY}, ts DESC LIMIT 1 BY {_KEY})"
-        )
-        settings = self._limits.settings()
-
-        def run(sql: str) -> list[tuple[Any, ...]]:
-            return self._client.query(sql, params, settings).result_rows
-
-        counts = dict.fromkeys(_COUNT_STAGES, 0)
-        for stage, n in run(f"SELECT stage, count() FROM {dedup} GROUP BY stage"):  # noqa: S608
-            if stage in counts:
-                counts[stage] = int(n)
-        destinations = [
-            {
-                "destination": d,
-                "sent": int(sent),
-                "retrying": int(retrying),
-                "error": int(error),
-                "dlq": int(dlq),
-                "duration_ms_p50": None if p50 is None or p50 != p50 else float(p50),
-                "duration_ms_p95": None if p95 is None or p95 != p95 else float(p95),
-            }
-            for d, sent, retrying, error, dlq, p50, p95 in run(
-                "SELECT destination, countIf(stage = 'sent'), countIf(stage = 'retrying'), countIf(stage = 'error'), "  # noqa: S608
-                "countIf(stage = 'dlq'), quantileIf(0.5)(duration_ms, stage = 'sent'), "
-                f"quantileIf(0.95)(duration_ms, stage = 'sent') FROM {dedup} WHERE destination != '' "
-                "GROUP BY destination ORDER BY destination LIMIT 64"
-            )
-        ]
-        errors = [
-            {"error_code": code, "count": int(n)}
-            for code, n in run(
-                f"SELECT error_code, count() AS n FROM {dedup} WHERE error_code != '' "  # noqa: S608
-                "GROUP BY error_code ORDER BY n DESC, error_code ASC LIMIT 20"
-            )
-        ]
-        versions = [
-            {"version": int(v), "instances": max(int(n), 1), "last_seen": stamp(last)}
-            for v, n, last in run(
-                "SELECT channel_version, uniqExactIf(instance, instance != ''), max(ts) "  # noqa: S608
-                f"FROM {dedup} GROUP BY channel_version ORDER BY channel_version DESC LIMIT 64"
-            )
-        ]
-        return {"counts": counts, "destinations": destinations, "errors": errors, "versions": versions}
