@@ -12,7 +12,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from api_kit import TEST_ACTOR
+from api_kit import OPENAPI, TEST_ACTOR
 from tributary.api import reingest
 from tributary.api.chclient import ArchiveClient
 from tributary.api.pools import Pools
@@ -423,3 +423,127 @@ def test_a_stream_poll_cancelled_while_queued_gives_its_slot_back() -> None:
             pools.shutdown()
 
     asyncio.run(go())
+
+
+# -- content storage flag outcomes, the SSE reset frame, and what the audit record claims -------------------------
+
+VIEW_ID = "01a133e9-0e50-7000-8000-0000000000aa"
+
+
+class FakeQueries:
+    """The three library calls the content path makes, scripted."""
+
+    def __init__(self, enabled: Any, read: Any) -> None:
+        self.enabled, self.read = enabled, read
+        self.calls: list[str] = []
+
+    def content_storage_enabled(self) -> Any:
+        self.calls.append("flag")
+        if isinstance(self.enabled, Exception):
+            raise self.enabled
+        return self.enabled
+
+    def read_content(self, *a: Any) -> Any:
+        self.calls.append("read")
+        if isinstance(self.read, Exception):
+            raise self.read
+        return self.read
+
+
+class RecordingAudit:
+    def __init__(self) -> None:
+        self.records: list[dict[str, Any]] = []
+
+    async def requested(self, **fields: Any) -> str:
+        self.records.append(fields)
+        return "audit-id"
+
+
+def content_reader(queries: FakeQueries, audit: RecordingAudit) -> Any:
+    from tributary.api.archive import ArchiveReader
+
+    async def require(env: str, channel: str) -> None:
+        return None
+
+    control = SimpleNamespace(require_channel=require)
+    reader = ArchiveReader(object(), {"dev": "db"}, control, audit, Log(), Pools())  # type: ignore[arg-type]
+    reader.content_queries = lambda env: queries  # type: ignore[method-assign]
+    return reader
+
+
+def view_content(reader: Any) -> Any:
+    return asyncio.run(reader.content("dev", "adt", VIEW_ID, "received", None, TEST_ACTOR))
+
+
+@pytest.mark.parametrize(
+    ("enabled", "read", "want"),
+    [
+        (False, None, ("CONTENT_STORAGE_OFF", 409)),  # the flag says off
+        (None, "table-missing", ("CONTENT_STORAGE_OFF", 409)),  # no flag ever written: a missing table reads as off
+        (True, "table-missing", ("ARCHIVE_UNAVAILABLE", 503)),  # on, and the table is not there: a fault
+        (True, "failed", ("ARCHIVE_UNAVAILABLE", 503)),  # any other query failure
+        (None, "other", ("ARCHIVE_UNAVAILABLE", 503)),  # any QueryError code the API does not know falls through
+        ("flag-failed", None, ("ARCHIVE_UNAVAILABLE", 503)),  # the flag itself cannot be read
+    ],
+)
+def test_every_content_flag_outcome_has_its_problem_and_the_audit_record_claims_nothing_was_served(
+    enabled: Any, read: Any, want: tuple[str, int]
+) -> None:
+    from tributary.archiver.errors import QueryError
+
+    errors = {
+        "table-missing": QueryError("CONTENT_TABLE_MISSING", "archive table is missing"),
+        "failed": QueryError("QUERY_FAILED", "archive query failed"),
+        "other": QueryError("SOMETHING_NEW", "an unlisted code"),
+    }
+    queries = FakeQueries(
+        QueryError("QUERY_FAILED", "x") if enabled == "flag-failed" else enabled,
+        errors.get(read, read),
+    )
+    audit = RecordingAudit()
+    with pytest.raises(ApiProblem) as e:
+        view_content(content_reader(queries, audit))
+    assert (e.value.code, e.value.status) == want
+    if enabled is False:
+        assert "read" not in queries.calls  # storage off: the table is never read
+    # L3: the audit record written before the refusal is the `requested` record and says nothing about an outcome.
+    [record] = audit.records
+    assert record["action"] == "message.content.view"
+    assert set(record) == {"action", "environment", "actor", "channel", "message_id", "stage", "destination"}
+    assert not {"outcome", "served", "count", "error_code", "phase"} & set(record)
+
+
+def test_the_content_audit_schema_has_no_outcome_field_so_a_requested_record_cannot_claim_a_serve() -> None:
+    from tributary.api.audit import _validator
+
+    properties = set(_validator().schema["properties"])
+    assert not {"outcome", "served", "result", "status"} & properties
+    schema_phases = _validator().schema["properties"]["phase"]["enum"]
+    assert schema_phases == ["requested", "completed", "failed"]  # a view is `requested` only (audit/v0 README 2)
+
+
+def test_the_dense_window_reset_frame_carries_the_reason_the_contract_enumerates() -> None:
+    """The reset for a window too dense to read in order, pinned against OpenAPI 0.2.3 `StreamNotice`."""
+    enum = json.loads(OPENAPI.read_text())["components"]["schemas"]["StreamNotice"]["properties"]["reason"]["enum"]
+    assert "backlog_too_dense" in enum and "cursor_expired" in enum
+
+    class Endless:
+        """A channel with more pages than any poll reads: every page is full and has a next cursor."""
+
+        def search(self, flt: Any, *, limit: int, cursor: Any) -> Any:
+            return SimpleNamespace(items=[object()] * limit, next_cursor="more")
+
+    async def go() -> bytes:
+        streamer = EventStreamer(SimpleNamespace(), StreamHub(), Log(), Pools(), poll_s=0.05, heartbeat_s=30)  # type: ignore[arg-type]
+        events = streamer._events(Endless(), ["adt"], 0.0, None)
+        try:
+            return await asyncio.wait_for(events.__anext__(), 10)
+        finally:
+            await events.aclose()
+
+    frame = asyncio.run(go()).decode()
+    lines = frame.strip().split("\n")
+    assert lines[0] == "event: reset"
+    reason = json.loads(lines[1].removeprefix("data: "))["reason"]
+    assert reason == "backlog_too_dense" and reason in enum
+    assert reason != "cursor_expired"  # real expiry keeps its own reason (stream.py resume path)
