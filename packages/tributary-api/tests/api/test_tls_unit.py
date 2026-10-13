@@ -8,10 +8,12 @@ import contextlib
 import datetime
 import http.client
 import http.server
+import logging
 import os
 import ssl
 import threading
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -151,6 +153,17 @@ def test_main_exits_2_with_the_code_for_non_loopback_plaintext(
 
 
 # -- the listener ------------------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _uvicorn_access_logger_restored() -> Iterator[None]:
+    """`uvicorn.Config(...)` (built by `tls.server_config`, even when nothing is served) reconfigures the
+    process-wide `uvicorn.access` logger, and the API's startup self-check refuses a handler on it. Put the logger back
+    after every test here so a later module sees what it started with."""
+    logger = logging.getLogger("uvicorn.access")
+    saved = (list(logger.handlers), logger.propagate, logger.level, logger.disabled)
+    yield
+    logger.handlers, logger.propagate, logger.level, logger.disabled = saved[0], saved[1], saved[2], saved[3]
 
 
 def serve(config_: uvicorn.Config) -> tuple[uvicorn.Server, threading.Thread]:
