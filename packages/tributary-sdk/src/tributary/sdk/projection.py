@@ -128,6 +128,14 @@ def validate_for_produce(
         if name in headers:
             raise EnvelopeError(f"class {topic_class}: header {safe_token(name)} must not be set")
 
+    received_at = headers.get(h.TB_RECEIVED_AT)
+    if received_at is not None and not h.is_well_formed(h.TB_RECEIVED_AT, received_at):
+        # The same pattern `decode_record` enforces on consume (envelope/v0 3): a record this layer let
+        # through would only be rejected one hop later, by every reader. The message never quotes the value.
+        raise EnvelopeError(
+            f"header {h.TB_RECEIVED_AT} must be RFC 3339 UTC with 3 to 9 fractional digits and a Z or +00:00 offset"
+        )
+
     _validate_conditionals(headers, topic_class=topic_class)
 
     if len(headers) > h.MAX_HEADERS:

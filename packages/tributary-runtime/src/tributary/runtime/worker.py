@@ -968,8 +968,10 @@ class PipelineHandler:
         archive collapses copies on `(message_id, stage, destination, attempt)` (contract 2.2).
         """
         consumed_at = now_text()
-        self._emit_once(spec, record, "received", self._received_ts(record, consumed_at))
-        self._emit_once(spec, record, "queued", consumed_at)
+        # `received.ts` is computed only when the key misses the memory: a re-handled record neither re-parses
+        # its header nor re-logs a fallback for an event it will not emit.
+        self._emit_once(spec, record, "received", lambda: self._received_ts(record, consumed_at))
+        self._emit_once(spec, record, "queued", lambda: consumed_at)
 
     def _received_ts(self, record: ConsumedRecord, consumed_at: str) -> str:
         """`received.ts` per events/v0 2.1 (ruled 2026-10-13).
@@ -996,7 +998,7 @@ class PipelineHandler:
             self._log.debug("received_ts_fallback", **fields)
             return consumed_at
 
-    def _emit_once(self, spec: ChannelSpec, record: ConsumedRecord, stage: str, ts: str) -> None:
+    def _emit_once(self, spec: ChannelSpec, record: ConsumedRecord, stage: str, ts: Callable[[], str]) -> None:
         """Emit an arrival stage unless this record's was already emitted by this process.
 
         The loop re-hands a record on a blocking retry and rewinds a whole window on a transactional abort;
@@ -1017,7 +1019,7 @@ class PipelineHandler:
                 ctx=None,
                 # A claim-checked payload has no inline bytes to count (events contract: size_bytes 0 or absent).
                 size_bytes=message.payload_size if message.claim_check is None else None,
-                ts=ts,
+                ts=ts(),
             )
         except (EventError, HeaderError) as exc:
             # Observability must not fail the message: the record still runs, and its later stages say why

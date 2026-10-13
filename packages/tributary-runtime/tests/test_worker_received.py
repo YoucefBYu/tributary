@@ -360,3 +360,17 @@ def test_queued_carries_the_same_identity_and_coordinates_as_received() -> None:
     same = ("message_id", "channel_version", "attempt", "topic", "partition", "offset", "size_bytes", "traceparent")
     assert all(getattr(received_event, name) == getattr(queued, name) for name in same)
     assert (queued.status, queued.attrs, queued.destination) == ("ok", None, None)
+
+
+def test_a_re_handled_record_does_not_re_parse_or_re_log_its_received_at() -> None:
+    """`received.ts` is computed only when the record misses the memory (review Low, b8199d6)."""
+    message = make_message(PAYLOAD, key=KEY).with_header(h.TB_RECEIVED_AT, "SYNTH-not-a-time")
+    emitter, log = RecordingEmitter(), io.StringIO()
+    run = handler(FakeProducer(), emitter, steps=(drop_all,), log=log, log_level="debug")
+    record = consumed(message)
+
+    for _attempt in range(3):  # a blocking retry or a transactional rewind re-hands the same record
+        run.handle(record)
+
+    assert log.getvalue().count('"received_ts_fallback"') == 1
+    assert emitter.stages().count("received") == 1 and emitter.stages().count("queued") == 1
