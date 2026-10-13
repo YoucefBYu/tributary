@@ -131,7 +131,7 @@ class Stack:
         return {**self.base, **settings}
 
     def migrate(self, **settings: str) -> subprocess.CompletedProcess[str]:
-        env = self.env_vars(TB_ARCHIVE_CONTENT="true", TB_ARCHIVE_CONTENT_CHANNELS="alpha", **settings)
+        env = self.env_vars(**{"TB_ARCHIVE_CONTENT": "true", "TB_ARCHIVE_CONTENT_CHANNELS": "alpha", **settings})
         return subprocess.run(
             [sys.executable, "-m", "tributary.archiver", "--env", self.env, "--migrate-only"],
             env=env, capture_output=True, text=True, timeout=120,
@@ -404,3 +404,151 @@ def test_content_archiver_starts_with_insert_and_select_and_states_that_custody_
         assert "operator" in notice["reason"] and "PHI" in notice["reason"]
     finally:
         proc.terminate_and_wait()
+
+
+def insert_events(stack: Stack, *events: dict[str, Any]) -> None:
+    import orjson
+    from tributary.archiver.event import parse_event
+    from tributary.archiver.sink import ClickhouseSink
+
+    client = connect(target(stack.ch, stack.database))
+    try:
+        ClickhouseSink(client).insert([parse_event(orjson.dumps(e)).values for e in events])
+    finally:
+        client.close()
+
+
+def insert_content(stack: Stack, *records: tuple[str, bytes, str, dict[str, str]]) -> None:
+    from tributary.archiver.content import COLUMNS, CONTENT_TABLE, parse_content_record
+    from tributary.archiver.sink import ClickhouseSink
+
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    rows = [
+        parse_content_record(
+            topic=f"{stack.env}.{topic}",
+            raw_headers=[(k, v.encode()) for k, v in {"tb-msg-id": msg_id, "tb-channel": "alpha", **extra}.items()],
+            value=payload,
+            timestamp_ms=now_ms,
+            partition=0,
+            offset=i,
+            enabled_channels=frozenset({"alpha"}),
+        )
+        for i, (topic, payload, msg_id, extra) in enumerate(records)
+    ]
+    client = connect(target(stack.ch, stack.database))
+    try:
+        ClickhouseSink(client, table=CONTENT_TABLE, columns=COLUMNS).insert([r.values for r in rows])
+    finally:
+        client.close()
+
+
+def test_the_query_library_reads_stats_and_content_as_the_insert_select_runtime_principal(stack: Stack) -> None:
+    """W3-6: ArchiveQueries.channel_stats / content_index / read_content on a real table, parameterised and
+    readonly, as a user that holds only INSERT and SELECT."""
+    import base64
+
+    from tributary.archiver.query import ArchiveQueries
+
+    assert stack.migrate().returncode == 0
+    ts = (datetime.now(UTC) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%S.123Z")
+    later = (datetime.now(UTC) - timedelta(minutes=4)).strftime("%Y-%m-%dT%H:%M:%S.123Z")
+    ids = [uuid7() for _ in range(3)]
+
+    def ev(i: int, stage: str, **over: Any) -> dict[str, Any]:
+        return {"v": 0, "kind": "message", "ts": ts, "channel": "alpha", "channel_version": 2, "stage": stage,
+                "status": "ok", "instance": "w-1", "message_id": ids[i], **over}  # fmt: skip
+
+    insert_events(
+        stack,
+        *[ev(i, "received") for i in range(3)],
+        ev(0, "routed", destination="sink"),
+        ev(0, "sent", destination="sink", duration_ms=10),
+        ev(1, "sent", destination="sink", duration_ms=30),
+        ev(1, "sent", destination="sink", duration_ms=30, ts=later),  # a re-emit: must count once
+        ev(2, "error", destination="sink", status="error", error_code="DEST_FAILED"),
+        ev(2, "dlq", destination="sink", status="error", error_code="DEST_FAILED"),
+        {**ev(0, "received"), "channel": "beta"},  # another channel: never counted
+    )
+    msg = ids[0]
+    insert_content(
+        stack,
+        ("alpha.raw", SYNTH_RAW, msg, {}),
+        ("alpha.out.sink", SYNTH_OUT, msg, {"tb-destination": "sink", "tb-attempt": "1"}),
+        ("alpha.raw", b"", ids[1], {"tb-claim-check": "s3://synth-bucket/obj/claimed-2"}),
+    )
+    client = connect(target(stack.ch, stack.database, stack.user, stack.pw))
+    try:
+        q = ArchiveQueries(client, database=stack.database)
+        stats = q.channel_stats("alpha", datetime.now(UTC) - timedelta(hours=1))
+        assert stats.counts == {
+            "received": 3,
+            "filtered": 0,
+            "routed": 1,
+            "sent": 2,
+            "retrying": 0,
+            "error": 1,
+            "dlq": 1,
+        }
+        (dest,) = stats.destinations
+        assert (dest.destination, dest.sent, dest.error, dest.dlq) == ("sink", 2, 1, 1)
+        assert dest.duration_ms_p50 is not None and 10 <= dest.duration_ms_p50 <= 30
+        assert stats.errors == (("DEST_FAILED", 2),)
+        assert [(v.version, v.instances) for v in stats.versions] == [(2, 1)]
+        assert q.channel_stats("beta", datetime.now(UTC) - timedelta(hours=1)).counts["received"] == 1
+        assert q.channel_stats("alpha", datetime.now(UTC) + timedelta(hours=1)).counts["received"] == 0
+
+        index = q.content_index("alpha", msg)
+        assert [(i.stage, i.destination, i.is_claim) for i in index] == [
+            ("received", "", False),
+            ("routed", "sink", False),
+        ]
+        received = q.read_content("alpha", msg, "received")
+        assert received is not None and base64.b64decode(received.payload_base64) == SYNTH_RAW
+        routed = q.read_content("alpha", msg, "routed", "sink")
+        assert routed is not None and base64.b64decode(routed.payload_base64) == SYNTH_OUT and routed.attempt == 1
+        claimed = q.read_content("alpha", ids[1], "received")
+        assert (
+            claimed is not None
+            and claimed.claim_ref == "s3://synth-bucket/obj/claimed-2"
+            and claimed.payload_base64 == ""
+        )
+        assert q.read_content("alpha", msg, "dlq") is None
+        assert q.read_content("beta", msg, "received") is None, "content is read per channel"
+        # The same statements cannot write: readonly=1 is on every one.
+        with pytest.raises(Exception):  # noqa: B017
+            client.query("INSERT INTO message_content (message_id) VALUES (generateUUIDv4())", settings={"readonly": 1})
+    finally:
+        client.close()
+
+
+def test_the_content_flag_follows_the_migrate_step_and_a_missing_table_is_distinguishable(stack: Stack) -> None:
+    from tributary.archiver.errors import QueryError
+    from tributary.archiver.query import ArchiveQueries
+
+    client = connect(target(stack.ch, stack.database))
+    q = ArchiveQueries(client, database=stack.database)
+    flags = (
+        "SELECT enabled FROM "
+        + stack.database
+        + ".archive_settings WHERE table_name = 'content_storage' ORDER BY applied_at"
+    )
+    try:
+        assert q.content_storage_enabled() is None, "never migrated"
+        assert stack.migrate().returncode == 0
+        assert q.content_storage_enabled() is True
+        assert stack.migrate().returncode == 0
+        assert stack.admin.query(flags).result_rows == [(True,)], "an unchanged flag writes no row"
+        # Enabled in the settings, table gone: the API answers 503, not 409.
+        stack.admin.command(f"DROP TABLE {stack.database}.message_content")
+        assert q.content_storage_enabled() is True
+        with pytest.raises(QueryError) as raised:
+            q.read_content("alpha", uuid7(), "received")
+        assert raised.value.code == "CONTENT_TABLE_MISSING"
+        assert q.content_index("alpha", uuid7()) == ()
+        # Content turned off: the migrate step records it.
+        off = stack.migrate(TB_ARCHIVE_CONTENT="false")
+        assert off.returncode == 0, off.stderr[-300:]
+        assert q.content_storage_enabled() is False
+        assert stack.admin.query(flags).result_rows == [(True,), (False,)]
+    finally:
+        client.close()

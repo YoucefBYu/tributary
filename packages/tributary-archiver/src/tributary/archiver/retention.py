@@ -168,6 +168,7 @@ def apply_retention(
     log: Logger,
     release: str,
     extra: Sequence[TableSpec] = (),
+    content_enabled: bool = False,
 ) -> list[Change]:
     """Create tables and apply TTLs as described in the module doc. Returns what was changed or created."""
     check_audit_engine(client, database)
@@ -205,7 +206,32 @@ def apply_retention(
             release=release,
         )
         done.append(change)
+    _record_content_flag(client, database, content_enabled, release, log)
     return done
+
+
+def _record_content_flag(client: Any, database: str | None, enabled: bool, release: str, log: Logger) -> None:
+    """Write the content on/off flag (`archive_settings`, row `content_storage`) when it differs from the last one
+    recorded, after every table above was created or altered, so `true` is never recorded for a table that was not
+    made. The API reads it: off answers 409 CONTENT_STORAGE_OFF, on with the table missing answers 503."""
+    table = qualified(SETTINGS_TABLE, database)
+    rows = int(client.command(f"SELECT count() FROM {table} WHERE table_name = 'content_storage'") or 0)  # noqa: S608
+    if rows:
+        last = int(
+            client.command(
+                f"SELECT argMax(toUInt8(ifNull(enabled, 0)), applied_at) FROM {table} "  # noqa: S608
+                "WHERE table_name = 'content_storage'"
+            )
+            or 0
+        )
+        if bool(last) == enabled:
+            return
+    client.command(
+        f"INSERT INTO {table} (table_name, days, previous_days, release, decrease_allowed, source, enabled) "  # noqa: S608
+        "VALUES ('content_storage', 0, NULL, {r:String}, false, 'applied', {e:Bool})",
+        parameters={"r": release, "e": enabled},
+    )
+    log.info("content_storage_flag", enabled=enabled, release=release)
 
 
 def _record(

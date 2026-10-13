@@ -439,7 +439,7 @@ class Migrator:
 
     def settings_rows(self) -> list[tuple[str, int, int | None]]:
         result = self.admin.query(
-            f"SELECT table_name, days, previous_days FROM {self.name}.archive_settings ORDER BY applied_at, table_name"  # noqa: S608
+            f"SELECT table_name, days, previous_days FROM {self.name}.archive_settings WHERE table_name != 'content_storage' ORDER BY applied_at, table_name"  # noqa: S608
         )
         return [(str(r[0]), int(r[1]), None if r[2] is None else int(r[2])) for r in result.result_rows]
 

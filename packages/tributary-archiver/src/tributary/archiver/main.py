@@ -82,6 +82,7 @@ def migrate(args: argparse.Namespace, log: JsonLogger) -> None:
                 log=log,
                 release=build_version("tributary-archiver"),
                 extra=extra_tables(config),
+                content_enabled=config.content_enabled,
             )
         except (RetentionChanged, RetentionDecreaseRefused, AuditLogEngineInvalid):
             raise

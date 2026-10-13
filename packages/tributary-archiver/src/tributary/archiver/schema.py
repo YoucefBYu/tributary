@@ -166,7 +166,8 @@ def audit_tamper_sql(*, database: str | None = None) -> str:
 def settings_ddl(*, database: str | None = None) -> str:
     """`archive_settings`: one row per applied retention change (ADR-004 R6 (3)); the API reads it (R3).
     No TTL: it is the record of what retention was. `source` is `applied` (this run altered the TTL) or
-    `backfilled` (an earlier run altered it and its row was lost)."""
+    `backfilled` (an earlier run altered it and its row was lost). `enabled` is NULL on TTL rows; the pseudo-table
+    row `content_storage` carries the content on/off flag the API reads (`query.ArchiveQueries.content_storage_enabled`)."""
     return f"""CREATE TABLE IF NOT EXISTS {qualified(SETTINGS_TABLE, database)} (
   table_name     LowCardinality(String),
   days           UInt32,
@@ -175,7 +176,8 @@ def settings_ddl(*, database: str | None = None) -> str:
   release        String,
   applied_by     String DEFAULT currentUser(),
   decrease_allowed Bool DEFAULT false,
-  source         LowCardinality(String) DEFAULT 'applied'
+  source         LowCardinality(String) DEFAULT 'applied',
+  enabled        Nullable(Bool)
 ) ENGINE = MergeTree
 ORDER BY (table_name, applied_at)"""
 
@@ -188,7 +190,8 @@ def settings_upgrade_commands(*, database: str | None = None, has_applied_by: bo
     name = qualified(SETTINGS_TABLE, database)
     commands = [
         f"ALTER TABLE {name} ADD COLUMN IF NOT EXISTS decrease_allowed Bool DEFAULT false, "
-        "ADD COLUMN IF NOT EXISTS source LowCardinality(String) DEFAULT 'applied'"
+        "ADD COLUMN IF NOT EXISTS source LowCardinality(String) DEFAULT 'applied', "
+        "ADD COLUMN IF NOT EXISTS enabled Nullable(Bool)"
     ]
     if not has_applied_by:
         commands += [

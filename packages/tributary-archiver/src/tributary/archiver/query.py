@@ -46,6 +46,7 @@ from typing import Any, Final
 
 import orjson
 
+from .content import CONTENT_TABLE
 from .errors import QueryError
 from .event import IDENTIFIER_NAMES, STAGES, STATUSES
 from .schema import TABLE
@@ -244,6 +245,81 @@ def uuid7_ms(message_id: str) -> int | None:
     return parsed.int >> 80 if parsed.version == 7 else None
 
 
+STATS_STAGES: Final = ("received", "filtered", "routed", "sent", "retrying", "error", "dlq")
+CONTENT_STAGES: Final = frozenset({"received", "routed", "dlq"})
+_CHANNEL: Final = re.compile(r"[a-z][a-z0-9-]{0,63}")
+_DEST: Final = re.compile(r"([a-z][a-z0-9-]{0,63})?")
+_LOCATOR: Final = re.compile(r"(s3|gs|az|https)://[A-Za-z0-9._-]{1,253}(:[0-9]{2,5})?(/[A-Za-z0-9._-]{1,128}){1,16}")
+_UNKNOWN_TABLE: Final = 60  # ClickHouse error code; read from the driver's text or an `ch_code` attribute
+_CH_CODE: Final = re.compile(r"Code: (\d{1,4})")
+CONTENT_FLAG_ROW: Final = "content_storage"  # `archive_settings.table_name` of the content on/off flag rows
+
+
+@dataclass(frozen=True, slots=True)
+class DestinationStats:
+    destination: str
+    sent: int
+    retrying: int
+    error: int
+    dlq: int
+    duration_ms_p50: float | None
+    duration_ms_p95: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class VersionStats:
+    version: int
+    instances: int
+    last_seen: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class ChannelStats:
+    """Counts of deduplicated message events since a time. Identifiers, codes, counts and durations only."""
+
+    counts: dict[str, int]
+    destinations: tuple[DestinationStats, ...]
+    errors: tuple[tuple[str, int], ...]
+    versions: tuple[VersionStats, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ContentIndexItem:
+    """What content is stored for one message, without bytes."""
+
+    stage: str
+    destination: str
+    content_type: str
+    size_bytes: int
+    is_claim: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ContentView:
+    """One stage's stored content. **PHI**: reading it is an auditable action; the caller audits first."""
+
+    channel_version: int
+    stage: str
+    destination: str
+    content_type: str
+    size_bytes: int
+    payload_base64: str
+    claim_ref: str
+    parent_id: uuid.UUID | None
+    correlation_id: uuid.UUID | None
+    attempt: int
+    error_code: str
+    archived_at: datetime
+
+
+def _is_unknown_table(exc: BaseException) -> bool:
+    code = getattr(exc, "ch_code", None)
+    if isinstance(code, int):
+        return code == _UNKNOWN_TABLE
+    found = _CH_CODE.search(str(exc))
+    return found is not None and int(found.group(1)) == _UNKNOWN_TABLE
+
+
 class ArchiveQueries:
     """Queries over one `message_events` table with a `clickhouse-connect` client.
 
@@ -251,7 +327,13 @@ class ArchiveQueries:
     """
 
     def __init__(
-        self, client: Any, *, database: str | None = None, table: str = TABLE, limits: QueryLimits | None = None
+        self,
+        client: Any,
+        *,
+        database: str | None = None,
+        table: str = TABLE,
+        limits: QueryLimits | None = None,
+        content_table: str = CONTENT_TABLE,
     ) -> None:
         self._client = client
         self._settings = (limits or QueryLimits()).settings()
@@ -259,6 +341,9 @@ class ArchiveQueries:
             _pattern(database, _IDENT, "database")
         _pattern(table, _IDENT, "table")
         self._table = f"`{database}`.{table}" if database else table
+        _pattern(content_table, _IDENT, "content_table")
+        self._content_table = f"`{database}`.{content_table}" if database else content_table
+        self._settings_table = f"`{database}`.archive_settings" if database else "archive_settings"
 
     # -- timeline ---------------------------------------------------------------------------------
 
@@ -403,6 +488,140 @@ class ArchiveQueries:
                 last.attempt,
             ).encode()
         return Page(items=items, next_cursor=next_cursor)
+
+    # -- stats and content (W3-6) -----------------------------------------------------------------
+    # Every statement is parameterised, runs with the limits above (`readonly=1`), and reads one channel.
+
+    def _rows(self, sql: str, params: Mapping[str, Any]) -> list[tuple[Any, ...]]:
+        try:
+            result = self._client.query(sql, parameters=dict(params), settings=dict(self._settings))
+            return list(result.result_rows)
+        except Exception as exc:  # the driver's text can echo SQL and values: class name only
+            if _is_unknown_table(exc):
+                raise QueryError("CONTENT_TABLE_MISSING", "archive table is missing") from None
+            raise QueryError("QUERY_FAILED", f"archive query failed ({type(exc).__name__})") from None
+
+    def channel_stats(self, channel: str, since: datetime) -> ChannelStats:
+        """Counts, per-destination outcomes, error codes and channel versions for `channel` since `since`."""
+        _pattern(channel, _CHANNEL, "channel")
+        params = {"channel": channel, "since_ms": _ms(since, "since")}
+        dedup = (
+            "(SELECT stage, destination, instance, channel_version, error_code, duration_ms, ts, "  # noqa: S608
+            f"{_KEY} FROM {self._table} WHERE kind = 'message' AND channel = {{channel:String}} "
+            "AND ts >= fromUnixTimestamp64Milli({since_ms:Int64}, 'UTC') "
+            f"ORDER BY {_KEY}, ts DESC LIMIT 1 BY {_KEY})"
+        )
+        counts = dict.fromkeys(STATS_STAGES, 0)
+        for stage, n in self._rows(f"SELECT stage, count() FROM {dedup} GROUP BY stage", params):  # noqa: S608
+            if stage in counts:
+                counts[stage] = int(n)
+
+        def _ms_or_none(value: Any) -> float | None:
+            return None if value is None or value != value else float(value)
+
+        destinations = tuple(
+            DestinationStats(d, int(sent), int(retrying), int(error), int(dlq), _ms_or_none(p50), _ms_or_none(p95))
+            for d, sent, retrying, error, dlq, p50, p95 in self._rows(
+                "SELECT destination, countIf(stage = 'sent'), countIf(stage = 'retrying'), countIf(stage = 'error'), "  # noqa: S608
+                "countIf(stage = 'dlq'), quantileIf(0.5)(duration_ms, stage = 'sent'), "
+                f"quantileIf(0.95)(duration_ms, stage = 'sent') FROM {dedup} WHERE destination != '' "
+                "GROUP BY destination ORDER BY destination LIMIT 64",
+                params,
+            )
+        )
+        errors = tuple(
+            (str(code), int(n))
+            for code, n in self._rows(
+                f"SELECT error_code, count() AS n FROM {dedup} WHERE error_code != '' "  # noqa: S608
+                "GROUP BY error_code ORDER BY n DESC, error_code ASC LIMIT 20",
+                params,
+            )
+        )
+        versions = tuple(
+            VersionStats(int(v), max(int(n), 1), last)
+            for v, n, last in self._rows(
+                "SELECT channel_version, uniqExactIf(instance, instance != ''), max(ts) "  # noqa: S608
+                f"FROM {dedup} GROUP BY channel_version ORDER BY channel_version DESC LIMIT 64",
+                params,
+            )
+        )
+        return ChannelStats(counts, destinations, errors, versions)
+
+    def content_index(self, channel: str, message_id: str | uuid.UUID) -> tuple[ContentIndexItem, ...]:
+        """Which stages have stored content for a message, without bytes. A missing table is an empty index
+        (content storage off), not an error."""
+        _pattern(channel, _CHANNEL, "channel")
+        params = {"channel": channel, "message_id": _uuid_text(message_id, "message_id")}
+        sql = (
+            "SELECT stage, destination, content_type, size_bytes, claim_ref != '' AS is_claim FROM ("  # noqa: S608
+            f"SELECT stage, destination, content_type, size_bytes, claim_ref FROM {self._content_table} "
+            "WHERE channel = {channel:String} AND message_id = {message_id:UUID} "
+            "ORDER BY stage, destination, ts DESC LIMIT 1 BY stage, destination) "
+            "ORDER BY stage, destination LIMIT 130"
+        )
+        try:
+            rows = self._rows(sql, params)
+        except QueryError as exc:
+            if exc.code == "CONTENT_TABLE_MISSING":
+                return ()
+            raise
+        return tuple(
+            ContentIndexItem(str(st), str(d), str(ct), int(size), bool(claim)) for st, d, ct, size, claim in rows
+        )
+
+    def read_content(
+        self, channel: str, message_id: str | uuid.UUID, stage: str, destination: str = ""
+    ) -> ContentView | None:
+        """The newest stored content for `(channel, message_id, stage, destination)`, or None. Raises
+        `QueryError("CONTENT_TABLE_MISSING")` when the table does not exist. **PHI**: the caller audits the
+        access before calling. A claim-checked row returns the locator and no bytes; a stored locator that fails
+        the claim-check grammar is never returned (`QUERY_FAILED`)."""
+        _pattern(channel, _CHANNEL, "channel")
+        if stage not in CONTENT_STAGES:
+            raise _bad("stage")
+        _pattern(destination, _DEST, "destination")
+        params = {
+            "channel": channel,
+            "message_id": _uuid_text(message_id, "message_id"),
+            "stage": stage,
+            "destination": destination,
+        }
+        rows = self._rows(
+            "SELECT channel_version, stage, destination, content_type, size_bytes, "  # noqa: S608
+            "base64Encode(payload) AS payload_b64, claim_ref, parent_id, correlation_id, attempt, error_code, ts "
+            f"FROM {self._content_table} WHERE channel = {{channel:String}} AND message_id = {{message_id:UUID}} "
+            "AND stage = {stage:String} AND destination = {destination:String} ORDER BY ts DESC LIMIT 1",
+            params,
+        )
+        if not rows:
+            return None
+        version, st, dest, ctype, size, b64, claim, parent, corr, attempt, error_code, archived = rows[0]
+        if claim and _LOCATOR.fullmatch(str(claim)) is None:
+            raise QueryError("QUERY_FAILED", "stored claim-check locator is invalid")
+        return ContentView(
+            int(version), str(st), str(dest), str(ctype), int(size), "" if claim else str(b64), str(claim or ""),
+            None if parent is None else uuid.UUID(str(parent)),
+            None if corr is None else uuid.UUID(str(corr)),
+            int(attempt), str(error_code), archived,
+        )  # fmt: skip
+
+    def content_storage_enabled(self) -> bool | None:
+        """The flag the migrate step last wrote (`archive_settings`, row `content_storage`): True when content
+        storage is on, False when off, None when no flag was ever written (migrate has not run, or predates it).
+        The API answers 409 CONTENT_STORAGE_OFF for False and 503 for True with `CONTENT_TABLE_MISSING`."""
+        try:
+            rows = self._rows(
+                f"SELECT count(), argMax(enabled, applied_at) FROM {self._settings_table} "  # noqa: S608
+                "WHERE table_name = {t:String}",
+                {"t": CONTENT_FLAG_ROW},
+            )
+        except QueryError as exc:
+            if exc.code == "CONTENT_TABLE_MISSING":  # archive_settings absent: nothing was ever migrated
+                return None
+            raise
+        if not rows or int(rows[0][0]) == 0 or rows[0][1] is None:
+            return None
+        return bool(rows[0][1])
 
     # -- plumbing ---------------------------------------------------------------------------------
 

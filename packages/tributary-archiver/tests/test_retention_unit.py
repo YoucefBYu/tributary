@@ -22,6 +22,7 @@ class FakeClickHouse:
         self.settings_rows: list[dict[str, Any]] = [
             {"t": t, "d": d, "p": None, "r": "old", "a": False} for t, d in tables.items() if d is not None
         ]
+        self.flag_rows: list[dict[str, Any]] = []
         self.audit_engine = "MergeTree"
         self.inserted_at_kind = "MATERIALIZED"
         self.has_applied_by = True
@@ -41,6 +42,10 @@ class FakeClickHouse:
             name = re.search(r"EXISTS (?:`[^`]+`\.)?(\w+)", cmd).group(1)  # type: ignore[union-attr]
             found = re.search(r"INTERVAL (\d+) DAY", cmd)
             self.tables.setdefault(name, int(found.group(1)) if found else None)
+        elif cmd.startswith("SELECT count() FROM") and "content_storage" in cmd:
+            return len(self.flag_rows)
+        elif cmd.startswith("SELECT argMax(toUInt8"):
+            return int(self.flag_rows[-1]["e"])
         elif cmd.startswith("SELECT argMax"):
             assert parameters is not None
             recorded = [r for r in self.settings_rows if r["t"] == parameters["t"]]
@@ -60,6 +65,9 @@ class FakeClickHouse:
             self.tables[name] = int(re.search(r"INTERVAL (\d+) DAY", cmd).group(1))  # type: ignore[union-attr]
         elif cmd.startswith("INSERT INTO"):
             assert parameters is not None
+            if "e" in parameters:
+                self.flag_rows.append(parameters)
+                return None
             if self.fail_record:
                 raise OSError("simulated")
             self.settings_rows.append(parameters)
@@ -86,6 +94,7 @@ def test_fresh_database_creates_both_tables_with_their_own_ttl_and_records_setti
 
 def test_unchanged_is_a_no_op() -> None:
     client = FakeClickHouse(message_events=90, audit_log=2190)
+    client.flag_rows = [{"e": False}]  # a previous run already recorded the flag
     assert run(client) == []
     assert not [c for c in client.commands if c.startswith(("INSERT",)) or "MODIFY" in c]
 
@@ -245,3 +254,23 @@ def test_audit_log_with_a_writable_inserted_at_is_refused() -> None:
     client.inserted_at_kind = "DEFAULT"
     with pytest.raises(AuditLogEngineInvalid):
         run(client)
+
+
+def test_the_content_flag_is_written_when_it_changes_and_not_otherwise() -> None:
+    client = FakeClickHouse(message_events=90, audit_log=2190)
+    run(client)  # content off (default): first run records False
+    assert [r["e"] for r in client.flag_rows] == [False]
+    run(client)
+    assert [r["e"] for r in client.flag_rows] == [False], "unchanged: no new row"
+    run(client, content_enabled=True)
+    assert [r["e"] for r in client.flag_rows] == [False, True]
+    run(client, content_enabled=True)
+    run(client)
+    assert [r["e"] for r in client.flag_rows] == [False, True, False]
+
+
+def test_the_flag_is_not_written_when_a_table_step_is_refused() -> None:
+    client = FakeClickHouse(message_events=90, audit_log=2190)
+    with pytest.raises(RetentionDecreaseRefused):
+        run(client, events=30, content_enabled=True)
+    assert client.flag_rows == []
