@@ -3,6 +3,16 @@
 Newest first. Each entry names the contract, the version, whether the change is additive or
 breaking, and the reason. Breaking changes reference an ADR.
 
+## 2026-10-13 (audit writer) — set 1.8: `audit/v0` consumer is lenient (README only)
+
+- **`audit/v0` README 4:** the archiver ignores unknown top-level fields and stores the known ones. It
+  rejects a record that is not a JSON object, has a known field missing or invalid, or has `v` other
+  than 0 (counted as `unsupported_version` and committed past; amended the same day on the
+  coordinator's proposal). A `v` bump needs an ADR, with the reading archiver shipped first. This resolves the conflict with the schema's own description ("consumers ignore unknown
+  fields") and `contracts/README.md` ("lenient consumers"); the old "fails the schema is not stored"
+  would have lost records on every additive change. `archive-engineer` adjusts 29316c8's writer.
+  Counts unchanged.
+
 ## 2026-10-13 (exit review) — set 1.8: `ts` of the `received` event (README only)
 
 - **`events/v0` 2.1:** `received.ts` = `tb-received-at` of the consumed record; for a re-injected

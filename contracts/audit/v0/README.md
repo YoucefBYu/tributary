@@ -127,9 +127,26 @@ One row per record. Column names equal the field names; absent fields are `NULL`
   `ttl_only_drop_parts = 1`, applied by the migrate step only, decrease guarded (ADR-004 R2, R6).
 - **Access:** archiver users INSERT; the API user SELECT (ADR-004 A5). A ClickHouse admin can alter
   rows: tamper evidence is an operational control in v0 (ADR-004 R7, give up).
-- **Invalid records:** a value that does not parse or fails the schema is not stored. The archiver
-  counts it under its rejected-record counter with a fixed code and logs topic, partition and offset
-  only, so an operator can inspect it with Kafka tools within the 30 d buffer.
+- **Lenient consumer (ruled 2026-10-13; supersedes "fails the schema is not stored").** The schema
+  binds the producer, not the archiver. The archiver:
+  1. Drops every top-level field it does not know.
+  2. **Stores `v: 0` only (amended the same day, coordinator's proposal).** A record with any other
+     `v` is not stored. It is counted as `unsupported_version`, logged by topic, partition and offset
+     only, and committed past: a breaking change could alter the meaning of fields v0 knows, and
+     storing it under v0 rules could misrecord an audit fact. Additive changes stay at `v: 0` (rule
+     1). A `v` bump is breaking and needs an ADR that ships the archiver able to read it **before**
+     any producer emits it. The `unsupported_version` count is alerted on above 0.
+  3. Validates what remains against the schema with `additionalProperties` not applied.
+  4. Stores the record if that passes, and logs `audit_unknown_fields_ignored` with the count of
+     dropped fields and the topic, partition and offset. Never the field names: values could be in
+     them.
+
+  A record is **rejected only** if it does not parse as a JSON object, its `v` is not 0, or a known
+  field is missing or invalid. A rejected record is counted under the rejected-record counter with a fixed code and logged
+  by topic, partition and offset only, so an operator can inspect it within the 30 d buffer. Reason:
+  rejecting unknown fields would turn an additive audit field into lost audit records until every
+  archiver upgrades. **Give up:** a new field is absent from `audit_log` until its column exists; the
+  topic keeps it for 30 d.
 
 ## 5. Conformance
 
