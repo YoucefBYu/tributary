@@ -33,6 +33,9 @@ class ArchiverConfig:
     content_enabled: bool = False
     #: `TB_ARCHIVE_CONTENT_CHANNELS`, comma separated: content is stored for these channels only.
     content_channels: frozenset[str] = frozenset()
+    #: `TB_ARCHIVE_AUDIT_CONSUME` (default true): the events archiver also consumes `_tb.<env>.audit` into
+    #: `audit_log` (ADR-004 R7). Off only for a deployment that does not provision the audit topic.
+    audit_consume: bool = True
     #: `TB_ARCHIVE_ALLOW_TTL_DECREASE`: read by the migrate step only (R6).
     allow_ttl_decrease: bool = False
 
@@ -132,4 +135,5 @@ def load_config(
         content_enabled=content_enabled,
         content_channels=_channels(environ),
         allow_ttl_decrease=_bool(environ, "TB_ARCHIVE_ALLOW_TTL_DECREASE", default=False),
+        audit_consume=_bool(environ, "TB_ARCHIVE_AUDIT_CONSUME", default=True),
     )

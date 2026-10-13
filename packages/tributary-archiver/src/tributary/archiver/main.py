@@ -17,7 +17,7 @@ import argparse
 import os
 import signal
 import sys
-from typing import cast
+from typing import Any, cast
 
 from tributary.runtime import DirSecretResolver, RuntimeConfigurationError, load_engine_kafka_or_exit
 from tributary.runtime.clients import consumer_config
@@ -31,9 +31,11 @@ from tributary.runtime.startup import (
     refuse_configuration,
     resolve_instance_id,
 )
-from tributary.runtime.topics import events_topic
+from tributary.runtime.topics import events_topic, platform_topic
 
-from .archiver import Archiver, ArchiverSettings, ConsumerLike
+from .archiver import Archiver, ArchiverSettings, ConsumerLike, RowLike, parse_event_record
+from .audit_record import COLUMNS as AUDIT_COLUMNS
+from .audit_record import parse_audit_record
 from .config import ArchiverConfig, load_config
 from .content import CONTENT_TABLE, content_ddl
 from .errors import (
@@ -49,7 +51,7 @@ from .exposition import ArchiverExposition
 from .grants import check_audit_grants, check_session_settings
 from .metrics import ArchiverMetrics
 from .retention import TableSpec, apply_retention, check_audit_engine
-from .schema import ensure_schema
+from .schema import AUDIT_TABLE, ensure_schema
 from .sink import ClickhouseSink, connect
 
 #: `/livez` fails when the loop has made no progress for this long (a consume, or a backoff slice).
@@ -188,9 +190,28 @@ def main() -> None:
     from confluent_kafka import Consumer
 
     consumer = Consumer(consumer_config(kafka, defaults, group_id=config.group_id, group_instance_id=instance))
-    consumer.subscribe([events_topic(config.env)])
+    events, audit = events_topic(config.env), platform_topic(config.env, "audit")
+    consumer.subscribe([events, audit] if config.audit_consume else [events])
     sink = ClickhouseSink(client)
-    archiver = Archiver(cast("ConsumerLike", consumer), sink, log=log, settings=settings, metrics=metrics)
+    audit_sink = ClickhouseSink(client, table=AUDIT_TABLE, columns=AUDIT_COLUMNS)
+
+    def parse_record(message: Any) -> RowLike:
+        """Events and audit records share one consumer (one group, one commit); the topic picks the parser."""
+        if message.topic() == audit:
+            return parse_audit_record(
+                message.value(), env=config.env, partition=message.partition(), offset=message.offset()
+            )
+        return parse_event_record(message)
+
+    archiver = Archiver(
+        cast("ConsumerLike", consumer),
+        sink,
+        log=log,
+        settings=settings,
+        metrics=metrics,
+        parser=parse_record,
+        side_sinks={AUDIT_TABLE: audit_sink},
+    )
     holder.append(archiver)
 
     def _shutdown(_signum: int, _frame: object) -> None:

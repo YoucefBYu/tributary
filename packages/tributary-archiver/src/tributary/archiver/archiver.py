@@ -30,7 +30,7 @@ names. Never an event field, a record value or an exception message.
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Final, Protocol
 
 from confluent_kafka import KafkaException, TopicPartition
@@ -141,8 +141,12 @@ class Archiver:
         sleep: Callable[[float], None] = time.sleep,
         metrics: ArchiverMetrics | None = None,
         parser: RecordParser = parse_event_record,
+        side_sinks: Mapping[str, Sink] | None = None,
     ) -> None:
         self._parse = parser
+        #: Rows whose `table` attribute names an entry here go to that sink (the audit rows of the events
+        #: archiver); every other row goes to the main sink. Absent attribute means the main sink.
+        self._side_sinks = dict(side_sinks or {})
         self._consumer = consumer
         self._sink = sink
         self._log = log
@@ -228,11 +232,19 @@ class Archiver:
         delay = self._settings.backoff_initial_s
         paused: dict[tuple[str, int], TopicPartition] = {}
         halted = False
+        groups: dict[str, list[tuple[Any, ...]]] = {}
+        for row in rows:
+            table = getattr(row, "table", "")
+            groups.setdefault(table if table in self._side_sinks else "", []).append(row.values)
+        done: set[str] = set()  # a group already inserted is not inserted again on a retry of the batch
         try:
             while True:
                 started = time.monotonic()
                 try:
-                    self._sink.insert([row.values for row in rows])
+                    for key, values in groups.items():
+                        if key not in done:
+                            (self._side_sinks[key] if key else self._sink).insert(values)
+                            done.add(key)
                 except SinkError as exc:
                     self.metrics.insert_failures += 1
                     if not exc.transient:
