@@ -83,6 +83,19 @@ def send(port: int, payload: bytes) -> bool:
     return b"MSA|AA" in buf
 
 
+def _strings(value: object) -> Iterator[str]:
+    """Every string in a decoded JSON value, keys and values, at any depth."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            yield str(key)
+            yield from _strings(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _strings(item)
+
+
 def control_id_of(payload: bytes) -> str:
     return payload.split(b"\r")[0].split(b"|")[9].decode()
 
@@ -99,8 +112,14 @@ class Journey:
     seq_of: dict[str, int] = field(default_factory=dict)  # tb-msg-id -> sequence within its key
     reprocessed: str | None = None
 
-    def raw_records(self, expected: int = 0) -> list:  # type: ignore[type-arg]
-        return drain_topic(self.kafka, RAW, partitions=PARTITIONS, expected=expected, timeout_s=30)
+    def raw_records(self) -> list:  # type: ignore[type-arg]
+        """Every record on `raw`, read to end-of-file on all partitions (never to an expected count)."""
+        return drain_topic(self.kafka, RAW, partitions=PARTITIONS, timeout_s=30)
+
+    def settled_raw_records(self) -> list:  # type: ignore[type-arg]
+        """As `raw_records`, after a pause, so a late duplicate publish would be counted."""
+        time.sleep(1.5)
+        return self.raw_records()
 
 
 @pytest.fixture(scope="module")
@@ -170,7 +189,7 @@ def journey(kafka: str, tmp_path_factory: pytest.TempPathFactory) -> Iterator[Jo
             msg_id = header_map(record)["tb-msg-id"]
             j.ids[control] = msg_id
             j.key_of[msg_id], j.seq_of[msg_id] = key_seq[control]
-        # The archive is complete when .
+        # Wait for the archive to hold every message's `transformed` and `routed` events (what the worker emits).
         with stack.client() as http:
 
             def archived() -> bool:
@@ -250,7 +269,7 @@ def test_content_view_returns_the_stored_bytes_and_writes_an_audit_record(journe
     def audit_records() -> list[dict[str, object]]:
         return [
             json.loads(r.value())
-            for r in drain_topic(journey.kafka, AUDIT, partitions=1, timeout_s=10)
+            for r in drain_topic(journey.kafka, AUDIT, partitions=1, timeout_s=3)
             if r.value() and b"message.content.view" in r.value()
         ]
 
@@ -259,9 +278,13 @@ def test_content_view_returns_the_stored_bytes_and_writes_an_audit_record(journe
     assert record["action"] == "message.content.view" and record["phase"] == "requested"
     assert record["actor"] == "synth-operator-w9b" and "admin" in record["actor_roles"]  # type: ignore[operator]
     assert record["channel"] == CHANNEL and record["stage"] == "received" and record["environment"] == ENV
-    raw_value = json.dumps(record).encode()
-    leaked = journey.sent[control] in raw_value or body["payload_base64"].encode() in raw_value
-    assert not leaked, "the audit record carries payload bytes"
+    tokens = (control, "TESTPATIENT", "SYNTHETIC", journey.key_of[message_id], body["payload_base64"])
+    strings = list(_strings(record))
+    assert strings, "the audit record has no string values to check"
+    leaked = [t for t in tokens for value in strings if t in value]
+    assert not leaked, f"the audit record carries {len(leaked)} payload-derived value(s)"
+    # The check can fail: the same tokens are found in a record that does carry the payload.
+    assert any(t in v for t in tokens for v in _strings({"payload": journey.sent[control].decode()}))
 
 
 def test_reprocess_reingests_under_a_new_id_linked_to_the_original_and_the_stream_shows_it(journey: Journey) -> None:
@@ -300,7 +323,12 @@ def test_reprocess_reingests_under_a_new_id_linked_to_the_original_and_the_strea
 
 def test_replay_over_a_window_reemits_exactly_the_window_and_keeps_each_keys_order(journey: Journey) -> None:
     originals = set(journey.ids.values())
-    before = {header_map(r)["tb-msg-id"] for r in journey.raw_records()}
+    before_records = journey.raw_records()
+    before = {header_map(r)["tb-msg-id"] for r in before_records}
+    # The only repeated id is the reprocess retried with the same operation id: it republishes the same id (at-least-once;
+    # loader idempotency on tb-msg-id absorbs it, invariant 4), so it is on raw twice.
+    ids_on_raw = [header_map(r)["tb-msg-id"] for r in before_records]
+    assert len(ids_on_raw) == len(before) + 1 and ids_on_raw.count(journey.reprocessed) == 2
     assert originals <= before and journey.reprocessed in before
     window = {"start": stamp(journey.started_at), "end": stamp(journey.originals_end + timedelta(milliseconds=500))}
     replay_id = uuid7()
@@ -308,23 +336,22 @@ def test_replay_over_a_window_reemits_exactly_the_window_and_keeps_each_keys_ord
         # Refused without allow_reorder on a per-key channel: nothing is published.
         refused = http.post(f"{BASE}/replays", json={"replay_id": uuid7(), **window})
         assert refused.status_code == 409 and refused.json()["code"] == "ORDERING_WOULD_BREAK"
+        assert len(journey.settled_raw_records()) == len(before_records), "a refused replay published records"
         # Bounded: a span larger than max_records publishes nothing.
         small = http.post(
             f"{BASE}/replays", json={"replay_id": uuid7(), **window, "allow_reorder": True, "max_records": 2}
         )
-        if small.status_code in (200, 202):
-            replay = small.json()
-            wait_until(
-                lambda: http.get(f"{BASE}/replays/{replay['replay_id']}").json()["status"] != "running",
-                "the bounded replay to finish",
-                timeout_s=60,
-            )
-            final = http.get(f"{BASE}/replays/{replay['replay_id']}").json()
-            assert final["status"] == "failed" and final["failure_code"] == "RANGE_TOO_LARGE"
-            assert final.get("republished", 0) == 0
-        else:
-            assert small.status_code in (409, 422), small.status_code
-        assert {header_map(r)["tb-msg-id"] for r in journey.raw_records()} == before
+        assert small.status_code == 202, small.status_code  # accepted, then fails after the audit record (README 3.14)
+        replay = small.json()
+        wait_until(
+            lambda: http.get(f"{BASE}/replays/{replay['replay_id']}").json()["status"] != "running",
+            "the bounded replay to finish",
+            timeout_s=60,
+        )
+        final = http.get(f"{BASE}/replays/{replay['replay_id']}").json()
+        assert final["status"] == "failed" and final["failure_code"] == "RANGE_TOO_LARGE"
+        assert final["republished"] == 0
+        assert len(journey.settled_raw_records()) == len(before_records), "a refused replay published records"
 
         with Sse(
             journey.stack.base, f"/v1/environments/{ENV}/events?channel={CHANNEL}", journey.stack.tokens.bearer()
@@ -359,7 +386,8 @@ def test_replay_over_a_window_reemits_exactly_the_window_and_keeps_each_keys_ord
                 lambda: len(replayed_ids()) == len(originals), "nine replayed messages on the stream", timeout_s=90
             )
 
-    after = journey.raw_records(expected=len(before) + len(originals))
+    after = journey.settled_raw_records()  # after the repeated POST too: a late duplicate would be counted
+    assert len(after) == len(before_records) + len(originals), f"{len(after)} records on raw after the replay"
     new = [r for r in after if header_map(r)["tb-msg-id"] not in before]
     assert len(new) == len(originals), f"{len(new)} records were replayed, expected {len(originals)}"
     parents = [header_map(r).get("tb-parent-id") for r in new]
