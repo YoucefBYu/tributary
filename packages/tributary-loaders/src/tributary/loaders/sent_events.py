@@ -16,7 +16,9 @@ record). When `handle` returns normally, the destination has confirmed the deliv
   `partition_paused` count failures (`ConsumerLoop` numbers the first failure `1`): a first-try success is `1`, a
   success after two failed tries is `3`. The loop does not hand its retry state to a handler, so the wrapper counts
   consecutive failures of the same `(topic, partition, offset)` itself, one entry per partition (bounded). After a
-  restart the count restarts, which can only repeat a dedup key, never invent a gap.
+  restart the count restarts, so a record that succeeded on try 3 and was redelivered after a crash in the commit
+  window emits `sent` with attempt 1: a different dedup key, so `channel_stats` can over-count `sent` for it. This
+  is accepted: it needs failed tries followed by a crash before the commit, which is rare.
 * **PHI (invariant 6).** The event carries ids, the destination name, coordinates, sizes, the content type and the
   trace parent. No payload byte, header value other than those, or exception text.
 """
@@ -97,11 +99,12 @@ class SentEventHandler:
                     partition=record.partition,
                     offset=record.offset,
                     duration_ms=(time.monotonic() - started) * 1000,
-                    traceparent=record.message.get(h.TRACEPARENT),
+                    traceparent=record.message.traceparent,
                     parent_id=record.message.get(h.TB_PARENT_ID),
                     correlation_id=record.message.get(h.TB_CORRELATION_ID),
                 )
             )
+            self._emit_failing = False  # the next failure streak is logged again
         except Exception as exc:  # observability must never fail a delivery that already succeeded
             if self._log is not None and not self._emit_failing:
                 self._emit_failing = True
