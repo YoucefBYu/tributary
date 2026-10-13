@@ -8,6 +8,11 @@ breaking, and the reason. Breaking changes reference an ADR.
 - **`events/v0` 2 field table:** on loader delivery stages, `attempt` is the 1-based number of the
   delivery try; `sent` after k failures is k+1, matching `ConsumerLoop`'s `retrying` numbering. This
   confirms 7574d38. It is not `tb-attempt`, which stays `0` under a blocking retry. Counts unchanged.
+  **Corrected the same day (code review of f7ef2c0):** "a restart can only repeat a key" was false.
+  A success on try k > 1 followed by a crash before the commit re-emits `sent` with attempt 1, a new
+  key. That rare over-count is now stated and accepted. Per-stage definition: `routed` and other
+  worker stages use the 0-based `tb-attempt`; `retrying`, `error`, `dlq` and `sent` use the 1-based
+  try. `stage` is in the key, so keys cannot collide across stages.
 
 ## 2026-10-13 (W3-30 part 2) — set 1.8: `tb_archiver_audit_records_total`
 
