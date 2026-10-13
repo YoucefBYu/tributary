@@ -129,7 +129,7 @@ def test_the_real_adt_step_produces_a_bundle_through_the_worker() -> None:
     assert bundle["type"] == "transaction"
     assert [entry["resource"]["resourceType"] for entry in bundle["entry"]] == ["Patient", "Encounter"]
     assert headers["tb-content-type"] == "application/fhir+json"
-    assert emitter.stages() == ["transformed", "routed"]
+    assert emitter.stages() == ["received", "transformed", "routed"]
     # The production fullUrl source (W2-2 open item 3): derived from tb-msg-id, so a redelivery of the
     # same record produces the same Bundle.
     expected = message_id_factory(record.message.msg_id)

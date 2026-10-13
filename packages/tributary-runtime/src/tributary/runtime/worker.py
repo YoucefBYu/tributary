@@ -4,6 +4,11 @@ One Kafka hop in, one per destination out, and everything between them in memory
 worker commits its input offset only after every `out.<dest>` record has a delivery callback, so a
 crash mid-flight replays rather than drops (invariants 1 and 4).
 
+Lifecycle events (`_tb.<env>.events`, fire-and-forget): `received` for every consumed `raw` record before any
+step runs (events/v0 2.1, set 1.8: the worker, not the receiver, emits it), then `filtered`, `transformed`,
+`routed` or `dlq`. A replayed record emits `received` again with the same `tb-msg-id` and `attempt`, which the
+archive collapses (events/v0 2.2); the loop's blocking retry of one record emits it once.
+
 `pipeline.transactional: true` (ADR-003 D6) makes each commit window one Kafka transaction: the
 `out.<dest>` and DLQ records and the `raw` offsets commit atomically (`transactions.py`). The flag is
 read at startup, because the producer's transactional identity is fixed at construction; a hot reload
@@ -62,7 +67,7 @@ from .errors import (
     RuntimeConfigurationError,
     safe_token,
 )
-from .events import EventEmitter, MessageEvent, NullEmitter
+from .events import EventEmitter, EventError, MessageEvent, NullEmitter
 from .executor import ChannelPlan, PipelineAbort, StepFailure, StepStats, run_splitter
 from .extensions import ContextResolver
 from .logs import JsonLogger
@@ -486,6 +491,11 @@ class PipelineHandler:
         self.stats = StepStats(observer=metrics.observe_step if metrics is not None else None)
         self.dead_lettered = 0
         self.filtered = 0
+        #: `(topic, partition) -> offset` of the last record whose `received` event was emitted. Only the
+        #: same record handled again back to back (the loop's blocking retry re-reads it) is suppressed;
+        #: any other redelivery re-emits, and the archive dedups it (events contract 2.2). One entry per
+        #: raw partition this process has read, so it is bounded by the topic's partition count.
+        self._received: dict[tuple[str, int], int] = {}
 
     # -- plan ------------------------------------------------------------------------------------
 
@@ -576,8 +586,9 @@ class PipelineHandler:
             )
         if self._replies is not None:
             self._replies.poll()  # serve the previous record's reply callback: its `replied` event
-        budget = TimeBudget(self._time_budget_s, clock=self._clock)
         message = record.message
+        self._emit_received(spec, record)
+        budget = TimeBudget(self._time_budget_s, clock=self._clock)
         ctx = WorkerContext(
             channel=spec.name,
             channel_version=spec.version,
@@ -925,6 +936,45 @@ class PipelineHandler:
             self._stage_timer.replied(record.msg_id, status=outcome.status)
 
     # -- events and stats ------------------------------------------------------------------------
+
+    def _emit_received(self, spec: ChannelSpec, record: ConsumedRecord) -> None:
+        """`received` for one consumed `raw` record, before any step runs (events contract 2.1, set 1.8).
+
+        The worker is the emitter: a receiver holds no WRITE on the events topic and must not put a
+        produce on its ACK path (invariants 1 and 9). Same fire-and-forget emitter as every other stage,
+        so a slow or absent archive never blocks or fails the record. The event carries ids, the raw
+        coordinates and the payload size only; `attrs` are omitted because no step has run yet.
+
+        `tb-msg-id` is the receiver's, read from the record, so every redelivery carries the same one and
+        the archive collapses copies on `(message_id, stage, destination, attempt)` (contract 2.2).
+        """
+        key = (record.topic, record.partition)
+        if self._received.get(key) == record.offset:
+            return  # the loop's blocking retry re-reading this record: one `received`, not one per attempt
+        message = record.message
+        try:
+            self._emit(
+                spec,
+                record,
+                message,
+                stage="received",
+                status="ok",
+                ctx=None,
+                # A claim-checked payload has no inline bytes to count (events contract: size_bytes 0 or absent).
+                size_bytes=message.payload_size if message.claim_check is None else None,
+            )
+        except (EventError, HeaderError) as exc:
+            # Observability must not fail the message: the record still runs, and its later stages say why
+            # if the envelope is really broken. Logged with ids and the exception type only (invariant 6).
+            self._log.warning(
+                "event_emit_failed",
+                stage="received",
+                error_type=type(exc).__name__,
+                topic=record.topic,
+                partition=record.partition,
+                offset=record.offset,
+            )
+        self._received[key] = record.offset
 
     def _emit_dead(
         self,
