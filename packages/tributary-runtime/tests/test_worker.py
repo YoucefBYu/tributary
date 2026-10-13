@@ -116,7 +116,7 @@ def test_a_message_flows_from_raw_to_the_destination_topic() -> None:
     assert sent[h.TB_DESTINATION] == "http-stub"
     assert sent[h.TB_ATTEMPT] == "0"
     assert sent[h.TB_MSG_ID] == record.message.msg_id
-    assert emitter.stages() == ["received", "transformed", "routed"]
+    assert emitter.stages() == ["received", "queued", "transformed", "routed"]
 
 
 def test_every_destination_record_is_flushed_before_the_handler_returns() -> None:
@@ -144,8 +144,8 @@ def test_a_dropped_message_is_filtered_and_nothing_is_produced() -> None:
     handler(producer, emitter, steps=(filter_everything,)).handle(consumed())
 
     assert producer.produced == []
-    assert emitter.stages() == ["received", "filtered"]
-    event = emitter.events[1]
+    assert emitter.stages() == ["received", "queued", "filtered"]
+    event = emitter.events[2]
     assert event.status == "dropped"
     assert event.error_message == "unsupported trigger event"
 
@@ -167,8 +167,8 @@ def test_attrs_and_usr_headers_set_by_a_step_reach_the_event_and_the_record() ->
     _topic, _key, _value, headers = producer.produced[0]
     sent = {name: blob.decode() for name, blob in headers or []}
     assert sent["tb-usr-batch-id"] == "b-4471"
-    received, transformed = emitter.events[0], emitter.events[1]
-    assert received.attrs is None, "`received` precedes every step, so no step attrs can be on it"
+    received, queued, transformed = emitter.events[0], emitter.events[1], emitter.events[2]
+    assert received.attrs is None and queued.attrs is None, "both precede every step: no step attrs on them"
     assert transformed.attrs == {"trigger": "a01"}
     # Envelope contract 2.2: tb-usr-* are propagated in headers and NOT projected into events.
     assert "batch-id" not in (transformed.attrs or {})

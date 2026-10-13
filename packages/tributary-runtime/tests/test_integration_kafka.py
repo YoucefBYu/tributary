@@ -310,11 +310,12 @@ def received_events(bootstrap: str, ids: set[str]) -> dict[str, list[dict[str, A
 def test_every_raw_record_gets_a_received_event_with_its_coordinates(
     deployed_spec: dict[str, Any], topics: str
 ) -> None:
-    """Events contract 2.1 (set 1.8): the worker emits `received` for each consumed `raw` record.
+    """Events contract 2.1 (set 1.8): the worker emits `received` then `queued` for each consumed `raw` record.
 
     The coordinates are checked against the record as it sits on `raw`, so the event points at the exact
-    record a reprocess would read. `received` precedes `transformed` for the same message: one key, one
-    events partition, emitted before any step runs.
+    record a reprocess would read. `received.ts` is that record's `tb-received-at` at millisecond precision.
+    `received`, `queued`, `transformed` in that order for the same message: one key, one events partition,
+    both arrival events emitted before any step runs.
     """
     published = set(publish(topics, 2, start=50))
     running = worker(topics, "pipeline-received")
@@ -322,7 +323,13 @@ def test_every_raw_record_gets_a_received_event_with_its_coordinates(
     running.run(max_iterations=300)
 
     coordinates = {
-        header_map(raw)[h.TB_MSG_ID]: (raw.topic(), raw.partition(), raw.offset(), len(raw.value() or b""))
+        header_map(raw)[h.TB_MSG_ID]: (
+            raw.topic(),
+            raw.partition(),
+            raw.offset(),
+            len(raw.value() or b""),
+            h.format_timestamp(h.parse_timestamp(h.TB_RECEIVED_AT, header_map(raw)[h.TB_RECEIVED_AT])),
+        )
         for raw in drain(topics, raw_topic(ENV, CHANNEL), expected=len(published))
         if header_map(raw).get(h.TB_MSG_ID) in published
     }
@@ -335,7 +342,7 @@ def test_every_raw_record_gets_a_received_event_with_its_coordinates(
     by_id = received_events(topics, published)
     assert set(by_id) == published, "one received event per consumed raw record"
     for message_id, copies in by_id.items():
-        topic, partition, offset, size = coordinates[message_id]
+        topic, partition, offset, size, received_at = coordinates[message_id]
         for event in copies:
             assert list(schema.iter_errors(event)) == []
             assert (event["kind"], event["status"], event["channel"]) == ("message", "ok", CHANNEL)
@@ -343,8 +350,13 @@ def test_every_raw_record_gets_a_received_event_with_its_coordinates(
             assert (event["topic"], event["partition"], event["offset"]) == (topic, partition, offset)
             assert event["attempt"] == 0 and event["size_bytes"] == size
             assert "attrs" not in event and "destination" not in event
-        timeline = [event["stage"] for event in emitted if event.get("message_id") == message_id]
-        assert timeline.index("received") < timeline.index("transformed"), "received comes first"
+            assert event["ts"] == received_at, "received.ts is the receiver's commit time"
+        timeline = [event for event in emitted if event.get("message_id") == message_id]
+        stages = [event["stage"] for event in timeline]
+        assert stages.index("received") < stages.index("queued") < stages.index("transformed")
+        queued = timeline[stages.index("queued")]
+        assert list(schema.iter_errors(queued)) == []
+        assert (queued["topic"], queued["partition"], queued["offset"]) == (topic, partition, offset)
 
 
 def test_an_experimental_header_is_tolerated_inbound_and_stripped_on_produce(

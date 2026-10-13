@@ -4,11 +4,13 @@ One Kafka hop in, one per destination out, and everything between them in memory
 worker commits its input offset only after every `out.<dest>` record has a delivery callback, so a
 crash mid-flight replays rather than drops (invariants 1 and 4).
 
-Lifecycle events (`_tb.<env>.events`, fire-and-forget): `received` for every consumed `raw` record before any
-step runs (events/v0 2.1, set 1.8: the worker, not the receiver, emits it), then `filtered`, `transformed`,
-`routed` or `dlq`. The handler remembers the last `RECEIVED_MEMORY` `(topic, partition, offset)` keys it emitted
-for, so the loop re-handing a record it already saw emits nothing new: a blocking retry of one record, and a
-transactional abort that rewinds the whole window, each yield one `received` per record. A replay this process
+Lifecycle events (`_tb.<env>.events`, fire-and-forget): `received` then `queued` for every consumed `raw` record
+before any step runs (events/v0 2.1, set 1.8: the worker, not the receiver, emits both; ADR-001 5.5 order), then
+`filtered`, `transformed`, `routed` or `dlq`. `received.ts` is the record's `tb-received-at` (consume time for a
+`tb-parent-id` re-injection or a missing/malformed header); `queued.ts` is the consume time. The handler
+remembers the last `RECEIVED_MEMORY` records it emitted those for, so the loop re-handing a record it already
+saw emits nothing new: a blocking retry of one record, and a transactional abort that rewinds the whole window,
+each yield one `received` and one `queued` per record. A replay this process
 did not see (another worker's records after a rebalance, a restart) emits again, with the same `tb-msg-id` and
 `attempt`, which the archive collapses (events/v0 2.2). A record the loop quarantines (undecodable) or rejects
 (malformed header) never reaches the handler, so it gets no `received`: its `quarantined` or `dlq` event is its
@@ -49,7 +51,7 @@ from tributary.sdk import Drop, Message
 from tributary.sdk import headers as h
 from tributary.sdk.codes import REPLY_BODY_MISSING, TB_OUTPUT_ENVELOPE_INVALID, TB_PIPELINE_TIME_BUDGET
 from tributary.sdk.context import Logger
-from tributary.sdk.errors import EnvelopeError, HeaderError, UsrHeaderError
+from tributary.sdk.errors import EnvelopeError, HeaderError, MissingHeaderError, UsrHeaderError
 from tributary.sdk.ids import child_traceparent, new_traceparent, uuid7
 from tributary.sdk.projection import Ordering, TopicClass, validate_for_produce
 from tributary.sdk.reply import ReplyBody
@@ -75,7 +77,7 @@ from .errors import (
     RuntimeConfigurationError,
     safe_token,
 )
-from .events import EventEmitter, EventError, MessageEvent, NullEmitter
+from .events import EventEmitter, EventError, MessageEvent, NullEmitter, now_text
 from .executor import ChannelPlan, PipelineAbort, StepFailure, StepStats, run_splitter
 from .extensions import ContextResolver
 from .logs import JsonLogger
@@ -505,12 +507,12 @@ class PipelineHandler:
         self.stats = StepStats(observer=metrics.observe_step if metrics is not None else None)
         self.dead_lettered = 0
         self.filtered = 0
-        #: The most recent `(topic, partition, offset)` keys whose `received` event was emitted, oldest first,
-        #: at most `received_memory` of them. Sized above a commit window, so a blocking retry and a
-        #: transactional rewind both find every record they re-hand. Bounded so memory does not grow with
-        #: traffic; a key that aged out simply re-emits, which the archive dedups (events contract 2.2).
-        self._received: OrderedDict[tuple[str, int, int], None] = OrderedDict()
-        self._received_memory = max(1, received_memory)
+        #: The most recent `(stage, topic, partition, offset)` keys whose `received` or `queued` event was
+        #: emitted, oldest first, for at most `received_memory` records. Sized above a commit window, so a
+        #: blocking retry and a transactional rewind both find every record they re-hand. Bounded so memory
+        #: does not grow with traffic; a key that aged out simply re-emits, which the archive dedups (2.2).
+        self._arrived: OrderedDict[tuple[str, str, int, int], None] = OrderedDict()
+        self._arrival_memory = 2 * max(1, received_memory)
 
     # -- plan ------------------------------------------------------------------------------------
 
@@ -602,7 +604,7 @@ class PipelineHandler:
         if self._replies is not None:
             self._replies.poll()  # serve the previous record's reply callback: its `replied` event
         message = record.message
-        self._emit_received(spec, record)
+        self._emit_arrival(spec, record)
         budget = TimeBudget(self._time_budget_s, clock=self._clock)
         ctx = WorkerContext(
             channel=spec.name,
@@ -952,47 +954,86 @@ class PipelineHandler:
 
     # -- events and stats ------------------------------------------------------------------------
 
-    def _emit_received(self, spec: ChannelSpec, record: ConsumedRecord) -> None:
-        """`received` for one consumed `raw` record, before any step runs (events contract 2.1, set 1.8).
+    def _emit_arrival(self, spec: ChannelSpec, record: ConsumedRecord) -> None:
+        """`received` then `queued` for one consumed `raw` record, before any step runs (events/v0 2.1).
 
-        The worker is the emitter: a receiver holds no WRITE on the events topic and must not put a
-        produce on its ACK path (invariants 1 and 9). Same fire-and-forget emitter as every other stage,
-        so a slow or absent archive never blocks or fails the record. The event carries ids, the raw
-        coordinates and the payload size only; `attrs` are omitted because no step has run yet.
+        The worker is the emitter of both: a receiver holds no WRITE on the events topic and must not put a
+        produce on its ACK path (invariants 1 and 9). Same fire-and-forget emitter as every other stage, so
+        a slow or absent archive never blocks or fails the record. ADR-001 5.5 orders them RECEIVED, QUEUED
+        (raw committed, ACK sent), then FILTERED / ERROR / TRANSFORMED, so both precede the first step.
+        Each carries ids, the raw coordinates and the payload size only; no `attrs`, no step has run yet.
 
-        `tb-msg-id` is the receiver's, read from the record, so every redelivery carries the same one and
-        the archive collapses copies on `(message_id, stage, destination, attempt)` (contract 2.2).
+        `ts`: `received` is the receiver's commit time (`tb-received-at`, `_received_ts`); `queued` is the
+        consume time. `tb-msg-id` is the receiver's, so every redelivery carries the same one and the
+        archive collapses copies on `(message_id, stage, destination, attempt)` (contract 2.2).
         """
-        key = (record.topic, record.partition, record.offset)
-        if key in self._received:
-            return  # the loop re-handing a record (blocking retry, transactional rewind): one `received` only
+        consumed_at = now_text()
+        self._emit_once(spec, record, "received", self._received_ts(record, consumed_at))
+        self._emit_once(spec, record, "queued", consumed_at)
+
+    def _received_ts(self, record: ConsumedRecord, consumed_at: str) -> str:
+        """`received.ts` per events/v0 2.1 (ruled 2026-10-13).
+
+        The record's `tb-received-at`, normalised to UTC with milliseconds. A record with `tb-parent-id` is
+        a reprocess or replay re-injection carrying the original's `tb-received-at` (envelope/v0 6 rule 5),
+        so it gets the consume time; so does a record whose header is missing or malformed (debug, ids only).
+        """
+        message = record.message
+        if message.get(h.TB_PARENT_ID) is not None:
+            return consumed_at
+        try:
+            return h.format_timestamp(h.parse_timestamp(h.TB_RECEIVED_AT, message.get(h.TB_RECEIVED_AT)))
+        except HeaderError as exc:
+            fields: dict[str, object] = {
+                "reason": "missing" if isinstance(exc, MissingHeaderError) else "malformed",
+                "topic": record.topic,
+                "partition": record.partition,
+                "offset": record.offset,
+            }
+            message_id = message.get(h.TB_MSG_ID)
+            if message_id:
+                fields["message_id"] = message_id
+            self._log.debug("received_ts_fallback", **fields)
+            return consumed_at
+
+    def _emit_once(self, spec: ChannelSpec, record: ConsumedRecord, stage: str, ts: str) -> None:
+        """Emit an arrival stage unless this record's was already emitted by this process.
+
+        The loop re-hands a record on a blocking retry and rewinds a whole window on a transactional abort;
+        neither is a new arrival. A key is remembered only after the emit succeeded, so a refused event is
+        tried again on the next attempt.
+        """
+        key = (stage, record.topic, record.partition, record.offset)
+        if key in self._arrived:
+            return
         message = record.message
         try:
             self._emit(
                 spec,
                 record,
                 message,
-                stage="received",
+                stage=stage,
                 status="ok",
                 ctx=None,
                 # A claim-checked payload has no inline bytes to count (events contract: size_bytes 0 or absent).
                 size_bytes=message.payload_size if message.claim_check is None else None,
+                ts=ts,
             )
         except (EventError, HeaderError) as exc:
             # Observability must not fail the message: the record still runs, and its later stages say why
             # if the envelope is really broken. Logged with ids and the exception type only (invariant 6).
             self._log.warning(
                 "event_emit_failed",
-                stage="received",
+                stage=stage,
                 error_type=type(exc).__name__,
                 topic=record.topic,
                 partition=record.partition,
                 offset=record.offset,
             )
-            return  # not remembered: the loop's next attempt at this record tries the event again
-        self._received[key] = None
-        if len(self._received) > self._received_memory:
-            self._received.popitem(last=False)
+            return
+        self._arrived[key] = None
+        if len(self._arrived) > self._arrival_memory:
+            self._arrived.popitem(last=False)
 
     def _emit_dead(
         self,
@@ -1047,6 +1088,7 @@ class PipelineHandler:
         size_bytes: int | None = None,
         error_code: str | None = None,
         error_message: str | None = None,
+        ts: str | None = None,
     ) -> None:
         event_attrs = dict(attrs if attrs is not None else ctx.attrs() if ctx is not None else {})
         self._emitter.emit(
@@ -1071,6 +1113,7 @@ class PipelineHandler:
                 parent_id=subject.get(h.TB_PARENT_ID),
                 correlation_id=subject.get(h.TB_CORRELATION_ID),
                 attrs=event_attrs or None,
+                ts=ts if ts is not None else now_text(),
             )
         )
 

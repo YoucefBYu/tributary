@@ -1,4 +1,6 @@
-"""The `received` stage event: the worker emits it once per consumed `raw` record, before any step runs.
+"""The `received` and `queued` stage events: the worker emits both once per consumed `raw` record, before any
+step runs, in ADR-001 5.5 order. `received.ts` is the receiver's commit time (`tb-received-at`), `queued.ts` the
+consume time (events/v0 2.1, ruled 2026-10-13).
 
 Events contract 2.1 (set 1.8) names the pipeline worker as the emitter, because a receiver holds no WRITE on
 the events topic and must not put a produce on its ACK path (invariants 1 and 9). No Kafka here: the
@@ -16,7 +18,14 @@ import orjson
 import pytest
 from jsonschema import Draft202012Validator
 from tributary.runtime.errors import DeliveryError
-from tributary.runtime.events import EventError, LifecycleEvent, MessageEvent, RecordingEmitter, serialize
+from tributary.runtime.events import (
+    EventError,
+    LifecycleEvent,
+    MessageEvent,
+    RecordingEmitter,
+    now_text,
+    serialize,
+)
 from tributary.runtime.executor import StepFailure
 from tributary.runtime.logs import JsonLogger
 from tributary.runtime.producer import KafkaEventEmitter, RecordProducer
@@ -24,6 +33,8 @@ from tributary.runtime.records import ConsumedRecord
 from tributary.runtime.spec import ChannelSpec
 from tributary.runtime.worker import RECEIVED_MEMORY, PipelineHandler
 from tributary.sdk import Drop, Message, step
+from tributary.sdk import headers as h
+from tributary.sdk.ids import uuid7
 from tributary.sdk.testing import make_message
 
 from .fakes import FakeProducer
@@ -58,6 +69,7 @@ def handler(
     *,
     steps: tuple[Any, ...],
     log: io.StringIO,
+    log_level: str | None = None,
     transactional: bool = False,
     received_memory: int = RECEIVED_MEMORY,
 ) -> PipelineHandler:
@@ -66,7 +78,7 @@ def handler(
         spec_provider=spec,
         producer=RecordProducer(producer, log=JsonLogger("test", stream=log)),
         emitter=emitter,
-        log=JsonLogger("worker", stream=log),
+        log=JsonLogger("worker", stream=log, level=log_level),
         instance="worker:test@localhost",
         steps_override=steps,
         transactional=transactional,
@@ -104,8 +116,8 @@ def test_received_is_emitted_first_with_the_raw_coordinates_and_no_payload() -> 
     record = consumed()
     handler(FakeProducer(), emitter, steps=(observe,), log=log).handle(record)
 
-    assert seen_before_step == [["received"]], "received is emitted before the first step runs"
-    assert emitter.stages() == ["received", "transformed", "routed"]
+    assert seen_before_step == [["received", "queued"]], "both are emitted before the first step runs"
+    assert emitter.stages() == ["received", "queued", "transformed", "routed"]
     event = emitter.events[0]
     assert isinstance(event, MessageEvent)
     assert (event.stage, event.status) == ("received", "ok")
@@ -141,7 +153,7 @@ def test_received_precedes_every_outcome(
     else:
         with pytest.raises(raises):
             run.handle(consumed())
-    assert emitter.stages() == ["received"] + ([after] if after else [])
+    assert emitter.stages() == ["received", "queued"] + ([after] if after else [])
 
 
 def test_a_blocking_retry_of_the_same_record_emits_received_once() -> None:
@@ -156,7 +168,7 @@ def test_a_blocking_retry_of_the_same_record_emits_received_once() -> None:
     producer.remaining = 0
     run.handle(record)
 
-    assert emitter.stages() == ["received", "transformed", "routed"]
+    assert emitter.stages() == ["received", "queued", "transformed", "routed"]
 
 
 def test_a_replay_another_process_sees_re_emits_with_the_same_dedup_key() -> None:
@@ -204,7 +216,7 @@ def test_a_refused_received_event_is_logged_by_id_and_the_record_still_runs() ->
 
     handler(producer, emitter, steps=(passthrough,), log=log).handle(consumed())
 
-    assert emitter.stages() == ["transformed", "routed"]
+    assert emitter.stages() == ["queued", "transformed", "routed"], "queued does not depend on received"
     assert producer.topics() == ["dev.adt-passthrough.out.http-stub"]
     lines = [json.loads(line) for line in log.getvalue().splitlines()]
     failed = [line for line in lines if line["event"] == "event_emit_failed"]
@@ -277,3 +289,74 @@ def test_a_transactional_abort_rewinds_the_window_but_emits_received_once_per_re
     assert emitter.stages().count("transformed") == 8
     coordinates = [(event.partition, event.offset) for event in received(emitter.events)]
     assert sorted(coordinates) == [(0, 0), (0, 1), (1, 0), (1, 1)], "one received per record, not per attempt"
+    assert emitter.stages().count("queued") == 4, "and one queued per record"
+
+
+def by_stage(emitter: RecordingEmitter) -> dict[str, MessageEvent]:
+    return {event.stage: event for event in emitter.events if isinstance(event, MessageEvent)}
+
+
+def arrive(message: Message, *, log: io.StringIO | None = None) -> tuple[dict[str, MessageEvent], str, str]:
+    """Handle one record; return its events by stage and the consume-time window around the handle.
+
+    The step drops the record, so nothing is produced: a record without `tb-received-at` is refused at
+    produce, and the arrival events are what is under test here.
+    """
+    emitter = RecordingEmitter()
+    run = handler(FakeProducer(), emitter, steps=(drop_all,), log=log or io.StringIO(), log_level="debug")
+    before = now_text()
+    run.handle(consumed(message))
+    return by_stage(emitter), before, now_text()
+
+
+def test_received_ts_is_the_receivers_commit_time_and_queued_ts_the_consume_time() -> None:
+    message = make_message(PAYLOAD, key=KEY, received_at="2026-01-02T03:04:05.123456789+00:00")
+    events, before, after = arrive(message)
+    assert events["received"].ts == "2026-01-02T03:04:05.123Z", "tb-received-at, in UTC with milliseconds"
+    assert before <= events["queued"].ts <= after, "queued is the consume time"
+    schema = Draft202012Validator(json.loads(EVENT_SCHEMA.read_text(encoding="utf-8")))
+    for stage in ("received", "queued"):
+        assert list(schema.iter_errors(orjson.loads(serialize(events[stage])))) == []
+
+
+def test_a_re_injected_record_gets_the_consume_time_for_received() -> None:
+    """A `tb-parent-id` record carries the original's `tb-received-at` (envelope/v0 6 rule 5)."""
+    message = make_message(PAYLOAD, key=KEY, received_at="2026-01-02T03:04:05.123Z", headers={h.TB_PARENT_ID: uuid7()})
+    events, before, after = arrive(message)
+    assert before <= events["received"].ts <= after
+    assert events["received"].ts != "2026-01-02T03:04:05.123Z"
+    assert events["received"].parent_id == message.get(h.TB_PARENT_ID)
+
+
+@pytest.mark.parametrize("reason", ["missing", "malformed"])
+def test_a_missing_or_malformed_received_at_falls_back_to_the_consume_time(reason: str) -> None:
+    original = make_message(PAYLOAD, key=KEY)
+    message = (
+        original.without_header(h.TB_RECEIVED_AT)
+        if reason == "missing"
+        else original.with_header(h.TB_RECEIVED_AT, "SYNTH-not-a-time")
+    )
+    log = io.StringIO()
+    events, before, after = arrive(message, log=log)
+
+    assert before <= events["received"].ts <= after
+    lines = [json.loads(line) for line in log.getvalue().splitlines()]
+    fallback = [line for line in lines if line["event"] == "received_ts_fallback"]
+    assert len(fallback) == 1
+    assert fallback[0]["level"] == "debug" and fallback[0]["reason"] == reason
+    assert fallback[0]["message_id"] == message.msg_id and fallback[0]["offset"] == 7
+    assert "SYNTH-not-a-time" not in log.getvalue(), "ids only, never the header value"
+
+
+def test_a_well_formed_received_at_logs_nothing() -> None:
+    log = io.StringIO()
+    arrive(make_message(PAYLOAD, key=KEY), log=log)
+    assert "received_ts_fallback" not in log.getvalue()
+
+
+def test_queued_carries_the_same_identity_and_coordinates_as_received() -> None:
+    events, _before, _after = arrive(make_message(PAYLOAD, key=KEY))
+    received_event, queued = events["received"], events["queued"]
+    same = ("message_id", "channel_version", "attempt", "topic", "partition", "offset", "size_bytes", "traceparent")
+    assert all(getattr(received_event, name) == getattr(queued, name) for name in same)
+    assert (queued.status, queued.attrs, queued.destination) == ("ok", None, None)
