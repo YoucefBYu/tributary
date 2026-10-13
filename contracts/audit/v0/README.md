@@ -135,14 +135,17 @@ One row per record. Column names equal the field names; absent fields are `NULL`
      only, and committed past: a breaking change could alter the meaning of fields v0 knows, and
      storing it under v0 rules could misrecord an audit fact. Additive changes stay at `v: 0` (rule
      1). A `v` bump is breaking and needs an ADR that ships the archiver able to read it **before**
-     any producer emits it. The `unsupported_version` count is alerted on above 0.
+     any producer emits it. Counted as
+     `tb_archiver_audit_records_total{outcome="unsupported_version"}`, and alerted on any increase
+     (`observability/v0` 3.5).
   3. Validates what remains against the schema with `additionalProperties` not applied.
   4. Stores the record if that passes, and logs `audit_unknown_fields_ignored` with the count of
      dropped fields and the topic, partition and offset. Never the field names: values could be in
      them.
 
   A record is **rejected only** if it does not parse as a JSON object, its `v` is not 0, or a known
-  field is missing or invalid. A rejected record is counted under the rejected-record counter with a fixed code and logged
+  field is missing or invalid. A rejected record is counted as `tb_archiver_audit_records_total{outcome="invalid"}` (or
+  `unsupported_version`) and logged
   by topic, partition and offset only, so an operator can inspect it within the 30 d buffer. Reason:
   rejecting unknown fields would turn an additive audit field into lost audit records until every
   archiver upgrades. **Give up:** a new field is absent from `audit_log` until its column exists; the

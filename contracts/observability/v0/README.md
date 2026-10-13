@@ -212,6 +212,20 @@ buckets alike. `latency` includes 0.05 s, the S2 ACK threshold.
   `time() - max by (environment) (tb_audit_tamper_check_timestamp_seconds) > 3 *
   interval` warns, and so does `absent(...)` once the API has run for 3 × interval.
 
+### 3.5 Audit records the archiver does not store (set 1.8, W3-30 part 2)
+
+`tb_archiver_audit_records_total{outcome}` counts `written`, `invalid` and `unsupported_version`, the
+same shape as `tb_archiver_events_total`. One counter with an `outcome` label is used rather than one
+counter per reason, so the written count is beside the losses. **Alerts (`devops-engineer`, Helm
+monitoring):** both page, because each increase is an audit record missing from the system of record
+(ADR-004 R7) and the 30 d topic buffer is the only remaining copy.
+
+- `sum by (namespace) (increase(tb_archiver_audit_records_total{outcome="unsupported_version"}[15m])) > 0`
+- `sum by (namespace) (increase(tb_archiver_audit_records_total{outcome="invalid"}[15m])) > 0`
+
+The runbook: find the record by the logged topic, partition and offset within 30 d. `invalid` from the
+API's strictly validating producer means a defect or a writer other than the API.
+
 ---
 
 ## 4. Log line schema

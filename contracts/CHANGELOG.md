@@ -3,6 +3,19 @@
 Newest first. Each entry names the contract, the version, whether the change is additive or
 breaking, and the reason. Breaking changes reference an ADR.
 
+## 2026-10-13 (W3-30 part 2) — set 1.8: `tb_archiver_audit_records_total`
+
+**Additive: one registered metric and no new label name. No example change; counts predicted
+unchanged (246 / 0, 154 / 0).**
+
+- **`metrics.json`:** counter `tb_archiver_audit_records_total{outcome}` with outcomes `written`,
+  `invalid` and `unsupported_version`, emitted by the archiver. It mirrors `tb_archiver_events_total`.
+  It replaces the two names proposed (`audit_rejected`, `audit_unsupported_version`) with one counter
+  and an outcome label, the existing convention.
+- **README 3.5:** two paging alerts, on any 15 min increase of `invalid` and of `unsupported_version`
+  (`devops-engineer`). `audit/v0` README 4 names the counter.
+- `archive-engineer` registers it in `ArchiverExposition` (416b4a0 follow-up).
+
 ## 2026-10-13 (audit writer) — set 1.8: `audit/v0` consumer is lenient (README only)
 
 - **`audit/v0` README 4:** the archiver ignores unknown top-level fields and stores the known ones. It
