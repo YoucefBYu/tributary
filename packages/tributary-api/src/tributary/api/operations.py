@@ -2,8 +2,8 @@
 
 Routes are registered from this table, a startup check refuses a route that is not in it, and a contract
 test compares it with `openapi.json`. Roles are global in v0 (ADR-009 D6). Message content operations
-(D14) are limited to operator and admin. The part 2 (archive) operations are answered by stubs until W3-6
-(`app.py`): authn and RBAC are real, the answer is the contract's declared failure.
+(D14) are limited to operator and admin. The part 2 (archive) operations are served by `archive.py`,
+`reingest.py`, `stream.py` and `retention.py`; their roles are the contract's.
 """
 
 from __future__ import annotations

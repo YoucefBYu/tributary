@@ -28,6 +28,8 @@ class TokenInvalid(Exception):
 class Principal:
     subject: str
     roles: frozenset[str]
+    #: The token's `exp` (epoch seconds). A long-lived response, an event stream, ends no later than this.
+    expires_at: float = 0.0
 
     def __repr__(self) -> str:  # a subject is personal data: never in a traceback or log by accident
         return "Principal(...)"
@@ -79,7 +81,7 @@ class TokenValidator:
         # ID-token-only claims (D4 b, c). Applied in both modes: no access token legitimately has them.
         if "nonce" in claims or "at_hash" in claims or claims.get("typ") == "ID":
             raise TokenInvalid
-        return Principal(subject=subject, roles=self._roles(claims))
+        return Principal(subject=subject, roles=self._roles(claims), expires_at=float(claims["exp"]))
 
     def _typ_ok(self, typ: object) -> bool:
         if not isinstance(typ, str):

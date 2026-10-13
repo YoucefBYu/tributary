@@ -211,6 +211,35 @@ class ControlPlane:
 
         return await self._run(work)
 
+    # -- archive support ---------------------------------------------------------------------------
+
+    async def require_channel(self, env_name: str, channel: str) -> None:
+        """404 `NOT_FOUND` unless both the environment and the channel exist."""
+
+        async def work(s: AsyncSession) -> None:
+            await EnvironmentRepository(s).get_by_name(env_name)
+            await ChannelRepository(s).get_by_name(channel)
+
+        await self._run(work)
+
+    async def deployed_ordering(self, env_name: str, channel: str) -> str:
+        """`spec.ordering` of the version currently deployed in `env`. 404 for an unknown environment or channel,
+        409 `NOT_DEPLOYED` when nothing (or a tombstone) is current there. The library skips its traits lookup when
+        `allow_reorder` is true, so the API checks deployment itself (openapi/v0 README 3.13)."""
+
+        async def work(s: AsyncSession) -> str:
+            ch = await ChannelRepository(s).get_by_name(channel)
+            env = await EnvironmentRepository(s).get_by_name(env_name)
+            drepo = DeploymentRepository(s)
+            current = await drepo.current(ch.id, env.id)
+            if current is None or current.kind == "undeploy" or current.version_id is None:
+                raise ApiProblem("NOT_DEPLOYED")
+            version = await ChannelRepository(s).version_by_id(current.version_id)
+            ordering = (version.spec.get("spec") or {}).get("ordering")
+            return str(ordering) if ordering in ("per-key", "none") else "per-key"  # unknown reads as the strict one
+
+        return await self._run(work)
+
     # -- channel writes --------------------------------------------------------------------------
 
     async def resolve_audit_home(self, configured: str | None) -> str | None:

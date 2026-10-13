@@ -12,6 +12,7 @@ dependencies = [
     "uvicorn>=0.32",        # BSD-3-Clause. No [standard] extra: no uvloop/httptools/watchfiles needed
     "pyjwt[crypto]>=2.10.1",  # MIT; the extra pulls cryptography (Apache-2.0 OR BSD-3-Clause) and cffi (MIT). ADR-009 D8
     "jsonschema>=4.23",     # MIT. Validates channel documents against channel-spec/v0 (the reconciler's job)
+    "tributary-archiver",   # the archive query, reprocess, replay and audit library. NOT the [clickhouse] extra: no clickhouse-connect, no certifi
     "tributary-runtime",    # reuse of the engine-kafka loader (engine_kafka.py) and the producer profile (clients.py)
 ]
 
@@ -24,3 +25,4 @@ packages = ["src/tributary"]
 
 [tool.uv.sources]
 tributary-runtime = { workspace = true }
+tributary-archiver = { workspace = true }

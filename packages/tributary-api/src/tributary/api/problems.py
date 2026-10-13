@@ -30,6 +30,37 @@ CODES: dict[str, tuple[int, str, str]] = {
     "NOTHING_TO_ROLL_BACK": (409, "Nothing to roll back", "There is no earlier published version."),
     "NOT_DEPLOYED": (409, "Not deployed", "The channel is not deployed in this environment."),
     "UNAVAILABLE": (503, "Unavailable", "A dependency is unavailable; retry later."),
+    "MESSAGE_NOT_FOUND": (
+        404,
+        "Message not found",
+        "The archive holds no event for this message; it may not have arrived yet.",
+    ),
+    "CONTENT_NOT_FOUND": (404, "Content not found", "No content is stored for that stage of the message."),
+    "CONTENT_STORAGE_OFF": (409, "Content storage off", "Message content is not stored in this environment."),
+    "ORDERING_WOULD_BREAK": (
+        409,
+        "Ordering would break",
+        "The channel is per-key ordered; pass allow_reorder to accept it.",
+    ),
+    "DESTINATION_SCOPED": (409, "Destination scoped", "A destination-scoped failure cannot be re-injected into raw."),
+    "CHILD_MESSAGE": (409, "Child message", "The message has a parent; reprocess the root message."),
+    "NO_PAYLOAD_COORDINATES": (409, "No payload coordinates", "The archive has no raw coordinates for this message."),
+    "RETENTION_LAPSED": (410, "Retention lapsed", "The original raw record is below the topic's log start."),
+    "OFFSET_NOT_FOUND": (409, "Offset not found", "The raw record is not at the recorded offset."),
+    "RECORD_MISMATCH": (409, "Record mismatch", "The record at the recorded offset is a different message."),
+    "RECORD_UNDECODABLE": (409, "Record undecodable", "The original raw record cannot be decoded."),
+    "ENVELOPE_INVALID": (409, "Envelope invalid", "The record cannot be re-published: its envelope is invalid."),
+    "REQUEST_ID_REUSED": (409, "Request id reused", "That id was used with a different request."),
+    "SOURCE_ERROR": (503, "Source error", "The raw topic could not be read; retry later."),
+    "SOURCE_TIMEOUT": (503, "Source timeout", "Reading the raw topic timed out; retry later."),
+    "PRODUCE_FAILED": (503, "Produce failed", "The broker did not acknowledge the re-published record."),
+    "PRODUCE_TIMEOUT": (503, "Produce timeout", "The broker did not acknowledge the re-published record in time."),
+    "PRODUCE_REFUSED": (503, "Produce refused", "The re-publish was refused before it was sent."),
+    "TOO_MANY_STREAMS": (
+        429,
+        "Too many streams",
+        "This subject already holds the maximum number of open event streams.",
+    ),
     "AUDIT_UNAVAILABLE": (
         503,
         "Audit unavailable",
@@ -50,8 +81,10 @@ class ApiProblem(Exception):
         status: int | None = None,
         errors: list[dict[str, str]] | None = None,
         headers: dict[str, str] | None = None,
+        republished: int | None = None,
     ) -> None:
         super().__init__(code)
+        self.republished = republished
         self.code = code
         self.status = status if status is not None else CODES[code][0]
         self.errors = errors
@@ -75,6 +108,8 @@ def render(problem: ApiProblem, request_id: str | None) -> JSONResponse:
     }
     if problem.errors:
         body["errors"] = problem.errors[:100]
+    if problem.republished is not None:
+        body["republished"] = min(problem.republished, 1)
     return JSONResponse(
         body, status_code=problem.status, media_type="application/problem+json", headers=problem.headers
     )

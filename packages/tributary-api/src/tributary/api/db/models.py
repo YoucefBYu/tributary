@@ -8,6 +8,7 @@ from typing import Any
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -139,3 +140,50 @@ class Deployment(Base):
     )
     created_by: Mapped[str] = mapped_column(String(255))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+REPLAY_STATUSES = ("running", "completed", "failed")
+REPLAY_FAILURE_CODES = (
+    "AUDIT_UNAVAILABLE", "TOPIC_NOT_FOUND", "RANGE_TOO_LARGE", "SOURCE_ERROR", "SOURCE_TIMEOUT",
+    "DEADLINE_EXCEEDED", "PRODUCE_FAILED", "PRODUCE_TIMEOUT", "PRODUCE_REFUSED", "ENVELOPE_INVALID",
+    "INTERRUPTED", "INTERNAL",
+)  # fmt: skip
+
+
+class Replay(Base):
+    """One channel replay (`openapi/v0` Replay). Counts and codes only. `body_sha256` makes `replay_id` an
+    idempotency key; a `running` row past `deadline_at` is rendered `failed` / `INTERRUPTED`."""
+
+    __tablename__ = "replays"
+    __table_args__ = (
+        CheckConstraint(_in("status", REPLAY_STATUSES), name="status"),
+        CheckConstraint("body_sha256 ~ '^[0-9a-f]{64}$'", name="body_sha256"),
+        CheckConstraint("range_start < range_end", name="range"),
+        CheckConstraint(_in("failure_code", REPLAY_FAILURE_CODES), name="failure_code"),
+        CheckConstraint("(status = 'failed') = (failure_code IS NOT NULL)", name="failed_has_code"),
+        CheckConstraint("(status = 'running') = (finished_at IS NULL)", name="finished_at"),
+        Index("ix_replays_channel_env_seq", "channel_id", "environment_id", "seq"),
+    )
+
+    replay_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    seq: Mapped[int] = mapped_column(BigInteger, Identity(always=True), unique=True)
+    environment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("environments.id", ondelete="RESTRICT"))
+    channel_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("channels.id", ondelete="RESTRICT"))
+    body_sha256: Mapped[str] = mapped_column(String(64))
+    range_start: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    range_end: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    allow_reorder: Mapped[bool] = mapped_column(Boolean)
+    max_records: Mapped[int] = mapped_column(Integer)
+    deadline_s: Mapped[int] = mapped_column(Integer)
+    requested_by: Mapped[str] = mapped_column(String(255))
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    deadline_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(String(16))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    partitions_scanned: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    span: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    republished: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    skipped_undecodable: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    skipped_out_of_range: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    skipped_no_timestamp: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    failure_code: Mapped[str | None] = mapped_column(String(32), nullable=True)

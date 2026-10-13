@@ -25,8 +25,10 @@ from tributary.runtime.topics import platform_group
 
 from . import config, tls
 from .app import assert_access_log_off, create_app
+from .archive import ArchiveBackend
 from .audit import AuditHook, KafkaAuditSender
 from .auth.jwks import Fetch, FileJwksFetcher, HttpsJwksFetcher, KeySet
+from .chclient import ArchiveClient
 from .db.connect import engine_from_settings
 from .db.engine import make_session_factory
 from .errors import ConfigurationError
@@ -71,6 +73,7 @@ def build_app(environ: dict[str, str] | None = None) -> FastAPI:
     reader = KafkaTopicReader(lambda env: Consumer(reconciler_consumer_config(kafka, defaults, env)))
     tamper: TamperChecker | None = None
     retention: RetentionReader | None = None
+    backend: ArchiveBackend | None = None
     app_metrics: AuditMetrics | None = None
     if settings.archive is not None:
         archive = settings.archive
@@ -90,6 +93,23 @@ def build_app(environ: dict[str, str] | None = None) -> FastAPI:
         except (ssl.SSLError, OSError):  # a CA file that is not a readable PEM bundle
             raise ConfigurationError("CLICKHOUSE_CA_INVALID", "the ClickHouse CA bundle is not usable") from None
         retention = RetentionReader(clickhouse.query, archive.targets)
+
+        def archive_client() -> ArchiveClient:
+            # One per kind of work, so one kind's stuck connections cannot use up another's allowance.
+            return ArchiveClient(
+                ClickHouseHttp(archive.url, archive.user, password, ca_file=ca_file, single_flight=False)
+            )
+
+        backend = ArchiveBackend(
+            archive_client(),
+            archive.targets,
+            content_client=archive_client(),
+            stream_client=archive_client(),
+            kafka=kafka,
+            defaults=defaults,
+            max_streams=archive.max_streams,
+            max_replays=archive.max_replays,
+        )
         tamper = TamperChecker(
             archive.targets,
             clickhouse.query,
@@ -123,6 +143,7 @@ def build_app(environ: dict[str, str] | None = None) -> FastAPI:
         topic_reader=reader,
         tamper=tamper,
         retention=retention,
+        archive=backend,
         audit=audit,
     )
     app.state.audit_metrics = app_metrics

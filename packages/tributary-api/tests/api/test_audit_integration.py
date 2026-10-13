@@ -177,7 +177,14 @@ class Recorder:
 
 
 def build_with(
-    tls_pg: TlsPg, idp: Idp, sender: Any, *, home: str | None = None, retention: Any = None
+    tls_pg: TlsPg,
+    idp: Idp,
+    sender: Any,
+    *,
+    home: str | None = None,
+    retention: Any = None,
+    archive: Any = None,
+    log_level: str = "error",
 ) -> tuple[Any, Any]:
     from tributary.api.app import create_app
     from tributary.api.auth.jwks import HttpsJwksFetcher, KeySet
@@ -191,7 +198,7 @@ def build_with(
         max_stale_s=oidc.max_stale_s,
         timeout_s=oidc.http_timeout_s,
     )
-    log = JsonLogger("api", level="error")
+    log = JsonLogger("api", level=log_level)  # type: ignore[arg-type]
     publisher = FakePublisher()
     engine = make_engine(tls_pg.plain_url)
     app = create_app(
@@ -202,6 +209,7 @@ def build_with(
         log=log,
         audit=AuditHook(sender, log, retry_pause_s=0),
         retention=retention,
+        archive=archive,
     )
     app.state.fake_publisher = publisher
     return app, engine

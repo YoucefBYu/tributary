@@ -7,7 +7,7 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any
 
-from .db.models import Channel, ChannelVersion, Deployment, Environment
+from .db.models import Channel, ChannelVersion, Deployment, Environment, Replay
 
 
 def ts(value: datetime) -> str:
@@ -83,4 +83,39 @@ def channel_detail(
         out["description"] = meta["description"]
     if isinstance(meta.get("labels"), dict):
         out["labels"] = meta["labels"]
+    return out
+
+
+def replay(row: Replay, environment: str, channel: str, *, now: datetime) -> dict[str, Any]:
+    """`Replay`. A `running` row whose deadline passed reads as `failed` / `INTERRUPTED`: the API process that
+    started it is gone (or its run never recorded an end), and the contract says so (README 3.14)."""
+    status, failure, finished = row.status, row.failure_code, row.finished_at
+    if status == "running" and now >= row.deadline_at:
+        status, failure, finished = "failed", "INTERRUPTED", row.deadline_at
+    out: dict[str, Any] = {
+        "replay_id": str(row.replay_id),
+        "environment": environment,
+        "channel": channel,
+        "target_topic": f"{environment}.{channel}.raw",
+        "range_start": ts(row.range_start),
+        "range_end": ts(row.range_end),
+        "allow_reorder": row.allow_reorder,
+        "max_records": row.max_records,
+        "deadline_s": row.deadline_s,
+        "requested_by": row.requested_by,
+        "requested_at": ts(row.requested_at),
+        "status": status,
+        "deadline_at": ts(row.deadline_at),
+    }
+    if finished is not None:
+        out["finished_at"] = ts(finished)
+    if status == "completed":
+        for name in (
+            "partitions_scanned", "span", "republished", "skipped_undecodable", "skipped_out_of_range",
+            "skipped_no_timestamp",
+        ):  # fmt: skip
+            out[name] = int(getattr(row, name) or 0)
+    elif status == "failed":
+        out["republished"] = int(row.republished or 0)
+        out["failure_code"] = failure
     return out

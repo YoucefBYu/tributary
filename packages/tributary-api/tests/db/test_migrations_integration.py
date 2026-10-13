@@ -11,7 +11,7 @@ from tributary.api.db.migrate import adowngrade, aupgrade, downgrade, upgrade
 
 pytestmark = pytest.mark.integration
 
-_TABLES = {"environments", "channels", "channel_versions", "deployments"}
+_TABLES = {"environments", "channels", "channel_versions", "deployments", "replays"}
 
 
 async def _scalars(url: str, sql: str) -> set[str]:
@@ -77,6 +77,11 @@ def test_migrated_schema_matches_models_and_constraints_exist(pg_url: str) -> No
         "ck_deployments_published_at",
         "ck_deployments_failed_has_code",
         "ck_environments_profile",
+        "ck_replays_status",
+        "ck_replays_range",
+        "ck_replays_failed_has_code",
+        "ck_replays_finished_at",
+        "ck_replays_failure_code",
     } <= checks
     triggers = asyncio.run(_scalars(pg_url, "SELECT tgname FROM pg_trigger WHERE NOT tgisinternal"))
     assert "channel_versions_no_update" in triggers

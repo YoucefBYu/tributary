@@ -23,7 +23,7 @@ from tributary.api.db.errors import (
     RepositoryError,
     TransientError,
 )
-from tributary.api.db.models import DIGEST_PATTERN, Channel, ChannelVersion, Deployment, Environment
+from tributary.api.db.models import DIGEST_PATTERN, Channel, ChannelVersion, Deployment, Environment, Replay
 
 _DIGEST_RE = re.compile(DIGEST_PATTERN)
 _MAX_NAME_IN_MESSAGE = 64
@@ -450,3 +450,82 @@ class DeploymentRepository:
             select(ChannelVersion.id, ChannelVersion.version).where(ChannelVersion.id.in_(ids))
         )
         return {row[0]: row[1] for row in rows.all()}
+
+
+class ReplayRepository:
+    """`replays` rows. Updates apply only to a row still `running`, so a late write (an abandoned run finishing
+    after the deadline rendered it `failed`) cannot overwrite a recorded outcome."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._s = session
+
+    async def get(self, replay_id: uuid.UUID, *, for_update: bool = False) -> Replay | None:
+        stmt = select(Replay).where(Replay.replay_id == replay_id)
+        if for_update:
+            stmt = stmt.with_for_update().execution_options(populate_existing=True)
+        return (await self._s.execute(stmt)).scalar_one_or_none()
+
+    async def create(
+        self,
+        ch: Channel,
+        env: Environment,
+        *,
+        replay_id: uuid.UUID,
+        body_sha256: str,
+        range_start: datetime,
+        range_end: datetime,
+        allow_reorder: bool,
+        max_records: int,
+        deadline_s: int,
+        requested_by: str,
+        deadline_at: datetime,
+    ) -> Replay:
+        row = Replay(
+            replay_id=replay_id,
+            environment_id=env.id,
+            channel_id=ch.id,
+            body_sha256=body_sha256,
+            range_start=range_start,
+            range_end=range_end,
+            allow_reorder=allow_reorder,
+            max_records=max_records,
+            deadline_s=deadline_s,
+            requested_by=requested_by,
+            deadline_at=deadline_at,
+            status="running",
+        )
+        try:
+            await _write_guarded(self._s, add=row)
+        except DBAPIError as exc:
+            raise _classify(exc, "replay") from None
+        return row
+
+    async def restart(self, row: Replay, *, now: datetime, deadline_at: datetime) -> None:
+        """A `failed` replay runs again under the same id: the record goes back to `running`, counts cleared."""
+        row.status = "running"
+        row.requested_at = now  # `requested_by` stays: who first asked; the audit records who ran it again
+        row.deadline_at = deadline_at
+        row.finished_at = None
+        row.failure_code = None
+        for name in (
+            "partitions_scanned", "span", "republished", "skipped_undecodable", "skipped_out_of_range",
+            "skipped_no_timestamp",
+        ):  # fmt: skip
+            setattr(row, name, None)
+        await self._s.flush()
+
+    async def finish(self, replay_id: uuid.UUID, **values: Any) -> None:
+        await self._s.execute(
+            update(Replay).where(Replay.replay_id == replay_id, Replay.status == "running").values(**values)
+        )
+
+    async def list(self, ch: Channel, env: Environment, *, limit: int, before_seq: int | None) -> Sequence[Replay]:
+        stmt = (
+            select(Replay)
+            .where(Replay.channel_id == ch.id, Replay.environment_id == env.id)
+            .order_by(Replay.seq.desc())
+            .limit(limit)
+        )
+        if before_seq is not None:
+            stmt = stmt.where(Replay.seq < before_seq)
+        return (await self._s.execute(stmt)).scalars().all()

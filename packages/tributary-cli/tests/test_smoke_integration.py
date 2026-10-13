@@ -175,5 +175,11 @@ def test_dev_validates_and_with_deploy_pushes_and_deploys_each_change(
     assert len(api.publisher.records) == 2
 
 
-def test_messages_is_unavailable_until_the_api_has_the_endpoints(cli: Any) -> None:
-    assert "W3-6" in cli("messages", expect=69).output
+def test_messages_and_replay_answer_503_when_the_api_has_no_archive_configured(cli: Any, tmp_path: Path) -> None:
+    """The smoke API has no ClickHouse: the commands reach the real endpoints and report the contract's refusal."""
+    cli("channels", "push", str(write(tmp_path, document())))
+    refused = cli(
+        "messages", "search", "adt-passthrough", "--env", "dev", "--since", "2026-10-01T00:00:00.000Z", expect=4
+    )
+    assert "ARCHIVE_UNAVAILABLE" in refused.output
+    assert "replays" not in cli("replay", "list", "adt-passthrough", "--env", "dev").output  # PostgreSQL-only: empty

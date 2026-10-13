@@ -12,10 +12,10 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Annotated, Any
 
-from fastapi import Depends, FastAPI, Path, Query, Request
+from fastapi import Depends, FastAPI, Header, Path, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -23,6 +23,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from tributary.sdk.context import Logger
 
 from . import schemas
+from .archive import ArchiveBackend, ArchiveReader
 from .audit import Actor, AuditHook
 from .auth.jwks import KeySet
 from .auth.request import authorize
@@ -31,11 +32,15 @@ from .config import Settings
 from .errors import ConfigurationError
 from .health import LIVE, Readiness
 from .operations import OPERATIONS, check_routes
+from .pools import Pools
 from .problems import ApiProblem, render
 from .publisher import ChannelsPublisher
 from .reconciler import Reconciler, TopicReader
+from .reingest import Reingest
+from .replays import ReplayStore
 from .retention import RetentionReader
 from .service import _ABSENT, INFLIGHT_WAIT_S, MAX_INFLIGHT_DEPLOYS, ControlPlane
+from .stream import EventStreamer, SlotStreamingResponse, StreamHub
 from .tamper import TamperChecker
 from .validation import control_plane_issues, validate_document
 
@@ -195,6 +200,7 @@ def create_app(
     tamper: TamperChecker | None = None,
     audit: AuditHook,
     retention: RetentionReader | None = None,
+    archive: ArchiveBackend | None = None,
 ) -> FastAPI:
     service = ControlPlane(
         sessions,
@@ -206,6 +212,46 @@ def create_app(
         audit_home=settings.audit_home_env,
     )
     readiness = Readiness(service.ping_database, keys, publisher)
+    pools = Pools(replays=archive.max_replays if archive is not None else 4)
+    archive_reader = (
+        None
+        if archive is None
+        else ArchiveReader(
+            archive.client,
+            archive.targets,
+            service,
+            audit,
+            log,
+            pools,
+            content_client=archive.content_client,
+            stream_client=archive.stream_client,
+        )
+    )
+    replay_store = ReplayStore(sessions)
+    hub = StreamHub(total=archive.max_streams if archive is not None else 64)
+    streamer = (
+        None
+        if archive is None or archive_reader is None
+        else EventStreamer(
+            archive_reader, hub, log, pools, poll_s=archive.stream_poll_s, heartbeat_s=archive.stream_heartbeat_s
+        )
+    )
+    reingest = (
+        Reingest(
+            archive_reader,
+            service,
+            audit,
+            replay_store,
+            archive.kafka,
+            archive.defaults,
+            log,
+            pools=pools,
+            max_replays=archive.max_replays,
+            **({} if archive.publisher_factory is None else {"publisher_factory": archive.publisher_factory}),
+        )
+        if archive is not None and archive_reader is not None and archive.kafka is not None and archive.defaults
+        else None
+    )
     reconciler = (
         None
         if topic_reader is None
@@ -234,6 +280,10 @@ def create_app(
         try:
             yield
         finally:
+            hub.closing.set()  # open event streams end with `server_shutdown`
+            if reingest is not None:
+                await reingest.close()
+            pools.shutdown()
             for task in (loop_task, tamper_task):
                 if task is not None:
                     task.cancel()
@@ -260,6 +310,7 @@ def create_app(
     app.state.validator = TokenValidator(settings.oidc, keys)
     app.state.keys = keys
     app.state.reconciler = reconciler
+    app.state.stream_hub = hub
 
     def request_id(request: Request) -> str | None:
         return getattr(request.state, "request_id", None)
@@ -356,40 +407,81 @@ def create_app(
         result = await service.undeploy(env, channel, req.expected_current_version, _actor(request))
         return JSONResponse(result, status_code=202)
 
-    # -- part 2 stubs (W3-6 replaces them). Authn and RBAC ran in the global dependency, so only a permitted
-    # caller reaches these. They read no body, query or header and log nothing: the content operations
-    # (x-tributary-phi-content) therefore cannot leak request data, and no content is ever returned. The
-    # answer is the failure the contract declares for the operation.
+    # -- part 2: archive endpoints. Authn and RBAC ran in the global dependency, so only a permitted caller gets here.
 
-    async def archive_unavailable() -> JSONResponse:
-        raise ApiProblem("ARCHIVE_UNAVAILABLE")
+    def reader() -> ArchiveReader:
+        if archive_reader is None:
+            raise ApiProblem("ARCHIVE_UNAVAILABLE")
+        return archive_reader
 
-    async def search_messages(env: EnvPath, channel: ChannelPath) -> JSONResponse:
-        return await archive_unavailable()
+    async def search_messages(env: EnvPath, channel: ChannelPath, body: Body) -> JSONResponse:
+        request = _parse(schemas.MessageSearchRequest, body)
+        return JSONResponse(await reader().search(env, channel, request))
 
     async def get_message(env: EnvPath, channel: ChannelPath, message_id: MessageIdPath) -> JSONResponse:
-        return await archive_unavailable()
+        return JSONResponse(await reader().detail(env, channel, message_id))
 
-    async def get_message_content(env: EnvPath, channel: ChannelPath, message_id: MessageIdPath) -> JSONResponse:
-        return await archive_unavailable()
+    async def get_message_content(
+        request: Request,
+        env: EnvPath,
+        channel: ChannelPath,
+        message_id: MessageIdPath,
+        stage: Annotated[str | None, Query(max_length=16)] = None,
+        destination: Annotated[str | None, Query(pattern=r"^[a-z][a-z0-9-]{0,63}$")] = None,
+    ) -> JSONResponse:
+        # PHI: nothing about this request is logged (the request log holds the route template only), and the
+        # response is never cached.
+        body = await reader().content(env, channel, message_id, stage or "", destination, _actor(request))
+        return JSONResponse(body, headers={"Cache-Control": "no-store"})
 
-    async def reprocess_message(env: EnvPath, channel: ChannelPath, message_id: MessageIdPath) -> JSONResponse:
-        return await archive_unavailable()
+    def reingester() -> Reingest:
+        if reingest is None:
+            raise ApiProblem("ARCHIVE_UNAVAILABLE")
+        return reingest
 
-    async def list_replays(env: EnvPath, channel: ChannelPath) -> JSONResponse:
-        raise ApiProblem("NOT_FOUND")  # the contract declares no 503 here; no replay can exist yet
+    async def reprocess_message(
+        request: Request, env: EnvPath, channel: ChannelPath, message_id: MessageIdPath, body: Body
+    ) -> JSONResponse:
+        req = _parse(schemas.ReprocessRequest, body)
+        return JSONResponse(await reingester().reprocess(env, channel, message_id, req, _actor(request)))
 
-    async def start_replay(env: EnvPath, channel: ChannelPath) -> JSONResponse:
-        return await archive_unavailable()
+    async def list_replays(
+        env: EnvPath, channel: ChannelPath, limit: LimitQuery = 50, cursor: CursorQuery = None
+    ) -> JSONResponse:
+        return JSONResponse(await replay_store.list(env, channel, limit, cursor))
+
+    async def start_replay(request: Request, env: EnvPath, channel: ChannelPath, body: Body) -> JSONResponse:
+        req = _parse(schemas.ReplayRequest, body)
+        record, status = await reingester().start_replay(env, channel, req, _actor(request))
+        return JSONResponse(record, status_code=status)
 
     async def get_replay(env: EnvPath, channel: ChannelPath, replay_id: ReplayIdPath) -> JSONResponse:
-        raise ApiProblem("NOT_FOUND")
+        return JSONResponse(await replay_store.get(env, channel, replay_id))
 
-    async def channel_stats(env: EnvPath, channel: ChannelPath) -> JSONResponse:
-        return await archive_unavailable()
+    async def channel_stats(
+        env: EnvPath, channel: ChannelPath, window: Annotated[str, Query(max_length=8)] = "15m"
+    ) -> JSONResponse:
+        return JSONResponse(await reader().stats(env, channel, window))
 
-    async def stream_events(env: EnvPath) -> JSONResponse:
-        return await archive_unavailable()
+    async def stream_events(
+        request: Request,
+        env: EnvPath,
+        channel: Annotated[list[Annotated[str, Query(pattern=CHANNEL)]], Query(min_length=1, max_length=16)],
+        last_event_id: Annotated[str | None, Header(pattern=r"^[A-Za-z0-9_-]{1,512}$")] = None,
+    ) -> StreamingResponse:
+        if streamer is None:
+            raise ApiProblem("ARCHIVE_UNAVAILABLE")
+        await service.require_channel(env, channel[0])  # 404 for an unknown environment before anything else
+        principal = request.state.principal
+        events, release = await streamer.prepare(
+            env, channel, str(principal.subject), principal.expires_at, last_event_id
+        )
+        return SlotStreamingResponse(
+            events,
+            release,
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+        )
 
     async def get_retention(env: EnvPath) -> JSONResponse:
         if env not in {e["name"] for e in (await service.environments())["items"]}:

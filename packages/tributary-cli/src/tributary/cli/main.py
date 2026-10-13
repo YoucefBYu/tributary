@@ -1,4 +1,4 @@
-"""`tributary`: dev, test, deploy (with rollback, undeploy, status), channels, messages.
+"""`tributary`: dev, test, deploy (with rollback, undeploy, status), channels, messages (search, show, reprocess), replay.
 
 Every command is a call to the control plane API. The token is read from the environment or a file
 (`config.py`), never from an argument. Exit codes are in `errors.py`.
@@ -25,7 +25,6 @@ from .errors import (
     ApiError,
     CliError,
     InputError,
-    UnavailableError,
 )
 
 app = typer.Typer(
@@ -349,16 +348,145 @@ def _dev_cycle(api: ApiClient, file: Path, env: str | None) -> bool:
         return False
 
 
-# -- messages --------------------------------------------------------------------------------------
+# -- messages and replay (metadata only: this tool never prints message content) --------------------
 
 
-@app.command("messages")
+messages_app = typer.Typer(help="Search, inspect and reprocess archived messages.", no_args_is_help=True)
+replay_app = typer.Typer(help="Replay a channel's raw records back into the same channel.", no_args_is_help=True)
+app.add_typer(messages_app, name="messages")
+app.add_typer(replay_app, name="replay")
+EnvOpt = Annotated[str, typer.Option("--env", help="The environment.")]
+
+
+def _event_line(e: dict[str, Any]) -> str:
+    dest = f"\t{e['destination']}" if e.get("destination") else "\t-"
+    return f"{e['ts']}\t{e['message_id']}\t{e['stage']}\t{e['status']}{dest}\tattempt {e['attempt']}"
+
+
+@messages_app.command("search")
 @guarded
-def messages_cmd() -> None:
-    """Search and reprocess messages (not available yet)."""
-    raise UnavailableError(
-        "this API version has no messages endpoints (openapi/v0 part 2, task W3-6); nothing was sent"
-    )
+def messages_search(
+    channel: str,
+    env: EnvOpt,
+    since: Annotated[str, typer.Option(help="Start, UTC, e.g. 2026-10-01T00:00:00.000Z.")],
+    until: Annotated[str | None, typer.Option(help="End (exclusive).")] = None,
+    stage: Annotated[list[str] | None, typer.Option(help="Only these stages (repeat).")] = None,
+    status: Annotated[str | None, typer.Option(help="ok, error, timeout or dropped.")] = None,
+    destination: Annotated[str | None, typer.Option()] = None,
+    error_code: Annotated[str | None, typer.Option()] = None,
+    limit: Annotated[int, typer.Option(min=1, max=200)] = 50,
+    cursor: Annotated[str | None, typer.Option(help="From a previous page.")] = None,
+    as_json: JsonOpt = False,
+) -> None:
+    """Search events (metadata only), newest first. Prints the cursor for the next page."""
+    body: dict[str, Any] = {"since": since, "limit": limit}
+    for name, value in (("until", until), ("stages", stage), ("status", status), ("destination", destination),
+                        ("error_code", error_code), ("cursor", cursor)):  # fmt: skip
+        if value:
+            body[name] = value
+    with _client() as api:
+        page = api.search_messages(env, channel, body)
+    if as_json:
+        return emit(page)
+    for e in page["items"]:
+        out(_event_line(e))
+    if page["next_cursor"]:
+        out(f"next: --cursor {page['next_cursor']}")
+
+
+@messages_app.command("show")
+@guarded
+def messages_show(channel: str, message_id: str, env: EnvOpt, as_json: JsonOpt = False) -> None:
+    """One message: its timeline, destination states and which content is stored (no bytes)."""
+    with _client() as api:
+        detail = api.get_message(env, channel, message_id)
+    if as_json:
+        return emit(detail)
+    for e in detail["events"]:
+        out(_event_line(e))
+    for d in detail["destinations"]:
+        out(f"destination {d['destination']}: {d['state']} (attempt {d['attempt']})")
+    for c in detail["content"]:
+        out(f"content {c['stage']} {c.get('destination', '-')}: {c['size_bytes']} bytes, {c['storage']}")
+
+
+@messages_app.command("reprocess")
+@guarded
+def messages_reprocess(
+    channel: str,
+    message_id: str,
+    env: EnvOpt,
+    allow_reorder: Annotated[bool, typer.Option("--allow-reorder", help="Accept breaking per-key order.")] = False,
+    operation_id: Annotated[str | None, typer.Option(help="Reuse an id to retry the same reprocess.")] = None,
+    as_json: JsonOpt = False,
+) -> None:
+    """Re-publish the original raw record under a new deterministic id. Prints the operation id: re-run with
+    --operation-id to retry safely."""
+    from tributary.sdk.ids import uuid7
+
+    op_id = operation_id or uuid7()
+    with _client() as api:
+        result = api.reprocess(env, channel, message_id, {"operation_id": op_id, "allow_reorder": allow_reorder})
+    if as_json:
+        return emit(result)
+    out(f"reprocessed {result['original_message_id']} as {result['new_message_id']} (operation {op_id})")
+
+
+def _replay_line(r: dict[str, Any]) -> str:
+    extra = f" republished {r.get('republished', 0)}" if r["status"] != "running" else ""
+    code = f" {r['failure_code']}" if r.get("failure_code") else ""
+    return f"{r['replay_id']}\t{r['status']}{code}{extra}\t{r['range_start']} .. {r['range_end']}"
+
+
+@replay_app.command("start")
+@guarded
+def replay_start(
+    channel: str,
+    env: EnvOpt,
+    start: Annotated[str, typer.Option(help="Range start, UTC (record timestamp).")],
+    end: Annotated[str, typer.Option(help="Range end (exclusive).")],
+    allow_reorder: Annotated[bool, typer.Option("--allow-reorder")] = False,
+    max_records: Annotated[int, typer.Option(min=1, max=1_000_000)] = 100_000,
+    deadline_s: Annotated[int, typer.Option(min=1, max=3600)] = 900,
+    replay_id: Annotated[str | None, typer.Option(help="Reuse an id to retry or check the same replay.")] = None,
+    as_json: JsonOpt = False,
+) -> None:
+    """Start a replay (runs in the background; poll with `replay show`)."""
+    from tributary.sdk.ids import uuid7
+
+    body = {
+        "replay_id": replay_id or uuid7(), "start": start, "end": end, "allow_reorder": allow_reorder,
+        "max_records": max_records, "deadline_s": deadline_s,
+    }  # fmt: skip
+    with _client() as api:
+        record, started = api.start_replay(env, channel, body)
+    if as_json:
+        return emit(record)
+    out(("started " if started else "exists ") + _replay_line(record))
+
+
+@replay_app.command("show")
+@guarded
+def replay_show(channel: str, replay_id: str, env: EnvOpt, as_json: JsonOpt = False) -> None:
+    """One replay and its counts."""
+    with _client() as api:
+        record = api.get_replay(env, channel, replay_id)
+    if as_json:
+        return emit(record)
+    out(_replay_line(record))
+    raise typer.Exit(EXIT_FAILED if record["status"] == "failed" else EXIT_OK)
+
+
+@replay_app.command("list")
+@guarded
+def replay_list(channel: str, env: EnvOpt, as_json: JsonOpt = False) -> None:
+    """Replays of this channel, newest first."""
+    with _client() as api:
+        items = api.list_replays(env, channel)
+    if as_json:
+        return emit(items)
+    for r in items:
+        out(_replay_line(r))
 
 
 def main() -> None:

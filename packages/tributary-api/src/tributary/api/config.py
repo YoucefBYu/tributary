@@ -100,6 +100,8 @@ class ArchiveSettings:
     #: Optional private CA for the ClickHouse endpoint: `<ca_secret_ref>/ca.crt` under `TB_SECRETS_DIR`. Without
     #: it the system trust store is used. Verification is never turned off.
     ca_secret_ref: str | None = None
+    max_streams: int = 64  # open event streams per replica (`TB_API_MAX_STREAMS`, 1-1000)
+    max_replays: int = 4  # replays running at once per replica (`TB_API_MAX_REPLAYS`, 1-16)
 
 
 def archive_from_env(env: Mapping[str, str]) -> ArchiveSettings | None:
@@ -154,8 +156,21 @@ def archive_from_env(env: Mapping[str, str]) -> ArchiveSettings | None:
         raise ConfigurationError(
             "CLICKHOUSE_CA_SECRET_REF_INVALID", "TB_CLICKHOUSE_CA_SECRET_REF is not a secretRef name"
         )
+    max_streams = int(_number(env, "TB_API_MAX_STREAMS", 64, "API_MAX_STREAMS_OUT_OF_RANGE"))
+    max_replays = int(_number(env, "TB_API_MAX_REPLAYS", 4, "API_MAX_REPLAYS_OUT_OF_RANGE"))
+    if not 1 <= max_streams <= 1000:
+        raise ConfigurationError("API_MAX_STREAMS_OUT_OF_RANGE", "TB_API_MAX_STREAMS must be within 1-1000")
+    if not 1 <= max_replays <= 16:
+        raise ConfigurationError("API_MAX_REPLAYS_OUT_OF_RANGE", "TB_API_MAX_REPLAYS must be within 1-16")
     return ArchiveSettings(
-        url=url, user=user, secret_ref=ref, targets=parsed, interval_s=interval, ca_secret_ref=ca_ref
+        url=url,
+        user=user,
+        secret_ref=ref,
+        targets=parsed,
+        interval_s=interval,
+        ca_secret_ref=ca_ref,
+        max_streams=max_streams,
+        max_replays=max_replays,
     )
 
 

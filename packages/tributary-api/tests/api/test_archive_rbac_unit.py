@@ -1,6 +1,8 @@
-"""Part 2 (archive) operations before W3-6: authn and RBAC are real and enforced per role; a permitted caller
-gets the failure the contract declares (503 ARCHIVE_UNAVAILABLE, or 404 where the contract declares no 503),
-validated against `openapi.json`. Nothing from the request comes back, and no content is ever returned."""
+"""Part 2 (archive) operations: authn and RBAC are enforced per role, before any validation or archive access.
+A denied role is 403, no token or a bad one is 401, and a permitted role gets through to the endpoint (whatever
+it then answers is validated against `openapi.json`). Nothing from the request comes back. The endpoints'
+behaviour is in the integration tests (`test_archive_read_integration`, `test_reingest_integration`,
+`test_stream_integration`, `test_retention_integration`)."""
 
 from __future__ import annotations
 
@@ -13,9 +15,10 @@ from tributary.api.operations import OPERATIONS
 MSG = "0191a2b3-c4d5-7e6f-8a9b-0c1d2e3f4a5b"
 REPLAY = "0191a2b3-c4d5-7e6f-8a9b-0c1d2e3f4a5c"
 PART2 = [
-    o for o in OPERATIONS if "/messages" in o.path or "/replays" in o.path or o.path.endswith(("/stats", "/events"))
+    o
+    for o in OPERATIONS
+    if "/messages" in o.path or "/replays" in o.path or o.path.endswith(("/stats", "/events", "/retention"))
 ]
-NOT_FOUND_STUBS = {"listReplays", "getReplay"}
 Make = Callable[..., Harness]
 
 
@@ -23,8 +26,8 @@ def url(path: str) -> str:
     return path.format(env="dev", channel="adt", message_id=MSG, replay_id=REPLAY)
 
 
-def test_the_nine_remaining_part_2_stubs_are_in_the_table() -> None:
-    assert len(PART2) == 9  # getRetention is real (test_retention_integration)
+def test_all_ten_part_2_operations_are_in_the_table() -> None:
+    assert len(PART2) == 10
 
 
 @pytest.mark.parametrize("op", PART2, ids=lambda o: o.operation_id)
@@ -40,8 +43,7 @@ def test_every_role_gets_exactly_what_the_contract_grants(make_harness: Make, id
                 )
                 contract.check(op.method, op.path, r)
                 if role in op.roles:
-                    want = (404, "NOT_FOUND") if op.operation_id in NOT_FOUND_STUBS else (503, "ARCHIVE_UNAVAILABLE")
-                    assert (r.status_code, r.json()["code"]) == want, (op.operation_id, role)
+                    assert r.status_code not in (401, 403), (op.operation_id, role)  # past authn and RBAC
                 else:
                     assert (r.status_code, r.json()["code"]) == (403, "FORBIDDEN"), (op.operation_id, role)
                 assert MSG not in r.text and REPLAY not in r.text  # nothing from the request is echoed
@@ -59,7 +61,7 @@ def test_content_and_reprocess_are_operator_and_admin_only() -> None:
         assert set(by_id[name].roles) == {"operator", "admin"}, name
 
 
-def test_a_malformed_id_is_not_found_not_a_stub_answer(make_harness: Make, idp: Idp) -> None:
+def test_a_malformed_id_is_not_found(make_harness: Make, idp: Idp) -> None:
     async def go() -> None:
         async with make_harness().running() as c:
             h = bearer(idp.mint(roles=["tb-admin"]))

@@ -312,12 +312,74 @@ def test_push_refuses_a_document_that_sets_its_own_version(scripted: list[Any], 
     assert not [c for c in scripted if c[0] in ("POST",)]
 
 
-def test_dev_requires_env_with_deploy_and_messages_is_honestly_unavailable(scripted: list[Any], tmp_path: Path) -> None:
+def test_dev_requires_env_with_deploy(scripted: list[Any], tmp_path: Path) -> None:
     f = tmp_path / "c.json"
     f.write_text("{}")
     assert runner.invoke(main.app, ["dev", str(f), "--deploy", "--once"]).exit_code == 2
-    r = runner.invoke(main.app, ["messages"])
-    assert r.exit_code == 69 and "W3-6" in r.output and not [c for c in scripted if c[0] != "replies"]
+
+
+def test_messages_search_show_and_reprocess_call_the_archive_endpoints(scripted: list[Any]) -> None:
+    base = "/v1/environments/dev/channels/adt"
+    ev = {"ts": "2026-10-06T07:00:00.000Z", "message_id": "m1", "stage": "sent", "status": "ok", "attempt": 0,
+          "destination": "ehr"}  # fmt: skip
+    replies = scripted[0][2]
+    replies[("POST", base + "/messages/search")] = (200, {"items": [ev], "next_cursor": "CUR"})
+    replies[("GET", base + "/messages/m1")] = (
+        200,
+        {"events": [ev], "destinations": [{"destination": "ehr", "state": "sent", "attempt": 0}],
+         "content": [{"stage": "received", "size_bytes": 12, "storage": "inline"}]},
+    )  # fmt: skip
+    replies[("POST", base + "/messages/m1/reprocess")] = (
+        200, {"original_message_id": "m1", "new_message_id": "m2"},
+    )  # fmt: skip
+    r = runner.invoke(
+        main.app,
+        [
+            "messages",
+            "search",
+            "adt",
+            "--env",
+            "dev",
+            "--since",
+            "2026-10-06T00:00:00.000Z",
+            "--stage",
+            "sent",
+            "--limit",
+            "5",
+        ],
+    )
+    assert r.exit_code == 0 and "m1" in r.output and "next: --cursor CUR" in r.output
+    body = next(c[2] for c in scripted if c[1].endswith("/messages/search"))
+    assert body == {"since": "2026-10-06T00:00:00.000Z", "limit": 5, "stages": ["sent"]}
+    shown = runner.invoke(main.app, ["messages", "show", "adt", "m1", "--env", "dev"])
+    assert shown.exit_code == 0 and "content received" in shown.output and "12 bytes" in shown.output
+    done = runner.invoke(main.app, ["messages", "reprocess", "adt", "m1", "--env", "dev", "--allow-reorder"])
+    assert done.exit_code == 0 and "m2" in done.output
+    sent = next(c[2] for c in scripted if c[1].endswith("/reprocess"))
+    assert sent["allow_reorder"] is True and len(sent["operation_id"]) == 36  # a fresh UUIDv7 each time
+
+
+def test_replay_start_show_and_exit_codes(scripted: list[Any]) -> None:
+    base = "/v1/environments/dev/channels/adt"
+    rec = {"replay_id": "r1", "status": "running", "range_start": "a", "range_end": "b"}
+    replies = scripted[0][2]
+    replies[("POST", base + "/replays")] = (202, rec)
+    r = runner.invoke(main.app, ["replay", "start", "adt", "--env", "dev", "--start", "a", "--end", "b"])
+    assert r.exit_code == 0 and r.output.startswith("started r1")
+    replies[("POST", base + "/replays")] = (200, rec)
+    assert runner.invoke(
+        main.app, ["replay", "start", "adt", "--env", "dev", "--start", "a", "--end", "b"]
+    ).output.startswith("exists")
+    replies[("GET", base + "/replays/r1")] = (
+        200,
+        {**rec, "status": "failed", "failure_code": "SOURCE_ERROR", "republished": 2},
+    )
+    failed = runner.invoke(main.app, ["replay", "show", "adt", "r1", "--env", "dev"])
+    assert failed.exit_code == 1 and "SOURCE_ERROR" in failed.output
+    problem = {"type": "about:blank", "title": "Conflict", "status": 409, "code": "ORDERING_WOULD_BREAK"}
+    replies[("POST", base + "/replays")] = (409, problem)
+    refused = runner.invoke(main.app, ["replay", "start", "adt", "--env", "dev", "--start", "a", "--end", "b"])
+    assert refused.exit_code == 4 and "ORDERING_WOULD_BREAK" in refused.output
 
 
 def test_ps_visible_environment_does_not_leak_the_token_into_output(

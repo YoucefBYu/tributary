@@ -17,6 +17,7 @@ from typing import Any
 
 import pytest
 import uvicorn
+from archive_kit import restore_uvicorn_logging
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
@@ -225,6 +226,7 @@ def test_a_client_verifying_the_ca_connects_and_a_wrong_hostname_is_refused(tmp_
     finally:
         server.should_exit = True
         thread.join(10)
+        restore_uvicorn_logging()
 
 
 def _s(**kw: Any) -> config.Settings:
@@ -340,6 +342,7 @@ def test_tls12_allows_only_forward_secret_suites_and_tls13_keeps_its_defaults(tm
     finally:
         server.should_exit = True
         thread.join(10)
+        restore_uvicorn_logging()
 
     # Control: the same client suite succeeds against a listener without the restriction, so the refusal above is
     # the cipher list's doing and not an artefact of the certificate.

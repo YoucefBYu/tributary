@@ -2123,6 +2123,7 @@ dependencies = [
     { name = "jsonschema" },
     { name = "pyjwt", extra = ["crypto"] },
     { name = "sqlalchemy", extra = ["asyncio"] },
+    { name = "tributary-archiver" },
     { name = "tributary-runtime" },
     { name = "uvicorn" },
 ]
@@ -2135,6 +2136,7 @@ requires-dist = [
     { name = "jsonschema", specifier = ">=4.23" },
     { name = "pyjwt", extras = ["crypto"], specifier = ">=2.10.1" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.36" },
+    { name = "tributary-archiver", editable = "packages/tributary-archiver" },
     { name = "tributary-runtime", editable = "packages/tributary-runtime" },
     { name = "uvicorn", specifier = ">=0.32" },
 ]

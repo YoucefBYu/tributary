@@ -69,19 +69,32 @@ def tamper_sql(*, database: str) -> str:
 
 
 class TamperQueryError(Exception):
-    """The archive could not answer. Carries no response text."""
+    """The archive could not answer. Carries no response text; `ch_code` is ClickHouse's numeric error code when
+    it sent one (for example 60, UNKNOWN_TABLE), never its message."""
+
+    def __init__(self, ch_code: int | None = None) -> None:
+        super().__init__()
+        self.ch_code = ch_code
+
+
+# Plain text: "Code: 60. DB::Exception ..."; with a JSON default_format: {... "exception": "Code: 60. ..."}.
+_ERROR_CODE_LINE = re.compile(rb'(?:^|"exception":\s*")Code: (\d{1,4})\.')
+#: Default settings of `query()`: one readonly, row-capped statement (the tamper count and the retention read).
+DEFAULT_SETTINGS: Final[Mapping[str, str]] = {"readonly": "1", "max_result_rows": "10"}
 
 
 class ClickHouseHttp:
-    """`query(sql) -> str` over ClickHouse's HTTP interface. Blocking: call it off the event loop.
+    """`query(sql) -> str` and `request(sql, ...) -> bytes` over ClickHouse's HTTP interface. Blocking: call it off
+    the event loop.
 
     Built on `http.client`, not `urllib.request.urlopen`, so by construction it never follows a redirect (a 3xx is
     an error, and the credential header goes to the configured host only) and never reads `HTTP_PROXY` or
     `HTTPS_PROXY` (the password is never handed to a proxy). TLS verifies against the system trust store. The
-    timeout is per socket operation; `deadline_s` is the overall wall clock for the whole exchange: `query` joins
+    timeout is per socket operation; `deadline_s` is the overall wall clock for the whole exchange: a call joins
     a worker thread for at most that long and, on expiry, abandons it (a server trickling bytes, or a black-holed
     connect, cannot hold a check open). An abandoned worker never sends: it closes as soon as it is connected.
-    A query for which an earlier worker is still alive is refused, so a hostile endpoint cannot pile up threads."""
+    With `single_flight`, a query for which an earlier worker is still alive is refused, so a hostile endpoint
+    cannot pile up threads (the tamper check; the archive client turns it off, concurrent users share SQL)."""
 
     def __init__(
         self,
@@ -92,55 +105,90 @@ class ClickHouseHttp:
         timeout_s: float = QUERY_TIMEOUT_S,
         deadline_s: float = QUERY_TIMEOUT_S,
         ca_file: str | None = None,
+        single_flight: bool = True,
+        max_abandoned: int = 16,
     ) -> None:
         check_url(url)
         parts = urlsplit(url)
         self._https = parts.scheme == "https"
         self._host = parts.hostname or ""
         self._port = parts.port or (443 if self._https else 80)
-        self._path = (
-            (parts.path.rstrip("/") or "")
-            + "/?"
-            + urlencode({"readonly": "1", "max_execution_time": str(int(timeout_s)), "max_result_rows": "10"})
-        )
+        self._base = (parts.path.rstrip("/") or "") + "/?"
+        self._default_settings = {**DEFAULT_SETTINGS, "max_execution_time": str(int(timeout_s))}
         self._headers = {"X-ClickHouse-User": user, "X-ClickHouse-Key": password}
         self._timeout_s = timeout_s
         self._deadline_s = deadline_s
+        self._single_flight = single_flight
+        self._max_abandoned = max_abandoned
+        self._abandoned: list[threading.Thread] = []  # workers given up on that have not ended yet
+        self._abandoned_lock = threading.Lock()  # `request` runs on many threads at once
         # System trust store, or exactly the operator's CA file when one is mounted. Never unverified.
         self._context = ssl.create_default_context(cafile=ca_file)
         self._workers: dict[str, threading.Thread] = {}  # by SQL text, which names the environment's database
 
     def query(self, sql: str) -> str:
+        return self.request(sql).decode("utf-8", "replace")
+
+    def request(
+        self,
+        sql: str,
+        *,
+        settings: Mapping[str, str] | None = None,
+        params: Mapping[str, str] | None = None,
+        max_bytes: int = MAX_RESPONSE_BYTES,
+        deadline_s: float | None = None,
+    ) -> bytes:
         """The whole exchange, DNS and connect and TLS included, has a hard bound of `deadline_s`: it runs in a
         daemon thread that this call joins for at most that long. On expiry the socket (if there is one yet) is
-        shut down and the call fails; an abandoned thread ends at its own per-operation timeouts."""
-        previous = self._workers.get(sql)
-        if previous is not None and previous.is_alive():
-            raise TamperQueryError  # the last attempt for this environment is still stuck: do not add another
+        shut down and the call fails; an abandoned thread ends at its own per-operation timeouts. `settings` are
+        sent in order (a `readonly` last, ClickHouse refuses a settings change after it); `params` become
+        server-side `{name:Type}` parameters (`param_<name>`)."""
+        with self._abandoned_lock:
+            self._abandoned = [t for t in self._abandoned if t.is_alive()]
+            if len(self._abandoned) >= self._max_abandoned:
+                raise TamperQueryError  # an endpoint that never answers must not be able to pile up threads
+        if self._single_flight:
+            previous = self._workers.get(sql)
+            if previous is not None and previous.is_alive():
+                raise TamperQueryError  # the last attempt for this query is still stuck: do not add another
+        query_string = urlencode(
+            [*(settings if settings is not None else self._default_settings).items()]
+            + [(f"param_{k}", v) for k, v in (params or {}).items()]
+        )
         held: dict[str, http.client.HTTPConnection] = {}
-        outcome: list[str | None] = []
+        outcome: list[bytes | int | None] = []
         abandoned = threading.Event()
         worker = threading.Thread(
-            target=self._exchange, args=(sql, held, outcome, abandoned), daemon=True, name="tb-tamper-query"
+            target=self._exchange,
+            args=(sql, self._base + query_string, max_bytes, held, outcome, abandoned),
+            daemon=True,
+            name="tb-tamper-query",
         )
-        self._workers[sql] = worker
+        if self._single_flight:
+            self._workers[sql] = worker
         worker.start()
-        worker.join(self._deadline_s)
+        worker.join(self._deadline_s if deadline_s is None else deadline_s)
         if worker.is_alive():
             abandoned.set()  # before the shutdown below: a worker that connects later sees it and closes
+            with self._abandoned_lock:
+                self._abandoned.append(worker)
             conn = held.get("conn")
             if conn is not None and conn.sock is not None:
                 _shutdown(conn.sock)
             raise TamperQueryError
         if not outcome or outcome[0] is None:
             raise TamperQueryError
+        if isinstance(outcome[0], int):
+            raise TamperQueryError(outcome[0] or None)
         return outcome[0]
 
     def _exchange(
         self,
         sql: str,
+        path: str,
+        max_bytes: int,
         held: dict[str, http.client.HTTPConnection],
-        outcome: list[str | None],
+        outcome: list[bytes | int | None],
         abandoned: threading.Event,
     ) -> None:
         conn: http.client.HTTPConnection
@@ -153,11 +201,15 @@ class ClickHouseHttp:
             conn.connect()
             if abandoned.is_set():
                 return  # the caller gave up while DNS or connect was pending: send nothing, keep nothing open
-            conn.request("POST", self._path, body=sql.encode(), headers=self._headers)
+            conn.request("POST", path, body=sql.encode(), headers=self._headers)
             response = conn.getresponse()
-            body = response.read(MAX_RESPONSE_BYTES)
             if response.status == 200:  # anything else, every 3xx included: a redirect is never followed
-                outcome.append(body.decode("utf-8", "replace"))
+                body = response.read(max_bytes + 1)
+                if len(body) <= max_bytes:  # a longer answer is cut off, and a cut-off answer is not an answer
+                    outcome.append(body)
+            else:
+                match = _ERROR_CODE_LINE.search(response.read(512))
+                outcome.append(int(match.group(1)) if match else 0)  # the numeric code only, never the text
         except (OSError, http.client.HTTPException, ValueError):
             pass  # library text can carry the host and headers: the caller raises a bare error
         finally:

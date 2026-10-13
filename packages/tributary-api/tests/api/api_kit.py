@@ -238,6 +238,17 @@ class Contract:
         assert not errors, [e.message for e in errors][:3]
 
 
+def _check_schema(self: Contract, name: str, instance: Any) -> None:
+    """An instance against a named component schema (for bodies that are not a plain JSON response, such as the
+    data of a server-sent event)."""
+    schema = {"$ref": f"#/components/schemas/{name}", "components": self.doc["components"]}
+    errors = list(Draft202012Validator(schema, format_checker=FormatChecker()).iter_errors(instance))
+    assert not errors, [e.message for e in errors][:3]
+
+
+Contract.check_schema = _check_schema  # type: ignore[attr-defined]
+
+
 def oidc_settings(idp: Idp, **overrides: Any) -> OidcSettings:
     values: dict[str, Any] = {"issuer": idp.issuer, "audience": AUDIENCE, "role_map": ROLE_MAP}
     values.update(overrides)

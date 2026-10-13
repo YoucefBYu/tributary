@@ -13,6 +13,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent))
 
 from api_kit import Contract, FakePublisher, Harness, Idp, TlsPg, fake_audit, oidc_settings
+from archive_kit import Admin
 from tributary.api.app import create_app
 from tributary.api.auth.jwks import HttpsJwksFetcher, KeySet
 from tributary.api.config import DatabaseSettings, OidcSettings, Settings
@@ -117,3 +118,12 @@ def tls_pg(tmp_path_factory: pytest.TempPathFactory) -> Iterator[TlsPg]:
         yield pg
     finally:
         pg.stop()
+
+
+@pytest.fixture(scope="module")
+def clickhouse_admin() -> Iterator[Admin]:
+    """A real ClickHouse for the archive endpoint tests (one per module)."""
+    from testcontainers.community.clickhouse import ClickHouseContainer
+
+    with ClickHouseContainer("clickhouse/clickhouse-server:24.8") as c:
+        yield Admin(f"http://{c.get_container_host_ip()}:{c.get_exposed_port(8123)}", c.username, c.password)

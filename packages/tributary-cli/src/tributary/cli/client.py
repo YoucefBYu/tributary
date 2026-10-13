@@ -69,6 +69,11 @@ class ApiClient:
         self.close()
 
     def _call(self, method: str, path: str, *, json: Any = None, params: dict[str, Any] | None = None) -> Any:
+        return self._call_status(method, path, json=json, params=params)[1]
+
+    def _call_status(
+        self, method: str, path: str, *, json: Any = None, params: dict[str, Any] | None = None
+    ) -> tuple[int, Any]:
         url = self._base + path + (f"?{urlencode(params)}" if params else "")
         headers = dict(self._headers)
         body: bytes | None = None
@@ -79,7 +84,7 @@ class ApiClient:
         if status >= 300:  # 3xx included: redirects are never followed
             raise _problem(status, raw)
         try:
-            return jsonlib.loads(raw)
+            return status, jsonlib.loads(raw)
         except ValueError:
             raise ApiError(status, "BAD_RESPONSE", "the API answered with a body that is not JSON") from None
 
@@ -150,6 +155,40 @@ class ApiClient:
             f"/v1/environments/{_seg(env)}/channels/{_seg(channel)}/undeploy",
             json={"expected_current_version": expected},
         )
+        return out
+
+    # -- archive (openapi/v0 part 2) -----------------------------------------------------------------
+
+    def _channel_path(self, env: str, channel: str) -> str:
+        return f"/v1/environments/{_seg(env)}/channels/{_seg(channel)}"
+
+    def search_messages(self, env: str, channel: str, body: dict[str, Any]) -> dict[str, Any]:
+        out: dict[str, Any] = self._call("POST", self._channel_path(env, channel) + "/messages/search", json=body)
+        return out
+
+    def get_message(self, env: str, channel: str, message_id: str) -> dict[str, Any]:
+        out: dict[str, Any] = self._call("GET", self._channel_path(env, channel) + f"/messages/{_seg(message_id)}")
+        return out
+
+    def reprocess(self, env: str, channel: str, message_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        out: dict[str, Any] = self._call(
+            "POST", self._channel_path(env, channel) + f"/messages/{_seg(message_id)}/reprocess", json=body
+        )
+        return out
+
+    def start_replay(self, env: str, channel: str, body: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+        """`(record, started)`: `started` is False when the API answered 200 (an identical replay already exists)."""
+        status, out = self._call_status("POST", self._channel_path(env, channel) + "/replays", json=body)
+        return out, status == 202
+
+    def get_replay(self, env: str, channel: str, replay_id: str) -> dict[str, Any]:
+        out: dict[str, Any] = self._call("GET", self._channel_path(env, channel) + f"/replays/{_seg(replay_id)}")
+        return out
+
+    def list_replays(self, env: str, channel: str, *, limit: int = 20) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = self._call(
+            "GET", self._channel_path(env, channel) + "/replays", params={"limit": limit}
+        )["items"]
         return out
 
     def _pages(self, path: str, limit: int) -> list[dict[str, Any]]:
