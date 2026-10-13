@@ -474,9 +474,12 @@ def test_a_replay_id_from_another_channel_is_not_found_and_a_rerun_keeps_who_fir
                     await store.begin(rig.env, "oru", request, start, end, "idp|other")
                 assert getattr(e.value, "code", None) == "NOT_FOUND"  # not 409: another channel's id is not ours
                 await store.finish_failed(request.replay_id, "SOURCE_ERROR", 0)
-                again, started = await store.begin(rig.env, "adt", request, start, end, "idp|second")
+                with pytest.raises(Exception) as e2:
+                    await store.begin(rig.env, "adt", request, start, end, "idp|second")
+                assert getattr(e2.value, "code", None) == "REQUEST_ID_REUSED"  # another subject cannot restart it
+                again, started = await store.begin(rig.env, "adt", request, start, end, "idp|first")
                 assert started and again["status"] == "running"
-                assert again["requested_by"] == "idp|first"  # a re-run does not rewrite who asked
+                assert again["requested_by"] == "idp|first"
             finally:
                 await engine.dispose()
 

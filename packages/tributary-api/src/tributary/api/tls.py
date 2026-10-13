@@ -47,6 +47,8 @@ def server_config(app: FastAPI, settings: Settings, resolver: DirSecretResolver 
         access_log=False,
         log_config=None,
         server_header=False,
+        limit_concurrency=settings.max_connections,  # beyond it uvicorn answers 503 instead of taking more work
+        backlog=max(64, settings.max_connections),
         ssl_certfile=certfile,
         ssl_keyfile=keyfile,
     )

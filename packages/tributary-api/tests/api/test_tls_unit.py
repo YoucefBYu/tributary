@@ -367,3 +367,34 @@ def test_tls12_allows_only_forward_secret_suites_and_tls13_keeps_its_defaults(tm
         assert _handshake(plain_port, pki.ca_file, ciphers="AES128-GCM-SHA256", tls13=False) == "AES128-GCM-SHA256"
     finally:
         srv.close()
+
+
+# -- security pass lows: L2 connection cap, L3 restart subject, L4 literal loopback only -------------------------
+
+
+def test_l4_only_literal_loopback_addresses_skip_the_tls_requirement() -> None:
+    refused("API_TLS_REQUIRED", TB_API_BIND="localhost")  # a name is not an address
+    refused("API_TLS_REQUIRED", TB_API_BIND="api.internal.example")
+    assert not config.is_loopback("localhost")
+    assert config.is_loopback("127.0.0.1") and config.is_loopback("127.1.2.3") and config.is_loopback("::1")
+    assert not config.is_loopback("0.0.0.0")  # noqa: S104
+
+
+def test_l2_the_listener_has_a_connection_cap_and_a_backlog_from_one_setting() -> None:
+    default = tls.server_config(app_with_route(), _s(), None, Log())  # type: ignore[arg-type]
+    assert default.limit_concurrency == 1000 and default.backlog == 1000
+    small = tls.server_config(app_with_route(), _s(max_connections=10), None, Log())  # type: ignore[arg-type]
+    assert small.limit_concurrency == 10 and small.backlog == 64
+    assert config.from_env({**BASE, "TB_API_MAX_CONNECTIONS": "250"}).max_connections == 250
+    for bad in ("0", "100001", "nan", "x"):
+        refused("API_MAX_CONNECTIONS_OUT_OF_RANGE", TB_API_MAX_CONNECTIONS=bad)
+
+
+def test_l3_only_the_original_subject_restarts_a_failed_replay() -> None:
+    from tributary.api.problems import ApiProblem
+    from tributary.api.replays import refuse_foreign_restart
+
+    refuse_foreign_restart("idp|first", "idp|first")
+    with pytest.raises(ApiProblem) as exc:
+        refuse_foreign_restart("idp|first", "idp|second")
+    assert exc.value.code == "REQUEST_ID_REUSED"

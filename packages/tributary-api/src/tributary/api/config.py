@@ -195,6 +195,9 @@ class Settings:
     audit_home_env: str | None = None
     tls_mode: str = "listener"
     tls_secret_ref: str | None = None
+    #: `TB_API_MAX_CONNECTIONS` (1-100000, default 1000): open connections per replica. Beyond it uvicorn answers 503;
+    #: the listen backlog is the same number (at least 64), so a burst queues in the kernel rather than being dropped.
+    max_connections: int = 1000
 
     def __post_init__(self) -> None:
         if self.profile not in PROFILES:
@@ -207,6 +210,10 @@ class Settings:
             )
         if self.audit_home_env is not None and not _ENV_NAME.fullmatch(self.audit_home_env):
             raise ConfigurationError("AUDIT_HOME_ENV_INVALID", "TB_AUDIT_HOME_ENV is not an environment name")
+        if not 1 <= self.max_connections <= 100_000:
+            raise ConfigurationError(
+                "API_MAX_CONNECTIONS_OUT_OF_RANGE", "TB_API_MAX_CONNECTIONS must be within 1-100000"
+            )
         if self.tls_mode not in ("listener", "mesh"):
             raise ConfigurationError("API_TLS_MODE_INVALID", "TB_API_TLS_MODE must be listener or mesh")
         if self.tls_secret_ref is not None and not _SECRET_REF.fullmatch(self.tls_secret_ref):
@@ -244,10 +251,12 @@ class Settings:
 
 
 def is_loopback(host: str) -> bool:
+    """True only for a literal loopback address (127.0.0.0/8, ::1). Names, `localhost` included, resolve through
+    configuration outside this process, so they never count as loopback for the TLS-required bypass."""
     try:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
-        return host == "localhost"
+        return False
 
 
 def _https(url: str) -> bool:
@@ -385,6 +394,7 @@ def from_env(env: Mapping[str, str]) -> Settings:
         audit_home_env=env.get("TB_AUDIT_HOME_ENV") or None,
         tls_mode=env.get("TB_API_TLS_MODE", "listener") or "listener",
         tls_secret_ref=env.get("TB_API_TLS_SECRET_REF") or None,
+        max_connections=int(_number(env, "TB_API_MAX_CONNECTIONS", 1000, "API_MAX_CONNECTIONS_OUT_OF_RANGE")),
         audit_timeout_s=_number(env, "TB_AUDIT_TIMEOUT_S", 10.0, "AUDIT_TIMEOUT_OUT_OF_RANGE"),
         reconcile_interval_s=_number(env, "TB_RECONCILE_INTERVAL_S", 30.0, "RECONCILE_INTERVAL_OUT_OF_RANGE"),
         reconcile_pending_grace_s=_number(env, "TB_RECONCILE_PENDING_GRACE_S", 120.0, "RECONCILE_GRACE_OUT_OF_RANGE"),

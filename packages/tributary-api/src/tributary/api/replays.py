@@ -85,6 +85,7 @@ class ReplayStore:
                 shown = render.replay(existing, env, channel, now=now)
                 if shown["status"] != "failed":
                     return shown, False
+                refuse_foreign_restart(existing.requested_by, actor)
                 await repo.restart(existing, now=now, deadline_at=now + timedelta(seconds=request.deadline_s))
                 return render.replay(existing, env, channel, now=now), True
             try:
@@ -164,3 +165,11 @@ class ReplayStore:
             }
 
         return await self._in(work)
+
+
+def refuse_foreign_restart(requested_by: str, actor: str) -> None:
+    """A `failed` replay is restarted only by the subject that asked for it: `requested_by` keeps meaning who asked,
+    and nobody takes over another subject's request id. The refusal is `REQUEST_ID_REUSED` (409), already in the
+    contract for this endpoint; a different subject starts its own run with a new `replay_id`."""
+    if requested_by != actor:
+        raise ApiProblem("REQUEST_ID_REUSED")
