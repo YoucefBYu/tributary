@@ -13,7 +13,6 @@ import asyncio
 import contextlib
 import copy
 import json
-import os
 import threading
 import time
 import uuid
@@ -129,7 +128,7 @@ def test_deploy_v2_then_rollback_reaches_a_running_worker_through_the_api(
                     spawn_pipeline_worker, env=env, channel=channel, bootstrap=kafka, instance_id=f"{env}-worker"
                 )
                 pid = worker.process.pid
-                assert applied(worker, channel) == [1]
+                await asyncio.to_thread(wait_for_sequence, worker, channel, [1])
 
                 second = await c.post(
                     f"{base}/deploy", json={"version": 2, "expected_current_version": 1}, headers=headers
@@ -168,35 +167,35 @@ def test_deploy_v2_then_rollback_reaches_a_running_worker_through_the_cli(
     port = free_port()
     server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, access_log=False, log_config=None))
     thread = threading.Thread(target=server.run, daemon=True)
-    thread.start()
     base = f"http://127.0.0.1:{port}"
-    deadline = time.monotonic() + 30
-    while time.monotonic() < deadline:
-        with contextlib.suppress(httpx.HTTPError):
-            if httpx.get(f"{base}/readyz", timeout=2).status_code == 200:
-                break
-        time.sleep(0.2)
-    else:
-        raise RuntimeError("the API under test did not become ready")
-
     monkeypatch.setenv("TRIBUTARY_API_URL", base)
-    monkeypatch.setenv("TRIBUTARY_TOKEN", idp.mint(roles=["tb-admin"]))
     runner = CliRunner()
     worker: ManagedProcess | None = None
 
     def tributary(*args: str) -> str:
+        monkeypatch.setenv("TRIBUTARY_TOKEN", idp.mint(roles=["tb-admin"]))  # fresh for each call (exp is 300 s)
         result = runner.invoke(cli.app, list(args))
         assert result.exit_code == 0, (args, result.exit_code, result.output)
         return result.output
 
+    thread.start()
     try:
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            with contextlib.suppress(httpx.HTTPError):
+                if httpx.get(f"{base}/readyz", timeout=2).status_code == 200:
+                    break
+            time.sleep(0.2)
+        else:
+            raise RuntimeError("the API under test did not become ready")
+
         assert "v1 (created)" in tributary("channels", "push", str(files[0]))
         assert "v2 (added)" in tributary("channels", "push", str(files[1]))
         assert "v1 published" in tributary("deploy", env, channel, "1", "--expect", "none")
 
         worker = spawn_pipeline_worker(env=env, channel=channel, bootstrap=kafka, instance_id=f"{env}-worker")
         pid = worker.process.pid
-        assert applied(worker, channel) == [1]
+        wait_for_sequence(worker, channel, [1])
 
         assert "v2 published" in tributary("deploy", env, channel, "2", "--expect", "1")
         wait_for_sequence(worker, channel, [1, 2])
@@ -205,10 +204,10 @@ def test_deploy_v2_then_rollback_reaches_a_running_worker_through_the_cli(
         assert "v1 published" in tributary("rollback", env, channel, "--expect", "2")
         wait_for_sequence(worker, channel, [1, 2, 1])
         assert worker.process.pid == pid and worker.process.poll() is None
-        assert os.environ["TRIBUTARY_API_URL"] == base  # (the CLI took its settings from the environment only)
     finally:
         if worker is not None:
             worker.terminate_and_wait()
         server.should_exit = True
         thread.join(15)
+        assert not thread.is_alive()
         restore_uvicorn_logging()
