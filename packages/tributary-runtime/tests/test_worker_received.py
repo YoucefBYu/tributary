@@ -22,11 +22,15 @@ from tributary.runtime.logs import JsonLogger
 from tributary.runtime.producer import KafkaEventEmitter, RecordProducer
 from tributary.runtime.records import ConsumedRecord
 from tributary.runtime.spec import ChannelSpec
-from tributary.runtime.worker import PipelineHandler
+from tributary.runtime.worker import RECEIVED_MEMORY, PipelineHandler
 from tributary.sdk import Drop, Message, step
 from tributary.sdk.testing import make_message
 
 from .fakes import FakeProducer
+from .test_consumer_loop import Clock
+from .test_consumer_loop import record as txn_record
+from .test_transactions import TxnConsumer
+from .test_transactions import build as build_txn
 
 CONTRACTS = Path(__file__).resolve().parents[3] / "contracts"
 EXAMPLES = CONTRACTS / "channel-spec" / "v0" / "examples" / "valid"
@@ -48,7 +52,15 @@ def consumed(message: Message | None = None, *, offset: int = 7) -> ConsumedReco
     )
 
 
-def handler(producer: FakeProducer, emitter: Any, *, steps: tuple[Any, ...], log: io.StringIO) -> PipelineHandler:
+def handler(
+    producer: FakeProducer,
+    emitter: Any,
+    *,
+    steps: tuple[Any, ...],
+    log: io.StringIO,
+    transactional: bool = False,
+    received_memory: int = RECEIVED_MEMORY,
+) -> PipelineHandler:
     return PipelineHandler(
         env="dev",
         spec_provider=spec,
@@ -57,6 +69,8 @@ def handler(producer: FakeProducer, emitter: Any, *, steps: tuple[Any, ...], log
         log=JsonLogger("worker", stream=log),
         instance="worker:test@localhost",
         steps_override=steps,
+        transactional=transactional,
+        received_memory=received_memory,
     )
 
 
@@ -145,14 +159,13 @@ def test_a_blocking_retry_of_the_same_record_emits_received_once() -> None:
     assert emitter.stages() == ["received", "transformed", "routed"]
 
 
-def test_a_redelivery_after_a_rewind_re_emits_with_the_same_dedup_key() -> None:
-    """A rebalance or transactional abort replays earlier offsets: the copy is identical on the archive's key."""
+def test_a_replay_another_process_sees_re_emits_with_the_same_dedup_key() -> None:
+    """A rebalance or restart hands uncommitted records to a process that never saw them: the copy is
+    identical on the archive's key. (Records the same process re-handles are covered below.)"""
     emitter = RecordingEmitter()
-    run = handler(FakeProducer(), emitter, steps=(passthrough,), log=io.StringIO())
     first = consumed(offset=7)
-    run.handle(first)
-    run.handle(consumed(offset=8))
-    run.handle(first)  # replayed from the window start / committed offset
+    handler(FakeProducer(), emitter, steps=(passthrough,), log=io.StringIO()).handle(first)
+    handler(FakeProducer(), emitter, steps=(passthrough,), log=io.StringIO()).handle(first)  # the successor
 
     copies = [event for event in received(emitter.events) if event.offset == 7]
     assert len(copies) == 2
@@ -173,8 +186,15 @@ def test_a_full_events_queue_never_fails_or_delays_the_record() -> None:
 
 
 class RefusingEmitter(RecordingEmitter):
+    """Refuses the first `refusals` received events, then accepts."""
+
+    def __init__(self, refusals: int = 1) -> None:
+        super().__init__()
+        self.refusals = refusals
+
     def emit(self, event: LifecycleEvent) -> None:
-        if event.stage == "received":
+        if event.stage == "received" and self.refusals > 0:
+            self.refusals -= 1
             raise EventError("refused by contract")
         super().emit(event)
 
@@ -191,3 +211,69 @@ def test_a_refused_received_event_is_logged_by_id_and_the_record_still_runs() ->
     assert len(failed) == 1
     assert failed[0]["stage"] == "received" and failed[0]["offset"] == 7
     assert "refused by contract" not in log.getvalue(), "exception text is never logged"
+
+
+def test_a_refused_received_event_is_not_remembered_so_the_next_attempt_retries_it() -> None:
+    emitter, producer = RefusingEmitter(), FakeProducer()
+    run = handler(producer, emitter, steps=(passthrough,), log=io.StringIO())
+    record = consumed()
+
+    producer.remaining = 1  # the first attempt fails after the refused event; the loop re-hands the record
+    with pytest.raises(DeliveryError):
+        run.handle(record)
+    producer.remaining = 0
+    run.handle(record)
+
+    assert [event.offset for event in received(emitter.events)] == [7], "the retry emitted the missed event"
+
+
+def test_memory_is_bounded_and_a_record_that_aged_out_re_emits() -> None:
+    emitter = RecordingEmitter()
+    run = handler(FakeProducer(), emitter, steps=(passthrough,), log=io.StringIO(), received_memory=2)
+    for offset in (1, 2, 3, 1):  # 1 is evicted by 3, so its replay emits again (archive dedups it)
+        run.handle(consumed(offset=offset))
+    assert [event.offset for event in received(emitter.events)] == [1, 2, 3, 1]
+
+
+class FailOnce:
+    """The real handler, then a retryable failure once for one record: a produce that did not land."""
+
+    def __init__(self, inner: PipelineHandler, fail: tuple[int, int]) -> None:
+        self.inner, self.fail = inner, fail
+        self.seen: list[tuple[int, int]] = []
+
+    def handle(self, rec: ConsumedRecord) -> None:
+        self.seen.append((rec.partition, rec.offset))
+        self.inner.handle(rec)
+        if (rec.partition, rec.offset) == self.fail:
+            self.fail = (-1, -1)
+            raise DeliveryError("PRODUCE_FAILED", retryable=True)
+
+
+def test_a_transactional_abort_rewinds_the_window_but_emits_received_once_per_record() -> None:
+    """The loop aborts and rewinds every partition in the window to its start (consumer.py, ADR-003 D6).
+
+    Every record in the window is handed to the pipeline again, so `transformed` and `routed` repeat
+    (those copies belong to the aborted transaction); `received` does not, because the record was
+    received once.
+    """
+    consumer = TxnConsumer()
+    for partition in (0, 1):
+        for offset in (0, 1):
+            consumer.append(txn_record(offset, partition=partition))
+    emitter = RecordingEmitter()
+    pipeline = handler(FakeProducer(), emitter, steps=(passthrough,), log=io.StringIO(), transactional=True)
+    failing = FailOnce(pipeline, fail=(1, 1))
+    clock = Clock()
+    loop, producer, _ = build_txn(consumer, failing, clock=clock)
+
+    loop.run(max_iterations=4)
+    assert "abort" in producer.calls
+    clock.advance(1.0)
+    loop.run(max_iterations=8)
+
+    replayed = failing.seen[4:]
+    assert sorted(replayed) == [(0, 0), (0, 1), (1, 0), (1, 1)], "the whole window really was re-handed"
+    assert emitter.stages().count("transformed") == 8
+    coordinates = [(event.partition, event.offset) for event in received(emitter.events)]
+    assert sorted(coordinates) == [(0, 0), (0, 1), (1, 0), (1, 1)], "one received per record, not per attempt"

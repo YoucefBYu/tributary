@@ -6,8 +6,15 @@ crash mid-flight replays rather than drops (invariants 1 and 4).
 
 Lifecycle events (`_tb.<env>.events`, fire-and-forget): `received` for every consumed `raw` record before any
 step runs (events/v0 2.1, set 1.8: the worker, not the receiver, emits it), then `filtered`, `transformed`,
-`routed` or `dlq`. A replayed record emits `received` again with the same `tb-msg-id` and `attempt`, which the
-archive collapses (events/v0 2.2); the loop's blocking retry of one record emits it once.
+`routed` or `dlq`. The handler remembers the last `RECEIVED_MEMORY` `(topic, partition, offset)` keys it emitted
+for, so the loop re-handing a record it already saw emits nothing new: a blocking retry of one record, and a
+transactional abort that rewinds the whole window, each yield one `received` per record. A replay this process
+did not see (another worker's records after a rebalance, a restart) emits again, with the same `tb-msg-id` and
+`attempt`, which the archive collapses (events/v0 2.2). A record the loop quarantines (undecodable) or rejects
+(malformed header) never reaches the handler, so it gets no `received`: its `quarantined` or `dlq` event is its
+whole timeline. There is no retry-topic redelivery to count here: the worker reads only `raw`, and
+`retry.policy: retry-topic` is refused at spec load (`spec.py`); were it added, each redelivery would be a new
+record with its own `tb-attempt`, so one `received` per attempt, each a distinct archive key.
 
 `pipeline.transactional: true` (ADR-003 D6) makes each commit window one Kafka transaction: the
 `out.<dest>` and DLQ records and the `raw` offsets commit atomically (`transactions.py`). The flag is
@@ -32,6 +39,7 @@ import os
 import signal
 import sys
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -119,6 +127,11 @@ from .worker_metrics import WorkerMetrics, WorkerSources
 #: with no destination to ask. JUDGEMENT, unmeasured: halting preserves order and never drops, which is
 #: the safe direction when the broker itself is the thing that is unwell.
 PRODUCE_RETRY = RetryPolicy(policy="blocking", max_attempts=10, on_exhaust="halt-partition", max_delay_ms=30_000)
+
+#: How many recent `(topic, partition, offset)` keys the handler remembers to emit `received` once per record.
+#: 4096 keys is about 0.5 MB, far above the contract's commit window (`commit_every`, 50), which the worker
+#: raises it to if a window is ever larger. JUDGEMENT, unmeasured.
+RECEIVED_MEMORY = 4096
 
 
 @dataclass(frozen=True, slots=True)
@@ -460,6 +473,7 @@ class PipelineHandler:
         step_resolver: StepResolver | None = None,
         metrics: WorkerMetrics | None = None,
         stage_timer: StageTimer | None = None,
+        received_memory: int = RECEIVED_MEMORY,
     ) -> None:
         self._env = env
         self._metrics = metrics
@@ -491,11 +505,12 @@ class PipelineHandler:
         self.stats = StepStats(observer=metrics.observe_step if metrics is not None else None)
         self.dead_lettered = 0
         self.filtered = 0
-        #: `(topic, partition) -> offset` of the last record whose `received` event was emitted. Only the
-        #: same record handled again back to back (the loop's blocking retry re-reads it) is suppressed;
-        #: any other redelivery re-emits, and the archive dedups it (events contract 2.2). One entry per
-        #: raw partition this process has read, so it is bounded by the topic's partition count.
-        self._received: dict[tuple[str, int], int] = {}
+        #: The most recent `(topic, partition, offset)` keys whose `received` event was emitted, oldest first,
+        #: at most `received_memory` of them. Sized above a commit window, so a blocking retry and a
+        #: transactional rewind both find every record they re-hand. Bounded so memory does not grow with
+        #: traffic; a key that aged out simply re-emits, which the archive dedups (events contract 2.2).
+        self._received: OrderedDict[tuple[str, int, int], None] = OrderedDict()
+        self._received_memory = max(1, received_memory)
 
     # -- plan ------------------------------------------------------------------------------------
 
@@ -948,9 +963,9 @@ class PipelineHandler:
         `tb-msg-id` is the receiver's, read from the record, so every redelivery carries the same one and
         the archive collapses copies on `(message_id, stage, destination, attempt)` (contract 2.2).
         """
-        key = (record.topic, record.partition)
-        if self._received.get(key) == record.offset:
-            return  # the loop's blocking retry re-reading this record: one `received`, not one per attempt
+        key = (record.topic, record.partition, record.offset)
+        if key in self._received:
+            return  # the loop re-handing a record (blocking retry, transactional rewind): one `received` only
         message = record.message
         try:
             self._emit(
@@ -974,7 +989,10 @@ class PipelineHandler:
                 partition=record.partition,
                 offset=record.offset,
             )
-        self._received[key] = record.offset
+            return  # not remembered: the loop's next attempt at this record tries the event again
+        self._received[key] = None
+        if len(self._received) > self._received_memory:
+            self._received.popitem(last=False)
 
     def _emit_dead(
         self,
@@ -1285,6 +1303,8 @@ class PipelineWorker:
             context_extensions=self.context_extensions,
             metrics=metrics,
             stage_timer=stage_timer,
+            # Above the commit window, so a transactional rewind re-hands only records it remembers.
+            received_memory=max(RECEIVED_MEMORY, 2 * defaults.consumer.commit_every),
         )
         # Resolve and bind every step, and load the declared context extensions, now: a bad `with`, a
         # splitter on a per-key channel or an unresolvable `pipeline.context` stops the worker before it
