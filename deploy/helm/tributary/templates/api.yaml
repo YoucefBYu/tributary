@@ -20,8 +20,8 @@
 {{- /* matchLabels only: matchExpressions can express catch-alls (Exists on a universal key, DoesNotExist on an absent one). */}}
 {{- if or (hasKey $psel "matchExpressions") (hasKey $nsel "matchExpressions") }}{{ fail (printf "api.tls.ingressControllerFrom[%d]: matchExpressions is not allowed in mesh mode; use matchLabels" $i) }}{{ end }}
 {{- $ps := (get $psel "matchLabels") | default dict }}{{ $ns := (get $nsel "matchLabels") | default dict }}
-{{- if not (or $ps $ns) }}{{ fail (printf "api.tls.ingressControllerFrom[%d] selects nothing (an empty selector matches every pod or namespace)" $i) }}{{ end }}
-{{- if and (hasKey $peer "podSelector") (not $ps) }}{{ fail (printf "api.tls.ingressControllerFrom[%d].podSelector.matchLabels is empty" $i) }}{{ end }}
+{{- /* L1: a namespaceSelector alone admits every pod in that namespace; ADR-004 C1a allows only the ingress controller. */}}
+{{- if not $ps }}{{ fail (printf "api.tls.ingressControllerFrom[%d].podSelector.matchLabels is required and must be non-empty in mesh mode (a namespaceSelector alone admits every pod in the namespace)" $i) }}{{ end }}
 {{- if and (hasKey $peer "namespaceSelector") (not $ns) }}{{ fail (printf "api.tls.ingressControllerFrom[%d].namespaceSelector.matchLabels is empty" $i) }}{{ end }}
 {{- end }}
 {{- end }}

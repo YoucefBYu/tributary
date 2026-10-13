@@ -90,7 +90,10 @@ api:
     mode: listener
     secretRef: ""
     caSecretRef: ""
-    ingressControllerFrom: []   # mesh only: peers (the ingress controller pods) allowed on the API port
+    # mesh only: peers (the ingress controller pods) allowed on the API port. Every peer MUST carry a non-empty
+    # podSelector.matchLabels (a namespaceSelector may narrow it further, but alone it would admit every pod in
+    # that namespace, so the render fails). No ipBlock, no matchExpressions.
+    ingressControllerFrom: []
   ingress:
     enabled: false
     className: nginx

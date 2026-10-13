@@ -115,8 +115,10 @@ jobs:
             --set networkPolicy.enabled=false --set networkPolicy.allowUnprotectedOpsPort=true 2>&1 | grep -q "networkPolicy.enabled must be true"
           # open or empty controller peers are refused at render time
           helm template tb "$CHART" -f "$CHART/ci/values-ci.yaml" --set api.tls.mode=mesh --set 'api.tls.ingressControllerFrom[0].ipBlock.cidr=0.0.0.0/0' 2>&1 | grep -q "ipBlock peer is not allowed"
-          helm template tb "$CHART" -f "$CHART/ci/values-ci.yaml" --set api.tls.mode=mesh --set 'api.tls.ingressControllerFrom[0].namespaceSelector=null' 2>&1 | grep -q "selects nothing"
-          helm template tb "$CHART" -f "$CHART/ci/values-ci.yaml" --set api.tls.mode=mesh --set 'api.tls.ingressControllerFrom[0].podSelector.matchLabels=null' 2>&1 | grep -q "selects nothing"
+          helm template tb "$CHART" -f "$CHART/ci/values-ci.yaml" --set api.tls.mode=mesh --set 'api.tls.ingressControllerFrom[0].namespaceSelector=null' 2>&1 | grep -q "podSelector.matchLabels is required"
+          helm template tb "$CHART" -f "$CHART/ci/values-ci.yaml" --set api.tls.mode=mesh --set 'api.tls.ingressControllerFrom[0].podSelector.matchLabels=null' 2>&1 | grep -q "podSelector.matchLabels is required"
+          # L1: a namespaceSelector-only peer would admit every pod in that namespace
+          helm template tb "$CHART" -f "$CHART/ci/values-ci.yaml" --set api.tls.mode=mesh --set 'api.tls.ingressControllerFrom[0].namespaceSelector.matchLabels.team=ingress' 2>&1 | grep -q "a namespaceSelector alone admits every pod"
           printf 'api:\n  tls:\n    mode: mesh\n    ingressControllerFrom:\n      - namespaceSelector: {matchExpressions: [{key: kubernetes.io/metadata.name, operator: Exists}]}\n' > mesh-expr.yaml
           helm template tb "$CHART" -f "$CHART/ci/values-ci.yaml" -f mesh-expr.yaml 2>&1 | grep -q "matchExpressions is not allowed"
           helm template tb "$CHART" -f "$CHART/ci/values-ci.yaml" "${mesh_set[@]}" --set networkPolicy.kubeletCIDR=10.20.0.0/16 2>&1 | grep -q "/24 or tighter"
