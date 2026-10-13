@@ -60,7 +60,7 @@ events; that made `message_id` meaninglessly non-null.
 | `parent_id` | UUID | no | From `tb-parent-id`. |
 | `correlation_id` | string | no | |
 | `destination` | string | no | Destination name; absent for pre-routing stages. |
-| `attempt` | integer 0-9999 | no | |
+| `attempt` | integer 0-9999 | no | **Ruled 2026-10-13.** Loader delivery stages (`retrying`, `sent`, and a loader's `error` or `dlq`): the **1-based number of the delivery try** the event reports. The first failure is `retrying` 1 (`ConsumerLoop`), and a success after k failures is `sent` k+1. That gives each try its own dedup key. It is counted by the loader process and restarts at 1 after a restart, which can repeat a key but never invents one. Not `tb-attempt`: a blocking retry does not re-produce the record, so the header stays `0`. Pipeline and receive stages: `0`, or the record's `tb-attempt` where the stage has one. |
 | `content_type` | string | no | |
 | `size_bytes` | integer ≥ 0 | no | Payload size. `0` with a claim-check. |
 | `claim_check` | string | no | Object-store URI, so the browser can fetch large content. |

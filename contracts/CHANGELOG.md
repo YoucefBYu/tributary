@@ -3,6 +3,12 @@
 Newest first. Each entry names the contract, the version, whether the change is additive or
 breaking, and the reason. Breaking changes reference an ADR.
 
+## 2026-10-13 (sent attempt) — set 1.8: `attempt` numbering on loader stages (README only)
+
+- **`events/v0` 2 field table:** on loader delivery stages, `attempt` is the 1-based number of the
+  delivery try; `sent` after k failures is k+1, matching `ConsumerLoop`'s `retrying` numbering. This
+  confirms 7574d38. It is not `tb-attempt`, which stays `0` under a blocking retry. Counts unchanged.
+
 ## 2026-10-13 (W3-30 part 2) — set 1.8: `tb_archiver_audit_records_total`
 
 **Additive: one registered metric and no new label name. No example change; counts predicted
