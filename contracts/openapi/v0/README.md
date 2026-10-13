@@ -180,6 +180,28 @@ CONTENT_STORAGE_OFF`. No row for that stage: `404 CONTENT_NOT_FOUND`. **Claim-ch
 the locator only.** Fetching the object through the API would put bucket credentials in the API
 process, which is a custody decision (ADR-004 H1, A3), so it is an open item, not v0.
 
+**W3-6 rulings (2026-10-13).**
+
+- **`422 REQUEST_INVALID`, not `400`,** for a well-formed query whose combination is refused: a
+  `destination` with `stage=received`, or none with `stage=routed`. This matches `DestinationQuery`
+  and search's "`until` not after `since`". `400` stays for a malformed value (a stage outside the
+  enum, a non-UUID id). The order of checks is validation, then audit, then read: a refused request
+  writes no audit record and reads nothing. Declared in 0.2.2.
+- **Where "content storage off" comes from: `archive_settings`, not the table's absence.** The migrate
+  step records content as enabled or disabled on every run (`archive-engineer`, with W3-30). Table
+  absence is ambiguous: a failed or partial migrate looks the same, and a table left behind after
+  content was switched off would make new messages answer `CONTENT_NOT_FOUND`, which hides the cause.
+  The API answers `409 CONTENT_STORAGE_OFF` when the latest setting says disabled. When the setting
+  says enabled but the table is missing, it answers `503 ARCHIVE_UNAVAILABLE`. Rows already stored
+  while content was on stay readable until their TTL (audited as any view). **Interim:** until the
+  flag exists, table absence may stand in for "off". It is removed when the flag lands.
+- **Archive SQL has one owner: `tributary-archiver`'s query library (`archive-engineer`).** Stats and the
+  content read move there beside `search` and `timeline`, and the API calls them. Two copies of the
+  deduplication rule (`events/v0` 4.1 rule 2) drift; that is a recurring defect here. W3-6 may merge
+  with its own parameterised readonly SQL plus a test that pins it, provided the move lands before the
+  wave 3 gate. The tamper check stays mirrored in the API with an equality test, because the API
+  owning that query is the point (ADR-004 R7 rev 3).
+
 ### 3.13 Reprocess
 
 `POST .../messages/{message_id}/reprocess` with `{operation_id, allow_reorder}` calls
@@ -248,7 +270,9 @@ the UI shows lag only through Grafana.
   one consumer per stream. **Give up:** latency is the archiver's batch delay plus the poll; with the
   archiver down the stream sends heartbeats only.
 - **Events:** `message` (data `MessageEvent`, `id` an opaque cursor), `heartbeat` every 15 s (data
-  `StreamHeartbeat`), `reset` (`cursor_expired`, `cursor_invalid`; the stream continues live) and `end`
+  `StreamHeartbeat`), `reset` (`cursor_expired`, `cursor_invalid`, and since 0.2.3 `backlog_too_dense`:
+a window still too dense to read completely after 10 halvings; the stream never skips events
+silently, it resets and continues live, and the client fills the gap with search) and `end`
   (`token_expiring`, `max_duration`, `server_shutdown`; the server closes). Delivery is at-least-once;
   clients deduplicate on `(message_id, stage, destination, attempt)`.
 - **Resume:** `Last-Event-ID` within 15 minutes; older, `reset` and live.

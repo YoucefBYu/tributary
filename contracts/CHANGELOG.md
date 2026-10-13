@@ -3,6 +3,26 @@
 Newest first. Each entry names the contract, the version, whether the change is additive or
 breaking, and the reason. Breaking changes reference an ADR.
 
+## 2026-10-13 (later) — set 1.8: `openapi/v0` 0.2.3, `reset` reason `backlog_too_dense`
+
+**Additive** (one enum value in `StreamNotice.reason`; no example change, counts unchanged). It is sent
+when a stream window cannot be read completely after 10 halvings. Reusing `cursor_expired` would have
+told the client its resume point was too old when the real cause was density. Both mean "a gap was
+skipped, fill it with search". README 3.16 updated. `control-plane-engineer` switches the string.
+
+## 2026-10-13 — set 1.8: `openapi/v0` 0.2.2, W3-6 rulings
+
+**Additive.** `getMessageContent` gains a declared `422` (`Unprocessable`, `REQUEST_INVALID`) for a
+destination with `stage=received` or none with `stage=routed`; `400` stays for malformed values. +1
+valid example, `response-problem-content-stage-destination.json`. **Predicted:** `validate.py`
+**246 / 0** (245 + 1); `--check-expectations` unchanged at **154 / 0**.
+
+- **README 3.12:** `CONTENT_STORAGE_OFF` comes from an `archive_settings` content flag that the migrate
+  step writes (`archive-engineer`). Table absence is an interim stand-in only; "enabled" with no table
+  answers `503 ARCHIVE_UNAVAILABLE`.
+- **Archive SQL ownership:** stats and the content read move into the `tributary-archiver` query
+  library (`archive-engineer`) before the wave 3 gate; W3-6 may merge first with pinned SQL.
+
 ## 2026-10-12 (W3-24) — set 1.8: `clients.worker_producer` with `linger.ms` 0
 
 **Additive: a new client profile; no role string, schema or example change. Counts unchanged.**

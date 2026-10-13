@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Tributary control-plane API",
-    "version": "0.2.1",
+    "version": "0.2.3",
     "summary": "Channels, versions, validation, deploy, rollback, health (part 1); message search, detail and content, reprocess, replay, stats, live events, retention (part 2). Contract tributary.openapi/v0, set 1.8.",
     "description": "See contracts/openapi/v0/README.md. Authentication: OIDC bearer access tokens validated as a resource server (ADR-009). The data plane never calls this API (invariant 3). No response echoes a request body, a token claim, or a value from a channel document beyond what the caller sent and stored; validation errors report json_path and keyword only (invariant 6). Operations marked x-tributary-phi-content read or re-publish message content: operator and admin only (ADR-009 D14), each one audited to _tb.<env>.audit before any content is read (contracts/audit/v0).",
     "license": { "name": "Apache-2.0", "identifier": "Apache-2.0" },
@@ -352,6 +352,7 @@
           "403": { "$ref": "#/components/responses/Forbidden" },
           "404": { "$ref": "#/components/responses/NotFound" },
           "409": { "$ref": "#/components/responses/Conflict" },
+          "422": { "$ref": "#/components/responses/Unprocessable" },
           "503": { "$ref": "#/components/responses/ServiceUnavailable" }
         }
       }
@@ -1246,10 +1247,10 @@
       },
       "StreamNotice": {
         "type": "object",
-        "description": "data of reset (cursor_expired, cursor_invalid: the stream continues live) and end (token_expiring, max_duration, server_shutdown: the server closes the stream; reconnect with a fresh token and Last-Event-ID).",
+        "description": "data of reset (cursor_expired, cursor_invalid, backlog_too_dense: the stream continues live from now, and events between the last id and now were NOT sent; use search to fill the gap) and end (token_expiring, max_duration, server_shutdown: the server closes the stream; reconnect with a fresh token and Last-Event-ID).",
         "required": ["reason"],
         "additionalProperties": false,
-        "properties": { "reason": { "enum": ["cursor_expired", "cursor_invalid", "token_expiring", "max_duration", "server_shutdown"] } }
+        "properties": { "reason": { "enum": ["cursor_expired", "cursor_invalid", "backlog_too_dense", "token_expiring", "max_duration", "server_shutdown"] } }
       },
       "RetentionSettings": {
         "type": "object",

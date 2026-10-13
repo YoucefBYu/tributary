@@ -30,6 +30,7 @@
     { "file": "valid/response-channel-stats.json", "schema": "../openapi.json#/components/schemas/ChannelStats", "note": "Part 2. Two versions seen during a rollout" },
     { "file": "valid/response-retention.json", "schema": "../openapi.json#/components/schemas/RetentionSettings", "note": "Part 2. ADR-004 R2 defaults with content raised to 60" },
     { "file": "valid/stream-event-message.json", "schema": "../openapi.json#/components/schemas/MessageEvent", "note": "Part 2. data of an SSE message event" },
+    { "file": "valid/response-problem-content-stage-destination.json", "schema": "../openapi.json#/components/schemas/Problem", "note": "0.2.2. getMessageContent 422: a destination with stage=received, or none with stage=routed. Fixed detail text, no echo of the query" },
     { "file": "valid/response-problem-audit-unavailable.json", "schema": "../openapi.json#/components/schemas/Problem", "note": "0.2.1. 503 from any audited operation (part 1 create, deploy, rollback, undeploy included) when the requested audit record is not committed: fail closed, nothing done" }
   ],
   "invalid": [
