@@ -5,7 +5,8 @@
 |---|---|
 | `tb_build_info{component, version}` | 1, set once |
 | `tb_commits_total{component, channel, outcome}` | `ArchiverMetrics.commits_ok` / `commit_failures`; `refused` never occurs |
-| `tb_archiver_events_total{outcome}` | `rows_written` (written), `events_rejected` (invalid) |
+| `tb_archiver_events_total{outcome}` | `rows_written - audit_written` (written), `events_rejected` (invalid) |
+| `tb_archiver_audit_records_total{outcome}` | events archiver only: `audit_written` (written), `audit_invalid` (invalid: every `AuditRejected`, including `RECORD_UNPARSEABLE`), `audit_unsupported_version` |
 | `tb_archiver_attrs_dropped_total{reason}` | `attrs_dropped_hmac` (hmac); the rest of `attrs_dropped` (denied_name) |
 | `tb_archiver_batches_total{outcome}` | `batches_written` (ok), `insert_failures` (failed: one per failed attempt) |
 | `tb_archiver_insert_duration_seconds` | observed per successful insert batch (`ArchiverMetrics.observe_insert`) |
@@ -57,6 +58,7 @@ class ArchiverExposition:
         self._content = content
         self._events = None if content else registry.counter("tb_archiver_events_total")
         self._attrs = None if content else registry.counter("tb_archiver_attrs_dropped_total")
+        self._audit = None if content else registry.counter("tb_archiver_audit_records_total")
         self._batches = registry.counter("tb_archiver_batches_total")
         self._insert = registry.histogram("tb_archiver_insert_duration_seconds")
         self._build_info.set(1, component=COMPONENT, version=version or build_version("tributary-archiver"))
@@ -68,10 +70,14 @@ class ArchiverExposition:
         for outcome, total in (("ok", m.commits_ok), ("refused", 0), ("failed", m.commit_failures)):
             self._commits.set_total(total, component=COMPONENT, channel=ARCHIVER_CHANNEL, outcome=outcome)
         if self._events is not None and self._attrs is not None:
-            self._events.set_total(m.rows_written, outcome="written")
+            self._events.set_total(max(0, m.rows_written - m.audit_written), outcome="written")
             self._events.set_total(m.events_rejected, outcome="invalid")
             self._attrs.set_total(m.attrs_dropped_hmac, reason="hmac")
             self._attrs.set_total(max(0, m.attrs_dropped - m.attrs_dropped_hmac), reason="denied_name")
+        if self._audit is not None:
+            self._audit.set_total(m.audit_written, outcome="written")
+            self._audit.set_total(m.audit_invalid, outcome="invalid")
+            self._audit.set_total(m.audit_unsupported_version, outcome="unsupported_version")
         self._batches.set_total(m.batches_written, outcome="ok")
         self._batches.set_total(m.insert_failures, outcome="failed")
 

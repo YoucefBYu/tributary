@@ -235,7 +235,7 @@ def test_a_malformed_audit_record_is_skipped_counted_and_committed_while_the_res
     archiver = build(consumer, sink, audit)
     archiver.run_once()
     assert len(audit.inserted) == 2 and sink.inserted == []
-    assert archiver.metrics.audit_rejected == 1 and archiver.metrics.events_rejected == 0
+    assert archiver.metrics.audit_invalid == 1 and archiver.metrics.events_rejected == 0
     assert consumer.commits[-1] == [(0, 3)], "the poison record is committed past, not retried"
 
 
@@ -430,7 +430,7 @@ def test_a_version_above_zero_is_counted_apart_logged_by_offset_and_committed_pa
     stream = io.StringIO()
     archiver = build_logged(consumer, FakeSink(), audit := FakeSink(), stream)
     archiver.run_once()
-    assert archiver.metrics.audit_unsupported_version == 1 and archiver.metrics.audit_rejected == 0
+    assert archiver.metrics.audit_unsupported_version == 1 and archiver.metrics.audit_invalid == 0
     assert archiver.metrics.events_rejected == 0 and len(audit.inserted) == 1
     (entry,) = lines(stream, "event_rejected")
     assert (entry["code"], entry["offset"]) == ("AUDIT_VERSION_UNSUPPORTED", 0)
@@ -527,3 +527,41 @@ def test_a_permanent_events_failure_names_the_events_table() -> None:
     archiver = build_logged(consumer, FakeSink(fail_times=2, transient=False), audit := FakeSink(), stream)
     archiver.run_once()
     assert lines(stream, "insert_halted")[0]["table"] == "events" and len(audit.inserted) == 1
+
+
+def test_every_audit_rejection_through_the_real_loop_is_invalid_and_each_outcome_is_scraped(monkeypatch: Any) -> None:
+    """Exposition end to end: written, invalid (not JSON, bad field, other environment, parser crash) and
+    unsupported_version all reach `tb_archiver_audit_records_total`; none is counted as an event rejection."""
+    import tributary.archiver.main as main_module
+    from tributary.archiver.exposition import ArchiverExposition
+
+    real = main_module.parse_audit_record
+
+    def flaky(value: Any, **kw: Any) -> Any:
+        if kw["offset"] == 3:
+            raise TypeError("boom")  # a validator bug on an audit record
+        return real(value, **kw)
+
+    monkeypatch.setattr(main_module, "parse_audit_record", flaky)
+
+    v1 = {**load("valid/content-view-requested.json"), "v": 1}
+    batch = [
+        audit_msg(0),
+        Topic("_tb.prod.audit", 1, b"{broken"),
+        Topic("_tb.prod.audit", 2, orjson.dumps({**load("valid/content-view-requested.json"), "environment": "dev"})),
+        audit_msg(3),
+        Topic("_tb.prod.audit", 4, orjson.dumps(v1)),
+        Topic("_tb.prod.audit", 5, orjson.dumps({**load("valid/content-view-requested.json"), "action": ["x"]})),
+    ]
+    archiver = build(FakeConsumer([batch]), FakeSink(), FakeSink())
+    archiver._parse = build_record_parser("prod")  # type: ignore[attr-defined]
+    exposition = ArchiverExposition(archiver.metrics, strict=True)
+    archiver.run_once()
+    text = exposition.render().decode()
+    assert 'tb_archiver_audit_records_total{outcome="written"} 1' in text
+    assert 'tb_archiver_audit_records_total{outcome="invalid"} 4' in text
+    assert 'tb_archiver_audit_records_total{outcome="unsupported_version"} 1' in text
+    assert (
+        'tb_archiver_events_total{outcome="invalid"} 0' in text
+        and 'tb_archiver_events_total{outcome="written"} 0' in text
+    )

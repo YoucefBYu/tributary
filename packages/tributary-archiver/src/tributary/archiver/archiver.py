@@ -218,7 +218,7 @@ class Archiver:
                 if isinstance(rejected, UnsupportedVersion):
                     self.metrics.audit_unsupported_version += 1
                 elif isinstance(rejected, AuditRejected):
-                    self.metrics.audit_rejected += 1
+                    self.metrics.audit_invalid += 1
                 else:
                     self.metrics.events_rejected += 1
                 self._log.warning(
@@ -309,6 +309,7 @@ class Archiver:
                 if self.metrics.observe_insert is not None:
                     self.metrics.observe_insert(elapsed)
                 self.metrics.rows_written += len(rows)
+                self.metrics.audit_written += sum(1 for row in rows if getattr(row, "table", "") in self._side_sinks)
                 self.metrics.batches_written += 1
                 self.metrics.attrs_dropped += sum(row.attrs_dropped for row in rows)
                 self.metrics.attrs_dropped_hmac += sum(row.attrs_dropped_hmac for row in rows)

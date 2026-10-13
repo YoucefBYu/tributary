@@ -55,7 +55,29 @@ def test_the_content_archiver_registers_a_strict_subset_of_the_contract_and_scra
     exposition = ArchiverExposition(metrics, strict=True, content=True)
     names = set(exposition.registry.names)
     assert names < _contract_archiver_names()
-    assert _contract_archiver_names() - names == {"tb_archiver_events_total", "tb_archiver_attrs_dropped_total"}
+    assert _contract_archiver_names() - names == {
+        "tb_archiver_events_total",
+        "tb_archiver_attrs_dropped_total",
+        "tb_archiver_audit_records_total",
+    }
     metrics.batches_written, metrics.commits_ok = 3, 3
     text = exposition.render().decode()
     assert 'tb_archiver_batches_total{outcome="ok"} 3' in text and "tb_archiver_events_total" not in text
+
+
+def test_audit_records_counter_exposes_each_outcome_and_events_written_excludes_audit_rows() -> None:
+    metrics = ArchiverMetrics()
+    exposition = ArchiverExposition(metrics, strict=True)
+    metrics.rows_written, metrics.audit_written = 10, 4
+    metrics.audit_invalid, metrics.audit_unsupported_version = 3, 2
+    text = exposition.render().decode()
+    assert 'tb_archiver_audit_records_total{outcome="written"} 4' in text
+    assert 'tb_archiver_audit_records_total{outcome="invalid"} 3' in text
+    assert 'tb_archiver_audit_records_total{outcome="unsupported_version"} 2' in text
+    assert 'tb_archiver_events_total{outcome="written"} 6' in text, "audit rows are not events"
+
+
+def test_the_audit_counter_is_zero_filled_before_the_first_record() -> None:
+    text = ArchiverExposition(ArchiverMetrics(), strict=True).render().decode()
+    for outcome in ("written", "invalid", "unsupported_version"):
+        assert f'tb_archiver_audit_records_total{{outcome="{outcome}"}} 0' in text
