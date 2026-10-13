@@ -42,6 +42,7 @@ from tributary.sdk.context import Logger
 
 from ..ops import LoaderOps, start_loader_ops
 from ..secrets import DirSecretResolver
+from ..sent_events import with_sent_events
 from ..startup import instance_or_exit, spec_reader_group_or_exit
 from .config import http_destination_config_from_destination
 from .handler import HttpRecordHandler
@@ -126,7 +127,16 @@ def build_loop(
     )
     loop = ConsumerLoop(
         consumer,
-        handler,
+        # `sent` after the destination acknowledged: fire-and-forget on the events emitter (events/v0 2.1)
+        with_sent_events(
+            handler,
+            emitter=emitter,
+            channel=a.channel,
+            channel_version=spec.version,
+            instance=instance,
+            destination=a.destination,
+            log=log,
+        ),
         topics=[out_topic(a.env, a.channel, a.destination)],
         retry=destination.retry,
         settings=LoopSettings(commit_every=defaults.consumer.commit_every),
