@@ -1,7 +1,7 @@
 {
   "marker": "integration",
   "command": "uv run pytest -m integration",
-  "count": 325,
+  "count": 326,
   "modules": {
     "packages/tributary-api/tests/api/test_archive_read_integration.py": 11,
     "packages/tributary-api/tests/api/test_audit_integration.py": 6,
@@ -46,7 +46,7 @@
     "packages/tributary-receivers/tests/integration/test_sftp_spec_lifecycle.py": 1,
     "packages/tributary-runtime/tests/test_integration_channels_outage.py": 1,
     "packages/tributary-runtime/tests/test_integration_engine_kafka.py": 7,
-    "packages/tributary-runtime/tests/test_integration_kafka.py": 4,
+    "packages/tributary-runtime/tests/test_integration_kafka.py": 5,
     "packages/tributary-runtime/tests/test_integration_ops.py": 3,
     "packages/tributary-runtime/tests/test_integration_reply.py": 4,
     "packages/tributary-runtime/tests/test_integration_tree.py": 1,
