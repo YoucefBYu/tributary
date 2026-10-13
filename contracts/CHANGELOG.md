@@ -3,6 +3,16 @@
 Newest first. Each entry names the contract, the version, whether the change is additive or
 breaking, and the reason. Breaking changes reference an ADR.
 
+## 2026-10-13 (latest) — set 1.8: emitter of `received` and `queued` (README only)
+
+**Documentation only; no schema or example change, counts unchanged.**
+
+- **`events/v0` 2.1:** the pipeline worker emits `received` and `queued` when it consumes the `raw`
+  record, with that record's topic, partition and offset. Receivers hold no events WRITE grant and
+  add no produce to the ACK path. The previous text named no emitter (W3-9b found no `received`
+  events). Build: `platform-engineer`.
+- **`openapi/v0` README 6:** replay cancel is deferred to wave 4 (also `wave-3.md` section 6).
+
 ## 2026-10-13 (later) — set 1.8: `openapi/v0` 0.2.3, `reset` reason `backlog_too_dense`
 
 **Additive** (one enum value in `StreamNotice.reason`; no example change, counts unchanged). It is sent

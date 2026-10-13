@@ -350,6 +350,7 @@ changes need an ADR.
 |---|---|---|
 | `retry-topic` spike report (W2-4); the refusal stays | `platform-engineer` | Not filed. "Stays refused" is an accepted outcome; file it when on call |
 | Destination-scoped reprocess (`out.<dest>` re-entry for loader exhaustion; destination-only step re-run via an additive `raw` header) | `architect` (ADR-003 amendment), then `archive-engineer`, `platform-engineer` | Wave 4. Needs `reprocessor` grants beyond `raw` (ADR-004 H7, human). 2.6 H5 |
+| Replay cancel (`POST .../replays/{replay_id}/cancel`, status `cancelled`, PostgreSQL flag polled by the running replica) | `architect` (contract), then `control-plane-engineer` | Wave 4, ruled 2026-10-13 on W3-9b's question. Wave 3 relies on `max_records`, `deadline_s` and `replay_id` idempotency (`openapi/v0` README 6) |
 | Claim-check spike | lead decides | Unscheduled since wave 2 (`wave-2.md` 5.2) |
 | Operator clear or skip for a halted partition | none yet | A skip is a drop; it needs a contract and an audit event first. Candidate for W3-7 only if the lead adds it |
 | W2-2 item 4: FHIR R4 schema validation of golden files | `healthcare-standards-engineer` | Waits on the human's network allow-list (7.5) |

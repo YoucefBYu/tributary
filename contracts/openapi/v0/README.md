@@ -343,6 +343,11 @@ components, and that a 4xx body never contains the request's own values.
 - ~~Part 2 (W3-1b)~~ published 2026-10-06 (above; audit shape in `audit/v0`).
 - Claim-check fetch through the API (3.12): needs a custody decision on bucket credentials in the API.
 - Destination-scoped reprocess: wave 4 (`wave-3.md` 2.6 H5).
+- **Replay cancel: deferred to wave 4** (ruled 2026-10-13, W3-9b question). It will be additive: `POST
+  .../replays/{replay_id}/cancel` and status `cancelled`, with a PostgreSQL flag that the running
+  replica polls. Wave 3 relies on `max_records`, `deadline_s` and `replay_id` idempotency.
+  **Give up:** a mistaken replay runs to its bound; the only emergency stop is an API restart, which
+  leaves it `failed` `INTERRUPTED`.
 - Cross-channel search, partition events on the stream, an auditor read API over `audit_log`.
 - `observability/v0` metric for OIDC key-set refreshes by outcome (ADR-009 follow-up 7): not in this
   part; still owed.

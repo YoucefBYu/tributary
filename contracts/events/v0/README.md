@@ -76,6 +76,10 @@ events; that made `message_id` meaninglessly non-null.
 `kind=message`: `received`, `queued`, `filtered`, `transformed`, `routed`, `pending`, `sent`,
 `retrying`, `replied`, `error`, `dlq`.
 
+**Emitter of `received` and `queued` (set 1.8, 2026-10-13):** the pipeline worker, when it consumes the
+`raw` record, carrying that record's `topic`, `partition` and `offset`. Receivers hold no WRITE on
+`_tb.<env>.events` (`topics/v0` 3.4.1), and no extra produce sits on the ACK path (invariants 1 and 9).
+
 `kind=partition`: `partition_paused`, `partition_resumed`, `partition_halted`.
 
 The message stages are exactly ADR-001 5.5 plus `replied` for synchronous reply mode. Adding a stage
