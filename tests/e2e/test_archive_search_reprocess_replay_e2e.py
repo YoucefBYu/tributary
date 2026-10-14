@@ -5,7 +5,7 @@ content are archived into ClickHouse by the real events archiver and the real co
 process then answers from that archive, authenticated with a signed bearer token:
 
 * **Search** finds the message by `tb-msg-id` (the id the receiver put on `raw`), and the message detail shows its
-  stages (`received`, `transformed`, `queued`, `routed`; `sent` is never emitted today, see the strict xfail).
+  stages (`received`, `transformed`, `queued`, `routed`, and `sent` once the loader delivered it).
 * **Destinations and routed content** (criterion 1): the detail lists each destination's status and the content index; the
   routed content of a destination is readable per destination, audited, and equals what a real HTTP loader delivered to the
   stub destination. Every API response in this module (and every SSE `message` and `heartbeat` event) is validated against
@@ -218,7 +218,9 @@ def journey(kafka: str, tmp_path_factory: pytest.TempPathFactory) -> Iterator[Jo
                     return False
                 seen = {(i["message_id"], i["stage"]) for i in page.json()["items"]}
                 return all(
-                    (m, s) in seen for m in j.ids.values() for s in ("received", "transformed", "queued", "routed")
+                    (m, s) in seen
+                    for m in j.ids.values()
+                    for s in ("received", "transformed", "queued", "routed", "sent")
                 )
 
             try:
@@ -294,7 +296,6 @@ def test_every_destination_has_a_status_and_the_routed_content_per_destination_i
     """Criterion 1: the detail carries each destination's status and the content index, and the routed content of a
     destination is readable per destination and equals what the loader delivered to it."""
     digest = hashlib.sha256
-    states: set[str] = set()
     with journey.stack.client() as http:
         for control, message_id in journey.ids.items():
             detail = http.get(f"{BASE}/messages/{message_id}")
@@ -302,13 +303,12 @@ def test_every_destination_has_a_status_and_the_routed_content_per_destination_i
             body = detail.json()
             destinations = {d["destination"]: d for d in body["destinations"]}
             assert set(destinations) == {"stub"}, f"destinations of {message_id}: {sorted(destinations)}"
-            assert destinations["stub"]["attempt"] == 0
-            states.add(destinations["stub"]["state"])
+            # The loader delivered it on the first try: `sent` is the newest event, and its attempt is 1-based (events/v0).
+            assert destinations["stub"]["state"] == "sent" and destinations["stub"]["attempt"] == 1
             index = {(c["stage"], c.get("destination", "")): c for c in body["content"]}
             assert ("received", "") in index and ("routed", "stub") in index, f"content index {sorted(index)}"
             assert index[("routed", "stub")]["storage"] == "inline"
             assert index[("routed", "stub")]["size_bytes"] == len(journey.sent[control])
-        print(f"DESTINATION_STATES {sorted(states)}")
         one = next(iter(journey.ids.items()))
         routed = http.get(f"{BASE}/messages/{one[1]}/content", params={"stage": "routed", "destination": "stub"})
         assert routed.status_code == 200 and routed.json()["destination"] == "stub"
@@ -319,33 +319,28 @@ def test_every_destination_has_a_status_and_the_routed_content_per_destination_i
             http.get(f"{BASE}/messages/{one[1]}/content", params={"stage": "routed", "destination": "nope"}).status_code
             == 404
         )
+
     # Viewing the routed content is its own audited action, naming the destination.
-    audit = [
-        json.loads(r.value())
-        for r in drain_topic(journey.kafka, AUDIT, partitions=1, timeout_s=3)
-        if r.value() and b"message.content.view" in r.value()
-    ]
-    assert any(
-        a.get("message_id") == one[1] and a.get("stage") == "routed" and a.get("destination") == "stub" for a in audit
-    )
+    def routed_view_audited() -> bool:
+        audit = [
+            json.loads(r.value())
+            for r in drain_topic(journey.kafka, AUDIT, partitions=1, timeout_s=3)
+            if r.value() and b"message.content.view" in r.value()
+        ]
+        return any(
+            a.get("message_id") == one[1] and a.get("stage") == "routed" and a.get("destination") == "stub"
+            for a in audit
+        )
+
+    wait_until(routed_view_audited, "the routed content-view audit record", timeout_s=30)
     # What the loader delivered to the destination is exactly the routed content: same bodies, one per message.
     wait_until(lambda: len(journey.stub.requests) >= len(journey.ids), "the stub to hold every delivery", timeout_s=30)
     delivered = [digest(r.body).hexdigest() for r in journey.stub.requests]
     expected = sorted(digest(p).hexdigest() for p in journey.sent.values())
-    assert sorted(delivered) == expected, f"{len(delivered)} deliveries for {len(expected)} messages"
-    assert states == {"routed"}  # today's truth; the next test is the expectation that it becomes `sent`
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason="GAP: no loader emits a `sent` event on a successful delivery (only dlq and error), so a delivered message's "
-    "destination status stays `routed` (state = the newest event's stage). Delete this xfail when it is fixed.",
-)
-def test_a_delivered_destination_reaches_the_sent_state(journey: Journey) -> None:
-    with journey.stack.client() as http:
-        for message_id in journey.ids.values():
-            body = http.get(f"{BASE}/messages/{message_id}").json()
-            assert {d["destination"]: d["state"] for d in body["destinations"]} == {"stub": "sent"}
+    # At-least-once: a duplicate delivery is allowed, a missing or different body is not.
+    assert set(delivered) == set(expected) and len(delivered) >= len(expected), (
+        f"{len(delivered)} deliveries, {len(set(delivered))} distinct, for {len(expected)} messages"
+    )
 
 
 def test_content_view_returns_the_stored_bytes_and_writes_an_audit_record(journey: Journey) -> None:

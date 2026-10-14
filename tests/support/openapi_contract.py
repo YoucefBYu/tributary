@@ -31,10 +31,11 @@ class OpenApiContract:
         self.checked = 0
 
     def template_for(self, path: str) -> str:
-        for pattern, template in self._templates:
-            if pattern.fullmatch(path):
-                return template
-        raise AssertionError(f"{path} matches no path in openapi.json")
+        """The matching template with the most literal segments (so `/a/{x}` never shadows `/a/special`)."""
+        matches = [t for pattern, t in self._templates if pattern.fullmatch(path)]
+        if not matches:
+            raise AssertionError(f"{path} matches no path in openapi.json")
+        return max(matches, key=lambda t: sum(1 for part in t.split("/") if part and not part.startswith("{")))
 
     def _resolve(self, node: dict[str, Any]) -> dict[str, Any]:
         while "$ref" in node:
@@ -59,6 +60,7 @@ class OpenApiContract:
         declared = self._resolve(declared)
         content = declared.get("content", {})
         if not content:
+            assert not response.content, f"{response.status_code} {method} {template} declares no body but sent one"
             return
         media = response.headers.get("content-type", "").split(";")[0]
         assert media in content, f"{media} not declared for {response.status_code} {method} {template}"
