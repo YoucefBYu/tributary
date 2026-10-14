@@ -418,3 +418,42 @@ def test_the_set_aside_log_for_an_event_names_where_it_came_from() -> None:
     assert (aside["table"], aside["topic"], aside["partition"], aside["offset"]) == ("events", "_tb.dev.events", 0, 42)
     assert sink.inserted == 4 and consumer.commits[-1] == [(0, 45)], "the rest landed and the batch committed"
     assert ids[2] not in stream.getvalue()
+
+
+class AcceptsAfterSink(RecordingSink):
+    """Refuses `late` until call number `after`, then takes it (a fault that clears)."""
+
+    def __init__(self, bad: set[str], late: str, after: int, transient_on_call: int) -> None:
+        super().__init__(bad, transient_on_call=transient_on_call)
+        self.late, self.after = late, after
+
+    def insert(self, rows: Sequence[Sequence[Any]]) -> None:
+        if self.calls >= self.after:
+            self.bad.discard(self.late)
+        super().insert(rows)
+
+
+def test_a_row_set_aside_by_an_interrupted_attempt_is_still_logged_and_counted() -> None:
+    """Code review M: the retry's lone suspect was accepted and the early return skipped the earlier bad row."""
+    rows = [Row(f"r{i}", datetime(2026, 10, 1, tzinfo=UTC)) for i in range(4)]
+    # Calls: 1 block, 2 [r0 r1], 3 r0, 4 r1 (bad), 5 [r2 r3], 6 r2, 7 r3 (bad), 8 retry r1 (bad), 9 retry r3 ->
+    # a connection reset. On the retried batch r1 is already known bad and r3 is the lone row, now accepted.
+    sink, stream = AcceptsAfterSink({"r1", "r3"}, late="r3", after=9, transient_on_call=9), io.StringIO()
+    archiver = archiver_for(sink, stream=stream)
+    archiver._origin[id(rows[1])] = ("_tb.dev.events", 0, 41)
+    assert archiver._write(rows)  # type: ignore[arg-type]
+    assert sorted(flat(sink)) == ["r0", "r2", "r3"], "r3 landed on its second try, r1 did not"
+    assert archiver.metrics.events_rejected == 1
+    (aside,) = [json.loads(x) for x in stream.getvalue().splitlines() if '"row_set_aside"' in x]
+    assert (aside["table"], aside["partition"], aside["offset"]) == ("events", 0, 41)
+
+
+def test_the_streak_resets_when_the_bisect_stores_rows() -> None:
+    sink = RecordingSink({"r3"})
+    archiver = archiver_for(sink)
+    archiver._aside_streak[""] = loop.ASIDE_STREAK_LIMIT - 1
+    assert archiver._write(rows_of(10)) is True  # type: ignore[arg-type]
+    assert archiver._aside_streak[""] == 1, "the nine stored rows broke the streak; only this block's bad row counts"
+    # With the old behaviour the streak would now be at the limit and a lone bad row would halt the archiver.
+    sink.bad.add("lone")
+    assert archiver._write([Row("lone", datetime(2026, 10, 1, tzinfo=UTC))]) is True  # type: ignore[arg-type]

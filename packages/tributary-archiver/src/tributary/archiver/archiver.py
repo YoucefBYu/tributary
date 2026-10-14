@@ -331,9 +331,12 @@ class Archiver:
                 worked = key in self._proven or any(id(row) in state.stored for row in chunk)  # this table took rows
                 if not worked or self._aside_streak.get(key, 0) >= ASIDE_STREAK_LIMIT:
                     raise
-                if self._retry_once(sink, todo[0], state):
-                    return []
-                state.bad.add(id(todo[0]))
+                if not self._retry_once(sink, todo[0], state):
+                    state.bad.add(id(todo[0]))
+                else:
+                    self._aside_streak[key] = 0
+                # Fall through: rows set aside by an earlier, interrupted attempt of this block still need their
+                # log line and their count.
             else:
                 budget = [isolation_budget(len(todo))]
                 before = len(state.stored)
@@ -344,6 +347,8 @@ class Archiver:
                 # A suspect that is accepted a second time was a transient fault in disguise: keep it.
                 state.bad.update(id(row) for row in found if not self._retry_once(sink, row, state))
                 self._proven.add(key)
+                if len(state.stored) > before:  # the bisect stored rows: the table works, this is not a streak
+                    self._aside_streak[key] = 0
         bad = [row for row in chunk if id(row) in state.bad]
         if bad:
             self._aside_streak[key] = self._aside_streak.get(key, 0) + len(bad)
