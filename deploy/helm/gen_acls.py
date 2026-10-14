@@ -70,13 +70,13 @@ def build() -> dict[str, object]:
                 ]
         roles[role] = sorted(rows, key=lambda g: tuple(str(v) for v in g.values()))
     defaults = json.loads(raw)
-    audit = defaults["classes"]["audit"]
-    topics = {  # `_tb.<env>.audit`: a 30 d transport buffer (ADR-004 R7); every value comes from the contract
-        "audit": {
-            "partitions": audit["partitions"],
+    topics = {  # `_tb.<env>.<kind>`: events (3 d) and audit (30 d buffer, ADR-004 R7); every value comes from the contract
+        kind: {
+            "partitions": defaults["classes"][kind]["partitions"],
             "replicas": defaults["profiles"]["production"]["replication_factor"],
-            "config": {k: str(v) for k, v in audit["configs"].items()},
+            "config": {k: str(v) for k, v in defaults["classes"][kind]["configs"].items()},
         }
+        for kind in ("events", "audit")
     }
     return {
         "topics": topics,

@@ -477,6 +477,11 @@ def check_retention(docs: list[dict[str, Any]], by_kind: dict[str, list[dict[str
             bad.append(f"{name}: TB_ARCHIVE_ALLOW_TTL_DECREASE is not 'false' by default")
     topics = by_kind.get("KafkaTopic", [])
     if by_kind.get("KafkaUser"):
+        for t in topics:
+            if t["spec"]["config"].get("message.timestamp.type") != "LogAppendTime":
+                bad.append(f"{t['spec']['topicName']}: message.timestamp.type is not LogAppendTime")
+        if {t["spec"]["topicName"].rsplit(".", 1)[1] for t in topics} != {"events", "audit"}:
+            bad.append("events and audit KafkaTopics are not both rendered")
         audit = [t for t in topics if t["spec"]["topicName"].endswith(".audit")]
         contract = json.loads((ROOT / "contracts/topics/v0/topic-defaults.json").read_text())["classes"]["audit"]
         if len(audit) != 1:

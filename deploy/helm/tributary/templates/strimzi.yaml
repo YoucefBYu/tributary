@@ -99,22 +99,24 @@ spec:
 {{- end }}
 {{- end }}
 {{- if .Values.strimzi.enabled }}
+{{- /* `_tb.<env>.events` and `_tb.<env>.audit`: values from topic-defaults.json via files/acls.json (drift-checked),
+       including message.timestamp.type=LogAppendTime. A KafkaTopic also reconciles the config of a topic that
+       already exists, so a re-run of `helm upgrade` fixes an older topic. audit is a 30 d buffer (ADR-004 R7). */}}
+{{- range $kind, $t := (.Files.Get "files/acls.json" | fromJson).topics }}
 ---
-# `_tb.<env>.audit`: a 30 d transport buffer for audit records; the system of record is the ClickHouse
-# audit_log table (ADR-004 R7). Values come from topic-defaults.json via files/acls.json (drift-checked).
 apiVersion: kafka.strimzi.io/v1beta2
 kind: KafkaTopic
 metadata:
-  name: tb-{{ .Values.env }}-audit
+  name: tb-{{ $.Values.env }}-{{ $kind }}
   labels:
-    strimzi.io/cluster: {{ .Values.strimzi.name }}
-    {{- include "tb.labels" . | nindent 4 }}
+    strimzi.io/cluster: {{ $.Values.strimzi.name }}
+    {{- include "tb.labels" $ | nindent 4 }}
 spec:
-  topicName: {{ printf "_tb.%s.audit" .Values.env | quote }}
-  {{- $t := (.Files.Get "files/acls.json" | fromJson).topics.audit }}
+  topicName: {{ printf "_tb.%s.%s" $.Values.env $kind | quote }}
   partitions: {{ $t.partitions }}
   replicas: {{ $t.replicas }}
   config: {{- range $k, $v := $t.config }}
     {{ $k | quote }}: {{ $v | quote }}
   {{- end }}
+{{- end }}
 {{- end }}

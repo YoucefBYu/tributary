@@ -276,6 +276,20 @@ def derive_topics(
     return topics
 
 
+#: Topic configs re-applied to a topic that already exists, because `create_topics` sets config only on a new one.
+#: Only settings that must hold on a long-lived cluster belong here (set 1.8: broker-stamped timestamps).
+ENFORCED_ON_EXISTING = ("message.timestamp.type",)
+
+
+def existing_topic_alterations(topics: list[TopicSpec], existing: set[str]) -> dict[str, dict[str, str]]:
+    """The `ENFORCED_ON_EXISTING` settings the contract gives each topic in `existing` (idempotent SET)."""
+    out: dict[str, dict[str, str]] = {}
+    for t in topics:
+        if t.name in existing and (cfg := {k: t.configs[k] for k in ENFORCED_ON_EXISTING if k in t.configs}):
+            out[t.name] = cfg
+    return out
+
+
 def emit_lite_warning(defaults: dict[str, Any], profile: str) -> None:
     """The mandatory, unsuppressable lite-profile startup warning (ADR-002 D14). This is the
     bootstrap job's own copy for defense in depth; it does not stand in for the per-component
@@ -331,18 +345,39 @@ def main(argv: list[str] | None = None) -> int:
     ]
     futures = admin.create_topics(new_topics, request_timeout=30)
     failed = False
+    existing: set[str] = set()
     for name, future in futures.items():
         try:
             future.result()
             log.info(json.dumps({"topic": name, "status": "created"}))
         except Exception as exc:  # TopicExistsError has no stable public import path across versions
             if "already exists" in str(exc).lower():
+                existing.add(name)
                 log.info(json.dumps({"topic": name, "status": "already-exists"}))
             else:
                 failed = True
                 log.error(json.dumps({"topic": name, "status": "failed", "reason": type(exc).__name__}))
     if failed:
         return 1
+    # Re-run safe: a topic created before a contract setting existed gets it now (incremental SET, no other key).
+    from confluent_kafka.admin import AlterConfigOpType, ConfigEntry, ConfigResource  # type: ignore[attr-defined]
+
+    alter = []
+    for name, cfg in existing_topic_alterations(topics, existing).items():
+        res = ConfigResource(ConfigResource.Type.TOPIC, name)
+        for k, v in cfg.items():
+            res.add_incremental_config(ConfigEntry(k, v, incremental_operation=AlterConfigOpType.SET))
+        alter.append(res)
+    if alter:
+        for res, fut in admin.incremental_alter_configs(alter).items():
+            try:
+                fut.result()
+                log.info(json.dumps({"topic": res.name, "status": "config-applied"}))
+            except Exception as exc:
+                failed = True
+                log.error(json.dumps({"topic": res.name, "status": "config-failed", "reason": type(exc).__name__}))
+        if failed:
+            return 1
 
     # Deny-by-default cluster: nothing but these grants lets a data-plane principal touch a topic.
     acls = derive_acls(

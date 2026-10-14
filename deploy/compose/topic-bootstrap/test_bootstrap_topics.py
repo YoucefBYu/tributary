@@ -17,7 +17,13 @@ import pytest
 # name"); a bare `sys.path` entry makes `bootstrap_topics` importable as a top-level module instead,
 # matching the pattern already used for `.github/scripts`.
 sys.path.insert(0, str(Path(__file__).parent))
-from bootstrap_topics import data_topic_name, derive_topics, load_defaults, platform_topic_name
+from bootstrap_topics import (
+    data_topic_name,
+    derive_topics,
+    existing_topic_alterations,
+    load_defaults,
+    platform_topic_name,
+)
 
 CONTRACT_PATH = Path(__file__).resolve().parents[3] / "contracts" / "topics" / "v0" / "topic-defaults.json"
 
@@ -327,3 +333,22 @@ def test_derive_acls_refuses_a_shared_principal(defaults: dict) -> None:  # type
             destinations=DESTS,
             principals={"receiver": "User:x", "worker": "User:x"},
         )
+
+
+@pytest.mark.parametrize("kind", ["events", "audit"])
+def test_events_and_audit_topics_use_broker_timestamps_from_the_contract(defaults: dict, kind: str) -> None:  # type: ignore[type-arg]
+    want = defaults["classes"][kind]["configs"]["message.timestamp.type"]
+    assert want == "LogAppendTime"
+    topics = {t.name: t for t in derive_topics(defaults, env="dev", profile="lite", channel="c", destinations=("d",))}
+    assert topics[platform_topic_name("dev", kind)].configs["message.timestamp.type"] == want
+
+
+def test_existing_events_and_audit_topics_get_the_setting_and_nothing_else(defaults: dict) -> None:  # type: ignore[type-arg]
+    topics = derive_topics(defaults, env="dev", profile="lite", channel="c", destinations=("d",))
+    existing = {t.name for t in topics}
+    alter = existing_topic_alterations(topics, existing)
+    assert alter == {
+        platform_topic_name("dev", "events"): {"message.timestamp.type": "LogAppendTime"},
+        platform_topic_name("dev", "audit"): {"message.timestamp.type": "LogAppendTime"},
+    }
+    assert existing_topic_alterations(topics, set()) == {}  # a topic that was just created is not altered
