@@ -224,9 +224,15 @@ def test_a_published_record_lands_once_a_redelivery_does_not_duplicate_it_and_po
         # The same loop, one commit: the event on the events topic landed too.
         assert rig.rows(f"SELECT count() FROM {rig.database}.message_events FINAL") == [(1,)]
         # Logs: unknown fields by count and offset only, rejections by code and offset, never a field name or value.
-        time.sleep(1.0)  # let the pump thread drain the last log lines
-        proc.collect_pending()
-        logged = list(proc.lines)
+        deadline = time.monotonic() + 30
+        while True:  # the pump thread drains the process's log lines asynchronously: wait for the ones we assert on
+            proc.collect_pending()
+            logged = list(proc.lines)
+            have = {x["event"] for x in logged if x.get("event") in ("audit_unknown_fields_ignored",)}
+            rejected_seen = sum(1 for x in logged if x.get("event") == "event_rejected")
+            if (have and rejected_seen >= 3) or time.monotonic() > deadline:
+                break
+            time.sleep(0.5)
         output = json.dumps(logged)
         assert "SYNTH-CONTENT-MUST-NOT-LAND" not in output and "future_field" not in output
         (unknown,) = [x for x in logged if x.get("event") == "audit_unknown_fields_ignored"]
