@@ -121,9 +121,21 @@ spec:
             - --env={{ $.Values.env }}
             # Loaders name the flag --instance-id; the value is the pod name all the same.
             - --instance-id=$(POD_NAME)
+            # W3-26: /livez and /metrics (tb_partitions_halted, tb_deliveries_total). Loopback by default, so bind the
+            # pod IP for kubelet and the collector; networkpolicy.yaml limits 9180.
+            - --ops-bind=$(POD_IP)
+            - --ops-port={{ $.Values.receiver.opsPort }}
           env:
             {{- include "tb.downwardEnv" $ | nindent 12 }}
             {{- include "tb.commonEnv" $ | nindent 12 }}
+          ports:
+            - {name: ops, containerPort: {{ $.Values.receiver.opsPort }}}
+          startupProbe:
+            httpGet: {path: /livez, port: ops}
+            {{- toYaml $.Values.receiver.probes.startup | nindent 12 }}
+          livenessProbe:
+            httpGet: {path: /livez, port: ops}
+            {{- toYaml $.Values.receiver.probes.liveness | nindent 12 }}
           resources: {{- toYaml $.Values.loader.resources | nindent 12 }}
           securityContext: {{- include "tb.containerSecurityContext" $ | nindent 12 }}
           volumeMounts: {{- include "tb.kafkaMounts" (dict "root" $ "role" "loader") | nindent 12 }}

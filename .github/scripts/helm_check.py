@@ -108,19 +108,25 @@ def check(docs: list[dict[str, Any]]) -> list[str]:
     if receivers and not cidr_ok:
         bad.append("no NetworkPolicy limiting ingress on 9180 to the kubelet CIDR")
 
+    # Every process that exports tb_* (worker, loaders, archiver) binds the pod IP, so the collector can scrape
+    # tb_partitions_halted and kubelet can probe, and has its own NetworkPolicy on the ops port.
     for n, spec in pods(docs):
-        if not n.endswith("-worker"):
+        if spec.get("restartPolicy") == "Never" or not (
+            n.endswith("-worker") or "-loader-" in n or n.endswith("-archiver")
+        ):
             continue
         c = spec["containers"][0]
         if "--ops-bind=$(POD_IP)" not in c["args"]:
-            bad.append(f"{n}: worker --ops-bind is not the pod IP")
+            bad.append(f"{n}: --ops-bind is not the pod IP")
+        if not any(p["name"] == "ops" and p["containerPort"] == 9180 for p in c.get("ports", [])):
+            bad.append(f"{n}: no container port named ops (the collector keeps only that name)")
         if c.get("livenessProbe", {}).get("httpGet", {}).get("path") != "/livez":
-            bad.append(f"{n}: worker has no /livez liveness probe")
+            bad.append(f"{n}: no /livez liveness probe")
         if not any(
             x["metadata"]["name"] == n and any(9180 in [p["port"] for p in r["ports"]] for r in x["spec"]["ingress"])
             for x in by_kind.get("NetworkPolicy", [])
         ):
-            bad.append(f"{n}: no NetworkPolicy limiting ops port 9180 for the worker")
+            bad.append(f"{n}: no NetworkPolicy limiting ops port 9180")
     arch = [s for n, s in pods(docs) if n.endswith("-archiver")]
     job = [s for n, s in pods(docs) if "archiver-migrate" in n]
     if not arch or "--skip-ddl" not in arch[0]["containers"][0]["args"]:

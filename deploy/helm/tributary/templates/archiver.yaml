@@ -36,6 +36,9 @@ spec:
             - --instance-id=$(POD_NAME)
             # ADR-004 A5: the runtime credential is INSERT-only; DDL is the migrate Job's.
             - --skip-ddl
+            # W3-27: /livez and /metrics. Loopback by default; bind the pod IP (networkpolicy.yaml limits 9180).
+            - --ops-bind=$(POD_IP)
+            - --ops-port={{ .Values.receiver.opsPort }}
           env:
             {{- include "tb.downwardEnv" . | nindent 12 }}
             {{- include "tb.archiverEnv" . | nindent 12 }}
@@ -43,6 +46,14 @@ spec:
             {{- if $ch.caCertSecretRef }}
             - {name: TB_ARCHIVE_CLICKHOUSE_CA_CERT, value: {{ printf "/var/run/secrets/tributary-ca/%s" $ch.caCertSecretKey | quote }}}
             {{- end }}
+          ports:
+            - {name: ops, containerPort: {{ .Values.receiver.opsPort }}}
+          startupProbe:
+            httpGet: {path: /livez, port: ops}
+            {{- toYaml .Values.receiver.probes.startup | nindent 12 }}
+          livenessProbe:
+            httpGet: {path: /livez, port: ops}
+            {{- toYaml .Values.receiver.probes.liveness | nindent 12 }}
           resources: {{- toYaml .Values.archiver.resources | nindent 12 }}
           securityContext: {{- include "tb.containerSecurityContext" . | nindent 12 }}
           volumeMounts:

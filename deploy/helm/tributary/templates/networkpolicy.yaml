@@ -172,6 +172,61 @@ spec:
         - {protocol: TCP, port: {{ .Values.api.opsPort }}}
     {{- end }}
 {{- end }}
+{{- range $ch := .Values.channels }}
+# Loader ops listener (/livez, /metrics) binds the pod IP: same restriction as the receiver's.
+{{- range $d := $ch.destinations }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "tb.name" $ }}-{{ $ch.name }}-loader-{{ $d.name }}
+  labels: {{- include "tb.labels" $ | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ $.Release.Name }}
+      app.kubernetes.io/component: loader
+      tributary.dev/channel: {{ $ch.name }}
+      tributary.dev/destination: {{ $d.name }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - ipBlock: {cidr: {{ $kubelet | quote }}}
+        {{- if $.Values.otel.enabled }}
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ $.Release.Name }}
+              app.kubernetes.io/component: otel-collector
+        {{- end }}
+      ports:
+        - {protocol: TCP, port: {{ $.Values.receiver.opsPort }}}
+{{- end }}
+{{- end }}
+{{- if .Values.archiver.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "tb.name" . }}-archiver
+  labels: {{- include "tb.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: archiver
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - ipBlock: {cidr: {{ $kubelet | quote }}}
+        {{- if .Values.otel.enabled }}
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              app.kubernetes.io/component: otel-collector
+        {{- end }}
+      ports:
+        - {protocol: TCP, port: {{ .Values.receiver.opsPort }}}
+{{- end }}
 {{- if .Values.otel.enabled }}
 {{- $prom := required "monitoring.prometheusFrom is required while otel and networkPolicy are enabled: it names who may scrape :8889" .Values.monitoring.prometheusFrom }}
 ---
