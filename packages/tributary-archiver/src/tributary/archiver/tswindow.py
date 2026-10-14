@@ -48,6 +48,8 @@ def in_window(
     when a `lookback` is given and there is an anchor, not more than that before it. Events pass no lookback: a
     `received` event legitimately carries `tb-received-at`, which a replay or reprocess can make arbitrarily old.
     The insert is cut by month anyway (`archiver.MAX_MONTHS_PER_BLOCK`); this bound only refuses absurd values."""
-    base = anchor or now or datetime.now(UTC)
+    clock = now or datetime.now(UTC)
+    # The anchor is the producer-set CreateTime: never trust it past the clock, or a writer moves both ends.
+    base = min(anchor, clock) if anchor is not None else clock
     lowest = max(EARLIEST, base - lookback) if (anchor is not None and lookback is not None) else EARLIEST
-    return lowest <= ts <= base + SKEW
+    return lowest <= ts <= min(base + SKEW, LATEST_RANGE)

@@ -60,6 +60,20 @@ LOCAL_CONVERSION_ERRORS: Final = (
 )
 
 
+def _network_cause(exc: BaseException) -> bool:
+    seen: set[int] = set()
+    stack: list[BaseException | None] = [exc]
+    while stack and len(seen) < 16:
+        current = stack.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, OSError | urllib3.exceptions.HTTPError):
+            return True
+        stack.extend([current.__cause__, current.__context__])
+    return False
+
+
 def is_permanent(exc: BaseException) -> bool:
     """Whether retrying the same insert is pointless. Reads the driver's text only to extract a number;
     nothing from it is logged or kept."""
@@ -72,7 +86,10 @@ def is_permanent(exc: BaseException) -> bool:
     if isinstance(exc, ch_exc.DataError | ch_exc.ProgrammingError):
         return True
     if isinstance(exc, LOCAL_CONVERSION_ERRORS):
-        return True  # the driver could not serialise a value: retrying the same bytes fails the same way
+        # The driver could not serialise a value: retrying the same bytes fails the same way. Unless the
+        # exception sits on top of a network fault (its chain holds an OSError or a urllib3 error): then it is
+        # transient and must not cost a row.
+        return not _network_cause(exc)
     match = _CODE.search(str(exc))
     return match is not None and int(match.group(1)) in PERMANENT_CODES
 

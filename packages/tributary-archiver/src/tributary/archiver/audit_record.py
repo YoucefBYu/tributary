@@ -189,7 +189,13 @@ def _require(present: dict[str, Any], *names: str) -> None:
 
 
 def parse_audit_record(
-    value: bytes | None, *, env: str, partition: int, offset: int, anchor: datetime | None = None
+    value: bytes | None,
+    *,
+    env: str,
+    partition: int,
+    offset: int,
+    anchor: datetime | None = None,
+    now: datetime | None = None,
 ) -> AuditRow:
     """The row for one record on `_tb.<env>.audit`, or `EventRejected(code)`. Codes are fixed; the record is
     never quoted."""
@@ -216,9 +222,7 @@ def parse_audit_record(
 
     audit_id = _match(record, "audit_id", _UUID7)
     ts = _when(_match(record, "ts", _TIMESTAMP))
-    if ts is not None and not in_window(
-        ts, anchor, lookback=LOOKBACK
-    ):  # `audit_log` is partitioned by month (tswindow.py)
+    if ts is not None and not in_window(ts, anchor, now=now, lookback=LOOKBACK):  # month partitions: tswindow.py
         raise _bad("AUDIT_TIMESTAMP_INVALID")
     environment = _match(record, "environment", _ENV)
     action, phase = record["action"], record["phase"]

@@ -171,7 +171,7 @@ def clean_attrs(value: Any) -> tuple[dict[str, str], int]:
     return kept, dropped
 
 
-def parse_event(record_value: bytes, *, anchor: datetime | None = None) -> EventRow:
+def parse_event(record_value: bytes, *, anchor: datetime | None = None, now: datetime | None = None) -> EventRow:
     """Decode one record value. Raises `EventRejected` (a code, never content) for anything unstorable."""
     try:
         raw = orjson.loads(record_value)
@@ -186,7 +186,7 @@ def parse_event(record_value: bytes, *, anchor: datetime | None = None) -> Event
     if kind not in KINDS:
         raise EventRejected("EVENT_KIND_UNKNOWN")
     ts = parse_ts(raw.get("ts"))
-    if not in_window(ts, anchor):  # the table is partitioned by month: an absurd ts must not reach an insert
+    if not in_window(ts, anchor, now=now):  # the table is partitioned by month: an absurd ts must not reach an insert
         raise EventRejected("EVENT_TS_OUT_OF_RANGE")
     channel = _str(raw, "channel", required=True, limit=64)
     stage = _str(raw, "stage", required=True, limit=32)

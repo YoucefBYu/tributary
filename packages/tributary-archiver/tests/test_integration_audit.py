@@ -320,6 +320,7 @@ def test_a_batch_spread_over_many_months_still_commits_and_one_unstorable_row_is
         bad_values = list(parse_audit_row(rig, rig.record(), 9).values)
         bad_values[0] = "not-a-uuid"
         bad = AuditRow(values=tuple(bad_values), ts=good[0].ts)
+        archiver._origin[id(bad)] = (rig.audit_topic, 0, 9)  # what the consume loop records for a real message
         assert archiver._write([*good[:4], bad, *good[4:]])  # type: ignore[arg-type]
         assert rig.rows(f"SELECT count() FROM {rig.database}.audit_log") == [(9,)], "the nine good rows landed once"
         aside = [json.loads(x) for x in stream.getvalue().splitlines() if '"row_set_aside"' in x]

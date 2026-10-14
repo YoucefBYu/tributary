@@ -49,7 +49,27 @@ from .tswindow import record_time
 
 KAFKA_ERROR_LOG_INTERVAL_S: Final = 60.0
 MAX_MONTHS_PER_BLOCK: Final = 50
-ISOLATION_FAILED_INSERTS: Final = 64  # beyond this many refused sub-inserts the cause is systemic, not a row
+ISOLATION_BASE: Final = 64
+ASIDE_STREAK_LIMIT: Final = 5  # this many rows set aside in a row on one table, with no insert between: systemic
+
+
+def isolation_budget(rows: int) -> int:
+    """How many refused sub-inserts to spend looking for bad rows in a block of `rows`: each bad row costs about
+    `log2(rows) + 1`, and up to 5% of the block may be bad before the cause is called systemic."""
+    return ISOLATION_BASE + (rows // 20) * (rows.bit_length() + 1)
+
+
+class _IsolationState:
+    """What one `_write` has already learned about its rows, kept across the retries of the batch."""
+
+    __slots__ = ("bad", "exhausted", "stored")
+
+    def __init__(self) -> None:
+        self.stored: set[int] = set()
+        self.bad: set[int] = set()
+        self.exhausted = False
+
+
 _PARTITION_EOF: Final = -191  # confluent_kafka.KafkaError._PARTITION_EOF
 
 
@@ -166,6 +186,9 @@ class Archiver:
         self.metrics = metrics if metrics is not None else ArchiverMetrics()
         self._ticked = time.monotonic()
         self._kafka_error_seen: dict[str, tuple[float | None, int]] = {}
+        self._origin: dict[int, tuple[str, int, int]] = {}  # row -> (topic, partition, offset), for the logs
+        self._proven: set[str] = set()  # sinks that have taken an insert in this process
+        self._aside_streak: dict[str, int] = {}
 
     def stop(self) -> None:
         """Safe from a signal handler: the loop notices at its next poll or backoff slice."""
@@ -208,6 +231,7 @@ class Archiver:
                 except Exception:  # a parser bug must not kill the loop: this record is skipped, never retried
                     raise EventRejected("RECORD_UNPARSEABLE") from None
                 rows.append(row)
+                self._origin[id(row)] = (key[0], key[1], message.offset())
                 unknown = getattr(row, "unknown_fields", 0)
                 if unknown:  # a count and a position, never a field name or value
                     self._log.warning(
@@ -231,7 +255,9 @@ class Archiver:
                     partition=key[1],
                     offset=message.offset(),
                 )
-        if rows and not self._write(rows):
+        written = not rows or self._write(rows)
+        self._origin.clear()
+        if not written:
             return handled  # stopping: nothing committed, the batch is redelivered
         if offsets:
             self._commit(offsets)
@@ -281,62 +307,90 @@ class Archiver:
             work.append((key, current))
         return work
 
-    def _insert_chunk(self, key: str, chunk: list[RowLike]) -> list[RowLike]:
-        """Insert one block. A PERMANENT failure of a block of several rows may be one bad row: bisect to find
-        it, insert the rest, and return the rows set aside. If (nearly) every row fails the cause is the table or
-        the grant, not a row, so the original error is raised and the batch halts as before (never dropped)."""
-        sink = self._side_sinks[key] if key else self._sink
-        try:
-            sink.insert([row.values for row in chunk])
-            return []
-        except SinkError as exc:
-            if exc.transient or len(chunk) < 2:
-                raise
-            budget = [ISOLATION_FAILED_INSERTS]
-            bad = self._isolate(sink, chunk, budget)
-            if bad is None or len(bad) == len(chunk):
-                raise exc from None
-            table = key or "events"
-            for row in bad:
-                if key:
-                    self.metrics.audit_invalid += 1
-                else:
-                    self.metrics.events_rejected += 1
-                position = row.values[-2:] if key else ()  # audit rows end with source partition and offset
-                self._log.error(
-                    "row_set_aside",
-                    table=table,
-                    error=type(exc).__name__,
-                    error_code=exc.code,
-                    partition=position[0] if position else None,
-                    offset=position[1] if position else None,
-                )
-            return bad
+    def _insert_chunk(self, key: str, chunk: list[RowLike], state: _IsolationState) -> list[RowLike]:
+        """Insert one block. A PERMANENT failure may be one bad row, so find it: bisect, insert the rest, re-insert
+        each suspect once, and return the rows set aside. If the cause is the table or the grant (the budget runs
+        out, every row fails, or a lone row fails on a sink that has never worked or keeps failing), the original
+        error is raised and the batch halts as before: nothing is dropped.
 
-    def _isolate(self, sink: Sink, rows: list[RowLike], budget: list[int]) -> list[RowLike] | None:
-        """The rows of `rows` the sink refuses, inserting every other row. `None` if the failed-insert budget runs
-        out (the failure is systemic). A transient error propagates: the whole batch is retried."""
-        if len(rows) == 1:
-            try:
-                sink.insert([rows[0].values])
-                return []
-            except SinkError as exc:
-                if exc.transient:
+        `state` outlives retries of the batch: rows already stored are not inserted again (the table does not
+        grow while halted), rows known bad are not tried again, and once the budget is spent the batch is not
+        bisected a second time."""
+        sink = self._side_sinks[key] if key else self._sink
+        todo = [row for row in chunk if id(row) not in state.stored and id(row) not in state.bad]
+        try:
+            if todo:
+                sink.insert([row.values for row in todo])
+                state.stored.update(id(row) for row in todo)
+                self._aside_streak[key] = 0
+                self._proven.add(key)
+        except SinkError as exc:
+            if exc.transient or state.exhausted:
+                raise
+            if len(todo) == 1:  # a lone refused row: only if this table has worked and this is not a streak
+                worked = key in self._proven or any(id(row) in state.stored for row in chunk)  # this table took rows
+                if not worked or self._aside_streak.get(key, 0) >= ASIDE_STREAK_LIMIT:
                     raise
-                budget[0] -= 1
-                return list(rows)
+                if self._retry_once(sink, todo[0], state):
+                    return []
+                state.bad.add(id(todo[0]))
+            else:
+                budget = [isolation_budget(len(todo))]
+                before = len(state.stored)
+                found = self._isolate(sink, todo, budget, state)
+                if found is None or (len(state.stored) == before and len(found) == len(todo)):
+                    state.exhausted = True
+                    raise exc from None
+                # A suspect that is accepted a second time was a transient fault in disguise: keep it.
+                state.bad.update(id(row) for row in found if not self._retry_once(sink, row, state))
+                self._proven.add(key)
+        bad = [row for row in chunk if id(row) in state.bad]
+        if bad:
+            self._aside_streak[key] = self._aside_streak.get(key, 0) + len(bad)
+        for row in bad:
+            self._set_aside(key, row)
+        return bad
+
+    def _retry_once(self, sink: Sink, row: RowLike, state: _IsolationState) -> bool:
+        """One more attempt for a row about to be set aside. True if the sink took it (it is then stored)."""
+        try:
+            sink.insert([row.values])
+        except SinkError as exc:
+            if exc.transient:
+                raise
+            return False
+        state.stored.add(id(row))
+        return True
+
+    def _set_aside(self, key: str, row: RowLike) -> None:
+        if key:
+            self.metrics.audit_invalid += 1
+        else:
+            self.metrics.events_rejected += 1
+        topic, partition, offset = self._origin.get(id(row), (None, None, None))
+        self._log.error("row_set_aside", table=key or "events", topic=topic, partition=partition, offset=offset)
+
+    def _isolate(
+        self, sink: Sink, rows: list[RowLike], budget: list[int], state: _IsolationState
+    ) -> list[RowLike] | None:
+        """The rows of `rows` the sink refuses, inserting every other row (recorded in `state.stored`). `None` if
+        the failed-insert budget runs out. A transient error propagates: the whole batch is retried, and the rows
+        stored so far are not inserted again."""
+        if len(rows) == 1:
+            return list(rows)
         middle = len(rows) // 2
         bad: list[RowLike] = []
         for half in (rows[:middle], rows[middle:]):
             try:
                 sink.insert([row.values for row in half])
+                state.stored.update(id(row) for row in half)
             except SinkError as exc:
                 if exc.transient:
                     raise
                 budget[0] -= 1
                 if budget[0] < 0:
                     return None
-                deeper = self._isolate(sink, half, budget) if len(half) > 1 else list(half)
+                deeper = self._isolate(sink, half, budget, state) if len(half) > 1 else list(half)
                 if deeper is None:
                     return None
                 bad.extend(deeper)
@@ -349,6 +403,7 @@ class Archiver:
         work = self._plan_inserts(rows)
         done: set[int] = set()  # a chunk already inserted is not inserted again on a retry of the batch
         aside: list[RowLike] = []  # rows the table cannot take, set aside and committed past
+        state = _IsolationState()
         failing = "events"  # the table of the insert that raised, for the log (a name, never a value)
         try:
             while True:
@@ -357,7 +412,7 @@ class Archiver:
                     for index, (key, chunk) in enumerate(work):
                         if index not in done:
                             failing = key or "events"
-                            aside.extend(self._insert_chunk(key, chunk))
+                            aside.extend(self._insert_chunk(key, chunk, state))
                             done.add(index)
                 except SinkError as exc:
                     self.metrics.insert_failures += 1
