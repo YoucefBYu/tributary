@@ -357,6 +357,27 @@ archive SQL moved into the query library (`channel_stats`, `read_content`); the
 default. Gate-tracked items (W3-13 image check, `partition_halted` alert firing) were **not
 re-checked** in this review.
 
+### 4.2 Re-assessment at `wave/1-3` `9892cb9` (architect, 2026-10-14)
+
+The gate is green locally (lead's run, relayed). **GitHub CI did not run: the account is blocked by
+billing.** That is a human item (spend). The architect read the tests named below; nothing was run.
+
+| # | State | Evidence | Remaining |
+|---|---|---|---|
+| 1 | **MET** | `tests/e2e/test_archive_search_reprocess_replay_e2e.py`. It asserts destination state `sent` with attempt 1, the content index including `routed` per destination, `routed` content by destination plus a 404 for an unknown one, and the full stage set `received`, `transformed`, `queued`, `routed`, `sent`. Responses are validated against `openapi.json` (`tests/support/openapi_contract.py`), against real ClickHouse | Pass lines at `9892cb9` are from the lead's local gate. `qa-engineer` should restate the `pytest -q` summary in the spike doc |
+| 2 | **MET** (lead's one-sided rule) | `docs/spikes/wave-3-outage-control-plane.md`, `ec7a3ec` | none; the set 3 outlier caveat stands (STATUS) |
+| 3 | **MET** | `packages/tributary-api/tests/api/test_deploy_rollback_hot_reload_integration.py`, API and CLI variants. The worker applies versions `[1, 2, 1]` with the same PID and no restart | none |
+| 4 | **MET (relayed)** | `security-reviewer` API pass: no Critical or High, L1-L4 closed (lead-relayed; no review file in the repo). Audit closes against W3-32 and W3-30 (2) (`audit_log` writer, its security fixes, metric and alerts) | Ask `security-reviewer` to commit its review handoff or a summary under `docs/`, so the gate cites a file |
+
+**Still open, none blocking criteria 1-4:**
+
+- GitHub CI (human, billing).
+- Gate-tracked W3-13 image check and the `partition_halted` alert firing, re-check (`devops-engineer`).
+- K2 / H7 role-model sign-off (human).
+- Gate report (`architect`, after the lead confirms the gate run).
+- Since 4.1, these landed and are no longer open: the reprocessor deny-by-default test, `queued` and
+  `sent` emission, `received.ts`, and `LogAppendTime`.
+
 **Also gate-tracked (not phase-1 criteria):** no image published before W3-13 is green;
 `tb_partitions_halted` exported and the `partition_halted` alert shown firing on a forced halt (2.5 H1,
 added 2026-10-06); ADR-004
