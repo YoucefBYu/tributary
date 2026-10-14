@@ -23,7 +23,7 @@ env:
 jobs:
   chaos-rf3:
     name: chaos on a 3-broker RF=3 cluster
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.TB_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1

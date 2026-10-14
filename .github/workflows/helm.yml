@@ -2,10 +2,10 @@ name: helm
 
 on:
   pull_request:
-    paths: ["deploy/helm/**", ".github/workflows/helm.yml", ".github/scripts/helm_check.py", "contracts/observability/**", "contracts/topics/**", "deploy/compose/topic-bootstrap/bootstrap_topics.py"]
+    paths: ["deploy/helm/**", ".github/workflows/helm.yml", ".github/scripts/helm_check.py", ".github/scripts/ci_local.sh", "contracts/observability/**", "contracts/topics/**", "deploy/compose/topic-bootstrap/bootstrap_topics.py"]
   push:
     branches: [main, "wave/**"]
-    paths: ["deploy/helm/**", ".github/workflows/helm.yml", ".github/scripts/helm_check.py", "contracts/observability/**", "contracts/topics/**", "deploy/compose/topic-bootstrap/bootstrap_topics.py"]
+    paths: ["deploy/helm/**", ".github/workflows/helm.yml", ".github/scripts/helm_check.py", ".github/scripts/ci_local.sh", "contracts/observability/**", "contracts/topics/**", "deploy/compose/topic-bootstrap/bootstrap_topics.py"]
 
 permissions:
   contents: read
@@ -14,17 +14,10 @@ concurrency:
   group: helm-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  HELM_VERSION: v3.16.2
-  HELM_SHA256: 9318379b847e333460d33d291d4c088156299a26cd93d570a7f5d0c36e50b5bb
-  KUBECONFORM_VERSION: v0.6.7
-  KUBECONFORM_SHA256: 95f14e87aa28c09d5941f11bd024c1d02fdc0303ccaa23f61cef67bc92619d73
-  CHART: deploy/helm/tributary
-
 jobs:
   chart:
     name: helm lint, template, kubeconform, chart assertions
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.TB_RUNNER || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -32,124 +25,8 @@ jobs:
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
         with:
           python-version: "3.12"
-      # Official release tarballs, verified against a pinned checksum before extraction.
+      # Official release tarballs, verified against a pinned checksum before extraction (ci_local.sh).
       - name: install helm and kubeconform (checksum-verified)
-        run: |
-          set -euo pipefail
-          curl -sSfLO "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
-          echo "${HELM_SHA256}  helm-${HELM_VERSION}-linux-amd64.tar.gz" | sha256sum -c -
-          tar xzf "helm-${HELM_VERSION}-linux-amd64.tar.gz" linux-amd64/helm
-          curl -sSfLO "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
-          echo "${KUBECONFORM_SHA256}  kubeconform-linux-amd64.tar.gz" | sha256sum -c -
-          tar xzf kubeconform-linux-amd64.tar.gz kubeconform
-          echo "$PWD/linux-amd64" >> "$GITHUB_PATH"
-          echo "$PWD" >> "$GITHUB_PATH"
-      - name: KafkaUser ACLs match topic-defaults.json (drift check)
-        run: python3 deploy/helm/gen_acls.py --check
-      - name: helm lint
-        run: helm lint "$CHART" -f "$CHART/ci/values-ci.yaml" --strict
-      - name: helm template (all optional parts on)
-        run: helm template tb "$CHART" -f "$CHART/ci/values-ci.yaml" --set strimzi.enabled=true > rendered.yaml
-      - name: kubeconform (CRDs without a published schema are skipped)
-        run: kubeconform -strict -summary -ignore-missing-schemas -kubernetes-version 1.30.0 rendered.yaml
-      - name: chart assertions (instance, probes, ops NetworkPolicy, skip-ddl, metric names, log format)
-        run: uv run --no-project --with pyyaml==6.0.3 python .github/scripts/helm_check.py rendered.yaml
-      - name: mutation control, a tampered render must fail the assertions
-        run: |
-          sed 's/--ops-bind=\$(POD_IP)/--ops-bind=127.0.0.1/' rendered.yaml > tampered.yaml
-          uv run --no-project --with pyyaml==6.0.3 python .github/scripts/helm_check.py tampered.yaml --negative
-      - name: mutation controls, ADR-004 C1/C3/C4 (subPath Secret, plaintext DB port, missing re-auth) must fail
-        run: |
-          py="uv run --no-project --with pyyaml==6.0.3 python .github/scripts/helm_check.py"
-          # C4: a subPath on the ClickHouse Secret mount
-          sed 's/{name: clickhouse, mountPath: \([^}]*\)}/{name: clickhouse, mountPath: \1, subPath: x}/' rendered.yaml > tampered-subpath.yaml
-          grep -q 'subPath: x' tampered-subpath.yaml
-          $py tampered-subpath.yaml --negative
-          # C1: a plaintext ClickHouse port in the archiver env
-          helm template tb "$CHART" -f "$CHART/ci/values-ci.yaml" --set strimzi.enabled=true --set archiver.clickhouse.port=8123 > tampered-port.yaml
-          $py tampered-port.yaml --negative
-          # C3: re-auth interval above the cap, and removed
-          # (the reauth check applies only to a render with strimzi.enabled=true, which is how rendered.yaml is made)
-          sed 's/connections.max.reauth.ms: 3600000/connections.max.reauth.ms: 7200000/' rendered.yaml > tampered-reauth.yaml
-          grep -q 7200000 tampered-reauth.yaml
-          $py tampered-reauth.yaml --negative
-          grep -v 'connections.max.reauth.ms' rendered.yaml > tampered-reauth-removed.yaml
-          $py tampered-reauth-removed.yaml --negative
-          # C1: ClickHouse TLS off
-          helm template tb "$CHART" -f "$CHART/ci/values-ci.yaml" --set strimzi.enabled=true --set archiver.clickhouse.secure=false > tampered-tls.yaml
-          $py tampered-tls.yaml --negative
-      - name: mutation controls, API (database CA, ops bind, liveness port, ClickHouse user and TLS) must fail
-        run: |
-          py="uv run --no-project --with pyyaml==6.0.3 python .github/scripts/helm_check.py"
-          mut() { sed "$1" rendered.yaml > tampered-api.yaml; cmp -s rendered.yaml tampered-api.yaml && exit 1; $py tampered-api.yaml --negative; }
-          mut 's/{name: TB_DATABASE_CA_SECRET_REF, value: "tb-api-db-ca"}/{name: TB_X, value: "1"}/'
-          mut 's/{name: TB_OPS_BIND, value: "\$(POD_IP)"}/{name: TB_OPS_BIND, value: "0.0.0.0"}/'
-          mut '/livenessProbe/,+1 s#port: http#port: ops#'
-          mut 's/value: "tb_api_audit_ro"/value: "default"/'
-          mut 's#value: "https://clickhouse.example.internal:8443"#value: "http://clickhouse.example.internal:8123"#'
-      - name: API TLS, ADR-004 C1a (mesh render passes; plaintext, missing mount, plain ingress and a missing mesh policy fail)
-        run: |
-          py="uv run --no-project --with pyyaml==6.0.3 python .github/scripts/helm_check.py"
-          helm template tb "$CHART" -f "$CHART/ci/values-ci.yaml" --set strimzi.enabled=true --set api.tls.mode=mesh \
-            --set 'api.tls.ingressControllerFrom[0].podSelector.matchLabels.app\.kubernetes\.io/name=ingress-nginx' > mesh.yaml
-          $py mesh.yaml
-          python3 - <<'PY'
-          import re
-          t = open("mesh.yaml").read()
-          docs = t.split("\n---\n")
-          kept = [d for d in docs if not (re.search(r"kind: NetworkPolicy", d) and re.search(r"name: tb-api\n", d))]
-          assert len(kept) < len(docs), "no api NetworkPolicy to remove"
-          open("mesh-nopolicy.yaml", "w").write("\n---\n".join(kept))
-          PY
-          $py mesh-nopolicy.yaml --negative
-          mut() { sed "$1" rendered.yaml > tampered-tls.yaml; cmp -s rendered.yaml tampered-tls.yaml && exit 1; $py tampered-tls.yaml --negative; }
-          mut 's/{name: TB_API_TLS_MODE, value: "listener"}/{name: TB_API_TLS_MODE, value: "plaintext"}/'
-          mut 's/scheme: HTTPS/scheme: HTTP/'
-          mut '/name: api-tls, mountPath/d'
-          mut 's/backend-protocol: "HTTPS"/backend-protocol: "HTTP"/'
-          mut 's/proxy-ssl-verify: "on"/proxy-ssl-verify: "off"/'
-          ! helm template tb "$CHART" -f "$CHART/ci/values-ci.yaml" --set api.tls.mode=mesh > /dev/null 2>&1
-          mesh_set=(--set api.tls.mode=mesh --set 'api.tls.ingressControllerFrom[0].podSelector.matchLabels.app=x')
-          # mesh with the NetworkPolicy off (even with the ops opt-out) is refused, with no opt-out
-          helm template tb "$CHART" -f "$CHART/ci/values-ci.yaml" "${mesh_set[@]}" --set channels=null --set ingress.enabled=false --set api.opsBindPodIP=false \
-            --set networkPolicy.enabled=false --set networkPolicy.allowUnprotectedOpsPort=true 2>&1 | grep -q "networkPolicy.enabled must be true"
-          # open or empty controller peers are refused at render time
-          helm template tb "$CHART" -f "$CHART/ci/values-ci.yaml" --set api.tls.mode=mesh --set 'api.tls.ingressControllerFrom[0].ipBlock.cidr=0.0.0.0/0' 2>&1 | grep -q "ipBlock peer is not allowed"
-          helm template tb "$CHART" -f "$CHART/ci/values-ci.yaml" --set api.tls.mode=mesh --set 'api.tls.ingressControllerFrom[0].namespaceSelector=null' 2>&1 | grep -q "podSelector.matchLabels is required"
-          helm template tb "$CHART" -f "$CHART/ci/values-ci.yaml" --set api.tls.mode=mesh --set 'api.tls.ingressControllerFrom[0].podSelector.matchLabels=null' 2>&1 | grep -q "podSelector.matchLabels is required"
-          # L1: a namespaceSelector-only peer would admit every pod in that namespace
-          helm template tb "$CHART" -f "$CHART/ci/values-ci.yaml" --set api.tls.mode=mesh --set 'api.tls.ingressControllerFrom[0].namespaceSelector.matchLabels.team=ingress' 2>&1 | grep -q "a namespaceSelector alone admits every pod"
-          printf 'api:\n  tls:\n    mode: mesh\n    ingressControllerFrom:\n      - namespaceSelector: {matchExpressions: [{key: kubernetes.io/metadata.name, operator: Exists}]}\n' > mesh-expr.yaml
-          helm template tb "$CHART" -f "$CHART/ci/values-ci.yaml" -f mesh-expr.yaml 2>&1 | grep -q "matchExpressions is not allowed"
-          helm template tb "$CHART" -f "$CHART/ci/values-ci.yaml" "${mesh_set[@]}" --set networkPolicy.kubeletCIDR=10.20.0.0/16 2>&1 | grep -q "/24 or tighter"
-      - name: an API ops listener on the pod IP without a NetworkPolicy is refused
-        run: |
-          helm template tb "$CHART" -f "$CHART/ci/values-ci.yaml" --set channels=null --set networkPolicy.enabled=false 2>&1 | grep -q "unprotected"
-          # the archiver alone (no channels, no API) also binds the pod IP
-          helm template tb "$CHART" -f "$CHART/ci/values-ci.yaml" --set channels=null --set ingress.enabled=false --set api.enabled=false --set networkPolicy.enabled=false 2>&1 | grep -q "unprotected"
-          # tampered renders: an archiver policy that selects nothing, and a second --ops-bind
-          helm template tb "$CHART" -f "$CHART/ci/values-ci.yaml" --set strimzi.enabled=true > ops.yaml
-          python3 - <<'PY'
-          s = open("ops.yaml").read()
-          a = s.replace("app.kubernetes.io/component: archiver\n  policyTypes: [Ingress]", "app.kubernetes.io/component: archiverx\n  policyTypes: [Ingress]")
-          assert a != s
-          open("ops-nosel.yaml", "w").write(a)
-          i = s.index("tributary.archiver\n")
-          j = s.index("- --ops-bind=$(POD_IP)", i)
-          open("ops-twobind.yaml", "w").write(s[:j] + "- --ops-bind=0.0.0.0\n            " + s[j:])
-          PY
-          uv run --no-project --with pyyaml==6.0.3 python .github/scripts/helm_check.py ops-nosel.yaml --negative
-          uv run --no-project --with pyyaml==6.0.3 python .github/scripts/helm_check.py ops-twobind.yaml --negative
-      - name: default values refuse to render without a kubelet CIDR
-        run: |
-          helm template tb "$CHART" 2>&1 | grep -q "networkPolicy.kubeletCIDR is required"
-      - name: too-short and open CIDRs, a disabled policy and plain-HTTP ingress are refused
-        run: |
-          v="-f $CHART/ci/values-ci.yaml"
-          helm template tb "$CHART" $v --set networkPolicy.kubeletCIDR=0.0.0.0/0 2>&1 | grep -q "is too short"
-          helm template tb "$CHART" $v --set networkPolicy.kubeletCIDR=10.0.0.0/8 2>&1 | grep -q "is too short"
-          helm template tb "$CHART" $v --set networkPolicy.enabled=false 2>&1 | grep -q "allowUnprotectedOpsPort"
-          helm template tb "$CHART" $v --set ingress.tlsSecretName= 2>&1 | grep -q "tlsSecretName is required"
-          helm template tb "$CHART" $v --set archiver.ttlDays=365 2>&1 | grep -q "archiver.ttlDays was removed"
-          helm template tb "$CHART" $v --set archiver.retention.eventsDays=0 2>&1 | grep -q "must be an integer from 1 to 36500"
-          helm template tb "$CHART" $v --set archiver.retention.auditDays=36501 2>&1 | grep -q "must be an integer from 1 to 36500"
+        run: .github/scripts/ci_local.sh --here install-helm-tools >> "$GITHUB_PATH"
+      - name: helm lint, template, kubeconform, chart assertions and all mutation controls
+        run: .github/scripts/ci_local.sh --here helm
