@@ -12,23 +12,20 @@ Run the gate on a **clean detached worktree** of the commit you intend to push, 
 - A skipped step is a FAIL until it runs. Do not push on any FAIL.
 
 ## Steps
-1. Worktree: `SHA=$(git rev-parse --short ${ARGUMENTS:-HEAD})`, then `git worktree add --detach /tmp/tb-gate-$SHA $SHA`. Run everything below as `cd /tmp/tb-gate-$SHA && <cmd>; echo "exit=$?"`. First sync: `uv sync --all-packages` (never a bare `uv sync`; see the `dev-env` skill).
-2. `uv run ruff check .` and `uv run ruff format --check .`
-3. `uv run mypy packages`
-4. `uv run python .github/scripts/secret_scan.py`
-5. `uv run python .github/scripts/licence_check.py`
-6. `uv run --no-project --python 3.12 --with jsonschema --with openapi-spec-validator python contracts/validate.py --check-expectations`
-7. `uv run python -m tests.support.integration_expected --check`
-8. `uv run pytest -m "not integration and not chaos and not bench" -q -p no:cacheprovider`
-9. Integration: `uv run pytest -m integration <affected package or tests dirs> -q -p no:cacheprovider`, or the full suite when the change is cross-cutting (runtime, sdk, contracts, compose, conftest).
-10. Only when `deploy/helm/` or `contracts/topics/` changed: `python3 deploy/helm/gen_acls.py --check`, then helm lint, template and helm_check exactly as in [reference.md](reference.md#helm).
-11. Clean up: `git worktree remove /tmp/tb-gate-$SHA`.
+The gate is `.github/scripts/ci_local.sh`, the same script every CI workflow calls (decision: docs/agent-team/decisions/ci-alternatives.md). It creates and removes its own clean detached worktree.
+
+1. `SHA=$(git rev-parse --short ${ARGUMENTS:-HEAD})`
+2. If another agent may be editing `ci_local.sh` in the shared checkout, run the committed copy: `git show $SHA:.github/scripts/ci_local.sh > $SCRATCH/ci_local.sh && chmod +x $SCRATCH/ci_local.sh`, and call that instead.
+3. Full gate (about 45 min; run it in the background): `TB_BUILD_CA_BUNDLE=/root/.ccr/ca-bundle.crt .github/scripts/ci_local.sh all --sha $SHA; echo "exit=$?"`. The CA variable is needed only in this sandbox, whose egress proxy re-terminates TLS for image builds.
+4. Report the `PASS`/`FAIL`/`SKIP` lines. `FAIL:` lines printed *inside* the helm job are its mutation controls, so judge the job by its own `PASS helm` or `FAIL helm` line.
+5. Small deltas on top of a commit that already passed `all`: run the affected jobs only (`contracts`, `lint`, `python`, `integration`, `supply-chain`, `image-check`, `ui`, `helm`, or `fast`) and say which ones you skipped and why.
+6. Optional, once the human has set `TB_STATUS_TOKEN_FILE`: add `--report` to post `local/<job>` commit statuses.
 
 ## Push
 Only after every step is PASS, as a **standalone command** (no `&&`, no pipes):
 
-`git push origin <sha>:refs/heads/wave/1-3`
+`git push -u origin wave/1-3` (the branch head must be the commit you gated)
 
-The remote wave branch is currently `wave/1-3`; confirm with `git rev-parse --abbrev-ref @{u}` if unsure. Never force-push, never push `+` refspecs.
+The remote wave branch is currently `wave/1-3`; confirm with `git rev-parse --abbrev-ref @{u}` if unsure. Never force-push, never push `+` refspecs. Pushing a partial refspec is not permitted in this session.
 
 For the helm block, extra CI-only checks and troubleshooting, see [reference.md](reference.md).
