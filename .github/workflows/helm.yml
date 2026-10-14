@@ -125,6 +125,21 @@ jobs:
       - name: an API ops listener on the pod IP without a NetworkPolicy is refused
         run: |
           helm template tb "$CHART" -f "$CHART/ci/values-ci.yaml" --set channels=null --set networkPolicy.enabled=false 2>&1 | grep -q "unprotected"
+          # the archiver alone (no channels, no API) also binds the pod IP
+          helm template tb "$CHART" -f "$CHART/ci/values-ci.yaml" --set channels=null --set ingress.enabled=false --set api.enabled=false --set networkPolicy.enabled=false 2>&1 | grep -q "unprotected"
+          # tampered renders: an archiver policy that selects nothing, and a second --ops-bind
+          helm template tb "$CHART" -f "$CHART/ci/values-ci.yaml" --set strimzi.enabled=true > ops.yaml
+          python3 - <<'PY'
+          s = open("ops.yaml").read()
+          a = s.replace("app.kubernetes.io/component: archiver\n  policyTypes: [Ingress]", "app.kubernetes.io/component: archiverx\n  policyTypes: [Ingress]")
+          assert a != s
+          open("ops-nosel.yaml", "w").write(a)
+          i = s.index("tributary.archiver\n")
+          j = s.index("- --ops-bind=$(POD_IP)", i)
+          open("ops-twobind.yaml", "w").write(s[:j] + "- --ops-bind=0.0.0.0\n            " + s[j:])
+          PY
+          uv run --no-project --with pyyaml==6.0.3 python .github/scripts/helm_check.py ops-nosel.yaml --negative
+          uv run --no-project --with pyyaml==6.0.3 python .github/scripts/helm_check.py ops-twobind.yaml --negative
       - name: default values refuse to render without a kubelet CIDR
         run: |
           helm template tb "$CHART" 2>&1 | grep -q "networkPolicy.kubeletCIDR is required"

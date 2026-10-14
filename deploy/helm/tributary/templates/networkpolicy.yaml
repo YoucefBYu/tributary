@@ -10,8 +10,8 @@
 {{- end -}}
 {{- end -}}
 
-{{- if and (not .Values.networkPolicy.enabled) (or .Values.channels (and .Values.api.enabled .Values.api.opsBindPodIP)) (not .Values.networkPolicy.allowUnprotectedOpsPort) }}
-{{- fail "networkPolicy.enabled=false leaves an ops listener (receiver, or the API with api.opsBindPodIP; pod IP) unprotected: set networkPolicy.allowUnprotectedOpsPort=true to opt out explicitly" }}
+{{- if and (not .Values.networkPolicy.enabled) (or .Values.channels .Values.archiver.enabled (and .Values.api.enabled .Values.api.opsBindPodIP)) (not .Values.networkPolicy.allowUnprotectedOpsPort) }}
+{{- fail "networkPolicy.enabled=false leaves an ops listener (receiver, loader, worker, archiver, or the API with api.opsBindPodIP; pod IP) unprotected: set networkPolicy.allowUnprotectedOpsPort=true to opt out explicitly" }}
 {{- end }}
 {{- if .Values.networkPolicy.enabled }}
 {{- $kubelet := required "networkPolicy.kubeletCIDR is required: the receiver ops listener binds the pod IP, and this CIDR is the only non-collector ingress on port 9180 (security-reviewer)" .Values.networkPolicy.kubeletCIDR }}

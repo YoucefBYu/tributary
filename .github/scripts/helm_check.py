@@ -110,23 +110,34 @@ def check(docs: list[dict[str, Any]]) -> list[str]:
 
     # Every process that exports tb_* (worker, loaders, archiver) binds the pod IP, so the collector can scrape
     # tb_partitions_halted and kubelet can probe, and has its own NetworkPolicy on the ops port.
+    labels = {
+        d["metadata"]["name"]: d["spec"]["template"]["metadata"].get("labels", {})
+        for d in docs
+        if d["kind"] == "StatefulSet"
+    }
     for n, spec in pods(docs):
-        if spec.get("restartPolicy") == "Never" or not (
-            n.endswith("-worker") or "-loader-" in n or n.endswith("-archiver")
-        ):
+        if n not in labels or not (n.endswith("-worker") or "-loader-" in n or n.endswith("-archiver")):
             continue
         c = spec["containers"][0]
-        if "--ops-bind=$(POD_IP)" not in c["args"]:
-            bad.append(f"{n}: --ops-bind is not the pod IP")
+        binds = [a for a in c["args"] if a.startswith("--ops-bind")]
+        if binds != ["--ops-bind=$(POD_IP)"]:
+            bad.append(f"{n}: --ops-bind must appear exactly once, as the pod IP")
         if not any(p["name"] == "ops" and p["containerPort"] == 9180 for p in c.get("ports", [])):
             bad.append(f"{n}: no container port named ops (the collector keeps only that name)")
         if c.get("livenessProbe", {}).get("httpGet", {}).get("path") != "/livez":
             bad.append(f"{n}: no /livez liveness probe")
+
+        # Matched by selector against the pod template labels, not by policy name: a policy that selects
+        # nothing (or the wrong pods) must not pass.
+        def selects(x: dict[str, Any], lab: dict[str, str] = labels[n]) -> bool:
+            want = x["spec"]["podSelector"].get("matchLabels") or {}
+            return bool(want) and want.items() <= lab.items()
+
         if not any(
-            x["metadata"]["name"] == n and any(9180 in [p["port"] for p in r["ports"]] for r in x["spec"]["ingress"])
+            selects(x) and any(9180 in [p["port"] for p in r["ports"]] for r in x["spec"].get("ingress", []))
             for x in by_kind.get("NetworkPolicy", [])
         ):
-            bad.append(f"{n}: no NetworkPolicy limiting ops port 9180")
+            bad.append(f"{n}: no NetworkPolicy selecting its pods that limits ops port 9180")
     arch = [s for n, s in pods(docs) if n.endswith("-archiver")]
     job = [s for n, s in pods(docs) if "archiver-migrate" in n]
     if not arch or "--skip-ddl" not in arch[0]["containers"][0]["args"]:
