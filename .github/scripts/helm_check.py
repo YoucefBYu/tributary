@@ -478,6 +478,8 @@ def check_retention(docs: list[dict[str, Any]], by_kind: dict[str, list[dict[str
     topics = by_kind.get("KafkaTopic", [])
     if by_kind.get("KafkaUser"):
         for t in topics:
+            if (t["metadata"].get("annotations") or {}).get("helm.sh/resource-policy") != "keep":
+                bad.append(f"{t['spec']['topicName']}: KafkaTopic lacks helm.sh/resource-policy: keep")
             if t["spec"]["config"].get("message.timestamp.type") != "LogAppendTime":
                 bad.append(f"{t['spec']['topicName']}: message.timestamp.type is not LogAppendTime")
         if {t["spec"]["topicName"].rsplit(".", 1)[1] for t in topics} != {"events", "audit"}:

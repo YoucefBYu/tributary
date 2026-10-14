@@ -290,6 +290,30 @@ def existing_topic_alterations(topics: list[TopicSpec], existing: set[str]) -> d
     return out
 
 
+def alter_existing_configs(admin: Any, topics: list[TopicSpec], existing: set[str]) -> bool:
+    """Re-run safe: set `ENFORCED_ON_EXISTING` on topics that already existed (incremental SET, no other key).
+    Returns True when any alter failed (logged by topic and exception class only)."""
+    from confluent_kafka.admin import AlterConfigOpType, ConfigEntry, ConfigResource  # type: ignore[attr-defined]
+
+    resources = []
+    for name, cfg in existing_topic_alterations(topics, existing).items():
+        res = ConfigResource(ConfigResource.Type.TOPIC, name)
+        for k, v in cfg.items():
+            res.add_incremental_config(ConfigEntry(k, v, incremental_operation=AlterConfigOpType.SET))
+        resources.append(res)
+    if not resources:
+        return False
+    failed = False
+    for res, fut in admin.incremental_alter_configs(resources).items():
+        try:
+            fut.result()
+            log.info(json.dumps({"topic": res.name, "status": "config-applied"}))
+        except Exception as exc:
+            failed = True
+            log.error(json.dumps({"topic": res.name, "status": "config-failed", "reason": type(exc).__name__}))
+    return failed
+
+
 def emit_lite_warning(defaults: dict[str, Any], profile: str) -> None:
     """The mandatory, unsuppressable lite-profile startup warning (ADR-002 D14). This is the
     bootstrap job's own copy for defense in depth; it does not stand in for the per-component
@@ -359,26 +383,6 @@ def main(argv: list[str] | None = None) -> int:
                 log.error(json.dumps({"topic": name, "status": "failed", "reason": type(exc).__name__}))
     if failed:
         return 1
-    # Re-run safe: a topic created before a contract setting existed gets it now (incremental SET, no other key).
-    from confluent_kafka.admin import AlterConfigOpType, ConfigEntry, ConfigResource  # type: ignore[attr-defined]
-
-    alter = []
-    for name, cfg in existing_topic_alterations(topics, existing).items():
-        res = ConfigResource(ConfigResource.Type.TOPIC, name)
-        for k, v in cfg.items():
-            res.add_incremental_config(ConfigEntry(k, v, incremental_operation=AlterConfigOpType.SET))
-        alter.append(res)
-    if alter:
-        for res, fut in admin.incremental_alter_configs(alter).items():
-            try:
-                fut.result()
-                log.info(json.dumps({"topic": res.name, "status": "config-applied"}))
-            except Exception as exc:
-                failed = True
-                log.error(json.dumps({"topic": res.name, "status": "config-failed", "reason": type(exc).__name__}))
-        if failed:
-            return 1
-
     # Deny-by-default cluster: nothing but these grants lets a data-plane principal touch a topic.
     acls = derive_acls(
         defaults,
@@ -407,6 +411,9 @@ def main(argv: list[str] | None = None) -> int:
             failed = True
             log.error(json.dumps({"acl": "create", "status": "failed", "reason": type(exc).__name__}))
     log.info(json.dumps({"acls": len(bindings), "status": "failed" if failed else "applied"}))
+    # After the ACLs on purpose: a missing ALTER_CONFIGS grant must not block ACL reconciliation. Still non-zero.
+    if alter_existing_configs(admin, topics, existing):
+        failed = True
     return 1 if failed else 0
 
 

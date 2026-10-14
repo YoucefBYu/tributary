@@ -108,6 +108,8 @@ apiVersion: kafka.strimzi.io/v1beta2
 kind: KafkaTopic
 metadata:
   name: tb-{{ $.Values.env }}-{{ $kind }}
+  annotations:
+    helm.sh/resource-policy: keep   # `helm uninstall` must not delete a topic (and its retained records)
   labels:
     strimzi.io/cluster: {{ $.Values.strimzi.name }}
     {{- include "tb.labels" $ | nindent 4 }}

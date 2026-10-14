@@ -18,6 +18,7 @@ import pytest
 # matching the pattern already used for `.github/scripts`.
 sys.path.insert(0, str(Path(__file__).parent))
 from bootstrap_topics import (
+    alter_existing_configs,
     data_topic_name,
     derive_topics,
     existing_topic_alterations,
@@ -352,3 +353,45 @@ def test_existing_events_and_audit_topics_get_the_setting_and_nothing_else(defau
         platform_topic_name("dev", "audit"): {"message.timestamp.type": "LogAppendTime"},
     }
     assert existing_topic_alterations(topics, set()) == {}  # a topic that was just created is not altered
+
+
+class _Future:
+    def __init__(self, exc: Exception | None = None) -> None:
+        self._exc = exc
+
+    def result(self) -> None:
+        if self._exc:
+            raise self._exc
+
+
+class _FakeAdmin:
+    def __init__(self, fail: set[str] = frozenset()) -> None:  # type: ignore[assignment]
+        self.fail, self.calls = fail, []  # type: ignore[var-annotated]
+
+    def incremental_alter_configs(self, resources):  # type: ignore[no-untyped-def]
+        self.calls.append(resources)
+        return {r: _Future(RuntimeError("denied") if r.name in self.fail else None) for r in resources}
+
+
+def test_alter_existing_configs_sends_one_incremental_set_per_topic(defaults: dict) -> None:  # type: ignore[type-arg]
+    topics = derive_topics(defaults, env="dev", profile="lite", channel="c", destinations=("d",))
+    admin = _FakeAdmin()
+    assert alter_existing_configs(admin, topics, {t.name for t in topics}) is False
+    (resources,) = admin.calls
+    assert {r.name for r in resources} == {platform_topic_name("dev", "events"), platform_topic_name("dev", "audit")}
+    for r in resources:
+        entries = r.incremental_configs
+        assert [(e.name, e.value) for e in entries] == [("message.timestamp.type", "LogAppendTime")]
+
+
+def test_alter_existing_configs_reports_failure_and_still_tries_the_rest(defaults: dict) -> None:  # type: ignore[type-arg]
+    topics = derive_topics(defaults, env="dev", profile="lite", channel="c", destinations=("d",))
+    admin = _FakeAdmin(fail={platform_topic_name("dev", "audit")})
+    assert alter_existing_configs(admin, topics, {t.name for t in topics}) is True
+
+
+def test_alter_existing_configs_does_nothing_for_new_topics(defaults: dict) -> None:  # type: ignore[type-arg]
+    topics = derive_topics(defaults, env="dev", profile="lite", channel="c", destinations=("d",))
+    admin = _FakeAdmin()
+    assert alter_existing_configs(admin, topics, set()) is False
+    assert admin.calls == []
