@@ -654,6 +654,17 @@ struck through were decided and are kept for one revision so the change is visib
 2026-10-05 and its one condition was lifted the same day, and wave 3 has started under the human's delegation to the lead and
 architect.
 
+**Open, new in wave 3:**
+
+- **CI while hosted Actions is refused (billing hold), PROPOSED 2026-10-14.** See
+  [`decisions/ci-alternatives.md`](decisions/ci-alternatives.md). Architect's recommendation: C, a
+  repo-owned `ci_local.sh` that the workflows call, with a parity test and a pre-push hook. Fallback A,
+  a self-hosted runner, if a 10-minute test shows it is dispatched under the hold.
+  **Needs the human:**
+  - run that test;
+  - optionally create a statuses token (credential);
+  - fixing billing (spend) or going public (publishing) are separate human decisions.
+
 **Open, new in wave 2:**
 
 - **FHIR R4 JSON Schema for W2-2 golden-file validation: DECIDED 2026-09-28, WAITING ON NETWORK
