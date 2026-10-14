@@ -101,6 +101,16 @@ def violations(name: str, doc: dict[str, Any], known: set[str]) -> list[str]:
     return bad
 
 
+@pytest.mark.parametrize("name", sorted(EXEMPT))
+def test_exempt_workflows_still_do_not_persist_credentials(name: str) -> None:
+    """Exempt from the run-only-the-script rule (they are measurement jobs), not from credential hygiene: they run on
+    TB_RUNNER too."""
+    for job_id, job in load(name)["jobs"].items():
+        for step in job["steps"]:
+            if str(step.get("uses", "")).startswith("actions/checkout@"):
+                assert (step.get("with") or {}).get("persist-credentials") is False, f"{name}:{job_id}"
+
+
 def test_the_gated_set_is_what_we_expect() -> None:
     assert {"ci.yml", "helm.yml"} <= set(gated_workflows())
 
