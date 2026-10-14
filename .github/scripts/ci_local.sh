@@ -16,10 +16,15 @@
 #
 # --here   run in the current checkout (what the workflows do). Refused unless CI=true or TB_CI_LOCAL_HERE=1:
 #          a bare `uv sync` in a shared checkout drops workspace packages other agents need.
+# pre-push: under pre-commit, the ref being pushed (PRE_COMMIT_TO_REF) is tested unless --sha is given.
 # --report post a `local/<job>` commit status (success or failure) for the sha. The token is read ONLY from the
-#          environment variable TB_STATUS_TOKEN; it is never echoed, logged, written to disk or passed to a job.
-#          Repo: TB_STATUS_REPO=owner/repo, else the origin remote. Self-attested: it proves this script ran on
-#          that sha on this machine (ci-alternatives.md option C).
+#          file named by TB_STATUS_TOKEN_FILE (a fine-grained token, this repo only, commit statuses: write).
+#          The file must be yours and mode 0600 (no group or other access) or --report refuses. The file is opened
+#          by the reporter alone, just before its one HTTPS request; the token is never in the environment, never
+#          echoed or logged. A job running as the same user could still read the file: use a dedicated account for
+#          untrusted code. Repo: TB_STATUS_REPO=owner/repo, else the origin remote. Self-attested: it proves this
+#          script ran on that sha on this machine (ci-alternatives.md option C).
+# pre-push: under pre-commit, the ref being pushed (PRE_COMMIT_TO_REF) is tested unless --sha is given.
 #
 # Each job prints `PASS <job>: <summary line>` or `FAIL <job>: ...` with the last lines of its output, and the
 # script exits non-zero if any job failed. Full logs: $TB_CI_LOGS (default a temp dir, path printed).
@@ -33,6 +38,8 @@ HELM_VERSION=v3.16.2
 HELM_SHA256=9318379b847e333460d33d291d4c088156299a26cd93d570a7f5d0c36e50b5bb
 KUBECONFORM_VERSION=v0.6.7
 KUBECONFORM_SHA256=95f14e87aa28c09d5941f11bd024c1d02fdc0303ccaa23f61cef67bc92619d73
+HELM_BIN_SHA256=2eead53d95473a37d72937e8e3aed5d964271685f3dac5b76955867818c040f4          # the extracted binary
+KUBECONFORM_BIN_SHA256=9e867e86e277de971bed3cfe46cf07f1d08db212e9188389670b3685c38281e7
 CHART=deploy/helm/tributary
 export UV_FROZEN=1   # fail if uv.lock is out of date, never re-resolve (same as ci.yml)
 
@@ -117,10 +124,16 @@ job_ui() {
 # --- helm: official release tarballs, verified against a pinned checksum before extraction ------------------
 tools_dir() { echo "${TB_CI_TOOLS:-${XDG_CACHE_HOME:-$HOME/.cache}/tributary-ci-tools}"; }
 
-install_helm_tools() {  # prints the directories to put on PATH, one per line (workflows append them to $GITHUB_PATH)
+tools_ok() {  # tools_ok <dir>: both extracted binaries are present and match the pinned sha256, every time
+  [ -x "$1/linux-amd64/helm" ] && [ -x "$1/kubeconform" ] \
+    && [ "$(sha256sum "$1/linux-amd64/helm" | cut -d' ' -f1)" = "$HELM_BIN_SHA256" ] \
+    && [ "$(sha256sum "$1/kubeconform" | cut -d' ' -f1)" = "$KUBECONFORM_BIN_SHA256" ]
+}
+
+install_helm_tools() {  # prints the two directories to put on PATH, one per line; fails (non-zero, no output) otherwise
   local d; d="$(tools_dir)/helm-${HELM_VERSION}-kubeconform-${KUBECONFORM_VERSION}"
-  if [ ! -x "$d/linux-amd64/helm" ] || [ ! -x "$d/kubeconform" ]; then
-    mkdir -p "$d"
+  if ! tools_ok "$d"; then
+    rm -rf "$d"; mkdir -p "$d"
     (
       set -euo pipefail
       cd "$d"
@@ -130,23 +143,18 @@ install_helm_tools() {  # prints the directories to put on PATH, one per line (w
       curl -sSfLO "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
       echo "${KUBECONFORM_SHA256}  kubeconform-linux-amd64.tar.gz" | sha256sum -c - >&2
       tar xzf kubeconform-linux-amd64.tar.gz kubeconform
-    )
+    ) >&2 || { echo "ci_local: helm tool install failed" >&2; return 1; }
+    tools_ok "$d" || { echo "ci_local: installed helm/kubeconform do not match the pinned sha256" >&2; return 1; }
   fi
   echo "$d/linux-amd64"; echo "$d"
 }
 
-have_helm_tools() {
-  command -v helm >/dev/null 2>&1 && command -v kubeconform >/dev/null 2>&1 \
-    && [ "$(helm version --short 2>/dev/null | cut -d+ -f1)" = "$HELM_VERSION" ] \
-    && [ "$(kubeconform -v 2>/dev/null)" = "$KUBECONFORM_VERSION" ]
-}
-
 job_helm() {
-  if ! have_helm_tools; then
-    step 'install helm and kubeconform (checksum-verified)'
-    local p; p="$(install_helm_tools | paste -sd: -)"; export PATH="$p:$PATH"
-    endstep
-  fi
+  # Always the pinned, hash-verified binaries from the tools dir: never a helm that merely happens to be on PATH.
+  local dirs
+  dirs="$(install_helm_tools)" || { echo "FAIL: cannot get verified helm and kubeconform" >&2; return 1; }
+  [ -n "$dirs" ] || return 1
+  export PATH="${dirs//$'\n'/:}:$PATH"
   trap 'rm -f rendered.yaml tampered*.yaml mesh*.yaml ops*.yaml' EXIT
   step 'KafkaUser ACLs match topic-defaults.json (drift check)'
   (
@@ -323,10 +331,10 @@ fi
 usage() { sed -n '2,/^set -euo/p' "$SELF" | sed '$d' | sed 's/^# \{0,1\}//'; }
 die() { echo "ci_local: $*" >&2; exit 2; }
 
-sha=HEAD; here=0; report=0; want=()
+sha=HEAD; sha_given=0; here=0; report=0; want=()
 while [ $# -gt 0 ]; do
   case "$1" in
-    --sha) [ $# -ge 2 ] || die "--sha needs a revision"; sha="$2"; shift 2 ;;
+    --sha) [ $# -ge 2 ] || die "--sha needs a revision"; sha="$2"; sha_given=1; shift 2 ;;
     --here) here=1; shift ;;
     --report) report=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -355,20 +363,33 @@ for w in "${want[@]}"; do
   esac
 done
 
-# --report: refuse up front, before spending an hour on the jobs. The token is moved out of the environment
-# at once, so no job (arbitrary test code) can read it; only the reporter gets it, for the one request.
-report_token=""
+# --report: refuse up front, before spending an hour on the jobs. The token is a FILE (TB_STATUS_TOKEN_FILE), not an
+# environment variable: an environment variable is readable by every child through /proc/<pid>/environ.
+token_file=""
 if [ "$report" = 1 ]; then
-  [ -n "${TB_STATUS_TOKEN:-}" ] || die "--report needs the environment variable TB_STATUS_TOKEN (a fine-grained token, this repo only, commit statuses: write). It is read from the environment only. Nothing was run."
-  report_token="$TB_STATUS_TOKEN"
+  [ -z "${TB_STATUS_TOKEN:-}" ] || die "TB_STATUS_TOKEN is no longer read (it would be visible to every job). Put the token in a file, chmod 600 it, and set TB_STATUS_TOKEN_FILE. Nothing was run."
+  token_file="${TB_STATUS_TOKEN_FILE:-}"
+  [ -n "$token_file" ] || die "--report needs TB_STATUS_TOKEN_FILE: the path of a 0600 file holding a fine-grained token (this repo only, commit statuses: write). Nothing was run."
+  { [ -f "$token_file" ] && [ ! -L "$token_file" ]; } || die "TB_STATUS_TOKEN_FILE must be a regular file (not a symlink). Nothing was run."
+  [ "$(stat -c '%u' "$token_file")" = "$(id -u)" ] || die "TB_STATUS_TOKEN_FILE must be owned by you. Nothing was run."
+  mode="$(stat -c '%a' "$token_file")"
+  [ $(( 8#$mode & 8#077 )) -eq 0 ] || die "TB_STATUS_TOKEN_FILE is mode $mode: group or world can read it. chmod 600 it. Nothing was run."
 fi
-unset TB_STATUS_TOKEN
+unset TB_STATUS_TOKEN TB_STATUS_TOKEN_FILE   # jobs never see even the path
 
 if [ "$here" = 1 ]; then
   [ "${CI:-}" = true ] || [ "${TB_CI_LOCAL_HERE:-}" = 1 ] || die "--here runs a bare 'uv sync' in this checkout; refused outside CI (set TB_CI_LOCAL_HERE=1 to override)"
   root="$(pwd)"
 else
   top="$(git rev-parse --show-toplevel)"
+  # pre-commit's pre-push stage exports the ref being pushed: test that commit, not whatever HEAD is.
+  if [ "$sha_given" = 0 ] && [ -n "${PRE_COMMIT_TO_REF:-}" ] && ! [[ "$PRE_COMMIT_TO_REF" =~ ^0+$ ]]; then
+    sha="$PRE_COMMIT_TO_REF"
+  fi
+  # Old run directories (logs, worktrees left by a kill -9) go after three days.
+  find "${TMPDIR:-/tmp}" -maxdepth 1 -type d -name 'tb-ci-local.*' -mtime +3 -exec rm -rf {} + 2>/dev/null || true
+  # L1: the worktree gets its own .venv; an inherited environment would make `uv sync` write into the caller's.
+  unset UV_PROJECT_ENVIRONMENT VIRTUAL_ENV
   full_sha="$(git -C "$top" rev-parse --verify "${sha}^{commit}")" || die "cannot resolve $sha"
   if [ -n "$(git -C "$top" status --porcelain --untracked-files=no)" ]; then
     echo "note: uncommitted changes are not tested; this runs ${full_sha:0:12}" >&2
@@ -402,11 +423,18 @@ post_status() {  # post_status <job> <success|failure> <description>   (token on
   if [ -z "$repo" ]; then
     repo="$(git remote get-url origin 2>/dev/null | sed -E 's#^(git@|https?://)([^/:]+)[:/]##; s#\.git$##' || true)"
   fi
-  TB_STATUS_TOKEN="$report_token" python3 -I - "$repo" "${full_sha:-$(git rev-parse HEAD)}" "local/$1" "$2" "$3" <<'PY'
+  python3 -I - "$repo" "${full_sha:-$(git rev-parse HEAD)}" "local/$1" "$2" "$3" "$token_file" <<'PY'
 import json, os, sys, urllib.error, urllib.request
 
-repo, sha, context, state, description = sys.argv[1:6]
-token = os.environ.pop("TB_STATUS_TOKEN", "")
+repo, sha, context, state, description, token_file = sys.argv[1:7]
+# Opened here, for this one request, and checked on the open descriptor (owner, no group or other access).
+fd = os.open(token_file, os.O_RDONLY | os.O_NOFOLLOW)
+st = os.fstat(fd)
+if st.st_uid != os.getuid() or st.st_mode & 0o077:
+    print("report: token file must be yours and mode 0600", file=sys.stderr)
+    sys.exit(1)
+with os.fdopen(fd) as fh:
+    token = fh.read().strip()
 if not repo or repo.count("/") != 1:
     print(f"report: cannot work out owner/repo (set TB_STATUS_REPO)", file=sys.stderr)
     sys.exit(1)
@@ -435,17 +463,33 @@ except Exception as exc:  # class name only
 PY
 }
 
-failed=0; results=(); python_failed=0
+failed=0; results=(); python_failed=0; job_pid=""
+on_signal() {
+  if [ -n "$job_pid" ]; then
+    kill -TERM -- "-$job_pid" 2>/dev/null || true
+    sleep 3
+    kill -KILL -- "-$job_pid" 2>/dev/null || true
+    wait "$job_pid" 2>/dev/null || true
+  fi
+  echo "ci_local: interrupted" >&2
+  exit 143
+}
+trap on_signal TERM HUP INT
 for job in "${jobs[@]}"; do
   if [ "$job" = integration ] && [ "$python_failed" = 1 ]; then  # ci.yml: integration needs python
     echo "SKIP integration (python failed in this run)"; failed=1; results+=("SKIP integration"); continue
   fi
   log="$logs/$job.log"
   echo "##### $job"
+  # Each job runs in its own session (setsid), so a TERM, HUP or INT to this script can kill the whole group:
+  # pytest, docker builds and their children must not outlive the worktree they run in.
+  setsid bash -c 'set -o pipefail; bash "$1" __run "$2" 2>&1 | tee "$3"' _ "$root/.github/scripts/ci_local.sh" "$job" "$log" &
+  job_pid=$!
   set +e
-  bash "$root/.github/scripts/ci_local.sh" __run "$job" 2>&1 | tee "$log"
-  rc="${PIPESTATUS[0]}"
+  wait "$job_pid"
+  rc=$?
   set -e
+  job_pid=""
   summary="$(summary_of "$log")"
   if [ "$rc" = 0 ]; then
     results+=("PASS $job: $summary"); state=success

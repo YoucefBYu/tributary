@@ -20,20 +20,35 @@ changes are not tested (it runs the commit). Behind a TLS-intercepting proxy set
 
 ## Posting statuses (`--report`)
 
-`ci_local.sh --report <jobs>` posts a `local/<job>` commit status (success or failure) for the sha. The token comes
-only from the environment variable `TB_STATUS_TOKEN`, a fine-grained token limited to this repository with
-"Commit statuses: write" and nothing else. Keep it in your shell profile or secrets manager, never in the repo,
-an `.env` in the tree, or a command line. The script removes it from the environment before any job runs,
-sends it in one HTTPS request from a python process, and never echoes, logs or stores it. Without the variable it
-exits 2 before running anything. A status is self-attested (it proves this script ran on that sha on that machine);
-on a private GitHub Free repo it cannot be made a required check.
+`ci_local.sh --report <jobs>` posts a `local/<job>` commit status (success or failure) for the sha.
+
+- The token is a fine-grained token limited to this repository with "Commit statuses: write" and nothing else.
+- It lives in a **file**, `TB_STATUS_TOKEN_FILE=/path/to/file`, owned by you with mode 0600. The script refuses a
+  symlink, a file owned by someone else, or one readable by group or others. Keep the file outside the repository and
+  out of any synced folder. The old `TB_STATUS_TOKEN` environment variable is no longer read (the script refuses to
+  run if it is set), because every child process can read the environment of its parent.
+- Only the reporter opens the file, just before its one HTTPS request. The token is never in a process's
+  environment, a command line, a log or a status description, and jobs do not even get the file's path.
+- **Limit:** a job runs as you, so test code you run could read a 0600 file in your home directory. This
+  protects against other users and accidental exposure, not against hostile code in the repository. Run untrusted
+  code under a separate account, keep the token's scope minimal, and rotate it if in doubt.
+
+A status is self-attested (it proves this script ran on that sha on that machine); on a private GitHub Free repo it
+cannot be made a required check. The pre-push hook tests the ref being pushed when pre-commit exposes it
+(`PRE_COMMIT_TO_REF`), otherwise HEAD; `--sha` overrides both.
 
 ## Self-hosted runner (option A)
 
 Only after the human's 10-minute test shows self-hosted jobs are dispatched during the billing hold.
 
+0. Before attaching anything: Settings > Actions > General > "Fork pull request workflows" and confirm that
+   workflows from fork pull requests cannot run (for a private repo, leave "Run workflows from fork pull requests"
+   off). Settings > Secrets and variables > Actions > Variables: restrict who can edit repository variables to
+   admins, because whoever can set `TB_RUNNER` chooses which machine runs the jobs. Write access to the repository
+   already lets someone push a workflow that runs on the runner, so only trusted people get write access.
 1. Settings > Actions > Runners > New self-hosted runner (Linux x64). Install it as a service and register it
-   with `--ephemeral` if you can (a fresh runner per job).
+   with **`--ephemeral` (required)**: a fresh runner per job, so no job inherits files, caches or processes
+   from the previous one.
 2. Install on the host: Docker, `uv`, Node 22 and pnpm (only when `ui/` exists), `curl`, `git`, `python3`.
 3. Set the repository variable `TB_RUNNER` to the runner's label. Every job uses
    `runs-on: ${{ vars.TB_RUNNER || 'ubuntu-24.04' }}`; unset, jobs go to GitHub-hosted runners. (Verify on the
