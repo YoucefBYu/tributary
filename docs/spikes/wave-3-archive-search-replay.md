@@ -23,6 +23,13 @@ an MLLP receiver and a pipeline worker started from the spec the API deployed. 9
   ids with `parent_id` in the originals; on `raw` each key's replayed copies are in the originals' order (0, 1, 2) and each key is on one
   partition.
 
+### Criterion 1 evidence at head 17394ac (2026-10-14)
+
+`uv run pytest -q -p no:cacheprovider -m integration tests/e2e/test_archive_search_reprocess_replay_e2e.py` -> `5 passed in 54.23s`
+(commit 17394ac, 2026-10-14). The module covers search by `tb-msg-id`, the per-destination status (`sent`, attempt 1) and content index,
+routed content per destination, the audited content view, reprocess, and replay; every API response and SSE event in it is validated
+against `contracts/openapi/v0/openapi.json`.
+
 ### Findings for other owners
 
 - **No replay cancel.** `openapi/v0` has no cancel operation (a replay is `running`, `completed` or `failed`), so "can be cancelled" is not
