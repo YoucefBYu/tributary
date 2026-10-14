@@ -29,6 +29,7 @@ import ipaddress
 import logging
 import re
 import ssl
+import struct
 from collections.abc import Sequence
 from dataclasses import dataclass
 from ssl import CertificateError
@@ -45,6 +46,18 @@ from .schema import TABLE
 #: 497 ACCESS_DENIED, 516 AUTHENTICATION_FAILED.
 PERMANENT_CODES: Final = frozenset({16, 47, 53, 60, 81, 497, 516})
 _CODE = re.compile(r"Code: (\d{1,4})")
+#: Raised by the driver while it turns a Python value into a column (a string for a UUID, a number out of range).
+#: Local, deterministic and a property of the row: permanent, so the loop can isolate the row instead of retrying.
+LOCAL_CONVERSION_ERRORS: Final = (
+    AttributeError,
+    TypeError,
+    ValueError,
+    OverflowError,
+    KeyError,
+    IndexError,
+    UnicodeError,
+    struct.error,
+)
 
 
 def is_permanent(exc: BaseException) -> bool:
@@ -58,6 +71,8 @@ def is_permanent(exc: BaseException) -> bool:
         return False
     if isinstance(exc, ch_exc.DataError | ch_exc.ProgrammingError):
         return True
+    if isinstance(exc, LOCAL_CONVERSION_ERRORS):
+        return True  # the driver could not serialise a value: retrying the same bytes fails the same way
     match = _CODE.search(str(exc))
     return match is not None and int(match.group(1)) in PERMANENT_CODES
 

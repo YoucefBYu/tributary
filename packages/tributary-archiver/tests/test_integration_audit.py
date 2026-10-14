@@ -271,3 +271,65 @@ def test_the_runtime_user_cannot_overwrite_a_row_and_a_forged_same_id_copy_raise
             runtime.command("ALTER TABLE audit_log UPDATE actor = 'x' WHERE 1")
     finally:
         runtime.close()
+
+
+def test_a_batch_spread_over_many_months_still_commits_and_one_unstorable_row_is_set_aside(rig: Rig) -> None:
+    """Security review (ts window): month-partitioned tables refuse an insert block over 100 partitions. The loop
+    cuts blocks by month, and a row the table cannot take is isolated instead of stalling both topics."""
+    import io
+
+    import orjson
+    from tributary.archiver.archiver import Archiver, ArchiverSettings
+    from tributary.archiver.audit_record import COLUMNS, AuditRow
+    from tributary.archiver.errors import SinkError
+    from tributary.archiver.event import parse_event
+    from tributary.archiver.sink import ClickhouseSink
+    from tributary.archiver.testing import sample_event
+    from tributary.runtime.logs import JsonLogger
+
+    # The default 90-day TTL would drop rows from 2000-2009 at insert; this test is about partitions, not TTL.
+    rig.admin.command(f"ALTER TABLE {rig.database}.message_events MODIFY TTL toDateTime(ts) + INTERVAL 20000 DAY")
+    client = connect(target(rig.ch, rig.database, rig.user, rig.pw))
+    try:
+        events = [
+            parse_event(
+                orjson.dumps(
+                    sample_event(
+                        ts=f"{2000 + i // 12}-{i % 12 + 1:02d}-15T00:00:00.123Z", message_id=uuid7(), channel="far"
+                    )
+                )
+            )
+            for i in range(120)  # ten years: 120 month partitions
+        ]
+        with pytest.raises(SinkError):  # the unchunked insert is refused by ClickHouse (TOO_MANY_PARTS)
+            ClickhouseSink(client).insert([e.values for e in events])
+        stream = io.StringIO()
+        archiver = Archiver(
+            None,  # type: ignore[arg-type]  # _write needs no consumer when nothing fails transiently
+            ClickhouseSink(client),
+            log=JsonLogger("t", stream=stream),
+            settings=ArchiverSettings(),
+            sleep=lambda _s: None,
+            side_sinks={"audit_log": ClickhouseSink(client, table="audit_log", columns=COLUMNS)},
+        )
+        assert archiver._write(list(events))  # type: ignore[arg-type]
+        assert rig.rows(f"SELECT count() FROM {rig.database}.message_events FINAL WHERE channel = 'far'") == [(120,)]
+
+        # Audit: nine good rows and one the table cannot convert (a non-UUID audit_id reaches the driver).
+        good = [parse_audit_row(rig, rig.record(), i) for i in range(9)]
+        bad_values = list(parse_audit_row(rig, rig.record(), 9).values)
+        bad_values[0] = "not-a-uuid"
+        bad = AuditRow(values=tuple(bad_values), ts=good[0].ts)
+        assert archiver._write([*good[:4], bad, *good[4:]])  # type: ignore[arg-type]
+        assert rig.rows(f"SELECT count() FROM {rig.database}.audit_log") == [(9,)], "the nine good rows landed once"
+        aside = [json.loads(x) for x in stream.getvalue().splitlines() if '"row_set_aside"' in x]
+        assert len(aside) == 1 and aside[0]["table"] == "audit_log" and aside[0]["offset"] == 9
+        assert archiver.metrics.audit_invalid == 1 and archiver.metrics.batches_halted == 0
+    finally:
+        client.close()
+
+
+def parse_audit_row(rig: Rig, record: dict[str, Any], offset: int) -> Any:
+    from tributary.archiver.audit_record import parse_audit_record
+
+    return parse_audit_record(json.dumps(record).encode(), env=rig.env, partition=0, offset=offset, anchor=None)

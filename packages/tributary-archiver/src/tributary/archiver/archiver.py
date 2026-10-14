@@ -45,8 +45,11 @@ from .errors import AuditRejected, EventRejected, SinkError, UnsupportedVersion
 from .event import parse_event
 from .metrics import ArchiverMetrics, now_ms
 from .sink import Sink
+from .tswindow import record_time
 
 KAFKA_ERROR_LOG_INTERVAL_S: Final = 60.0
+MAX_MONTHS_PER_BLOCK: Final = 50
+ISOLATION_FAILED_INSERTS: Final = 64  # beyond this many refused sub-inserts the cause is systemic, not a row
 _PARTITION_EOF: Final = -191  # confluent_kafka.KafkaError._PARTITION_EOF
 
 
@@ -73,7 +76,7 @@ def parse_event_record(message: Any) -> RowLike:
     value = message.value()
     if value is None:
         raise EventRejected("EVENT_EMPTY")
-    return parse_event(value)
+    return parse_event(value, anchor=record_time(message))
 
 
 class ConsumerLike(Protocol):
@@ -255,25 +258,107 @@ class Archiver:
                 break
         return batch
 
+    def _plan_inserts(self, rows: list[RowLike]) -> list[tuple[str, list[RowLike]]]:
+        """Rows grouped by destination table, then cut into insert blocks that touch at most
+        `MAX_MONTHS_PER_BLOCK` month partitions: ClickHouse refuses a block over `max_partitions_per_insert_block`
+        (100) with TOO_MANY_PARTS, and a batch that retried that forever would stall every topic behind it."""
+        groups: dict[str, list[RowLike]] = {}
+        for row in rows:
+            table = getattr(row, "table", "")
+            groups.setdefault(table if table in self._side_sinks else "", []).append(row)
+        work: list[tuple[str, list[RowLike]]] = []
+        for key, members in groups.items():
+            ordered = sorted(members, key=lambda r: (r.ts.year, r.ts.month))
+            current: list[RowLike] = []
+            months: set[tuple[int, int]] = set()
+            for row in ordered:
+                month = (row.ts.year, row.ts.month)
+                if month not in months and len(months) >= MAX_MONTHS_PER_BLOCK:
+                    work.append((key, current))
+                    current, months = [], set()
+                current.append(row)
+                months.add(month)
+            work.append((key, current))
+        return work
+
+    def _insert_chunk(self, key: str, chunk: list[RowLike]) -> list[RowLike]:
+        """Insert one block. A PERMANENT failure of a block of several rows may be one bad row: bisect to find
+        it, insert the rest, and return the rows set aside. If (nearly) every row fails the cause is the table or
+        the grant, not a row, so the original error is raised and the batch halts as before (never dropped)."""
+        sink = self._side_sinks[key] if key else self._sink
+        try:
+            sink.insert([row.values for row in chunk])
+            return []
+        except SinkError as exc:
+            if exc.transient or len(chunk) < 2:
+                raise
+            budget = [ISOLATION_FAILED_INSERTS]
+            bad = self._isolate(sink, chunk, budget)
+            if bad is None or len(bad) == len(chunk):
+                raise exc from None
+            table = key or "events"
+            for row in bad:
+                if key:
+                    self.metrics.audit_invalid += 1
+                else:
+                    self.metrics.events_rejected += 1
+                position = row.values[-2:] if key else ()  # audit rows end with source partition and offset
+                self._log.error(
+                    "row_set_aside",
+                    table=table,
+                    error=type(exc).__name__,
+                    error_code=exc.code,
+                    partition=position[0] if position else None,
+                    offset=position[1] if position else None,
+                )
+            return bad
+
+    def _isolate(self, sink: Sink, rows: list[RowLike], budget: list[int]) -> list[RowLike] | None:
+        """The rows of `rows` the sink refuses, inserting every other row. `None` if the failed-insert budget runs
+        out (the failure is systemic). A transient error propagates: the whole batch is retried."""
+        if len(rows) == 1:
+            try:
+                sink.insert([rows[0].values])
+                return []
+            except SinkError as exc:
+                if exc.transient:
+                    raise
+                budget[0] -= 1
+                return list(rows)
+        middle = len(rows) // 2
+        bad: list[RowLike] = []
+        for half in (rows[:middle], rows[middle:]):
+            try:
+                sink.insert([row.values for row in half])
+            except SinkError as exc:
+                if exc.transient:
+                    raise
+                budget[0] -= 1
+                if budget[0] < 0:
+                    return None
+                deeper = self._isolate(sink, half, budget) if len(half) > 1 else list(half)
+                if deeper is None:
+                    return None
+                bad.extend(deeper)
+        return bad
+
     def _write(self, rows: list[RowLike]) -> bool:
         delay = self._settings.backoff_initial_s
         paused: dict[tuple[str, int], TopicPartition] = {}
         halted = False
-        groups: dict[str, list[tuple[Any, ...]]] = {}
-        for row in rows:
-            table = getattr(row, "table", "")
-            groups.setdefault(table if table in self._side_sinks else "", []).append(row.values)
-        done: set[str] = set()  # a group already inserted is not inserted again on a retry of the batch
+        work = self._plan_inserts(rows)
+        done: set[int] = set()  # a chunk already inserted is not inserted again on a retry of the batch
+        aside: list[RowLike] = []  # rows the table cannot take, set aside and committed past
         failing = "events"  # the table of the insert that raised, for the log (a name, never a value)
         try:
             while True:
                 started = time.monotonic()
                 try:
-                    for key, values in groups.items():
-                        if key not in done:
+                    for index, (key, chunk) in enumerate(work):
+                        if index not in done:
                             failing = key or "events"
-                            (self._side_sinks[key] if key else self._sink).insert(values)
-                            done.add(key)
+                            aside.extend(self._insert_chunk(key, chunk))
+                            done.add(index)
                 except SinkError as exc:
                     self.metrics.insert_failures += 1
                     if not exc.transient:
@@ -308,8 +393,9 @@ class Archiver:
                 self.metrics.last_insert_ms = elapsed * 1000.0
                 if self.metrics.observe_insert is not None:
                     self.metrics.observe_insert(elapsed)
-                self.metrics.rows_written += len(rows)
-                self.metrics.audit_written += sum(1 for row in rows if getattr(row, "table", "") in self._side_sinks)
+                stored = [row for row in rows if not any(row is a for a in aside)] if aside else rows
+                self.metrics.rows_written += len(stored)
+                self.metrics.audit_written += sum(1 for row in stored if getattr(row, "table", "") in self._side_sinks)
                 self.metrics.batches_written += 1
                 self.metrics.attrs_dropped += sum(row.attrs_dropped for row in rows)
                 self.metrics.attrs_dropped_hmac += sum(row.attrs_dropped_hmac for row in rows)

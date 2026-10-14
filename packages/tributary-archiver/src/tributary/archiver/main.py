@@ -55,6 +55,7 @@ from .metrics import ArchiverMetrics
 from .retention import TableSpec, apply_retention, check_audit_engine
 from .schema import AUDIT_TABLE, ensure_schema
 from .sink import ClickhouseSink, connect
+from .tswindow import record_time
 
 #: `/livez` fails when the loop has made no progress for this long (a consume, or a backoff slice).
 LIVENESS_STALE_S = 60.0
@@ -76,7 +77,11 @@ def build_record_parser(env: str) -> Callable[[Any], RowLike]:
         if message.topic() == audit:
             try:
                 return parse_audit_record(
-                    message.value(), env=env, partition=message.partition(), offset=message.offset()
+                    message.value(),
+                    env=env,
+                    partition=message.partition(),
+                    offset=message.offset(),
+                    anchor=record_time(message),
                 )
             except AuditRejected:
                 raise

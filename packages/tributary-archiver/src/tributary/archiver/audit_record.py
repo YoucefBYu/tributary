@@ -38,6 +38,7 @@ from typing import Any, Final
 import orjson
 
 from .errors import AuditRejected, UnsupportedVersion
+from .tswindow import EARLIEST, LATEST_RANGE, LOOKBACK, in_window
 
 TABLE: Final = "audit_log"
 MAX_RECORD_BYTES: Final = 8192
@@ -175,12 +176,21 @@ def _when(text: str | None) -> datetime | None:
         raise _bad("AUDIT_FIELD_INVALID") from None
 
 
+def _bounded(value: datetime | None) -> datetime | None:
+    """`range_start`/`range_end` are DateTime64 columns (1900-2299): a value outside makes the insert fail."""
+    if value is not None and not EARLIEST <= value <= LATEST_RANGE:
+        raise _bad("AUDIT_TIMESTAMP_INVALID")
+    return value
+
+
 def _require(present: dict[str, Any], *names: str) -> None:
     if any(present.get(n) is None for n in names):
         raise _bad("AUDIT_FIELD_MISSING")
 
 
-def parse_audit_record(value: bytes | None, *, env: str, partition: int, offset: int) -> AuditRow:
+def parse_audit_record(
+    value: bytes | None, *, env: str, partition: int, offset: int, anchor: datetime | None = None
+) -> AuditRow:
     """The row for one record on `_tb.<env>.audit`, or `EventRejected(code)`. Codes are fixed; the record is
     never quoted."""
     if value is None or not value:
@@ -206,6 +216,10 @@ def parse_audit_record(value: bytes | None, *, env: str, partition: int, offset:
 
     audit_id = _match(record, "audit_id", _UUID7)
     ts = _when(_match(record, "ts", _TIMESTAMP))
+    if ts is not None and not in_window(
+        ts, anchor, lookback=LOOKBACK
+    ):  # `audit_log` is partitioned by month (tswindow.py)
+        raise _bad("AUDIT_TIMESTAMP_INVALID")
     environment = _match(record, "environment", _ENV)
     action, phase = record["action"], record["phase"]
     if not (isinstance(action, str) and action in ACTIONS and isinstance(phase, str) and phase in PHASES):
@@ -237,8 +251,8 @@ def parse_audit_record(value: bytes | None, *, env: str, partition: int, offset:
     if "allow_reorder" in record and not isinstance(allow_reorder, bool):
         raise _bad("AUDIT_FIELD_INVALID")
     target_topic = _match(record, "target_topic", _TARGET)
-    range_start = _when(_match(record, "range_start", _TIMESTAMP))
-    range_end = _when(_match(record, "range_end", _TIMESTAMP))
+    range_start = _bounded(_when(_match(record, "range_start", _TIMESTAMP)))
+    range_end = _bounded(_when(_match(record, "range_end", _TIMESTAMP)))
     count = _int(record, "count", 0, _MAX_COUNT)
     error_code = _match(record, "error_code", _ERROR_CODE)
 
