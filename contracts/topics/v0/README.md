@@ -215,6 +215,27 @@ any of it for sizing (`docs/spikes/S4-topic-scale.md`).
 archive path under load, so whether the archiver keeps up at roughly four events per message is
 unknown.
 
+### 2.3 Record timestamps (set 1.8, 2026-10-14)
+
+`_tb.<env>.events` and `_tb.<env>.audit` set **`message.timestamp.type=LogAppendTime`**: the broker
+stamps each record, not the producer. Ruled on the security review of the archiver's ts window
+(`dbccffb`), which was anchored on a producer-chosen CreateTime. **Checked against every reader of
+Kafka record timestamps (grep, 2026-10-14):**
+
+- The archiver's ts-window anchor and its ingest-lag metric (`archiver.py`) read these two topics. Both
+  become broker time, which is what they mean.
+- Replay windows and `offsetsForTimes` (`replay.py`, `content_backfill.py`) and the content archiver's
+  timestamps read `raw`, `out` and `dlq`. Those **keep CreateTime**: replay is defined on the time the
+  receiver produced the record (`openapi/v0` 3.14), and tests produce backdated `raw` records on
+  purpose.
+- Latency measures use the event's own `ts` field or `tb-received-at`, never the Kafka timestamp.
+  The `ts` field is unchanged.
+
+**Give up:** a producer cannot backdate an event's Kafka timestamp, which no code needs. An archiver
+test that produces backdated event or audit records to exercise the window gets broker time on a
+topic created from these configs (`archive-engineer` to check). The archiver's `min(record time, now)`
+anchor stays as defence in depth.
+
 ---
 
 ## 3. Required configuration

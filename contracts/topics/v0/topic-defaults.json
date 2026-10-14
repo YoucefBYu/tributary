@@ -136,8 +136,10 @@
         "retention.ms": 259200000,
         "compression.type": "producer",
         "min.insync.replicas": 2,
-        "unclean.leader.election.enable": "false"
-      }
+        "unclean.leader.election.enable": "false",
+        "message.timestamp.type": "LogAppendTime"
+      },
+      "timestamp_note": "Set 1.8 (2026-10-14, security review of dbccffb): the broker stamps records, so the archiver's ts-window anchor and ingest-lag metric do not trust a producer clock. The event's own ts field (the value) is unchanged and remains the event time. raw keeps CreateTime: replay windows are defined on it. _tb.<env>.audit has the same setting. README 2.3."
     },
     "audit": {
       "partitions": 6,
@@ -147,7 +149,8 @@
         "retention.ms": 2592000000,
         "compression.type": "producer",
         "min.insync.replicas": 2,
-        "unclean.leader.election.enable": "false"
+        "unclean.leader.election.enable": "false",
+        "message.timestamp.type": "LogAppendTime"
       }
     }
   },

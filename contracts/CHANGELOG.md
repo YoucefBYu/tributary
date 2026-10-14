@@ -3,6 +3,21 @@
 Newest first. Each entry names the contract, the version, whether the change is additive or
 breaking, and the reason. Breaking changes reference an ADR.
 
+## 2026-10-14 — set 1.8: `LogAppendTime` on `_tb.<env>.events` and `_tb.<env>.audit`
+
+**Topic configuration change, additive in the contract sense; no schema or example change, counts
+unchanged. No invariant changes.**
+
+- **`topic-defaults.json`:** `classes.events.configs` and `classes.audit.configs` gain
+  `"message.timestamp.type": "LogAppendTime"`, plus `classes.events.timestamp_note`. `raw`, `out`,
+  `dlq`, `reply` and `channels` are unchanged (CreateTime).
+- **README 2.3:** the readers of Kafka timestamps were checked. Only the archiver's window anchor and
+  ingest-lag metric read these topics; replay and `offsetsForTimes` read `raw`.
+- **DevOps:** regenerate `acls.json` (`gen_acls.py` renders the audit topic config). Bootstrap creates
+  new topics with the setting, but **existing** `_tb.<env>.events` and `_tb.<env>.audit` need an
+  incremental config alter in Compose bootstrap (re-run safe) and in the Strimzi `KafkaTopic` render.
+  Check that `test_bootstrap_topics.py` and `helm_check.py` still pass.
+
 ## 2026-10-13 (sent attempt) — set 1.8: `attempt` numbering on loader stages (README only)
 
 - **`events/v0` 2 field table:** on loader delivery stages, `attempt` is the 1-based number of the
