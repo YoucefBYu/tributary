@@ -390,11 +390,11 @@ mkdir -p "$logs"
 cd "$root"
 
 strip_ansi() { sed 's/\x1b\[[0-9;]*[A-Za-z]//g'; }
-summary_of() {  # the real summary line: a pytest/ruff/helm result if there is one, else the last output line
+summary_of() {  # the real summary lines: up to 3 pytest/ruff/helm results if there are any, else the last output line
   local log="$1" line
-  line="$(strip_ansi <"$log" | grep -E '[0-9]+ passed|All checks passed|files? already formatted|[0-9]+ problems|Summary: |helm_check: ok|Success: no issues|skipped: ' | tail -n 1 || true)"
+  line="$(strip_ansi <"$log" | grep -E '[0-9]+ passed|All checks passed|files? already formatted|[0-9]+ problems|Summary: |helm_check: ok|Success: no issues|skipped: |[0-9]+ failed' | sed 's/^[= ]*//; s/[= ]*$//' | tail -n 3 | paste -sd'|' | sed 's/|/ | /g' || true)"
   [ -n "$line" ] || line="$(strip_ansi <"$log" | grep -v '^\s*$' | tail -n 1 || true)"
-  echo "$line" | sed 's/^[= ]*//; s/[= ]*$//' | cut -c1-200
+  echo "$line" | cut -c1-200
 }
 
 post_status() {  # post_status <job> <success|failure> <description>   (token only in this python process)
