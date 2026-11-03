@@ -15,8 +15,8 @@ Official docs: https://code.claude.com/docs/en/sub-agents and https://code.claud
 |---|---|
 | `CLAUDE.md` | Loaded by every agent: invariants, standards, protocol, definition of done |
 | `.claude/settings.json` | Enables agent teams, pre-approves safe commands, denies risky ones, wires hooks |
-| `.claude/agents/` | 12 roles (below) |
-| `.claude/skills/` | `/run-phase`, `/phase-gate`, `/new-adr` |
+| `.claude/agents/` | 12 roles plus the `scout` helper (below) |
+| `.claude/skills/` | `/run-phase`, `/phase-gate`, `/new-adr`, plus on-demand procedures `gate`, `handoff`, `dev-env`, `review-loop`, `steward` (see [Agent tooling and token budget](#agent-tooling-and-token-budget)) |
 | `.claude/hooks/` | `guard-content.sh` (blocks non-synthetic HL7 fixtures and secrets), `task-completed.sh` (lint, type and fast-test gate before a task can complete) |
 | `docs/adr/ADR-001-...md` | The architecture the team implements |
 | `docs/agent-team/` | This guide, `OWNERSHIP.md`, `STATUS.md`, and phase plans in `phases/` |
@@ -38,8 +38,37 @@ Official docs: https://code.claude.com/docs/en/sub-agents and https://code.claud
 | `migration-engineer` | sonnet | full dev, web | Mirth importer, compat shim, porting |
 | `security-reviewer` | opus | read-only + Bash | security and PHI review |
 | `code-reviewer` | sonnet | read-only + Bash | correctness and invariants review |
+| `scout` | haiku | read-only + Bash | log triage, test-failure summaries, locating code (20-line answers) |
 
 Models use aliases (`opus`, `sonnet`) so they follow the current versions. Change them in each file's frontmatter.
+
+## Agent tooling and token budget
+
+Recurring procedures live in skills, so they are not re-explained in every spawn prompt and only load when used. A skill's `description` sits in context every turn; its body loads on invocation; sibling files load only when the body links to them and the agent opens them.
+
+| Skill | Used by | What it holds |
+|---|---|---|
+| `gate` (+ `reference.md`) | lead | Pre-push gate on a clean `git worktree add --detach` tree: ruff, format, mypy, secret scan, licence check, contract validation, integration-count pin, fast tests, integration tests, helm checks when `deploy/helm` or `contracts/topics` change. Real exit codes; push as a standalone `git push origin <sha>:refs/heads/wave/1-3`. |
+| `handoff` | every role | The 15-line handoff: what changed, files, verify output with real counts, integration tests per module, invariants and PHI, risks. No commits unless told. |
+| `dev-env` | engineers, QA | Sandbox facts: dockerd restart, unique testcontainer names, `TB_OPS_PORT=0`, `TB_BUILD_CA_BUNDLE`, no bare `uv sync`, `gh` is api-only, one editor of `pyproject.toml`/`uv.lock` per batch. |
+| `review-loop` | lead, reviewers | When code-reviewer and security-reviewer run, the Critical/High rule, re-review after fixes. |
+| `steward` | lead on PR events | CI-red handling, regenerating generated files with tooling, the gate before every push. |
+
+Wiring:
+
+- Agent files preload skills with the `skills:` frontmatter field (engineers and QA get `handoff` and `dev-env`, reviewers get `review-loop`, the architect gets `handoff`). This applies when a role runs as a **subagent**. **Teammates ignore `skills:`**, so every role also lists `Skill` in `tools` and its body tells it to invoke the skills when they are not already loaded.
+- `scout` (haiku, read-only, `maxTurns: 20`) is the lead's cheap helper for log triage, CI-failure summaries and "where is X". Implementer roles have no Agent tool, so they grep themselves.
+- `subagentPromptCacheTtl: "1h"` in `.claude/settings.json` keeps teammate and subagent prompt caches warm across long integration runs (the default is 5 minutes). One-hour cache writes cost more than five-minute ones, so set it back to `"5m"` if waves are mostly short tasks.
+
+Token rules (also in each agent body):
+
+1. Grep first, then read line ranges; do not read whole large files.
+2. Never read `uv.lock`, `packages/tributary-content-hl7-fhir/tests/fixtures/fhir-r4/fhir.schema.json`, `sbom.cdx.json` or caches. `.venv/`, `.mypy_cache/`, `.pytest_cache/`, `node_modules/` and `sbom.cdx.json` are `Read`-denied in settings. `uv.lock` and the FHIR schema stay readable because tests and tooling use them; grep them for one entry.
+3. Run pytest with `-q` and report only the summary line and failing ids; do not paste large outputs.
+4. Handoffs are 15 lines or fewer.
+5. Lead: keep spawn prompts to task ids, owned paths, contracts and exit criteria; point at skills instead of restating procedures. Shut teammates down when their tasks are done.
+
+Permissions added for fewer prompts: read-only `git -C <path>` forms (with matching `-C` denies for push --force, reset --hard, checkout, switch, stash, rebase, clean), `git fetch`, `git push origin <sha>:refs/heads/wave/*`, `gh api` (mutating flags `-X`, `--method`, `-f`, `-F`, `--field`, `--raw-field` and `--input` ask), `helm` (install, upgrade, uninstall, delete, rollback and push ask), `python3`. A bare `uv sync` now asks.
 
 ## Prerequisites
 

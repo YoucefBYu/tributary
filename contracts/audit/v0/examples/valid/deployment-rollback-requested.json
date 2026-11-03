@@ -1,0 +1,15 @@
+{
+  "v": 0,
+  "audit_id": "0192f3f0-0006-7abc-8def-0123456789ab",
+  "ts": "2026-10-05T09:20:00.000Z",
+  "environment": "prod",
+  "action": "deployment.rollback",
+  "phase": "requested",
+  "actor": "synth-operator-0002",
+  "actor_roles": ["operator"],
+  "request_id": "0192f3f0-0007-7abc-8def-0123456789ab",
+  "channel": "adt-fanout",
+  "deployment_id": "0192f3a4-7100-7abc-8def-0123456789ab",
+  "version": 2,
+  "previous_version": 3
+}

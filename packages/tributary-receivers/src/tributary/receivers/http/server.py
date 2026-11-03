@@ -14,12 +14,23 @@ Size and shape are enforced strictly before any bytes past the headers are read:
 required (no chunked transfer-encoding -- refused outright, see `_read_head`), and a request whose
 `Content-Length` exceeds `maxMessageBytes` gets `413` without this receiver ever reading its body
 (README 3.2.2's "before the body is buffered past the limit").
+
+**Synchronous reply** (`source.reply`, README 3.2.6 "What the sender gets (HTTP)", set 1.8; `tributary.receivers.reply`).
+The request is published to `raw` with `tb-correlation-id`, `tb-reply-partition` and `tb-reply-deadline`, the raw
+delivery callback starts the reply clock, and the one answer comes from the runtime's `SyncRequest` state machine
+through `reply/pending.py`: `AA` is `200`, every `AE` is `202` with `Tb-Reply-Code` and a JSON body, every `AR` is
+`503` with `Retry-After`. No committed outcome ever uses a status that clients or proxies retry on their own
+(`5xx`, `408`, `429`): a resend of a committed message is a duplicate. The answer is written only after the receiver's
+own successful `raw` callback (invariant 1). A request holds one pending entry (one request per connection); while it
+waits the receiver watches the socket, and a sender that closes it frees the slot (the message is still processed).
+`Idempotency-Key`, like every request header that is not read for routing, is ignored: never logged, echoed or copied.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import hmac
 import json
 import logging
@@ -36,6 +47,7 @@ from tributary.runtime import load_engine_kafka_or_exit
 from tributary.runtime.logs import JsonLogger
 from tributary.sdk import Message
 from tributary.sdk import headers as h
+from tributary.sdk.codes import REPLY_ROUTE_LOST, REPLY_TIMEOUT
 
 from ..backpressure import BudgetExceeded, ByteBudget
 from ..envelope import build_raw_envelope
@@ -43,9 +55,11 @@ from ..errors import ConfigError, PermanentPublishError
 from ..events import event_logger
 from ..keys import resolve_key
 from ..metrics import Metrics
-from ..mllp.kafka_publisher import RawPublisher, topic_name
+from ..mllp.kafka_publisher import PublishResult, RawPublisher, publish_outcome, topic_name
 from ..net import is_loopback, require_safe_bind
 from ..payload import well_formed
+from ..reply.feed import ReplyFeed
+from ..reply.pending import Outcome, Pending, PendingMap
 from ..secrets import DirSecretResolver, SecretResolver
 from ..tls import AEAD_CIPHER_PIN, build_ssl_context, log_peer_refused, peer_san_allowed
 from .config import HttpSettings
@@ -71,13 +85,23 @@ class _HttpError(Exception):
     """One synchronous outcome: send this status and stop reading, no publish attempted."""
 
     def __init__(
-        self, status: int, reason: str, *, retry_after_s: float | None = None, headers: dict[str, str] | None = None
+        self,
+        status: int,
+        reason: str,
+        *,
+        retry_after_s: float | None = None,
+        headers: dict[str, str] | None = None,
+        sync_code: str | None = None,
+        msg_id: str | None = None,
     ) -> None:
         super().__init__(reason)
         self.status = status
         self.reason = reason
         self.retry_after_s = retry_after_s
         self.headers = headers or {}
+        #: Set on a synchronous-mode `503`: the answer then has the sync body (`not_committed`, `code`).
+        self.sync_code = sync_code
+        self.msg_id = msg_id
 
 
 def _encode_response(status: int, reason: str, body: bytes, *, extra_headers: dict[str, str] | None = None) -> bytes:
@@ -102,6 +126,31 @@ def _tb_content_type(header_value: str, accepted: frozenset[str]) -> str | None:
             if _CHARSET.match(value):
                 return f"{media}; charset={value.lower()}"
     return media
+
+
+_SYNC_HEADERS = {"Cache-Control": "no-store"}
+
+
+def _sync_body(status: str, code: str | None, msg_id: str | None) -> bytes:
+    """`{"v": 0, "status", "tb-msg-id", "code"}` (README 3.2.6): ids and registered codes only, never a value the
+    sender supplied. `tb-msg-id` is absent when nothing was published (there is no message to name)."""
+    doc: dict[str, object] = {"v": 0, "status": status}
+    if msg_id is not None:
+        doc["tb-msg-id"] = msg_id
+    if code is not None:
+        doc["code"] = code
+    return json.dumps(doc).encode("ascii")
+
+
+def _sync_headers(code: str | None, msg_id: str | None, *, retry_after_s: float | None = None) -> dict[str, str]:
+    headers = dict(_SYNC_HEADERS)
+    if msg_id is not None:
+        headers["Tb-Msg-Id"] = msg_id
+    if code is not None:
+        headers["Tb-Reply-Code"] = code
+    if retry_after_s:
+        headers["Retry-After"] = str(max(1, int(retry_after_s)))
+    return headers
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,10 +209,22 @@ class HttpServer:
         self._listener: asyncio.base_events.Server | None = None
         self._conns: dict[asyncio.StreamWriter, _Conn] = {}
         self._refusal: str | None = None  # set by `stop_accepting`: later requests are refused, none published
+        self._reply_feed: ReplyFeed | None = None
+        self._pending: PendingMap | None = None
 
     @property
     def cfg(self) -> HttpSettings:
         return self._live.cfg
+
+    def use_reply_feed(self, feed: ReplyFeed) -> None:
+        """The process's reply consumer, for a spec with `source.reply`. Before `start`; the feed outlives the
+        server (the runner owns it: a redeploy must not build a second consumer on the same
+        `group.instance.id`, which would fence the first)."""
+        self._reply_feed = feed
+
+    @property
+    def pending(self) -> PendingMap | None:
+        return self._pending
 
     @property
     def open_connections(self) -> int:
@@ -181,6 +242,8 @@ class HttpServer:
             raise ValueError("settings changed a field that needs a restart")
         tokens = _load_bearer_tokens(new, self._resolver)
         self.budget.set_limits(new.queue_max_bytes, new.queue_max_messages)
+        if self._pending is not None and new.reply is not None:
+            self._pending.configure(new.reply)
         self._live = _Live(new, tokens)
         self._revoke_disallowed_peers(new)
         await self.budget.wake()
@@ -208,6 +271,8 @@ class HttpServer:
         written (invariant 1). Idempotent; the first reason wins."""
         if self._refusal is None:
             self._refusal = reason
+        if self._pending is not None:
+            self._pending.retire()
         if self._listener is not None:
             self._listener.close()
 
@@ -217,6 +282,13 @@ class HttpServer:
         deadline = time.monotonic() + timeout_s
         while any(c.publishing for c in self._conns.values()) and time.monotonic() < deadline:
             await asyncio.sleep(0.01)
+        if self._pending is not None and len(self._pending):
+            # Whatever outlived the budget is answered `202` / `REPLY_ROUTE_LOST` (committed) or `503` (not
+            # committed) rather than dropped on a closed socket; a short bounded wait lets the answers be written.
+            self._pending.route_lost_all()
+            grace = time.monotonic() + self.cfg.write_timeout_s
+            while any(c.publishing for c in self._conns.values()) and time.monotonic() < grace:
+                await asyncio.sleep(0.01)
         drained = not any(c.publishing for c in self._conns.values())
         for w in list(self._conns):
             w.close()
@@ -274,10 +346,12 @@ class HttpServer:
             raise _HttpError(400, "Bad Request")  # ambiguous, never "the first one"
         return matches[0] if matches else None
 
-    def _check_auth(self, live: _Live, headers: list[tuple[str, str]]) -> None:
+    def _check_auth(self, live: _Live, headers: list[tuple[str, str]]) -> str | None:
+        """Raises 401 unless the request is authenticated. Returns the matched credential's identity for the
+        fairness bound (`bearer:<sha256 of the token>`, never the token), or `None` when the mode has no per-sender secret."""
         mode = live.cfg.auth.mode
         if mode in ("none", "mtls"):  # mtls: the TLS layer already required and verified the certificate
-            return
+            return None
         value = self._header(headers, "authorization")
         scheme, _, token = (value or "").partition(" ")
         presented = token.strip().encode("utf-8")
@@ -287,6 +361,23 @@ class HttpServer:
         if not ok:
             self.metrics.rejected_auth += 1
             raise _HttpError(401, "Unauthorized", headers={"WWW-Authenticate": "Bearer"})
+        # A digest of the matched token, in memory only: stable when a rotation reorders the secret file, and the
+        # token itself is never a key, a log field or a metric label.
+        return "bearer:" + hashlib.sha256(live.bearer_tokens[matches.index(True)]).hexdigest()
+
+    @staticmethod
+    def _fairness_peer(conn: _Conn, identity: str | None, remote: str) -> str:
+        """Who the per-sender pending cap counts a request against: the verified client certificate (its SHA-256
+        fingerprint), else the bearer credential that matched (a digest of the token), else the remote address, which is
+        only the identity for `auth: none` (loopback-only). Behind a proxy or SNAT an address would throttle
+        every sender together, so it is the last resort. Never a token, a SAN string or a header value."""
+        der = None
+        if conn.ssl_object is not None:
+            with contextlib.suppress(ValueError, AttributeError, ssl.SSLError):
+                der = conn.ssl_object.getpeercert(binary_form=True)
+        if der:
+            return "cert:" + hashlib.sha256(der).hexdigest()
+        return identity or "addr:" + (remote.rpartition(":")[0] or remote)
 
     async def _read_body(self, r: asyncio.StreamReader, already: bytes, content_length: int, deadline: float) -> bytes:
         body = bytearray(already[:content_length])
@@ -299,21 +390,23 @@ class HttpServer:
             remaining -= len(chunk)
         return bytes(body)
 
-    async def _publish(self, message: Message, deadline: float, *, gate: Callable[[], None] | None = None) -> bool:
+    async def _publish(
+        self, message: Message, deadline: float, *, gate: Callable[[], None] | None = None
+    ) -> PublishResult:
         async with self._inflight:
             if gate is not None:
                 gate()  # under the semaphore: the wait for a slot can be long, and the last look comes after it
             timeout = max(deadline - time.monotonic(), 0.001)
             t0 = time.monotonic()
             try:
-                ok = await self.publisher.publish(message, timeout_s=timeout)
+                result: PublishResult = await publish_outcome(self.publisher, message, timeout_s=timeout)
             except PermanentPublishError:
                 self.metrics.rejected_envelope += 1
                 raise _HttpError(422, "Unprocessable Content") from None  # retrying cannot help: no Retry-After
             except Exception:  # any failure is "not committed"; its text is never surfaced
-                ok = False
+                result = "failed"
             self.metrics.record_ack_latency_ms((time.monotonic() - t0) * 1000)
-            return ok
+            return result
 
     def _check_open(self, conn: _Conn) -> None:
         """Refuse work for a peer whose certificate was revoked, or after the channel was undeployed. Nothing of
@@ -324,7 +417,9 @@ class HttpServer:
             self.metrics.nacked_not_accepting += 1
             raise _HttpError(503, "Service Unavailable", retry_after_s=1.0)
 
-    async def _handle_request(self, r: asyncio.StreamReader, remote: str, ctx: dict[str, Any], conn: _Conn) -> bytes:
+    async def _handle_request(
+        self, r: asyncio.StreamReader, remote: str, ctx: dict[str, Any], conn: _Conn
+    ) -> tuple[bytes, int]:
         live = self._live  # one spec for this whole request, from the head to the stamped envelope
         cfg = live.cfg
         request_deadline = time.monotonic() + cfg.request_timeout_s
@@ -336,7 +431,7 @@ class HttpServer:
             raise _HttpError(404, "Not Found")
         if method != "POST":
             raise _HttpError(405, "Method Not Allowed", headers={"Allow": "POST"})
-        self._check_auth(live, headers)  # before the body is read or anything is reserved
+        identity = self._check_auth(live, headers)  # before the body is read or anything is reserved
 
         content_type = _tb_content_type(self._header(headers, "content-type") or "", cfg.accept)
         if content_type is None:
@@ -371,6 +466,7 @@ class HttpServer:
         if not reserved:
             self.metrics.nacked_queue_full += 1
             raise _HttpError(503, "Service Unavailable", retry_after_s=1.0)
+        entry: Pending | None = None
         try:
             body = await self._read_body(r, rest, content_length, request_deadline)
             ctx["bytes"] = len(body)
@@ -388,6 +484,15 @@ class HttpServer:
             if outcome.reason is not None:
                 self.metrics.nacked_parse_error += 1
                 raise _HttpError(400, "Bad Request")  # unresolved per-key: a parse-error NACK (README 4.3)
+            if cfg.reply is not None and self._pending is not None:
+                # Refused before anything is published: no reply partition held, or maxPending reached. Opened
+                # after the body is in, so a slow upload never holds a slot (nor a sender's value: none is kept).
+                opened = self._pending.open(
+                    sender_control_id="", connection=conn, peer=self._fairness_peer(conn, identity, remote)
+                )
+                if isinstance(opened, str):
+                    raise _HttpError(503, "Service Unavailable", retry_after_s=1.0, sync_code=opened)
+                entry = opened
             message = build_raw_envelope(
                 channel=cfg.channel,
                 channel_version=cfg.channel_version,
@@ -395,15 +500,25 @@ class HttpServer:
                 payload=body,
                 key=outcome.key,
                 content_type=content_type,
+                reply_headers=entry.routing_headers(ack_timeout_s=cfg.ack_timeout_s) if entry is not None else None,
             )
             msg_id = message.require(h.TB_MSG_ID)
             ctx["msg_id"] = msg_id
+            if entry is not None:
+                entry.bind(msg_id)  # before the produce: no reply can name it earlier
             conn.publishing = True  # from here its answer is owed: revocation and drain wait for it
             # The ACK budget starts now, once the body is in: a slow upload must not eat it and turn a
             # healthy Kafka into a 503 (whose retry would duplicate the message).
             ack_deadline = time.monotonic() + cfg.ack_timeout_s
 
             def last_look() -> None:
+                try:
+                    gate()
+                except _HttpError:
+                    ctx.pop("msg_id", None)  # refused before the produce: the log line must not name a message
+                    raise
+
+            def gate() -> None:
                 # Run by `_publish` after it holds an in-flight slot, immediately before the produce, because
                 # the wait for the slot is the longest gap since the checks above. Tombstoned or revoked while
                 # waiting for the queue, the body or the slot: not published. Then the credentials again under
@@ -414,15 +529,94 @@ class HttpServer:
                 if current.cfg.auth != cfg.auth or current.bearer_tokens != live.bearer_tokens:
                     self._check_auth(current, headers)
 
-            ok = await self._publish(message, ack_deadline, gate=last_look)
+            published = await self._publish(message, ack_deadline, gate=last_look)
+            ok = published == "committed"
+            if entry is not None:
+                entry.produce_code = "PRODUCE_TIMEOUT" if published == "timeout" else "PRODUCE_FAILED"
+        except BaseException as exc:
+            if isinstance(exc, _HttpError):
+                ctx.pop("msg_id", None)  # every `_HttpError` out of `_publish` is raised before the produce
+            if entry is not None and self._pending is not None:
+                self._pending.commit(entry, ok=False)  # never leave an entry no one will settle
+            raise
         finally:
             await self.budget.release(content_length)
+        if entry is not None and self._pending is not None:
+            self._pending.commit(entry, ok=ok)
+            return self._sync_answer(await self._await_outcome(r, conn, entry), msg_id)
         if not ok:
             self.metrics.publish_failures += 1
             self.metrics.nacked_unavailable += 1
             raise _HttpError(503, "Service Unavailable", retry_after_s=1.0)
         self.metrics.acked += 1
-        return _encode_response(202, "Accepted", json.dumps({"tb-msg-id": msg_id}).encode("ascii"))
+        return _encode_response(202, "Accepted", json.dumps({"tb-msg-id": msg_id}).encode("ascii")), 202
+
+    async def _await_outcome(self, r: asyncio.StreamReader, conn: _Conn, entry: Pending) -> Outcome:
+        """Wait for the one answer, bounded by `reply.timeoutMs` (the pending map's timer). The socket is watched
+        meanwhile: end of stream means the sender is gone, its entry ends (slot freed, nothing written) and the
+        message is still processed. A sender that half-closes its write side forfeits the answer; HTTP/1.1
+        clients waiting for a response do not. Bytes after the request are discarded, bounded."""
+        pending = self._pending
+        if pending is None:
+            raise RuntimeError("synchronous reply without a pending map")
+        extra = 0
+        watcher: asyncio.Future[bytes] = asyncio.ensure_future(r.read(4096))
+        try:
+            while not entry.outcome.done():
+                waiters: set[asyncio.Future[Any]] = {entry.outcome, watcher}
+                await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+                if entry.outcome.done() or not watcher.done():
+                    continue
+                try:
+                    chunk = watcher.result()
+                except (ConnectionError, OSError, ssl.SSLError):
+                    chunk = b""
+                extra += len(chunk)
+                if not chunk or extra > _LINGER_BYTES:
+                    pending.abandon(conn)  # the sender is gone (or abusive): the entry ends, nothing is written
+                    raise ConnectionError("sender closed before the reply")
+                watcher = asyncio.ensure_future(r.read(4096))
+            return entry.outcome.result()
+        finally:
+            watcher.cancel()
+            pending.abandon(conn)  # a no-op once settled; ends the entry if this task was cancelled
+
+    def _sync_answer(self, outcome: Outcome, msg_id: str) -> tuple[bytes, int]:
+        """The wire answer for a resolved entry (README 3.2.6 HTTP table). Raises `_HttpError` for `AR`."""
+        resolution = outcome.resolution
+        m = self.metrics
+        if resolution.answer == "AA":
+            m.acked += 1
+            m.reply_aa += 1
+            return (
+                _encode_response(
+                    200, "OK", _sync_body("accepted", None, msg_id), extra_headers=_sync_headers(None, msg_id)
+                ),
+                200,
+            )
+        if resolution.answer == "AE":
+            code = resolution.code
+            m.reply_ae += 1
+            m.record_sync_answer("AE", code)
+            if code == REPLY_TIMEOUT:
+                m.reply_timeouts += 1
+            elif code == REPLY_ROUTE_LOST:
+                m.reply_route_lost += 1
+            known = code not in (REPLY_TIMEOUT, REPLY_ROUTE_LOST) and outcome.reply_status in ("rejected", "failed")
+            status = outcome.reply_status if known and outcome.reply_status is not None else "unknown"
+            return (
+                _encode_response(
+                    202, "Accepted", _sync_body(status, code, msg_id), extra_headers=_sync_headers(code, msg_id)
+                ),
+                202,
+            )
+        if resolution.answer == "AR":
+            m.publish_failures += 1
+            m.nacked_unavailable += 1
+            code = resolution.code or outcome.produce_code or "PRODUCE_FAILED"
+            m.record_sync_answer("AR", code)
+            raise _HttpError(503, "Service Unavailable", retry_after_s=1.0, sync_code=code, msg_id=msg_id)
+        raise ConnectionError("sender closed before the reply")  # abandoned: nothing can be written
 
     @staticmethod
     async def _linger(r: asyncio.StreamReader) -> None:
@@ -452,7 +646,7 @@ class HttpServer:
         remote = f"{peer[0]}:{peer[1]}" if peer else "unknown"
         cfg = self.cfg
         if self._refusal is not None or self.metrics.connections_open >= cfg.max_conns:
-            self.metrics.connections_refused += 1
+            self.metrics.refuse_connection("not_accepting" if self._refusal is not None else "max_conns")
             w.close()
             return
         if cfg.tls is not None and cfg.tls.allowed_client_sans:
@@ -477,17 +671,23 @@ class HttpServer:
         lingering = False
         try:
             try:
-                response = await self._handle_request(r, remote, ctx, conn)
-                status = 202
+                response, status = await self._handle_request(r, remote, ctx, conn)
             except _HttpError as exc:
                 extra = dict(exc.headers)
                 if exc.retry_after_s:
                     extra["Retry-After"] = str(max(1, int(exc.retry_after_s)))
-                body = json.dumps({"error": exc.reason}).encode("ascii")
+                if exc.sync_code is not None:
+                    # Synchronous mode, not committed: README 3.2.6 `503` + `Retry-After` + `Tb-Reply-Code`.
+                    extra.update(_sync_headers(exc.sync_code, exc.msg_id))
+                    body = _sync_body("not_committed", exc.sync_code, exc.msg_id)
+                else:
+                    body = json.dumps({"error": exc.reason}).encode("ascii")
                 response = _encode_response(exc.status, exc.reason, body, extra_headers=extra)
                 status = exc.status
                 lingering = exc.status in (400, 401, 403, 404, 405, 411, 413, 415, 417, 431)
             except (TimeoutError, ConnectionError, OSError, ssl.SSLError):
+                if ctx.get("msg_id") is not None and conn.publishing:
+                    self._log_access(ctx, 499)  # a committed request whose sender went away: ids only, no answer
                 return  # idle/slow/reset peer, or a connection closed by a revocation: no response can be written
             except Exception:  # a bug here must not leak text to the peer or wedge the connection
                 response = _encode_response(400, "Bad Request", b'{"error": "Bad Request"}')
@@ -511,14 +711,41 @@ class HttpServer:
         (asyncio calls the handler after the handshake), so it does not count against `max_conns`. Half-open
         handshakes are bounded by `tls_handshake_timeout_s` and the listen backlog; a plaintext-to-TLS flood
         is the operator's edge-firewall concern. Counting them needs a custom protocol factory, not done."""
-        self._listener = await asyncio.start_server(
-            self.handle,
-            self.cfg.bind,
-            self.cfg.port,
-            ssl=self._ssl_context,
-            backlog=1024,
-            ssl_handshake_timeout=self.cfg.tls_handshake_timeout_s if self._ssl_context else None,
-        )
+        if self.cfg.reply is not None:
+            if self.cfg.reply.max_pending > self.cfg.max_conns:
+                # Each request holds one connection, so `max_conns` is the real cap on pending entries.
+                event_logger("receiver-http").warning(
+                    "reply_max_pending_exceeds_max_conns",
+                    channel=self.cfg.channel,
+                    max_pending=self.cfg.reply.max_pending,
+                    max_conns=self.cfg.max_conns,
+                )
+            if self._reply_feed is None:
+                raise ConfigError(
+                    f"channel {self.cfg.channel!r}: source.reply needs a reply consumer, none was provided"
+                )
+            self._pending = PendingMap(
+                self.cfg.reply,
+                feed=self._reply_feed,
+                loop=asyncio.get_running_loop(),
+                budget=self.budget,
+                metrics=self.metrics,
+                max_connections=self.cfg.max_conns,
+            )
+            self._reply_feed.attach(self._pending)
+        try:
+            self._listener = await asyncio.start_server(
+                self.handle,
+                self.cfg.bind,
+                self.cfg.port,
+                ssl=self._ssl_context,
+                backlog=1024,
+                ssl_handshake_timeout=self.cfg.tls_handshake_timeout_s if self._ssl_context else None,
+            )
+        except BaseException:
+            if self._pending is not None:
+                self._pending.retire()  # a failed bind leaves no sink behind on the shared feed
+            raise
         return self._listener
 
 
@@ -531,8 +758,10 @@ def main() -> None:
     supervisor restarts on 0), 2 for a refused startup configuration."""
     from tributary.runtime.config import load_topic_defaults
     from tributary.runtime.errors import RuntimeConfigurationError
+    from tributary.runtime.ops import add_ops_arguments, ops_settings_or_exit
+    from tributary.runtime.startup import QuietArgumentParser
 
-    from ..cli import QuietArgumentParser, add_ops_arguments, ops_settings_or_exit, run_until_stopped, spec_feed_opener
+    from ..cli import run_until_stopped, spec_feed_opener
     from ..startup import refuse, refuse_retired_channel_spec_flag, spec_reader_group_or_exit
     from .runner import HttpRunner, RunnerOptions
 
@@ -545,12 +774,20 @@ def main() -> None:
     p = QuietArgumentParser(log, description=__doc__)
     p.add_argument("--channel", required=True, help="the deployed channel name (spec.metadata.name)")
     p.add_argument("--env", required=True, help="the topic-name env segment, e.g. 'dev' or 'prod'")
-    p.add_argument("--instance", default="http-0", help="this process's identity, for tb-source")
+    p.add_argument(
+        "--instance",
+        default=None,
+        help="this process's identity, for tb-source (default http-0). REQUIRED and unique per replica when the "
+        "channel has source.reply: it names the replier group member, and a duplicate fences a live replica",
+    )
     p.add_argument("--secrets-dir", help="overrides TB_SECRETS_DIR / the default secrets mount")
     p.add_argument("--contracts-dir", help="overrides TB_CONTRACTS_DIR / the default contracts/ search")
     p.add_argument("--metrics-file")
     add_ops_arguments(p)
     a = p.parse_args(argv)
+    instance_explicit = a.instance is not None
+    if a.instance is None:
+        a.instance = "http-0"
     logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(message)s")
     # Operator input is validated (and refused without being echoed) before it becomes a log field.
     spec_group = spec_reader_group_or_exit(a.env, a.channel, a.instance, log)
@@ -581,12 +818,27 @@ def main() -> None:
     def make_server(cfg: HttpSettings, publisher: RawPublisher, metrics: Metrics) -> HttpServer:
         return HttpServer(cfg, publisher, metrics=metrics, secret_resolver=resolver)
 
+    def make_reply_feed(metrics: Metrics) -> ReplyFeed:
+        from ..reply.feed import open_reply_feed
+
+        return open_reply_feed(
+            kafka,
+            defaults,
+            env=a.env,
+            channel=a.channel,
+            instance=a.instance if instance_explicit else None,
+            pid=os.getpid(),
+            log=log,
+            metrics=metrics,
+        )
+
     runner = HttpRunner(
         open_feed=spec_feed_opener(
             kafka=kafka, defaults=defaults, env=a.env, channel=a.channel, group=spec_group, log=log
         ),
         make_publisher=make_publisher,
         make_server=make_server,
+        make_reply_feed=make_reply_feed,
         options=RunnerOptions(
             env=a.env,
             instance=a.instance,

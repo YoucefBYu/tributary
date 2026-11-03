@@ -46,7 +46,6 @@ capabilities:
 - {name: engine-kafka, mountPath: /etc/tributary, readOnly: true}
 - {name: kafka-role, mountPath: /var/run/secrets/tributary/{{ index .root.Values.kafka.roleSecretRefs .role }}, readOnly: true}
 - {name: kafka-ca, mountPath: /var/run/secrets/tributary/{{ .root.Values.kafka.caSecretRef }}, readOnly: true}
-- {name: contracts, mountPath: /contracts, readOnly: true}
 - {name: tmp, mountPath: /tmp}
 {{- end -}}
 
@@ -57,25 +56,29 @@ capabilities:
   secret: {secretName: {{ index .root.Values.kafka.roleSecretRefs .role }}}
 - name: kafka-ca
   secret: {secretName: {{ .root.Values.kafka.caSecretRef }}}
-- name: contracts
-  configMap: {name: {{ .root.Values.contractsConfigMap }}}
 - name: tmp
   emptyDir: {sizeLimit: 64Mi}
 {{- end -}}
 
 {{- define "tb.commonEnv" -}}
 - {name: TB_ENGINE_KAFKA_FILE, value: /etc/tributary/engine-kafka.json}
-- {name: TB_CONTRACTS_DIR, value: /contracts}
 - {name: TB_PROFILE, value: production}
 {{- end -}}
 
 {{- define "tb.archiverEnv" -}}
 - {name: TB_ENGINE_KAFKA_FILE, value: /etc/tributary/engine-kafka.json}
-- {name: TB_CONTRACTS_DIR, value: /contracts}
 - {name: TB_PROFILE, value: production}
 - {name: TB_ARCHIVE_CLICKHOUSE_HOST, value: {{ .Values.archiver.clickhouse.host | quote }}}
 - {name: TB_ARCHIVE_CLICKHOUSE_PORT, value: {{ .Values.archiver.clickhouse.port | quote }}}
 - {name: TB_ARCHIVE_CLICKHOUSE_DATABASE, value: {{ .Values.archiver.clickhouse.database | quote }}}
 - {name: TB_ARCHIVE_CLICKHOUSE_SECURE, value: {{ ternary "1" "0" .Values.archiver.clickhouse.secure | quote }}}
-- {name: TB_ARCHIVE_TTL_DAYS, value: {{ .Values.archiver.ttlDays | quote }}}
+{{- if hasKey .Values.archiver "ttlDays" }}{{ fail "archiver.ttlDays was removed (it drifted from the documented 90); use archiver.retention.eventsDays" }}{{ end }}
+{{- $r := .Values.archiver.retention }}
+{{- range $k := list "eventsDays" "contentDays" "auditDays" }}
+{{- $v := index $r $k }}
+{{- if or (not (or (kindIs "float64" $v) (kindIs "int64" $v))) (lt (float64 $v) 1.0) (gt (float64 $v) 36500.0) (ne (float64 $v) (floor (float64 $v))) }}{{ fail (printf "archiver.retention.%s must be an integer from 1 to 36500" $k) }}{{ end }}
+{{- end }}
+- {name: TB_ARCHIVE_TTL_DAYS, value: {{ $r.eventsDays | int | quote }}}
+- {name: TB_ARCHIVE_CONTENT_TTL_DAYS, value: {{ $r.contentDays | int | quote }}}
+- {name: TB_ARCHIVE_AUDIT_TTL_DAYS, value: {{ $r.auditDays | int | quote }}}
 {{- end }}

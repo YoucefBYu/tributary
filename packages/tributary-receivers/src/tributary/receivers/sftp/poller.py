@@ -137,7 +137,7 @@ class SftpPoller:
         try:
             session = await asyncio.to_thread(self._connect)
         except SessionError as exc:
-            self.metrics.connections_refused += 1  # a failed connect, whatever the reason
+            self.metrics.refuse_connection("connect_failed")  # a failed connect, whatever the reason
             self.metrics.poll_errors += 1
             _event("sftp_connect_failed", channel=self.cfg.channel, error=type(exc).__name__)
             return 0
@@ -332,8 +332,10 @@ def main() -> None:
     0), 2 for a refused startup configuration."""
     from tributary.runtime.config import load_topic_defaults
     from tributary.runtime.errors import RuntimeConfigurationError
+    from tributary.runtime.ops import add_ops_arguments, ops_settings_or_exit
+    from tributary.runtime.startup import QuietArgumentParser
 
-    from ..cli import QuietArgumentParser, add_ops_arguments, ops_settings_or_exit, run_until_stopped, spec_feed_opener
+    from ..cli import run_until_stopped, spec_feed_opener
     from ..startup import refuse, refuse_retired_channel_spec_flag, spec_reader_group_or_exit
     from .runner import RunnerOptions, SftpRunner
     from .service import SftpService

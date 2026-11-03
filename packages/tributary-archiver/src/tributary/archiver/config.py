@@ -10,7 +10,7 @@ from typing import Final
 from tributary.runtime.secrets import SecretResolver
 
 from .errors import ArchiverConfigError
-from .schema import DEFAULT_TTL_DAYS, MAX_TTL_DAYS
+from .schema import DEFAULT_AUDIT_TTL_DAYS, DEFAULT_CONTENT_TTL_DAYS, DEFAULT_TTL_DAYS, MAX_TTL_DAYS
 from .sink import ClickhouseTarget
 
 ENV_NAME: Final = re.compile(r"^[a-z][a-z0-9-]{0,15}$")
@@ -25,6 +25,19 @@ class ArchiverConfig:
     target: ClickhouseTarget
     ttl_days: int
     group_id: str
+    #: ADR-004 R2: `TB_ARCHIVE_AUDIT_TTL_DAYS`, default 2190.
+    audit_ttl_days: int = DEFAULT_AUDIT_TTL_DAYS
+    #: `TB_ARCHIVE_CONTENT_TTL_DAYS` (default 30), read only when `TB_ARCHIVE_CONTENT=true` (W3-2b); else None.
+    content_ttl_days: int | None = None
+    #: `TB_ARCHIVE_CONTENT=true` (A4). Off by default: no content is stored.
+    content_enabled: bool = False
+    #: `TB_ARCHIVE_CONTENT_CHANNELS`, comma separated: content is stored for these channels only.
+    content_channels: frozenset[str] = frozenset()
+    #: `TB_ARCHIVE_AUDIT_CONSUME` (default true): the events archiver also consumes `_tb.<env>.audit` into
+    #: `audit_log` (ADR-004 R7). Off only for a deployment that does not provision the audit topic.
+    audit_consume: bool = True
+    #: `TB_ARCHIVE_ALLOW_TTL_DECREASE`: read by the migrate step only (R6).
+    allow_ttl_decrease: bool = False
 
 
 def archiver_group(env: str) -> str:
@@ -35,6 +48,21 @@ def archiver_group(env: str) -> str:
     if not ENV_NAME.fullmatch(env):
         raise ArchiverConfigError("env does not match the topic-name segment grammar")
     return f"tb.{env}.archiver"
+
+
+def content_group(env: str) -> str:
+    """`tb.<env>.archiver.content`: the content archiver's literal group (ADR-004 section 5, A1)."""
+    return f"{archiver_group(env)}.content"
+
+
+_CHANNEL: Final = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
+
+
+def _channels(environ: Mapping[str, str]) -> frozenset[str]:
+    names = [n.strip() for n in environ.get("TB_ARCHIVE_CONTENT_CHANNELS", "").split(",") if n.strip()]
+    if any(_CHANNEL.fullmatch(n) is None for n in names):
+        raise ArchiverConfigError("TB_ARCHIVE_CONTENT_CHANNELS has an invalid channel name")
+    return frozenset(names)
 
 
 def _bool(environ: Mapping[str, str], name: str, *, default: bool) -> bool:
@@ -92,9 +120,20 @@ def load_config(
         secure=secure,
         ca_cert=environ.get("TB_ARCHIVE_CLICKHOUSE_CA_CERT") or None,
     )
+    content_enabled = _bool(environ, "TB_ARCHIVE_CONTENT", default=False)
     return ArchiverConfig(
         env=env,
         target=target,
         ttl_days=_int(environ, "TB_ARCHIVE_TTL_DAYS", DEFAULT_TTL_DAYS, 1, MAX_TTL_DAYS),
         group_id=archiver_group(env),
+        audit_ttl_days=_int(environ, "TB_ARCHIVE_AUDIT_TTL_DAYS", DEFAULT_AUDIT_TTL_DAYS, 1, MAX_TTL_DAYS),
+        content_ttl_days=(
+            _int(environ, "TB_ARCHIVE_CONTENT_TTL_DAYS", DEFAULT_CONTENT_TTL_DAYS, 1, MAX_TTL_DAYS)
+            if content_enabled
+            else None
+        ),
+        content_enabled=content_enabled,
+        content_channels=_channels(environ),
+        allow_ttl_decrease=_bool(environ, "TB_ARCHIVE_ALLOW_TTL_DECREASE", default=False),
+        audit_consume=_bool(environ, "TB_ARCHIVE_AUDIT_CONSUME", default=True),
     )

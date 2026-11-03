@@ -1,0 +1,18 @@
+{
+  "channel": "adt-fanout",
+  "message_id": "0192f3b0-1a2b-7c3d-8e4f-0123456789ab",
+  "stage": "received",
+  "content_type": "text/plain",
+  "size_bytes": 15,
+  "storage": "inline",
+  "payload_base64": "VFJJQlVUQVJZLVNZTlRI",
+  "headers": {
+    "tb-msg-id": "0192f3b0-1a2b-7c3d-8e4f-0123456789ab",
+    "tb-channel": "adt-fanout",
+    "tb-channel-version": "3",
+    "tb-received-at": "2026-10-06T08:40:59.004Z",
+    "tb-content-type": "text/plain",
+    "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+  },
+  "archived_at": "2026-10-06T08:41:02.000Z"
+}

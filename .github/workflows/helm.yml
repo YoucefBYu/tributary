@@ -2,10 +2,10 @@ name: helm
 
 on:
   pull_request:
-    paths: ["deploy/helm/**", ".github/workflows/helm.yml", ".github/scripts/helm_check.py", "contracts/observability/**"]
+    paths: ["deploy/helm/**", ".github/workflows/helm.yml", ".github/scripts/helm_check.py", ".github/scripts/ci_local.sh", "contracts/observability/**", "contracts/topics/**", "deploy/compose/topic-bootstrap/bootstrap_topics.py"]
   push:
     branches: [main, "wave/**"]
-    paths: ["deploy/helm/**", ".github/workflows/helm.yml", ".github/scripts/helm_check.py", "contracts/observability/**"]
+    paths: ["deploy/helm/**", ".github/workflows/helm.yml", ".github/scripts/helm_check.py", ".github/scripts/ci_local.sh", "contracts/observability/**", "contracts/topics/**", "deploy/compose/topic-bootstrap/bootstrap_topics.py"]
 
 permissions:
   contents: read
@@ -14,17 +14,10 @@ concurrency:
   group: helm-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  HELM_VERSION: v3.16.2
-  HELM_SHA256: 9318379b847e333460d33d291d4c088156299a26cd93d570a7f5d0c36e50b5bb
-  KUBECONFORM_VERSION: v0.6.7
-  KUBECONFORM_SHA256: 95f14e87aa28c09d5941f11bd024c1d02fdc0303ccaa23f61cef67bc92619d73
-  CHART: deploy/helm/tributary
-
 jobs:
   chart:
     name: helm lint, template, kubeconform, chart assertions
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.TB_RUNNER || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -32,37 +25,8 @@ jobs:
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
         with:
           python-version: "3.12"
-      # Official release tarballs, verified against a pinned checksum before extraction.
+      # Official release tarballs, verified against a pinned checksum before extraction (ci_local.sh).
       - name: install helm and kubeconform (checksum-verified)
-        run: |
-          set -euo pipefail
-          curl -sSfLO "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
-          echo "${HELM_SHA256}  helm-${HELM_VERSION}-linux-amd64.tar.gz" | sha256sum -c -
-          tar xzf "helm-${HELM_VERSION}-linux-amd64.tar.gz" linux-amd64/helm
-          curl -sSfLO "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
-          echo "${KUBECONFORM_SHA256}  kubeconform-linux-amd64.tar.gz" | sha256sum -c -
-          tar xzf kubeconform-linux-amd64.tar.gz kubeconform
-          echo "$PWD/linux-amd64" >> "$GITHUB_PATH"
-          echo "$PWD" >> "$GITHUB_PATH"
-      - name: helm lint
-        run: helm lint "$CHART" -f "$CHART/ci/values-ci.yaml" --strict
-      - name: helm template (all optional parts on)
-        run: helm template tb "$CHART" -f "$CHART/ci/values-ci.yaml" --set strimzi.enabled=true > rendered.yaml
-      - name: kubeconform (CRDs without a published schema are skipped)
-        run: kubeconform -strict -summary -ignore-missing-schemas -kubernetes-version 1.30.0 rendered.yaml
-      - name: chart assertions (instance, probes, ops NetworkPolicy, skip-ddl, metric names, log format)
-        run: uv run --no-project --with pyyaml==6.0.3 python .github/scripts/helm_check.py rendered.yaml
-      - name: mutation control, a tampered render must fail the assertions
-        run: |
-          sed 's/--ops-bind=\$(POD_IP)/--ops-bind=127.0.0.1/' rendered.yaml > tampered.yaml
-          uv run --no-project --with pyyaml==6.0.3 python .github/scripts/helm_check.py tampered.yaml --negative
-      - name: default values refuse to render without a kubelet CIDR
-        run: |
-          helm template tb "$CHART" 2>&1 | grep -q "networkPolicy.kubeletCIDR is required"
-      - name: too-short and open CIDRs, a disabled policy and plain-HTTP ingress are refused
-        run: |
-          v="-f $CHART/ci/values-ci.yaml"
-          helm template tb "$CHART" $v --set networkPolicy.kubeletCIDR=0.0.0.0/0 2>&1 | grep -q "is too short"
-          helm template tb "$CHART" $v --set networkPolicy.kubeletCIDR=10.0.0.0/8 2>&1 | grep -q "is too short"
-          helm template tb "$CHART" $v --set networkPolicy.enabled=false 2>&1 | grep -q "allowUnprotectedOpsPort"
-          helm template tb "$CHART" $v --set ingress.tlsSecretName= 2>&1 | grep -q "tlsSecretName is required"
+        run: .github/scripts/ci_local.sh --here install-helm-tools >> "$GITHUB_PATH"
+      - name: helm lint, template, kubeconform, chart assertions and all mutation controls
+        run: .github/scripts/ci_local.sh --here helm

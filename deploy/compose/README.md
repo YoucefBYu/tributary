@@ -42,8 +42,10 @@ broker.
   `down -v` also regenerates the credentials. (Regenerated credentials also force a reformat.)
 - The broker's own identity is a client certificate, not a password: the controller, inter-broker and
   admin listeners are SSL with required client certificates, each on the broker's loopback. The SCRAM
-  users are created after start by `kafka-users-init` (`topic-bootstrap/add_scram_users.py`, granted only ALTER on the cluster, not a super
-  user), which
+  users are created after start by `kafka-users-init` (`topic-bootstrap/add_scram_users.py`, not a super user). It is granted ALTER on the cluster only for
+  the length of the run: it asks the broker wrapper (request file on the secret-free `kafka-grant` volume),
+  provisions, then revokes its own ALTER, so a second `up` provisions again and the ACL list is empty
+  afterwards (W3-16). It
   shares the broker's network namespace to reach the loopback admin listener and reads each password
   from that component's own secret file. No password is ever a process argument (not in a container's
   `ps`, not in the host's), nor in a properties file, and the broker container never has them. The
@@ -117,6 +119,20 @@ or run a client as `docker compose exec mllp-receiver python -c '...'` for anyth
 not need its own image. This is the intended reachability model for the lite profile, not a
 workaround: see `docker-compose.yml`'s `mllp-receiver` comment.
 
+## Synthetic data only (ADR-004 C7, `topics/v0` 3.8 rule 4)
+
+This stack holds **synthetic data only**. It uses provider-default, unmanaged storage keys and tmpfs or local
+volumes. Without a customer-managed key, or on a host without full-disk encryption, never send real PHI
+through it. Real PHI needs the production custody rules (see the chart README). Host-published ports are bound to
+127.0.0.1, including ClickHouse (8123, 9000) and PostgreSQL (5432), but ClickHouse and PostgreSQL speak
+plaintext on the Compose network, so **this stack does not meet ADR-004 C1**. That is why it is synthetic-only
+(C7), not a deployment to copy. The broker sets `connections.max.reauth.ms=3600000`. Every ClickHouse client in this file connects as the
+`default` user without a password, which can ALTER, TRUNCATE and DROP `audit_log`; the lite stack has no
+INSERT-only archiver user. That is accepted only because the data is synthetic (C7). The production
+INSERT-only grants, the `insert_allow_materialized_columns = 0 CONST` settings profile the archiver requires,
+and their verification queries are in the chart README. This stack has no archiver service; a stack that runs
+the archiver must provision that user and profile itself.
+
 ## The lite-profile durability warning
 
 RF=1 / min.insync.replicas=1 is a human-approved, documented exception to invariant 1 (ADR-002 D14),
@@ -151,8 +167,13 @@ variable defaulting to a warning is not.
   read-only), not a copy baked into the image, so a contract change or the scheduled Linux
   re-measurement of `session.timeout.ms`/partition defaults reaches this stack without a rebuild —
   see the file's own `must_not_hardcode` block and `topic-bootstrap/bootstrap_topics.py`'s docstring.
-  `_tb.<env>.audit` and `<channel>.reply` are deliberately never created here; both reasons are in
-  that docstring. `worker`, `mllp-receiver` and `loader` mount the same file (via `TB_CONTRACTS_DIR`)
+  `_tb.<env>.audit` IS created (a 30 d buffer, ADR-004 R7; settings from `classes.audit`), so an events
+  archiver added to this stack, which consumes it by default (`TB_ARCHIVE_AUDIT_CONSUME`), finds it.
+  Compose has no archiver or API service today. `<channel>.reply` is deliberately never created here
+  (the demo channel is not sync-reply); the reason is in that docstring.
+  Order of work: create topics, grant ACLs, then re-apply `message.timestamp.type` (the only setting re-applied) to
+  events and audit topics that already existed. The alter runs last so a missing ALTER_CONFIGS grant cannot block ACL
+  reconciliation; a failed alter still makes the job exit non-zero. `worker`, `mllp-receiver` and `loader` mount the same file (via `TB_CONTRACTS_DIR`)
   for the same reason: `tributary-runtime`'s producer/consumer settings and
   `tributary-receivers`' Kafka producer config both read it rather than hardcode it.
 - **`channel-publish`'s record shape is a contract with `ChannelCache`, not just an implementation
@@ -175,3 +196,14 @@ variable defaulting to a warning is not.
   its output. `channel-spec-volume-init` exists only because Docker creates a new named volume owned
   by `root:root`, and every long-running container here is non-root (Phase 1 requirement 7) — it
   chowns the volume once, as root, and is the only thing in this file that runs as root.
+
+## RF=3 test cluster (W3-33a)
+
+`docker-compose.rf3.yml` adds `kafka-2` and `kafka-3` to make three KRaft nodes with RF=3 and
+`min.insync.replicas=2` (the `production` profile of `topic-defaults.json`), within about 3 GiB of broker memory:
+
+    docker compose -f deploy/compose/docker-compose.yml -f deploy/compose/docker-compose.rf3.yml \
+      up -d kafka kafka-2 kafka-3 kafka-users-init topic-bootstrap
+
+Host ports 19092 to 19094 (loopback). It proves RF=3 correctness, not absolute latency. CI runs it weekly and on
+demand (`.github/workflows/chaos-rf3.yml`).

@@ -1,0 +1,251 @@
+{
+  "topics": {
+    "events": {
+      "partitions": 24,
+      "replicas": 3,
+      "config": {
+        "cleanup.policy": "delete",
+        "retention.ms": "259200000",
+        "compression.type": "producer",
+        "min.insync.replicas": "2",
+        "unclean.leader.election.enable": "false",
+        "message.timestamp.type": "LogAppendTime"
+      }
+    },
+    "audit": {
+      "partitions": 6,
+      "replicas": 3,
+      "config": {
+        "cleanup.policy": "delete",
+        "retention.ms": "2592000000",
+        "compression.type": "producer",
+        "min.insync.replicas": "2",
+        "unclean.leader.election.enable": "false",
+        "message.timestamp.type": "LogAppendTime"
+      }
+    }
+  },
+  "generatedFrom": "contracts/topics/v0/topic-defaults.json",
+  "sourceSha256": "39df39bb94036e185e821893d8dd0b0e1e96f0537a68b8ad130309292df6aefb",
+  "lagReaderIsPlaceholder": false,
+  "placeholders": {
+    "env": "@ENV@",
+    "channel": "@CHANNEL@",
+    "destination": "@DEST@"
+  },
+  "roles": {
+    "receiver": [
+      {
+        "resourceType": "CLUSTER",
+        "name": "kafka-cluster",
+        "patternType": "LITERAL",
+        "operation": "IDEMPOTENT_WRITE"
+      },
+      {
+        "resourceType": "GROUP",
+        "name": "tb.@ENV@.@CHANNEL@.channels.",
+        "patternType": "PREFIXED",
+        "operation": "READ"
+      },
+      {
+        "resourceType": "GROUP",
+        "name": "tb.@ENV@.@CHANNEL@.replier",
+        "patternType": "LITERAL",
+        "operation": "READ",
+        "syncReplyOnly": true
+      },
+      {
+        "resourceType": "TOPIC",
+        "name": "@ENV@.@CHANNEL@.raw",
+        "patternType": "LITERAL",
+        "operation": "DESCRIBE"
+      },
+      {
+        "resourceType": "TOPIC",
+        "name": "@ENV@.@CHANNEL@.raw",
+        "patternType": "LITERAL",
+        "operation": "WRITE"
+      },
+      {
+        "resourceType": "TOPIC",
+        "name": "@ENV@.@CHANNEL@.reply",
+        "patternType": "LITERAL",
+        "operation": "READ",
+        "syncReplyOnly": true
+      },
+      {
+        "resourceType": "TOPIC",
+        "name": "_tb.@ENV@.channels",
+        "patternType": "LITERAL",
+        "operation": "READ"
+      }
+    ],
+    "worker": [
+      {
+        "resourceType": "GROUP",
+        "name": "tb.@ENV@.@CHANNEL@.channels.",
+        "patternType": "PREFIXED",
+        "operation": "READ"
+      },
+      {
+        "resourceType": "GROUP",
+        "name": "tb.@ENV@.@CHANNEL@.pipeline",
+        "patternType": "LITERAL",
+        "operation": "READ"
+      },
+      {
+        "resourceType": "GROUP",
+        "name": "tb.@ENV@.@CHANNEL@.pipeline.shadow-",
+        "patternType": "PREFIXED",
+        "operation": "READ"
+      },
+      {
+        "resourceType": "TOPIC",
+        "name": "@ENV@.@CHANNEL@.dlq",
+        "patternType": "LITERAL",
+        "operation": "WRITE"
+      },
+      {
+        "resourceType": "TOPIC",
+        "name": "@ENV@.@CHANNEL@.out.",
+        "patternType": "PREFIXED",
+        "operation": "WRITE"
+      },
+      {
+        "resourceType": "TOPIC",
+        "name": "@ENV@.@CHANNEL@.raw",
+        "patternType": "LITERAL",
+        "operation": "READ"
+      },
+      {
+        "resourceType": "TOPIC",
+        "name": "@ENV@.@CHANNEL@.reply",
+        "patternType": "LITERAL",
+        "operation": "WRITE",
+        "syncReplyOnly": true
+      },
+      {
+        "resourceType": "TOPIC",
+        "name": "_tb.@ENV@.channels",
+        "patternType": "LITERAL",
+        "operation": "READ"
+      },
+      {
+        "resourceType": "TOPIC",
+        "name": "_tb.@ENV@.events",
+        "patternType": "LITERAL",
+        "operation": "WRITE"
+      }
+    ],
+    "loader": [
+      {
+        "resourceType": "GROUP",
+        "name": "tb.@ENV@.@CHANNEL@.channels.",
+        "patternType": "PREFIXED",
+        "operation": "READ"
+      },
+      {
+        "resourceType": "GROUP",
+        "name": "tb.@ENV@.@CHANNEL@.loader.@DEST@",
+        "patternType": "LITERAL",
+        "operation": "READ"
+      },
+      {
+        "resourceType": "TOPIC",
+        "name": "@ENV@.@CHANNEL@.dlq",
+        "patternType": "LITERAL",
+        "operation": "WRITE"
+      },
+      {
+        "resourceType": "TOPIC",
+        "name": "@ENV@.@CHANNEL@.out.@DEST@",
+        "patternType": "LITERAL",
+        "operation": "READ"
+      },
+      {
+        "resourceType": "TOPIC",
+        "name": "_tb.@ENV@.channels",
+        "patternType": "LITERAL",
+        "operation": "READ"
+      },
+      {
+        "resourceType": "TOPIC",
+        "name": "_tb.@ENV@.events",
+        "patternType": "LITERAL",
+        "operation": "WRITE"
+      }
+    ],
+    "archiver": [
+      {
+        "resourceType": "GROUP",
+        "name": "tb.@ENV@.archiver",
+        "patternType": "LITERAL",
+        "operation": "READ"
+      },
+      {
+        "resourceType": "TOPIC",
+        "name": "_tb.@ENV@.audit",
+        "patternType": "LITERAL",
+        "operation": "READ"
+      },
+      {
+        "resourceType": "TOPIC",
+        "name": "_tb.@ENV@.events",
+        "patternType": "LITERAL",
+        "operation": "READ"
+      }
+    ],
+    "api": [
+      {
+        "resourceType": "CLUSTER",
+        "name": "kafka-cluster",
+        "patternType": "LITERAL",
+        "operation": "IDEMPOTENT_WRITE"
+      },
+      {
+        "resourceType": "GROUP",
+        "name": "tb.@ENV@.reconciler",
+        "patternType": "LITERAL",
+        "operation": "DESCRIBE"
+      },
+      {
+        "resourceType": "TOPIC",
+        "name": "_tb.@ENV@.audit",
+        "patternType": "LITERAL",
+        "operation": "WRITE"
+      },
+      {
+        "resourceType": "TOPIC",
+        "name": "_tb.@ENV@.channels",
+        "patternType": "LITERAL",
+        "operation": "READ"
+      },
+      {
+        "resourceType": "TOPIC",
+        "name": "_tb.@ENV@.channels",
+        "patternType": "LITERAL",
+        "operation": "WRITE"
+      }
+    ],
+    "lag_reader": [
+      {
+        "resourceType": "GROUP",
+        "name": "tb.@ENV@.",
+        "patternType": "PREFIXED",
+        "operation": "DESCRIBE"
+      },
+      {
+        "resourceType": "TOPIC",
+        "name": "@ENV@.",
+        "patternType": "PREFIXED",
+        "operation": "DESCRIBE"
+      },
+      {
+        "resourceType": "TOPIC",
+        "name": "_tb.@ENV@.events",
+        "patternType": "LITERAL",
+        "operation": "DESCRIBE"
+      }
+    ]
+  }
+}

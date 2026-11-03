@@ -14,28 +14,9 @@ from __future__ import annotations
 
 import ipaddress
 
+from tributary.runtime.ops import is_loopback as is_loopback
+
 from .errors import BindError
-
-#: Exact literals the channel-spec `bindAddress` pattern also accepts spelled as words, not IP
-#: literals. `"::"` (the IPv6 wildcard) is deliberately absent: it is not loopback.
-_LOOPBACK_WORDS = frozenset({"localhost"})
-
-
-def is_loopback(bind: str) -> bool:
-    """True for `127.0.0.1`, any other `127.0.0.0/8` literal, `::1`, or the word `localhost`.
-
-    `localhost` is trusted here without a DNS lookup: resolving a name at bind-rule-check time would
-    let a poisoned or multi-homed resolver turn a loopback-looking config into a wildcard bind, which
-    is the exact hole this rule closes. The channel-spec `bindAddress` pattern accepts the word
-    itself for the same reason `asyncio.start_server` does: the OS resolves it to the loopback
-    interface at bind time, not before.
-    """
-    if bind in _LOOPBACK_WORDS:
-        return True
-    try:
-        return ipaddress.ip_address(bind).is_loopback
-    except ValueError:
-        return False
 
 
 def require_safe_bind(bind: str, *, tls_configured: bool) -> None:

@@ -3,7 +3,329 @@
 Newest first. Each entry names the contract, the version, whether the change is additive or
 breaking, and the reason. Breaking changes reference an ADR.
 
-## 2026-10-06 (latest) — contract set 1.8, W3-3 rulings (README only)
+## 2026-10-14 — set 1.8: `LogAppendTime` on `_tb.<env>.events` and `_tb.<env>.audit`
+
+**Topic configuration change, additive in the contract sense; no schema or example change, counts
+unchanged. No invariant changes.**
+
+- **`topic-defaults.json`:** `classes.events.configs` and `classes.audit.configs` gain
+  `"message.timestamp.type": "LogAppendTime"`, plus `classes.events.timestamp_note`. `raw`, `out`,
+  `dlq`, `reply` and `channels` are unchanged (CreateTime).
+- **README 2.3:** the readers of Kafka timestamps were checked. Only the archiver's window anchor and
+  ingest-lag metric read these topics; replay and `offsetsForTimes` read `raw`.
+- **DevOps:** regenerate `acls.json` (`gen_acls.py` renders the audit topic config). Bootstrap creates
+  new topics with the setting, but **existing** `_tb.<env>.events` and `_tb.<env>.audit` need an
+  incremental config alter in Compose bootstrap (re-run safe) and in the Strimzi `KafkaTopic` render.
+  Check that `test_bootstrap_topics.py` and `helm_check.py` still pass.
+
+## 2026-10-13 (sent attempt) — set 1.8: `attempt` numbering on loader stages (README only)
+
+- **`events/v0` 2 field table:** on loader delivery stages, `attempt` is the 1-based number of the
+  delivery try; `sent` after k failures is k+1, matching `ConsumerLoop`'s `retrying` numbering. This
+  confirms 7574d38. It is not `tb-attempt`, which stays `0` under a blocking retry. Counts unchanged.
+  **Corrected the same day (code review of f7ef2c0):** "a restart can only repeat a key" was false.
+  A success on try k > 1 followed by a crash before the commit re-emits `sent` with attempt 1, a new
+  key. That rare over-count is now stated and accepted. Per-stage definition: `routed` and other
+  worker stages use the 0-based `tb-attempt`; `retrying`, `error`, `dlq` and `sent` use the 1-based
+  try. `stage` is in the key, so keys cannot collide across stages.
+
+## 2026-10-13 (W3-30 part 2) — set 1.8: `tb_archiver_audit_records_total`
+
+**Additive: one registered metric and no new label name. No example change; counts predicted
+unchanged (246 / 0, 154 / 0).**
+
+- **`metrics.json`:** counter `tb_archiver_audit_records_total{outcome}` with outcomes `written`,
+  `invalid` and `unsupported_version`, emitted by the archiver. It mirrors `tb_archiver_events_total`.
+  It replaces the two names proposed (`audit_rejected`, `audit_unsupported_version`) with one counter
+  and an outcome label, the existing convention.
+- **README 3.5:** two paging alerts, on any 15 min increase of `invalid` and of `unsupported_version`
+  (`devops-engineer`). `audit/v0` README 4 names the counter.
+- `archive-engineer` registers it in `ArchiverExposition` (416b4a0 follow-up).
+
+## 2026-10-13 (audit writer) — set 1.8: `audit/v0` consumer is lenient (README only)
+
+- **`audit/v0` README 4:** the archiver ignores unknown top-level fields and stores the known ones. It
+  rejects a record that is not a JSON object, has a known field missing or invalid, or has `v` other
+  than 0 (counted as `unsupported_version` and committed past; amended the same day on the
+  coordinator's proposal). A `v` bump needs an ADR, with the reading archiver shipped first. This resolves the conflict with the schema's own description ("consumers ignore unknown
+  fields") and `contracts/README.md` ("lenient consumers"); the old "fails the schema is not stored"
+  would have lost records on every additive change. `archive-engineer` adjusts 29316c8's writer.
+  Counts unchanged.
+
+## 2026-10-13 (exit review) — set 1.8: `ts` of the `received` event (README only)
+
+- **`events/v0` 2.1:** `received.ts` = `tb-received-at` of the consumed record; for a re-injected
+  record (`tb-parent-id` present), the worker's consume time instead; `queued` = consume time. Reason:
+  the stage records when the receiver committed the message, not when the worker reached it, and the
+  copied `tb-received-at` of a re-injection would date a new message's first event in the past.
+  Counts unchanged. Build: `platform-engineer`.
+
+## 2026-10-13 (latest) — set 1.8: emitter of `received` and `queued` (README only)
+
+**Documentation only; no schema or example change, counts unchanged.**
+
+- **`events/v0` 2.1:** the pipeline worker emits `received` and `queued` when it consumes the `raw`
+  record, with that record's topic, partition and offset. Receivers hold no events WRITE grant and
+  add no produce to the ACK path. The previous text named no emitter (W3-9b found no `received`
+  events). Build: `platform-engineer`.
+- **`openapi/v0` README 6:** replay cancel is deferred to wave 4 (also `wave-3.md` section 6).
+
+## 2026-10-13 (later) — set 1.8: `openapi/v0` 0.2.3, `reset` reason `backlog_too_dense`
+
+**Additive** (one enum value in `StreamNotice.reason`; no example change, counts unchanged). It is sent
+when a stream window cannot be read completely after 10 halvings. Reusing `cursor_expired` would have
+told the client its resume point was too old when the real cause was density. Both mean "a gap was
+skipped, fill it with search". README 3.16 updated. `control-plane-engineer` switches the string.
+
+## 2026-10-13 — set 1.8: `openapi/v0` 0.2.2, W3-6 rulings
+
+**Additive.** `getMessageContent` gains a declared `422` (`Unprocessable`, `REQUEST_INVALID`) for a
+destination with `stage=received` or none with `stage=routed`; `400` stays for malformed values. +1
+valid example, `response-problem-content-stage-destination.json`. **Predicted:** `validate.py`
+**246 / 0** (245 + 1); `--check-expectations` unchanged at **154 / 0**.
+
+- **README 3.12:** `CONTENT_STORAGE_OFF` comes from an `archive_settings` content flag that the migrate
+  step writes (`archive-engineer`). Table absence is an interim stand-in only; "enabled" with no table
+  answers `503 ARCHIVE_UNAVAILABLE`.
+- **Archive SQL ownership:** stats and the content read move into the `tributary-archiver` query
+  library (`archive-engineer`) before the wave 3 gate; W3-6 may merge first with pinned SQL.
+
+## 2026-10-12 (W3-24) — set 1.8: `clients.worker_producer` with `linger.ms` 0
+
+**Additive: a new client profile; no role string, schema or example change. Counts unchanged.**
+
+- **`topic-defaults.json` `clients.worker_producer`** and **`topics/v0` README 3.2.1:** the
+  `receiver_producer` profile with `linger.ms` 0, for the worker's `out`, `dlq` and `reply` produces.
+  Estimated ~5 ms off the sync-reply p50 (W3-24 measurement). Accepted on the condition of a worker
+  throughput comparison before and after. The receiver keeps 5.
+- **Rejected for now:** a per-stage latency histogram in `observability/v0`. The tail is host
+  scheduling, not a stage; `tb_ack_latency_seconds` and `tb_stage_duration_seconds` already give the
+  sender-visible and per-stage numbers; the stage-timing flag stays a diagnostic. Revisit if a stage,
+  rather than the host, is ever shown to own the tail.
+- **Build:** `platform-engineer` (runtime `config.py` reads the block into a worker producer profile;
+  the worker uses it; the effective-config test pins it; plus the throughput comparison).
+
+## 2026-10-12 (W3-23, W3-37a) — set 1.8: grant notes and the API TLS cipher pin (description only)
+
+- **`topic-defaults.json`:** in `lag_reader_note` and `api_note`, "UNVERIFIED until a W3-23-style test" is
+  replaced by a pointer to `qa-engineer`'s deny-by-default test
+  (`tests/integration/test_platform_roles_deny_by_default_acls.py`, coordinator-relayed). No role string
+  changes.
+- **ADR-004 C1a amended:** the API's TLS 1.2 suites are restricted to `ECDHE+AESGCM:ECDHE+CHACHA20`, the
+  `engine-kafka/v0` pin. Counts unchanged.
+
+## 2026-10-12 (W3-32 gap) — set 1.8: `openapi/v0` 0.2.1, `503` on audited part 1 operations
+
+**Additive.** An operation gains a declared response; no previously valid document becomes invalid.
+
+- **`openapi.json` 0.2.0 → 0.2.1:** `503` (`ServiceUnavailable`, code `AUDIT_UNAVAILABLE`) declared on
+  `createChannel`, `createChannelVersion`, `deployChannelVersion`, `rollbackChannel` and
+  `undeployChannel`. Since W3-32 their audit `requested` record fails closed (`audit/v0` 3 rule 1). The
+  code was already in the closed `Problem` list.
+- **Example:** +1 valid, `response-problem-audit-unavailable.json`. **Predicted:** `validate.py`
+  **245 / 0**; `--check-expectations` unchanged at **154 invalid / 0 drifted**.
+- **`observability/v0` L6a** also names `API_TLS_INVALID` and `AUDIT_HOME_ENV_UNKNOWN` (not registered);
+  `audit/v0` 2 names the latter.
+
+## 2026-10-12 (rulings) — set 1.8: audit home environment, W3-19 clarifications (README only)
+
+**Documentation only. No schema, example or code-registry change; counts unchanged. No invariant
+changes.**
+
+- **`audit/v0` 2:** `channel.version.create` goes to the audit home environment `TB_AUDIT_HOME_ENV`.
+  It defaults only when one environment is managed; otherwise startup is refused with
+  `AUDIT_HOME_ENV_REQUIRED` (named in `observability/v0` L6a, not registered). Rejected: every
+  environment, and the environment from the request.
+- **`channel-spec/v0` 3.2.6 (W3-19):**
+  - `tb-msg-id` and `Tb-Msg-Id` are present exactly when a `raw` publish was attempted, so they are
+    absent on `REPLY_BUSY` and `REPLY_UNAVAILABLE`.
+  - `Tb-Reply-Code` may be absent on a fail-safe `202`. The table wins, and `AE` is identified by the
+    body `status`, so the "never uncoded" sentence was removed.
+  - A `raw` delivery timeout answers `PRODUCE_TIMEOUT`, not `PRODUCE_FAILED`. The receiver currently
+    reports `PRODUCE_FAILED` (`connector-engineer`, coordinator-relayed), so this is a code fix.
+
+## 2026-10-12 (final) — set 1.8: `API_TLS_REQUIRED` named (README only)
+
+- **`observability/v0` L6a** names `API_TLS_REQUIRED`, the API's startup refusal for plaintext on a
+  non-loopback bind (ADR-004 C1a, ruled 2026-10-12). It is not registered; counts are unchanged.
+
+## 2026-10-12 (newest) — set 1.8: `api` Kafka role and the `tb.<env>.reconciler` group
+
+**Additive: a new role string, a new platform group, and one more alternative in the
+`consumerGroup` pattern. No example, manifest or pinned pair changes, so `validate.py` is predicted
+unchanged (244 / 0; 154 invalid / 0 drifted). No invariant changes.**
+
+- **`topic-defaults.json` `security.acls.api`:** `READ, WRITE on _tb.<env>.channels; WRITE on
+  _tb.<env>.audit; IDEMPOTENT_WRITE on the cluster; DESCRIBE on group tb.<env>.reconciler`, with
+  `api_note`. All LITERAL. Each grant was checked against `packages/tributary-api` (publisher,
+  reconciler, audit; read, not run). The reconciler reads only `_tb.<env>.channels` and never commits.
+  No cluster DESCRIBE, no READ on audit or events. `control_plane` is unchanged (lite Compose
+  one-shot).
+- **`consumer_groups.platform_groups.reconciler`** and **`topic-name.schema.json` `consumerGroup`**
+  `(archiver|reprocessor|reconciler)`; README 3.4.1 row and paragraph; 3.6 line.
+- **Coordinated changes:**
+  - `devops-engineer`: regenerate `acls.json`, and add `api` to `gen_acls.py` `ROLES` (it renders only
+    the roles it lists).
+  - `control-plane-engineer`: reconciler `group.id` `tb-api-reconciler` → `tb.<env>.reconciler`
+    (`main.py:63`).
+  - `platform-engineer`: add `"reconciler"` to `topics.PlatformGroup` in the same push, or
+    `test_roles_and_platform_groups_match_the_contract` goes red.
+  - `qa-engineer`: a deny-by-default test for the API under exactly this role.
+
+## 2026-10-12 (latest) — set 1.8: HTTP synchronous reply mapping ruled (W3-19; README only)
+
+**Additive, documentation only. No schema, example, manifest, header or error-code change, so
+`validate.py` is predicted unchanged (244 / 0; 154 invalid / 0 drifted). No invariant changes; the
+ruling checks invariant 1.**
+
+- **`channel-spec/v0` 3.2.6:** the set 1.2 placeholder "HTTP mapping: not fixed" is replaced by the
+  normative HTTP table. `200` = `AA`; coded `202` (`Tb-Reply-Code` and a JSON body) for every `AE`;
+  `503` + `Retry-After` for every `AR`; pre-publish errors unchanged. The response shape, the
+  invariant 1 check and the pending-map bounds are written into the section. Rulings: `202` not `409`
+  for `Reject`; `Idempotency-Key` ignored (no dedupe, never logged or echoed); `body: step` deferred for
+  `http` and refused at startup.
+- **3.2.2** `http` row points to 3.2.6 for sync mode. The **3.0** status row says the mapping is ruled,
+  the build is pending, and the refusal stays until it lands. The proposal also cited the 3.2.8
+  `nackOn` table; it is unrelated to `reply` and unchanged.
+- **Follow-ups:** `connector-engineer` builds and removes the startup refusal for `body: ack` only. When
+  it lands, the architect updates the `REPLY_*` emitter strings in `error-codes.json` (descriptions
+  only; `test_codes_contract.py` compares codes, so it is unaffected).
+
+## 2026-10-12 (later) — set 1.8: W3-29 items 2 and 3, the instance rule (README only)
+
+**Additive, documentation only. No schema, example or manifest change, so `validate.py` counts and
+pinned pairs are predicted unchanged (244 / 0; 154 invalid / 0 drifted). No invariant changes.**
+
+- **`topics/v0` 3.3, rules 1-6:** worker, loader and archiver require `--instance-id` or
+  `TB_INSTANCE_ID` (flag wins, no default) and use it verbatim as `group.instance.id`; grammar
+  `^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$`; unique per replica (pod name). Receivers keep `--instance`
+  (two spellings, `wave-3.md` 2.5 H2). The rule applies to any process whose id becomes a
+  `group.instance.id`. That covers the `kafka` source receiver, which still defaults to `kafka-0`
+  (gap, sent to `connector-engineer`). The text matches what `tributary-runtime` `startup.py` and the
+  loaders' `startup.py` already do (read, not run).
+- **`observability/v0` L6a:** `INSTANCE_REQUIRED`, `ARGUMENTS_INVALID` and `RETENTION_DECREASE_REFUSED`
+  are named as `startup_refused` codes. They are still **not registered**: no `error-codes.json` change,
+  so `test_codes_contract.py` is unaffected. Section 6 updated.
+- `topic-defaults.json` is deliberately untouched (no `acls.json` regeneration).
+
+## 2026-10-12 — set 1.8: `audit_log` tamper-check metrics (`observability/v0` 3.4)
+
+**Additive. No example, manifest or pinned pair changes, so `validate.py` is predicted unchanged at
+244 / 0 and 154 invalid / 0 drifted (the registry file itself is checked; not run by the architect).**
+
+- **`metrics.json`:** new gauges `tb_audit_tamper_suspect_ids{environment}` and
+  `tb_audit_tamper_check_timestamp_seconds{environment}`, emitter `api`. New label `environment`
+  (`^[a-z][a-z0-9-]{0,15}$`). **`metrics.schema.json` `labelName`** gains `environment` (a closed list
+  that grows by one name; nothing previously valid becomes invalid).
+- **README 3.4:** the API runs the check periodically (`TB_AUDIT_TAMPER_CHECK_INTERVAL_S`, default 900),
+  never inside a scrape (O6). The query excludes provenance columns, and a failed check leaves the
+  timestamp stale. Alert expressions are given. Rejected: the archiver as emitter (INSERT-only, and it
+  is the writer being checked).
+- **Coordinated changes:** `control-plane-engineer` registers both gauges in the API's registry in the
+  same push (a two-way registry test goes red otherwise) and builds the task. `devops-engineer` adds
+  the two alerts. `archive-engineer`: no metric change; `audit_log` stays plain `MergeTree` (ADR-004 R7
+  rev 3).
+
+## 2026-10-06 (newest, after W3-1b) — set 1.8: `tb-` channel names reserved (ADR-010), `audit_log` engine, HTTP code ruling
+
+- **`channel-spec/v0` `metadata.name` → `^(?!tb-)[a-z][a-z0-9-]{0,63}$` (ADR-010). NON-ADDITIVE:** a
+  spec named `tb-*` is now refused. It is the one recorded exception to "1.x is additive". Grep shows no
+  such channel anywhere, and nothing is released. Reason: the archiver labels its metrics
+  `channel="tb-archiver"`, and the label grammar equals the channel grammar. The header, topic and
+  metric-label grammars are unchanged. README 3 name row updated. New invalid example
+  `channel-name-reserved-prefix.json`, pinned `$.metadata.name` / `pattern` (predicted).
+- **`audit/v0` README 4 and ADR-004 R7 rev 3:** `audit_log` is plain `MergeTree` with query-time dedup
+  on `audit_id` (earliest copy kept) and a tamper-signal count. Under `ReplacingMergeTree` an INSERT-only
+  user could overwrite a row (security review). Documentation; no schema or example change.
+- **`envelope/v0` README 2.3.2 ruling:** `HTTP_<status>` is the exact status. `HTTP_4XX` and `HTTP_5XX`
+  are not registered; the http loader emits `HTTP_404`, `HTTP_503` and so on (`HTTP_429` already
+  conforms). `error-codes.json` is unchanged, so `test_codes_contract.py` is unaffected.
+- **Predicted totals with W3-1b:** `validate.py` **244 / 0**; `--check-expectations` **154 invalid, 0
+  drifted**.
+
+## 2026-10-06 (newest) — contract set 1.8 part 2 (W3-1b): `openapi/v0` part 2, `audit/v0` (new)
+
+**Additive. No previously valid document becomes invalid and no existing pinned pair moves. No
+invariant changes.** `openapi.json` `info.version` 0.1.0 → 0.2.0.
+
+- **`openapi/v0` part 2** (README 1.1, 3.9-3.17, 4.1), all under
+  `/v1/environments/{env}/channels/{channel}/`: `POST messages/search`, `GET messages/{id}` (timeline,
+  destination statuses, content index; exit criterion 1), `GET messages/{id}/content` (PHI),
+  `POST messages/{id}/reprocess` (PHI, synchronous), `POST/GET replays`, `GET replays/{id}` (PHI on
+  POST; `202` plus a resource), `GET stats`; env-level `GET events` (SSE, archive-tailed) and
+  `GET retention` (read-only, ADR-004 R3). Semantics follow the W3-3 library: channel required,
+  `allow_reorder`, source-channel-only replay (no target field), refusal codes kept by name (4.1).
+- **`x-tributary-phi-content: true`** on content, reprocess and replay POST; roles `operator`, `admin`
+  only (ADR-009 D14). **`x-tributary-audit-action`** on those and on part 1's create, deploy,
+  rollback and undeploy (additive extension).
+- **Problem codes** +21 (closed list grows; no code removed). `Problem.republished` (optional).
+- **Rollback wording (3.3):** the default target is the most recently published version that differs
+  from the current one, so repeated default rollbacks alternate; `RollbackRequest.to_version`
+  description and the `request-rollback` manifest note follow. Wording only.
+- **Reprocess id layout pinned** (3.13), as the W3-3 entry below promised.
+- **`audit/v0` (new):** `audit-event.schema.json`, seven actions, fail-closed `requested`, one record
+  per content view, `allow_reorder` on every reprocess and replay `requested`; `audit_log` row shape,
+  dedup key and TTL (README 4). `validate.py` `FILE_CONTRACTS` gains `audit`.
+- **`topics/v0` 3.4.1 and `topic-defaults.json`:** `archiver` = `READ on _tb.<env>.events,
+  _tb.<env>.audit; READ on group tb.<env>.archiver` (ADR-004 R7), plus `archiver_audit_note`. **3.1:**
+  lite wording now points at 3.8 rules 2 and 4. `events/v0` 6 pointer updated.
+- **ADR-008 D5** reasoning restated to match `topics/v0` 3.8 and ADR-004 C7; decision unchanged.
+- **Examples:** `openapi/v0` +13 valid, +7 invalid; `audit/v0` 5 valid, 5 invalid. **VERIFIED
+  2026-10-12 (coordinator's run, including ADR-010's example):** `validate.py` **244 passed / 0 failed**;
+  `--check-expectations` **154 invalid / 0 drifted**. Code review approved W3-1b.
+- **Coordinated changes requested:** `devops-engineer` regenerates `deploy/helm/tributary/files/acls.json`
+  (`gen_acls.py` pins its SHA-256); `qa-engineer` adds `audit` to `tests/conformance` with
+  `AUDIT_PHI_GUARDS` (1) and grows `OPENAPI_PHI_GUARDS` to 6; `archive-engineer` adds
+  `AuditEvent.error_code` on `failed` and widens `ACTOR` to the `Subject` grammar (`audit/v0` 3.1).
+
+## 2026-10-06 (latest) — contract set 1.8: `reprocessor` and `lag_reader` roles (W3-29 items 1 and 4)
+
+**Additive. No example or manifest change, so `validate.py` counts and pinned pairs are unchanged
+(predicted). No invariant changes.**
+
+- **`topic-defaults.json` `security.acls`:** new `reprocessor` = `READ, WRITE, DESCRIBE on
+  <env>.<channel>.raw; IDEMPOTENT_WRITE on the cluster; DESCRIBE on group tb.<env>.reprocessor`.
+  New `lag_reader` = `DESCRIBE on <env>.*, _tb.<env>.events; DESCRIBE on group tb.<env>.*` (the same
+  string as `deploy/helm/gen_acls.py`'s placeholder). Each has a `_note`. Both parse under the set 1.4
+  grammar (`bootstrap_topics.py parse_grants`); read, not run.
+- **`consumer_groups.platform_groups`:** adds `reprocessor: tb.<env>.reprocessor`.
+- **`topic-name.schema.json` `$defs.consumerGroup`:** the platform branch becomes
+  `(archiver|reprocessor)`. Additive: it accepts one more name.
+- **README 3.4.1:** two table rows and a paragraph; **3.6:** the group line.
+- Evidence for the group DESCRIBE: `archive-engineer` measured on a deny-by-default broker that
+  assign-only still needs a `group.id` and FindCoordinator (lead-relayed). Lead's ruling recorded:
+  replay targets only its source channel; "shadow" keeps its 3.6 meaning; per-key replay needs an
+  audited `allow_reorder`.
+- **Coordinated code change:** `tributary-runtime` `test_roles_and_platform_groups_match_the_contract`
+  compares `platform_groups` with `topics.PlatformGroup`. `platform-engineer` adds `"reprocessor"` to
+  that `Literal` in the same push, or the test goes red. `deploy/helm/tributary/files/acls.json`
+  needs regenerating (`gen_acls.py` pins the file's SHA-256).
+
+## 2026-10-06 (later) — contract set 1.8: retention is an operator setting (README and description only)
+
+**Additive, documentation only. No schema, example or manifest change; `validate.py` counts and
+pinned pairs unchanged. No invariant changes.** The human's answer to wave-3 7.2 / ADR-004 H4, relayed
+by the lead, verbatim: *"Give the user a possibility to change it"*.
+
+- **`topics/v0` 2.1 rewritten as decided.** Audit records are kept in ClickHouse `audit_log`,
+  retention `TB_ARCHIVE_AUDIT_TTL_DAYS` (default 2190 d, range 1-36500). `_tb.<env>.audit` stays a
+  30 d transport buffer, and its `retention.ms` is unchanged. Status line, defaults table row and
+  open-items bullet updated.
+- **`topic-defaults.json` `classes.audit`:** the description key `retention_open_question` is
+  replaced by `retention_note` (no code reads it, by grep; only a docstring in
+  `deploy/compose/topic-bootstrap/bootstrap_topics.py` names it, and W3-31 updates that). No
+  config value changes.
+- **`events/v0` 4.1 rule 4:** archived-event retention is an operator setting (`TB_ARCHIVE_TTL_DAYS`,
+  default 90), applied by the migrate step with a decrease guard. Section 6 bullet updated.
+- **`contracts/README.md`:** the audit-events contract is no longer blocked. Its shape lands with
+  W3-1b (set 1.8 part 2), which also adds the events-archiver READ LITERAL `_tb.<env>.audit` grant
+  and a read-only retention `GET` (ADR-004 R3, R7).
+- Rejected: a retention write endpoint in the API, which would need the ClickHouse DDL credential
+  (ADR-004 A5). **Give up:** a retention change needs a redeploy.
+- **`topics/v0` 3.8 rule 4 (ADR-004 C7):** `lite` without a customer-managed key or full-disk
+  encryption holds synthetic data only. Documentation rule; `profiles.lite.warning` is unchanged.
+
+## 2026-10-06 — contract set 1.8, W3-3 rulings (README only)
 
 **Additive, documentation only. No schema, example or manifest change; `validate.py` counts and
 pinned pairs unchanged from set 1.8 part 1. No invariant changes.**

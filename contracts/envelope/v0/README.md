@@ -320,6 +320,16 @@ The numeric families (`HTTP_<status>`, `SFTP_<status>`, `CH_<code>`) and `PG_<cl
 Behaviour of `Reject` does not change: every new name was already under a reserved prefix. Only the
 cross-check test moves, so `ENGINE_CODES` gains all seventeen in the same commit.
 
+**Set 1.8 ruling (2026-10-06): `HTTP_<status>` means the exact three-digit status.** The http loader
+exported its internal reasons `http-4xx` and `http-5xx` as `HTTP_4XX` and `HTTP_5XX`. Those are class
+buckets, not statuses, so they are fixed names, which rule 2 would require registering. **They are not
+registered.** The loader maps a refused response to the family member for the status it received
+(`HTTP_404`, `HTTP_429`, `HTTP_503`), as the fhir loader already does, and a 3xx to
+`HTTP_REDIRECT_REFUSED`. **Rejected:** registering the buckets, which would give one failure two
+spellings across the http and fhir loaders and drop the status an operator needs. **Give up:** an
+alert on "any 5xx" matches `HTTP_5..` instead of one fixed name. The `code` label on
+`tb_deliveries_total` stays bounded, because statuses are 100-599.
+
 **Set 1.4 (2026-09-29): `REPLY_EXPIRED`.** The worker skips a reply that is past `tb-reply-deadline`
 plus the 5 s skew allowance (channel-spec README 3.2.6). Its `replied` event keeps `status: dropped`,
 because the skip is deliberate and must not count toward error-rate alerts. It now also carries

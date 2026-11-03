@@ -1,0 +1,15 @@
+{
+  "v": 0,
+  "audit_id": "0192f3f0-0002-7abc-8def-0123456789ab",
+  "ts": "2026-10-06T09:36:00.000Z",
+  "environment": "prod",
+  "action": "message.reprocess",
+  "phase": "requested",
+  "actor": "synth-admin-0001",
+  "actor_roles": ["admin", "operator"],
+  "request_id": "0192f3f0-0003-7abc-8def-0123456789ab",
+  "operation_id": "0192f3c1-0000-7abc-9def-0123456789ab",
+  "channel": "adt-fanout",
+  "message_id": "0192f3b0-1a2b-7c3d-8e4f-0123456789ab",
+  "allow_reorder": false
+}

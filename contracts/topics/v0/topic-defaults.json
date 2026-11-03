@@ -136,18 +136,21 @@
         "retention.ms": 259200000,
         "compression.type": "producer",
         "min.insync.replicas": 2,
-        "unclean.leader.election.enable": "false"
-      }
+        "unclean.leader.election.enable": "false",
+        "message.timestamp.type": "LogAppendTime"
+      },
+      "timestamp_note": "Set 1.8 (2026-10-14, security review of dbccffb): the broker stamps records, so the archiver's ts-window anchor and ingest-lag metric do not trust a producer clock. The event's own ts field (the value) is unchanged and remains the event time. raw keeps CreateTime: replay windows are defined on it. _tb.<env>.audit has the same setting. README 2.3."
     },
     "audit": {
       "partitions": 6,
-      "retention_open_question": "TODO(human): 30 days is an engineering default, not a compliance decision. A six-year retention duty may apply to an audit trail (HIPAA 164.316(b)(2)(i)); if it does, the system of record is probably ClickHouse or object storage with Kafka as a buffer, not a larger retention.ms. Unverified, no legal review. See README.md section 2.1.",
+      "retention_note": "Decided 2026-10-06 (set 1.8; README 2.1; ADR-004 R2, R6, R7): this topic is a 30-day transport buffer, not the system of record. Audit records are kept in the ClickHouse audit_log table, with retention set by the operator through TB_ARCHIVE_AUDIT_TTL_DAYS (default 2190 days, range 1-36500), applied by the archiver migrate step. The default is conservative, not a compliance determination. Bootstrap creates this topic.",
       "configs": {
         "cleanup.policy": "delete",
         "retention.ms": 2592000000,
         "compression.type": "producer",
         "min.insync.replicas": 2,
-        "unclean.leader.election.enable": "false"
+        "unclean.leader.election.enable": "false",
+        "message.timestamp.type": "LogAppendTime"
       }
     }
   },
@@ -196,9 +199,16 @@
       "pipeline_worker_transactional": "Set 1.4. Only for a channel with pipeline.transactional true, in addition to pipeline_worker: WRITE on the TRANSACTIONAL_ID resource PREFIXED tb.<env>.<channel>.pipeline. (the clients.transactional_stage_producer transactional.id template). Kept out of the pipeline_worker string because the lite parser has no transactional-id target and the demo channel is not transactional; without the grant the worker fails at init_transactions with TRANSACTIONAL_ID_AUTHORIZATION_FAILED, before consuming (fail closed).",
       "loader": "READ on <env>.<channel>.out.<dest>; WRITE on <env>.<channel>.dlq; WRITE on _tb.<env>.events; READ on _tb.<env>.channels; READ on group tb.<env>.<channel>.loader.<dest>; READ on group tb.<env>.<channel>.channels.*",
       "loader_retry_topic": "Set 1.4, NOT GRANTED in v0: retry.policy retry-topic is refused by the schema and no code reads or writes <env>.<channel>.retry. When it lifts (channel-spec README 4.1.1), the loader gains READ, WRITE on <env>.<channel>.retry and consumes it in its OWN destination group tb.<env>.<channel>.loader.<dest>, filtering on tb-destination. A channel-wide retry group is forbidden: topics README 3.4.1.",
-      "archiver": "READ on _tb.<env>.events; READ on group tb.<env>.archiver",
+      "archiver": "READ on _tb.<env>.events, _tb.<env>.audit; READ on group tb.<env>.archiver",
+      "archiver_audit_note": "Set 1.8 part 2 (W3-1b; ADR-004 R7): the events archiver also consumes _tb.<env>.audit into ClickHouse audit_log (contracts/audit/v0), LITERAL, in the same group. No WRITE: the archiver can never forge an audit record. Takes effect when W3-30 part 2 subscribes; granting it earlier is harmless.",
       "archiver_note": "Set 1.8: group grant LITERAL (was PREFIXED tb.<env>.archiver*, which broke rule 2 of README 3.4.1 and would also have matched the groups of a channel named 'archiver'). Group name as built in W3-2a (tributary.archiver.config.archiver_group, per archive-engineer's report; the architect has not read the code). Still owed: confirm the archiver touches no other topic, group or cluster resource (W3-23 style exact-grant test).",
+      "reprocessor": "READ, WRITE, DESCRIBE on <env>.<channel>.raw; IDEMPOTENT_WRITE on the cluster; DESCRIBE on group tb.<env>.reprocessor",
+      "reprocessor_note": "Set 1.8 (W3-29; wave-3.md 2.6 H8). Granted per channel: replay and reprocess target only their source channel, so the topic grant is LITERAL <env>.<channel>.raw, never PREFIXED <env>. (which would also grant WRITE on out, dlq and reply). READ fetches the original payload. The consumer uses assign() and never joins or commits, but librdkafka requires a group.id and still sends FindCoordinator for it, so the LITERAL platform group tb.<env>.reprocessor gets DESCRIBE only, no READ (measured by archive-engineer on a deny-by-default broker, lead-relayed; the architect has not run it). Its producer enforces the receivers' 1,000,000-byte input limit. Human sign-off folds into ADR-004 H7.",
+      "lag_reader": "DESCRIBE on <env>.*, _tb.<env>.events; DESCRIBE on group tb.<env>.*",
+      "lag_reader_note": "Set 1.8 (W3-29; wave-3.md 2.5 H4). Used by KEDA and the lag exporter only. DESCRIBE on topics PREFIXED <env>. and LITERAL _tb.<env>.events, DESCRIBE on groups PREFIXED tb.<env>.: enough to read end offsets and committed offsets, never a payload. No READ, no WRITE, no cluster grant. Grants verified 2026-10-12 on a deny-by-default broker by qa-engineer's tests/integration/test_platform_roles_deny_by_default_acls.py (coordinator-relayed; the architect has not seen the run).",
       "control_plane": "WRITE on _tb.<env>.channels and _tb.<env>.audit; DESCRIBE on the cluster",
+      "api": "READ, WRITE on _tb.<env>.channels; WRITE on _tb.<env>.audit; IDEMPOTENT_WRITE on the cluster; DESCRIBE on group tb.<env>.reconciler",
+      "api_note": "Set 1.8 (2026-10-12, devops request): the control-plane API process, one principal per environment it manages. WRITE channels: deploy, rollback, undeploy and the W3-5 reconciler's repairs. READ channels: the reconciler's table read (assign, from the beginning to the start-time end offsets; orphan keys come from this topic only, reconciler.py). WRITE audit: the W3-32 AuditHook. Both producers are acks=all and idempotent. The reconciler never commits (enable.auto.commit false), so its group gets DESCRIBE only, the reprocessor's measured case. All LITERAL. No READ on audit or events, no data topic, no cluster DESCRIBE. control_plane stays as the lite Compose one-shot publisher's grant. The API runs reprocess and replay under each channel's reprocessor principal, never under this one. Grants verified 2026-10-12 on a deny-by-default broker by qa-engineer's tests/integration/test_platform_roles_deny_by_default_acls.py (coordinator-relayed; the architect has not seen the run).",
       "forbidden": "No data-plane component gets cluster-wide WRITE, DELETE or ALTER, and none gets WRITE on _tb.<env>.channels — a compromised worker must not be able to deploy a channel spec.",
       "open_question": "The complete role model, credential rotation and key management are ADR-004 plus a human decision. This block is the minimum shape that the config contract must state, not the finished model."
     }
@@ -213,6 +223,16 @@
       "linger.ms_source": "TODO set from the S2 ACK-latency-versus-throughput curve",
       "compression.type": "lz4",
       "compression.type_source": "assumption, unmeasured: cheaper CPU than zstd for small text records"
+    },
+    "worker_producer": {
+      "$comment": "Set 1.8 (2026-10-12, W3-24). The pipeline worker's non-transactional producer for out.<dest>, dlq and reply. The invariant 1 profile of receiver_producer, except linger.ms. Until this block existed the worker reused receiver_producer.",
+      "acks": "all",
+      "enable.idempotence": true,
+      "max.in.flight.requests.per.connection": 5,
+      "delivery.timeout.ms": 120000,
+      "linger.ms": 0,
+      "linger.ms_source": "MEASURED (platform-engineer, W3-24 stage timing, 2026-10-12): the worker waits on every record's delivery anyway, so linger only delays it; the reply produce, which is never flushed, waited a fixed 5 ms. Estimated ~5 ms off the sync-reply p50; tail unchanged (host scheduling). Accepted on condition that a worker throughput run before and after shows no loss beyond run-to-run noise",
+      "compression.type": "lz4"
     },
     "transactional_stage_producer": {
       "acks": "all",
@@ -266,7 +286,9 @@
     "roles": ["pipeline", "loader", "replier", "receiver"],
     "platform_groups": {
       "$comment": "Set 1.8. Environment-wide groups with no channel segment. The archiver reads _tb.<env>.events for every channel, so 'archiver' moved out of roles, where the pattern implied a per-channel group nothing builds.",
-      "archiver": "tb.<env>.archiver"
+      "archiver": "tb.<env>.archiver",
+      "reprocessor": "tb.<env>.reprocessor",
+      "reconciler": "tb.<env>.reconciler"
     },
     "roles_note": "replier (set 1.2) = the receivers' reply-consumer group in synchronous reply mode, on this engine's cluster (clients.reply_consumer). receiver (set 1.1) = a kafka source's group on the EXTERNAL cluster it reads; README 3.6 added it in set 1.1 and this list omitted it until set 1.2",
     "spec_reader": {

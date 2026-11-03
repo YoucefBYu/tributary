@@ -31,6 +31,7 @@ import time
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from functools import lru_cache
+from typing import Literal, Protocol
 
 from tributary.runtime.clients import KafkaSettings, producer_config
 from tributary.runtime.config import TopicDefaults, load_topic_defaults
@@ -46,6 +47,22 @@ _ENV = re.compile(r"^[a-z][a-z0-9-]{0,15}$")
 _CHANNEL = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
 
 CONTENT_TYPE = "application/hl7-v2+er7"
+
+PublishResult = Literal["committed", "failed", "timeout"]
+
+
+class _Publishes(Protocol):
+    async def publish(self, message: Message, *, timeout_s: float) -> bool: ...
+
+
+async def publish_outcome(publisher: _Publishes, message: Message, *, timeout_s: float) -> PublishResult:
+    """`publisher.publish_result` when it has one (`RawPublisher`), else the plain bool mapped to
+    `committed` / `failed` (a test double that cannot tell a timeout)."""
+    result = getattr(publisher, "publish_result", None)
+    if result is not None:
+        return await result(message, timeout_s=timeout_s)  # type: ignore[no-any-return]
+    return "committed" if await publisher.publish(message, timeout_s=timeout_s) else "failed"
+
 
 #: Readiness (`contracts/observability/v0` 2.3, R1): while the producer reports every broker down, one
 #: metadata probe at most this often, each bounded by `PROBE_TIMEOUT_S`, tells it that it has recovered.
@@ -279,11 +296,17 @@ class RawPublisher:
         help). Otherwise `True` once committed, `False` on any failure, a full local queue, or `timeout_s`
         elapsing first — every one of those is "not committed," so every one of them is a NACK,
         never a dropped message that was silently ACKed (invariant 1)."""
+        return await self.publish_result(message, timeout_s=timeout_s) == "committed"
+
+    async def publish_result(self, message: Message, *, timeout_s: float) -> PublishResult:
+        """`publish`, telling a delivery **timeout** apart from a failure. After a timeout librdkafka may still
+        complete the write, so a resend can duplicate (it cannot lose data): synchronous reply mode answers it
+        `PRODUCE_TIMEOUT`, distinct from `PRODUCE_FAILED` (channel-spec README 3.2.6)."""
         loop = self._loop
         if loop is None:
             raise RuntimeError("RawPublisher.start() must run before publish() is awaited")
         if self._closed:
-            return False  # a closed producer commits nothing: never ACK
+            return "failed"  # a closed producer commits nothing: never ACK
         try:
             # `ordering` is the channel's, fixed at construction: `none` (the MLLP receiver's only mode)
             # takes a null key, `per-key` refuses a record whose key did not resolve (invariant 5).
@@ -311,8 +334,8 @@ class RawPublisher:
                 self.topic, value=message.payload, key=message.key, headers=kafka_headers, on_delivery=on_delivery
             )
         except BufferError:
-            return False  # local queue full: refuse rather than buffer unboundedly
+            return "failed"  # local queue full: refuse rather than buffer unboundedly
         try:
-            return await asyncio.wait_for(future, timeout_s)
+            return "committed" if await asyncio.wait_for(future, timeout_s) else "failed"
         except TimeoutError:
-            return False
+            return "timeout"

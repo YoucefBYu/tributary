@@ -1,0 +1,15 @@
+{
+  "replay_id": "0192f3d2-5555-7abc-8def-0123456789ab",
+  "environment": "prod",
+  "channel": "adt-fanout",
+  "target_topic": "prod.adt-fanout.raw",
+  "range_start": "2026-10-06T06:00:00.000Z",
+  "range_end": "2026-10-06T07:00:00.000Z",
+  "allow_reorder": true,
+  "max_records": 50000,
+  "deadline_s": 600,
+  "requested_by": "synth-operator-0002",
+  "requested_at": "2026-10-06T09:30:00.000Z",
+  "status": "running",
+  "deadline_at": "2026-10-06T09:40:00.000Z"
+}

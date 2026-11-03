@@ -40,14 +40,20 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from tributary.runtime.channels import LiveSpecSource
-from tributary.runtime.errors import ChannelSpecError, ChannelsUnavailableError, safe_token
+from tributary.runtime.errors import (
+    ChannelSpecError,
+    ChannelsUnavailableError,
+    RuntimeConfigurationError,
+    safe_token,
+)
+from tributary.runtime.ops import OpsServer, OpsSettings
 from tributary.runtime.spec import ChannelSpec
 from tributary.sdk.context import Logger
 
 from . import readiness as rd
 from .errors import CHANNEL_SPEC_UNAVAILABLE, ConfigError, SecretUnresolvedError
+from .exposition import ReceiverMetrics
 from .metrics import Metrics
-from .ops import OpsServer, OpsSettings
 
 #: Non-blocking polls of the channels consumer per tick. Each is a librdkafka `poll(0)`; the count only
 #: bounds how long one tick can spend catching up on a backlog of spec records.
@@ -299,7 +305,25 @@ class ReceiverLifecycle[S](ABC):
         settings = self._opts.ops
         if settings is None:
             return True
-        ops = OpsServer(settings, self.readiness_report, log=self._log)
+        try:
+            exposition = ReceiverMetrics.create(
+                self.metrics,
+                self.readiness_report,
+                channel=self._opts.channel,
+                receiver_type=self.RECEIVER_TYPE,
+                log=self._log,
+            )
+        except RuntimeConfigurationError as exc:
+            self._log.error("startup_refused", error=type(exc).__name__, code=safe_token(exc.code))
+            self.exit_code = 2
+            return False
+        ops = OpsServer(
+            settings,
+            self.readiness_report,
+            component="receiver",
+            metrics=exposition.render,
+            log=self._log,
+        )
         try:
             self.ops_port = await ops.start()
         except OSError as exc:

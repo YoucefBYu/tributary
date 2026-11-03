@@ -34,8 +34,10 @@ PlatformKind = Literal["channels", "events", "audit"]
 #: environment-wide platform group `tb.<env>.archiver` (`platform_group`), and its ACL is LITERAL. A
 #: per-channel `tb.<env>.<ch>.archiver` group is one nothing grants.
 Role = Literal["pipeline", "loader", "replier"]
-#: Environment-wide consumer groups with no channel segment (set 1.8, `consumer_groups.platform`).
-PlatformGroup = Literal["archiver"]
+#: Environment-wide consumer groups with no channel segment (set 1.8, `consumer_groups.platform_groups`).
+#: `reprocessor` (W3-29) and `reconciler` (the API's W3-5 spec reconciler, set 1.8 `api` role) are
+#: assign-only: their principals hold DESCRIBE on the literal group, no READ, and never commit.
+PlatformGroup = Literal["archiver", "reprocessor", "reconciler"]
 
 MAX_TOPIC_LENGTH = 249
 
@@ -122,7 +124,9 @@ def consumer_group(
 
 
 def platform_group(env: str, kind: PlatformGroup) -> str:
-    """`tb.<env>.<kind>`: an environment-wide platform group, today only `tb.<env>.archiver` (set 1.8).
+    """`tb.<env>.<kind>`: an environment-wide platform group, e.g. `tb.<env>.archiver` (set 1.8).
+
+    `kind` is one of `PlatformGroup`: `archiver`, `reprocessor` or `reconciler`.
 
     No channel segment and no suffix: the ACL is LITERAL on exactly this name. A PREFIXED
     `tb.<env>.archiver` grant would also match the groups of a channel named `archiver`

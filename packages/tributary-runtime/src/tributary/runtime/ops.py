@@ -1,38 +1,54 @@
-"""The ops listener: `GET /livez` and `GET /readyz` on a port of their own (`contracts/observability/v0` 2.1).
+"""The ops listener for every Tributary process: `GET /livez`, `GET /readyz`, `GET /metrics` on a port of their
+own (`contracts/observability/v0` 2.1 and 3.1). One implementation, moved here from `tributary.receivers.ops`
+(W3-25, ruling H1) with the hardening unchanged.
 
 Rules this module implements, by their contract names:
 
 * **O1** never served on an ingest port: this is a separate `asyncio` server.
 * **O2/O3** loopback `127.0.0.1:9180` by default (`--ops-bind`, `--ops-port`, `TB_OPS_BIND`, `TB_OPS_PORT`;
   the flag wins). A non-loopback bind is accepted only when given explicitly, and only as an IP literal (a
-  name is never resolved here, the same reason as `net.is_loopback`).
-* **O4** the caller treats a bind failure as `startup_refused`, exit 2.
+  name is never resolved here).
+* **O4** the caller treats a bind failure as `startup_refused` with `code: OPS_LISTENER_BIND_FAILED`, exit 2
+  (`start_ops_or_exit` does that for a synchronous process).
 * **O5** `GET` only (other methods 405), unknown path 404, both with an empty body. The query string is ignored,
   a request body is never read, the request line plus headers are capped at 8 KiB, the read has a 1 s deadline,
-  and at most 8 connections are served at once. **No response echoes the path, a header or a peer address, and
-  nothing is logged per request.**
-* **O6** `/readyz` serialises a snapshot the lifecycle holds; this module has no Kafka client.
+  and at most 8 connections are served at once (at most 4 per peer address, with the eviction rules in
+  `OpsServer`). **No response echoes the path, a header or a peer address, and nothing is logged per request.**
+* **O6** `/readyz` and `/metrics` serialise state the process already holds; this module has no Kafka client.
+
+Which paths a process serves is decided by what it passes: `/readyz` only with a `readiness` callable (receivers
+and the API; `observability/v0` 1 contracts no worker, loader or archiver `/readyz`, so they get 404), `/metrics`
+only with a `metrics` callable. `/livez` is always served.
+
+**Liveness on a thread.** A synchronous process (the worker) serves this listener from a background thread
+(`OpsThread`), so the endpoint is no longer "served by the loop it vouches for" (2.2). It passes `liveness`, a
+heartbeat check on its own main loop, so a wedged loop still fails `/livez` (503, empty body) instead of looking
+alive for ever. Liveness still never depends on Kafka, the spec or readiness.
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
+import concurrent.futures
 import contextlib
 import errno
 import ipaddress
 import os
 import socket
+import threading
 import time
 from collections import Counter
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from functools import partial
+from typing import Final, Protocol
 
-from tributary.runtime.errors import safe_token
+import orjson
 from tributary.sdk.context import Logger
 
-from .net import is_loopback
-from .readiness import LIVE_BODY, Report
+from .errors import safe_token
+from .startup import refuse
 
 DEFAULT_BIND = "127.0.0.1"
 DEFAULT_PORT = 9180
@@ -40,6 +56,12 @@ MAX_HEAD_BYTES = 8 * 1024
 READ_TIMEOUT_S = 1.0
 WRITE_TIMEOUT_S = 1.0
 MAX_CONNECTIONS = 8
+
+#: `observability/v0` `metrics.json` `labels.component`: the process roles.
+COMPONENTS: Final = frozenset({"receiver", "worker", "loader", "archiver", "api"})
+#: Prometheus text exposition format 0.0.4.
+METRICS_CONTENT_TYPE: Final = "text/plain; version=0.0.4; charset=utf-8"
+JSON_CONTENT_TYPE: Final = "application/json"
 
 _REASONS = {
     200: "OK",
@@ -50,9 +72,30 @@ _REASONS = {
     503: "Service Unavailable",
 }
 
+_LOOPBACK_WORDS = frozenset({"localhost"})
+
 
 class OpsConfigError(ValueError):
     """A bad `--ops-bind` or `--ops-port`. The message names the flag, never its value."""
+
+
+class ReadinessReport(Protocol):
+    """What `/readyz` serialises: a status code and a PHI-free body (`readiness.schema.json`)."""
+
+    @property
+    def http_status(self) -> int: ...
+
+    def body(self) -> bytes: ...
+
+
+def is_loopback(bind: str) -> bool:
+    """True for any `127.0.0.0/8` literal, `::1`, or the word `localhost`. A name is never resolved."""
+    if bind in _LOOPBACK_WORDS:
+        return True
+    try:
+        return ipaddress.ip_address(bind).is_loopback
+    except ValueError:
+        return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,10 +135,29 @@ def resolve_ops_settings(
     return OpsSettings(bind=chosen_bind, port=chosen_port)
 
 
-def _response(status: int, body: bytes = b"", *, allow: bool = False) -> bytes:
+def add_ops_arguments(parser: argparse.ArgumentParser) -> None:
+    """`--ops-bind` and `--ops-port` (O2). Resolved by `ops_settings_or_exit`, so the flag wins over the env."""
+    parser.add_argument("--ops-bind", default=None, help=f"ops listener address (default {DEFAULT_BIND}; TB_OPS_BIND)")
+    parser.add_argument(
+        "--ops-port", default=None, help=f"ops listener port, 0 = ephemeral (default {DEFAULT_PORT}; TB_OPS_PORT)"
+    )
+
+
+def ops_settings_or_exit(args: argparse.Namespace, log: Logger) -> OpsSettings:
+    try:
+        return resolve_ops_settings(bind=args.ops_bind, port=args.ops_port)
+    except OpsConfigError:
+        refuse(log, error="UsageError", code="ARGUMENTS_INVALID", reason="invalid --ops-bind or --ops-port")
+
+
+def live_body(component: str) -> bytes:
+    return orjson.dumps({"v": 0, "status": "alive", "component": component})
+
+
+def _response(status: int, body: bytes = b"", *, allow: bool = False, content_type: str = JSON_CONTENT_TYPE) -> bytes:
     head = [f"HTTP/1.1 {status} {_REASONS[status]}", "Connection: close", f"Content-Length: {len(body)}"]
     if body:
-        head.append("Content-Type: application/json")
+        head.append(f"Content-Type: {content_type}")
     head.append("Cache-Control: no-store")
     if allow:
         head.append("Allow: GET")
@@ -139,16 +201,39 @@ class OpsServer:
     When all 8 are protected (young, or past their head), accepting pauses until one is evictable or done: the
     waiting connections sit in the kernel backlog (128) instead of costing the loop an accept each.
 
-    The accept loop is ours (`loop.sock_accept`), because `asyncio.Server` cannot pause its listening socket."""
+    The accept loop is ours (`loop.sock_accept`), because `asyncio.Server` cannot pause its listening socket.
 
-    def __init__(self, settings: OpsSettings, readiness: Callable[[], Report], *, log: Logger | None = None) -> None:
+    `readiness`, `metrics` and `liveness` are called on this server's event loop and must not block: they read a
+    snapshot the process maintains (O6). Any exception from one answers 503 with an empty body, never a 500 with
+    text.
+    """
+
+    def __init__(
+        self,
+        settings: OpsSettings,
+        readiness: Callable[[], ReadinessReport] | None = None,
+        *,
+        component: str,
+        metrics: Callable[[], bytes] | None = None,
+        liveness: Callable[[], bool] | None = None,
+        log: Logger | None = None,
+    ) -> None:
+        if component not in COMPONENTS:
+            raise ValueError("component must be one of the observability/v0 component roles")
         self._settings = settings
         self._readiness = readiness
+        self._metrics = metrics
+        self._liveness = liveness
+        self._live_body = live_body(component)
         self._log = log
         self._sock: socket.socket | None = None
         self._accept_task: asyncio.Task[None] | None = None
         self._active: dict[asyncio.StreamWriter, _Conn] = {}
         self._closing = False
+
+    @property
+    def settings(self) -> OpsSettings:
+        return self._settings
 
     @property
     def port(self) -> int:
@@ -263,13 +348,25 @@ class OpsServer:
         if method != "GET":
             return _response(405, allow=True)
         if path == "/livez":
-            return _response(200, LIVE_BODY)
-        if path == "/readyz":
+            if self._liveness is not None:
+                try:
+                    alive = self._liveness()
+                except Exception:
+                    alive = False
+                if not alive:
+                    return _response(503)
+            return _response(200, self._live_body)
+        if path == "/readyz" and self._readiness is not None:
             try:
                 report = self._readiness()
+                return _response(report.http_status, report.body())
             except Exception:  # a probe must answer; a broken snapshot is "not ready", never a 500 with text
                 return _response(503)
-            return _response(report.http_status, report.body())
+        if path == "/metrics" and self._metrics is not None:
+            try:
+                return _response(200, self._metrics(), content_type=METRICS_CONTENT_TYPE)
+            except Exception:  # never a traceback on the wire
+                return _response(503)
         return _response(404)
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -304,8 +401,9 @@ class OpsServer:
 
     @staticmethod
     async def _read_head(reader: asyncio.StreamReader, conn: _Conn) -> bytes | None:
-        """The request head (to the blank line), an empty head with `conn.oversize` set past 8 KiB, `None` on a timeout or a closed peer. The 1 s
-        deadline covers the whole head, so a trickle does not extend it. `conn` records the first byte."""
+        """The request head (to the blank line), an empty head with `conn.oversize` set past 8 KiB, `None` on a
+        timeout or a closed peer. The 1 s deadline covers the whole head, so a trickle does not extend it. `conn`
+        records the first byte."""
         deadline = time.monotonic() + READ_TIMEOUT_S
         buffer = b""
         try:
@@ -331,3 +429,70 @@ class OpsServer:
         with contextlib.suppress(TimeoutError, ConnectionError, OSError):
             writer.write(data)
             await asyncio.wait_for(writer.drain(), WRITE_TIMEOUT_S)
+
+
+class OpsThread:
+    """Runs an `OpsServer` on its own event loop in a daemon thread, for a synchronous process (the worker).
+
+    `start()` returns once the socket is bound, or raises the bind's `OSError` in the caller's thread, so O4 is
+    decided before the process builds anything. `close()` is idempotent and bounded.
+    """
+
+    def __init__(self, server: OpsServer) -> None:
+        self._server = server
+        self._thread: threading.Thread | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._stop: asyncio.Event | None = None
+        self._bound: concurrent.futures.Future[int] = concurrent.futures.Future()
+
+    @property
+    def server(self) -> OpsServer:
+        return self._server
+
+    def start(self, *, timeout_s: float = 10.0) -> int:
+        if self._thread is not None:
+            raise RuntimeError("ops thread already started")
+        self._thread = threading.Thread(target=self._run, name="tb-ops", daemon=True)
+        self._thread.start()
+        return self._bound.result(timeout=timeout_s)  # re-raises the OSError of a failed bind
+
+    def _run(self) -> None:
+        asyncio.run(self._main())
+
+    async def _main(self) -> None:
+        self._loop = asyncio.get_running_loop()
+        self._stop = asyncio.Event()
+        try:
+            port = await self._server.start()
+        except BaseException as exc:
+            self._bound.set_exception(exc)
+            return
+        self._bound.set_result(port)
+        try:
+            await self._stop.wait()
+        finally:
+            await self._server.close()
+
+    def close(self, *, timeout_s: float = 5.0) -> None:
+        loop, stop, thread = self._loop, self._stop, self._thread
+        if loop is not None and stop is not None and not loop.is_closed():
+            with contextlib.suppress(RuntimeError):  # the loop finished between the check and the call
+                loop.call_soon_threadsafe(stop.set)
+        if thread is not None:
+            thread.join(timeout_s)
+
+
+def start_ops_or_exit(server: OpsServer, log: Logger) -> OpsThread:
+    """Bind on a background thread, or one `startup_refused` line and exit 2 (O4). Logs `ops_listening` with the
+    bound port, and `ops_listener_non_loopback` at WARN for an explicit non-loopback bind (O3)."""
+    thread = OpsThread(server)
+    try:
+        port = thread.start()
+    except OSError as exc:
+        thread.close()
+        log.error("startup_refused", error="OSError", code="OPS_LISTENER_BIND_FAILED", errno=exc.errno or 0)
+        raise SystemExit(2) from None
+    if server.settings.explicit_non_loopback:
+        log.warning("ops_listener_non_loopback", ops_port=port)
+    log.info("ops_listening", ops_port=port)
+    return thread

@@ -107,7 +107,9 @@ class LoaderMetrics:
         self.by_reason[reason] = self.by_reason.get(reason, 0) + 1
 
     def snapshot(self) -> dict[str, int]:
-        out: dict[str, int] = {f"delivery_{reason}": count for reason, count in self.by_reason.items()}
+        out: dict[str, int] = {
+            f"delivery_{reason}": count for reason, count in dict(self.by_reason).items()
+        }  # one C-level copy: the ops thread reads it
         out["circuit_opens"] = self.circuit_opens
         out["circuit_closes"] = self.circuit_closes
         return out

@@ -1,7 +1,7 @@
 # Contract: topic naming, defaults and required configuration — v0 (draft)
 
 **Contract id:** `tributary.topics/v0`
-**Status:** Draft. Partition defaults and `session.timeout.ms` are **measured** (S4, S5, 2026-09-20) and are lower bounds from a laptop-hosted cluster; `_tb.<env>.events` partitions and audit retention are still open. **Set 1.4 (2026-09-29):** ACL role table
+**Status:** Draft. Partition defaults and `session.timeout.ms` are **measured** (S4, S5, 2026-09-20) and are lower bounds from a laptop-hosted cluster; `_tb.<env>.events` partitions are still open. Audit retention was decided on 2026-10-06 as an operator setting (2.1). **Set 1.4 (2026-09-29):** ACL role table
 reconciled with the code (3.4.1), `super.users` restated, spec-reader group named (3.6). **Set 1.4.1
 (patch):** 3.4 `super.users` row: a user-provisioning identity is no longer a super user. **Set 1.7
 (2026-10-05):** 3.3.1: the reply consumer reads its own `clients.reply_consumer` values, and the unique
@@ -111,7 +111,7 @@ Helm read one source instead of hardcoding three.
 | `reply` | 3, or `spec.source.reply.partitions` (set 1.2); created only for a sync-reply channel | 10 min | delete |
 | `_tb.<env>.channels` | 6 | compacted | compact |
 | `_tb.<env>.events` | 24 (**still unmeasured**, section 2.2) | 3 d | delete |
-| `_tb.<env>.audit` | 6 | 30 d (**TODO(human)**, section 2.1) | delete |
+| `_tb.<env>.audit` | 6 | 30 d (transport buffer; the system of record is ClickHouse, section 2.1) | delete |
 
 `out.<dest>` MUST have the same partition count as its `raw` topic when the channel declares
 per-key ordering. Different counts change the hash-to-partition mapping, so two messages for one
@@ -128,7 +128,29 @@ It must be at least the number of receiver processes, because each process needs
 (3.3.1). Raising it on a live topic is harmless; lowering it means recreating the topic, which a
 10-minute retention makes cheap.
 
-### 2.1 Audit retention is a human decision, not an engineering default
+### 2.1 Audit retention: operator-configurable (decided 2026-10-06)
+
+**Decision (set 1.8, 2026-10-06; ADR-004 section 4).** The human answered on 2026-10-06 (relayed by
+the lead), verbatim: *"Give the user a possibility to change it"*. So:
+
+1. **Retention is an operator setting with documented defaults.** No agent has made, or implies, a
+   compliance determination.
+2. **The system of record for audit records is the ClickHouse `audit_log` table.** The events
+   archiver fills it from `_tb.<env>.audit` (ADR-004 R7). Its retention is
+   `TB_ARCHIVE_AUDIT_TTL_DAYS`, default **2190 days**, range 1-36500. The default is conservative
+   because deleting an audit trail is irreversible. It is not a reading of any rule.
+3. **`_tb.<env>.audit` is a transport buffer** and keeps 30 days (table above, `topic-defaults.json`),
+   which bounds how long the archiver may be down before audit records are lost. It is not an
+   operator setting in v0.
+4. **The same setting pattern covers archived events** (`TB_ARCHIVE_TTL_DAYS`, default 90) **and
+   archived content** (`TB_ARCHIVE_CONTENT_TTL_DAYS`, default 30). Kafka retention of `raw` (7 d) and
+   `_tb.<env>.events` (3 d) is unchanged and is not a records-retention control (ADR-004 R8).
+5. **Changes apply through the archiver's migrate step only:** `MODIFY TTL` on the existing table.
+   A decrease is refused unless `TB_ARCHIVE_ALLOW_TTL_DECREASE=true` (ADR-004 R6). Helm values,
+   Compose variables and the read-only API view are in ADR-004 R3.
+
+The rest of this section is the 2026-09-20 analysis that led to the question, kept because it
+explains the default.
 
 `_tb.<env>.audit` retains 30 days. That number was chosen to match the DLQ and keep a small cluster
 small. It is an engineering default and it may be wrong by two orders of magnitude.
@@ -156,9 +178,12 @@ Three questions for the human, carried in `docs/agent-team/STATUS.md`:
    places a "what happened to this message, and who touched it" question is answered, and `raw` is
    also the replay source. A retention duty that covers the audit trail may or may not cover them.
 
-Until that is answered, the 30-day value stands and is marked `TODO(human)` in
-[`topic-defaults.json`](topic-defaults.json). The `_tb.<env>.audit` event contract itself is unwritten
-(see the events contract, section 6), so nothing depends on this yet.
+~~Until that is answered, the 30-day value stands and is marked `TODO(human)`.~~ **Answered
+2026-10-06** (decision at the top of this section): question 1 is the operator's, through the
+setting. Question 2 is ClickHouse with Kafka as a buffer. Question 3: Kafka retention is unchanged,
+and archived events and content get settings of their own. The `_tb.<env>.audit` record shape is
+published with W3-1b (set 1.8 part 2): [`audit/v0`](../../audit/v0/README.md), including the
+`audit_log` row shape.
 
 ### 2.2 Why 3 partitions, not 12 — and the partition budget
 
@@ -190,6 +215,27 @@ any of it for sizing (`docs/spikes/S4-topic-scale.md`).
 archive path under load, so whether the archiver keeps up at roughly four events per message is
 unknown.
 
+### 2.3 Record timestamps (set 1.8, 2026-10-14)
+
+`_tb.<env>.events` and `_tb.<env>.audit` set **`message.timestamp.type=LogAppendTime`**: the broker
+stamps each record, not the producer. Ruled on the security review of the archiver's ts window
+(`dbccffb`), which was anchored on a producer-chosen CreateTime. **Checked against every reader of
+Kafka record timestamps (grep, 2026-10-14):**
+
+- The archiver's ts-window anchor and its ingest-lag metric (`archiver.py`) read these two topics. Both
+  become broker time, which is what they mean.
+- Replay windows and `offsetsForTimes` (`replay.py`, `content_backfill.py`) and the content archiver's
+  timestamps read `raw`, `out` and `dlq`. Those **keep CreateTime**: replay is defined on the time the
+  receiver produced the record (`openapi/v0` 3.14), and tests produce backdated `raw` records on
+  purpose.
+- Latency measures use the event's own `ts` field or `tb-received-at`, never the Kafka timestamp.
+  The `ts` field is unchanged.
+
+**Give up:** a producer cannot backdate an event's Kafka timestamp, which no code needs. An archiver
+test that produces backdated event or audit records to exercise the window gets broker time on a
+topic created from these configs (`archive-engineer` to check). The archiver's `min(record time, now)`
+anchor stays as defence in depth.
+
 ---
 
 ## 3. Required configuration
@@ -215,7 +261,10 @@ correct. The per-class values carry the production floor so that a tool which ap
 and forgets the profile overrides fails safe; only the explicit `lite` profile lowers it.
 
 Lite mode (RF=1) cannot satisfy RPO=0 and must say so in its documentation. It is for development and
-small sites that have accepted the risk, and the distribution should warn at startup.
+small sites that have accepted the risk, and the distribution should warn at startup. **Read with 3.8**
+(2026-10-06): lite is barred from production use (rule 2), and holds synthetic data only unless
+ADR-004's custody rules are met (rule 4, ADR-004 C7). "Accepted risk" covers durability, never those
+two rules.
 
 ### 3.2 Receiver producer (the ACK-after-commit path)
 
@@ -233,6 +282,20 @@ The receiver ACKs the sender only from the producer's delivery callback, after a
 commit. On `delivery.timeout.ms` expiry, or when fewer than `min.insync.replicas` replicas are
 available, it NACKs or refuses the connection. It never ACKs optimistically.
 
+#### 3.2.1 Worker producer (set 1.8, W3-24)
+
+`topic-defaults.json` `clients.worker_producer` is the worker's non-transactional producer for
+`out.<dest>`, `dlq` and `reply`. It is the profile above with **`linger.ms` 0**; until set 1.8 the
+worker reused the receiver's block. Evidence (`platform-engineer`, stage-timing run, 2026-10-12):
+sync-reply p50 is about 15 ms, of which about 11 ms is two fixed 5 ms linger waits, one on the
+receiver's `raw` produce and one on the worker's reply produce, which is never flushed. The tail (44-71
+ms) is host CPU scheduling: an asyncio echo control without Kafka shows the same. The worker already
+waits on every record's delivery, so linger buys no batching there. **Give up:** fewer records per
+produce request under burst. **Condition:** the build ships a worker throughput comparison, before and
+after on the same host, with no loss beyond run-to-run noise. The receiver's `linger.ms` (5) is
+unchanged; it remains the S2-curve `TODO` above. The effective-configuration test (3.7) pins the new
+block.
+
 ### 3.3 Worker and loader consumer
 
 | Setting | Value | Why |
@@ -244,6 +307,31 @@ available, it NACKs or refuses the connection. It never ACKs optimistically.
 | `commit_every` (runtime, not librdkafka) | **50** | **Measured (S5):** committing every 50 records rather than every 1 gave 4.9x throughput (151 → 733 msg/s) for a replay window of 50 instead of 1. Invariant 4 requires loader idempotency on `tb-msg-id` anyway, so a window of 1 buys little. **It is the replay window:** after an unclean death up to 50 records are redelivered (S5 saw 12 at `commit_every=20`). A destination declaring `idempotency.technique: none` has no absorber for that — lower it there or accept it in the justification the channel spec already requires. 50 is a measured point, not a measured optimum: the surrounding curve was never run. |
 | `isolation.level` | `read_committed` on topics written by a transactional stage | Otherwise a consumer sees aborted records. |
 | `max.poll.interval.ms` | ≥ the slowest destination timeout plus backoff | Otherwise a slow sink looks like a dead consumer and causes a rebalance loop. |
+
+**Set 1.8 (W3-29 item 2): the instance rule for worker, loader and archiver.** The defect set 1.7
+fixed for receivers recurred here. `pipeline-<pid>`, `loader-<dest>-<pid>` and `archiver-<pid>` are
+the same string in every container (the pid is 1), so replicas fenced one another (`wave-3.md` W3-28).
+
+1. **Required, no default.** The id comes from `--instance-id` or `TB_INSTANCE_ID`; the flag wins, and
+   an explicit empty flag counts as missing. Without one, the process logs `startup_refused` with `code:
+   INSTANCE_REQUIRED` and exits 2 (`observability/v0` L6a).
+2. **Grammar** `^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$`. The id is also the free segment of the
+   spec-reader group `tb.<env>.<ch>.channels.<instance>`, which a PREFIXED ACL covers. Any other value
+   gets `code: ARGUMENTS_INVALID`, exit 2, and the value is never echoed.
+3. **Used verbatim as `group.instance.id`** on the process's engine consumer: the worker in
+   `tb.<env>.<ch>.pipeline`, a loader in `tb.<env>.<ch>.loader.<dest>`, the archiver in
+   `tb.<env>.archiver`. There is no pid suffix, because each replica runs one consuming process.
+4. **Unique per replica**, per group and environment. Helm uses the pod's `metadata.name` (StatefulSets,
+   `wave-3.md` 2.5 H3), and Compose sets it per service.
+5. **Two spellings in v0** (`wave-3.md` 2.5 H2). Receivers keep `--instance` (set 1.7: required with
+   `source.reply`; the reply consumer's id is `<instance>-p<pid>`, 3.3.1). Worker, loader and archiver
+   use `--instance-id` / `TB_INSTANCE_ID`. The value rule is the same and the flag name differs.
+   Rejected: renaming ten entry points for cosmetics.
+6. **The rule follows the use, not the role.** Any process that puts its instance id into a
+   `group.instance.id` must require it. That includes the `kafka` source receiver, which uses
+   `--instance` verbatim as its static member id on the foreign cluster. **Gap (2026-10-12, read, not
+   run):** that receiver still defaults to `kafka-0` (`kafka_source/receiver.py:376`), so two replicas
+   left on the default fence each other. Sent to `connector-engineer`.
 
 #### 3.3.1 Receiver reply consumer (set 1.2, synchronous reply mode)
 
@@ -338,7 +426,52 @@ loader path ran end to end. Set 1.4 rebuilds the table from what each role's cod
 | pipeline worker | READ `raw`; WRITE `out.*`, `dlq`, `_tb.<env>.events`; READ `_tb.<env>.channels`; sync-reply only: WRITE `reply` | `tb.<env>.<ch>.pipeline` (literal), `tb.<env>.<ch>.pipeline.shadow-` (prefixed), `tb.<env>.<ch>.channels.` (prefixed) | transactional channels only: WRITE on transactional id prefix `tb.<env>.<ch>.pipeline.` |
 | loader | READ `out.<dest>`; WRITE `dlq`, `_tb.<env>.events`; READ `_tb.<env>.channels` | `tb.<env>.<ch>.loader.<dest>` (literal), `tb.<env>.<ch>.channels.` (prefixed) | none |
 | control plane (channel publisher) | WRITE `_tb.<env>.channels`, `_tb.<env>.audit` | none | DESCRIBE |
-| archiver (set 1.8) | READ `_tb.<env>.events` | `tb.<env>.archiver` (literal) | none |
+| **api** (set 1.8, 2026-10-12) | READ, WRITE `_tb.<env>.channels`; WRITE `_tb.<env>.audit` (all literal) | DESCRIBE on `tb.<env>.reconciler` (literal); no group READ | IDEMPOTENT_WRITE |
+| archiver (set 1.8) | READ `_tb.<env>.events`; **part 2:** READ `_tb.<env>.audit` (literal) | `tb.<env>.archiver` (literal) | none |
+| reprocessor (set 1.8, W3-29) | READ, WRITE, DESCRIBE on `<env>.<ch>.raw` (literal, per channel) | DESCRIBE on `tb.<env>.reprocessor` (literal); no group READ | IDEMPOTENT_WRITE |
+| lag_reader (set 1.8, W3-29) | DESCRIBE on `<env>.` (prefixed) and `_tb.<env>.events` (literal) | DESCRIBE on `tb.<env>.` (prefixed) | none |
+
+**Set 1.8 roles (W3-29).** The **reprocessor** (W3-3 reprocess and replay) reads the original record
+from `raw` and republishes to the **same channel's** `raw`. There is no cross-channel republish (lead's
+ruling, 2026-10-06), so its topic grant is LITERAL per channel and never PREFIXED `<env>.`, which would
+add WRITE on `out`, `dlq` and `reply`. Its consumer uses `assign()` and never joins or commits.
+librdkafka still requires a `group.id` and sends FindCoordinator for it, so the platform group
+`tb.<env>.reprocessor` gets **DESCRIBE only** (measured by `archive-engineer` on a deny-by-default
+broker, lead-relayed). It produces under the receivers' 1,000,000-byte input limit. A replay into a
+per-key channel needs an explicit, audited `allow_reorder` (invariant 5; W3-1b request shape). The
+**lag_reader** (KEDA, the lag exporter) reads end offsets and committed offsets only, and can never
+read a payload. Both are rendered by the Helm `KafkaUser` generator from `security.acls`. **lag_reader:
+grants verified 2026-10-12** on a deny-by-default broker by `qa-engineer`'s
+`tests/integration/test_platform_roles_deny_by_default_acls.py` (coordinator-relayed; the architect has
+not seen the run). **reprocessor: still unverified** until the same kind of test shows reprocess
+publishing under that role alone.
+Human sign-off folds into ADR-004 H7.
+
+**Set 1.8 `api` role (2026-10-12).** This is the control-plane API process, one principal per
+environment. Each grant has a code path in `packages/tributary-api`:
+
+- WRITE `_tb.<env>.channels`: deploy, rollback, undeploy (`publisher.py`) and the W3-5 reconciler's
+  repairs.
+- READ `_tb.<env>.channels`: the reconciler's table read (`reconciler.py`, `assign` from the beginning
+  to the start-time end offsets). Orphan keys come from this topic alone; it reads nothing else.
+- WRITE `_tb.<env>.audit`: the W3-32 `AuditHook`.
+- IDEMPOTENT_WRITE: both producers are `acks=all` and idempotent, as for the receiver.
+- DESCRIBE only on the group: the reconciler never commits, the same measured case as the
+  reprocessor. **Code change requested:** its `group.id` is the literal `tb-api-reconciler`
+  (`main.py:63`), which is not per environment and not in the 3.6 grammar. It becomes
+  `tb.<env>.reconciler` (`control-plane-engineer`).
+
+There is no cluster DESCRIBE (the `control_plane` row's grant is not carried over) and no READ on
+`audit` or `events`. The `control_plane` row stays as the grant of the lite Compose one-shot
+`channel-publish`. Reprocess and replay run under each channel's `reprocessor` principal, never under
+`api` (`openapi/v0` 3.14). **Grants verified 2026-10-12** on a deny-by-default broker by
+`qa-engineer`'s `tests/integration/test_platform_roles_deny_by_default_acls.py` (coordinator-relayed;
+the architect has not seen the run).
+
+**Set 1.8 part 2 (W3-1b).** The **archiver** gains READ on LITERAL `_tb.<env>.audit` in its existing
+group: it fills ClickHouse `audit_log`, the audit system of record (2.1, ADR-004 R7; record shape
+[`audit/v0`](../../audit/v0/README.md)). It gets no WRITE there, so it cannot forge an audit record;
+only the control-plane publisher writes it.
 
 **Rules the table follows.**
 
@@ -422,6 +555,8 @@ likewise an ADR-004 question; the requirement that encryption be on is not.
 ```
 tb.<env>.<channel>.<role>[.<destination>]     role = pipeline | loader | replier | receiver
 tb.<env>.archiver                             environment-wide platform group (set 1.8)
+tb.<env>.reprocessor                          environment-wide platform group, assign-only (set 1.8)
+tb.<env>.reconciler                           environment-wide platform group, assign-only: the API's channels-table reader (set 1.8)
 ```
 
 **Set 1.8: the archiver's group has no channel segment.** It consumes `_tb.<env>.events` for every
@@ -496,6 +631,9 @@ itself is unchanged. Three rules follow, and none of them is advisory:
 3. `lite` is the only place the durability floor may be lowered, and it is lowered explicitly in
    `profiles.lite.class_config_overrides` rather than inherited. A tool that applies the class
    configs and forgets the profile overrides fails **safe**, at the production floor.
+4. **(2026-10-06, ADR-004 C7.)** A `lite` deployment without a customer-managed key, or on a host
+   without full-disk encryption, holds **synthetic data only**. Real PHI requires ADR-004 H1's
+   production custody rules. Documentation rule; the warning string is unchanged.
 
 Acceptance: a test asserts the warning is emitted when the profile is `lite` and not emitted
 otherwise. A warning nobody can prove fires is the same as no warning — the lesson Phase 0 recorded
@@ -521,5 +659,6 @@ each invalid one breaks. Tests validate each string against `topic-name.schema.j
   versus customer-managed KMS keys) and application-level payload encryption, both ADR-004. The
   requirement itself is not deferred — a v0 deployment with unencrypted broker disks does not
   conform.
-- Audit retention (section 2.1) is an open human decision, and the `_tb.<env>.audit` event contract
-  is unwritten. Both must be settled together.
+- ~~Audit retention (section 2.1) is an open human decision, and the `_tb.<env>.audit` event contract
+  is unwritten.~~ Retention decided on 2026-10-06 (operator setting, 2.1). The record shape is
+  `audit/v0` (W3-1b, 2026-10-06).

@@ -105,11 +105,16 @@ def test_all_brokers_down_clears_on_a_metadata_round_trip_off_the_poll_thread(pu
             pub.warm_up(0.1)
             producer().fail_metadata = True
             producer().config["error_cb"](FakeError("_ALL_BROKERS_DOWN"))
-            await asyncio.sleep(0.15)
+            base = producer().metadata_calls
+            for _ in range(1000):  # wait for a failed probe to have actually run, not for a fixed time
+                if producer().metadata_calls >= base + 2:
+                    break
+                await asyncio.sleep(0.01)
+            assert producer().metadata_calls >= base + 2
             assert pub.readiness_reason() == "all_brokers_down", "a failed probe does not clear it"
             calls = producer().metadata_calls
             producer().fail_metadata = False
-            for _ in range(200):
+            for _ in range(1000):
                 if pub.readiness_reason() is None:
                     break
                 await asyncio.sleep(0.01)
@@ -130,7 +135,10 @@ def test_all_brokers_down_clears_on_a_successful_delivery_report(pub: RawPublish
         pub.start(asyncio.get_running_loop())
         msg = Message(headers=_headers(), payload=b"MSH|synthetic", key=None)
         task = asyncio.ensure_future(pub.publish(msg, timeout_s=2.0))
-        await asyncio.sleep(0.05)
+        for _ in range(500):
+            if producer().produced:
+                break
+            await asyncio.sleep(0.01)
         producer().produced[0]["on_delivery"](None, None)  # the broker acknowledged
         assert await task is True
         pub.close()
@@ -158,6 +166,14 @@ def test_fatal_is_reported_once_to_the_handler(pub: RawPublisher) -> None:
 # -- the recovery probe's lifecycle (observability/v0 R1) --------------------------------------------------
 
 
+def finish_probe(pub: RawPublisher) -> None:
+    """Wait for the probe thread itself to end (not for its visible effect, which lands before its `finally`)."""
+    thread = pub._probe_thread
+    assert thread is not None
+    thread.join(5)
+    assert not thread.is_alive() and not pub._probe_in_flight
+
+
 def wait_until(predicate: Any, what: str, timeout_s: float = 3.0) -> None:
     deadline = time.monotonic() + timeout_s
     while not predicate():
@@ -178,18 +194,28 @@ def test_at_most_one_probe_is_in_flight_and_they_are_rate_limited(
     release = threading.Event()
     original = producer().list_topics
 
+    concurrent = [0, 0]  # now, peak
+
     def blocking(topic: str | None = None, timeout: float = -1) -> Any:
+        concurrent[0] += 1
+        concurrent[1] = max(concurrent)
         release.wait(5)
+        concurrent[0] -= 1
         return original(topic, timeout)
 
     producer().list_topics = blocking  # type: ignore[method-assign]
     producer().config["error_cb"](FakeError("_ALL_BROKERS_DOWN"))
     for _ in range(20):
         pub._maybe_probe()  # as the poll thread does on every loop
-    threads = [t for t in threading.enumerate() if t.name == "raw-publisher-probe"]
-    assert len(threads) == 1, "one probe in flight, however often it is asked for"
+    assert pub._probe_thread is not None and pub._probe_in_flight
+    first_thread = pub._probe_thread
+    wait_until(lambda: concurrent[0] == 1, "the probe to be inside list_topics")
+    for _ in range(20):
+        pub._maybe_probe()
+    assert pub._probe_thread is first_thread and concurrent[1] == 1, "one probe in flight, however often asked"
     release.set()
-    wait_until(lambda: pub.readiness_reason() is None, "the probe to clear the flag")
+    finish_probe(pub)
+    assert pub.readiness_reason() is None
     assert producer().metadata_calls == calls_before + 1
     # Rate limit: down again at once, the next probe waits for the interval.
     producer().config["error_cb"](FakeError("_ALL_BROKERS_DOWN"))
@@ -197,7 +223,9 @@ def test_at_most_one_probe_is_in_flight_and_they_are_rate_limited(
     assert producer().metadata_calls == calls_before + 1 and pub.readiness_reason() == "all_brokers_down"
     now[0] += 5.1
     pub._maybe_probe()
-    wait_until(lambda: pub.readiness_reason() is None, "the second probe after the interval")
+    assert pub._probe_thread is not first_thread, "a new probe started after the interval"
+    finish_probe(pub)
+    assert pub.readiness_reason() is None
     assert producer().metadata_calls == calls_before + 2
 
 
@@ -219,7 +247,7 @@ def test_a_probe_that_began_before_a_newer_all_brokers_down_cannot_clear_it(pub:
     assert started.wait(3)
     producer().config["error_cb"](FakeError("_ALL_BROKERS_DOWN"))  # a fresh outage after the probe began
     release.set()
-    wait_until(lambda: not pub._probe_in_flight, "the stale probe to finish")
+    finish_probe(pub)
     assert pub.readiness_reason() == "all_brokers_down", "its success says nothing about the newer outage"
 
 

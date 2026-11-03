@@ -1,0 +1,21 @@
+{
+  "environment": "prod",
+  "channel": "adt-fanout",
+  "window": "15m",
+  "since": "2026-10-06T09:15:00.000Z",
+  "until": "2026-10-06T09:30:00.000Z",
+  "generated_at": "2026-10-06T09:30:01.204Z",
+  "counts": { "received": 1800, "filtered": 12, "routed": 3576, "sent": 3570, "retrying": 9, "error": 0, "dlq": 2 },
+  "destinations": [
+    { "destination": "fhir-store", "sent": 1786, "retrying": 0, "error": 0, "dlq": 2, "duration_ms_p50": 31.0, "duration_ms_p95": 88.5 },
+    { "destination": "archive-s3", "sent": 1784, "retrying": 9, "error": 0, "dlq": 0, "duration_ms_p50": 12.2, "duration_ms_p95": 40.1 }
+  ],
+  "errors": [
+    { "error_code": "DESTINATION_UNAVAILABLE", "count": 9 },
+    { "error_code": "FHIR_VALIDATION_FAILED", "count": 2 }
+  ],
+  "versions": [
+    { "version": 3, "instances": 4, "last_seen": "2026-10-06T09:29:59.871Z" },
+    { "version": 2, "instances": 1, "last_seen": "2026-10-06T09:16:40.002Z" }
+  ]
+}

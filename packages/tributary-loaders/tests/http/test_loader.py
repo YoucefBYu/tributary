@@ -71,11 +71,11 @@ class FakeSecretResolver:
     [
         (200, "success"),
         (201, "success"),
-        (301, "http-3xx"),
-        (302, "http-3xx"),
-        (429, "http-429"),
-        (500, "http-5xx"),
-        (404, "http-4xx"),
+        (301, "HTTP_REDIRECT_REFUSED"),
+        (302, "HTTP_REDIRECT_REFUSED"),
+        (429, "HTTP_429"),
+        (500, "HTTP_500"),
+        (404, "HTTP_404"),
     ],
 )
 def test_classify_status(status: int, expected: str) -> None:
@@ -89,7 +89,7 @@ def test_3xx_is_not_retryable() -> None:
     loader = HttpLoader(make_config(), send=lambda req: Response(302, {"Location": "https://elsewhere.example/"}))
     outcome = asyncio.run(loader.deliver(make_message()))
     assert outcome.success is False
-    assert outcome.reason == "http-3xx"
+    assert outcome.reason == "HTTP_REDIRECT_REFUSED"
     assert outcome.retryable is False
 
 
@@ -111,7 +111,7 @@ def test_deliver_5xx_is_failure_and_retryable() -> None:
     outcome = asyncio.run(loader.deliver(make_message()))
     assert outcome.success is False
     assert outcome.retryable is True
-    assert outcome.reason == "http-5xx"
+    assert outcome.reason == "HTTP_503"
 
 
 def test_deliver_4xx_is_failure_and_not_retryable() -> None:
@@ -119,7 +119,7 @@ def test_deliver_4xx_is_failure_and_not_retryable() -> None:
     outcome = asyncio.run(loader.deliver(make_message()))
     assert outcome.success is False
     assert outcome.retryable is False
-    assert outcome.reason == "http-4xx"
+    assert outcome.reason == "HTTP_422"
 
 
 def test_deliver_transport_error_is_retryable() -> None:
@@ -279,7 +279,7 @@ def test_metrics_snapshot_counts_by_reason() -> None:
     asyncio.run(loader.deliver(make_message()))
     snapshot = loader.metrics.snapshot()
     assert snapshot["delivery_success"] == 2
-    assert snapshot["delivery_http-5xx"] == 1
+    assert snapshot["delivery_HTTP_503"] == 1
 
 
 def test_delivery_failed_is_logged_with_no_response_body_or_headers() -> None:
@@ -287,7 +287,7 @@ def test_delivery_failed_is_logged_with_no_response_body_or_headers() -> None:
     loader = HttpLoader(make_config(), send=lambda req: Response(500, {"X-Sensitive": "value"}, b"body"), log=log)
     asyncio.run(loader.deliver(make_message()))
     [record] = [r for r in log.records if r.event == "delivery_failed"]
-    assert record.fields["reason"] == "http-5xx"
+    assert record.fields["reason"] == "HTTP_500"
     assert "body" not in str(record.fields)
     assert "X-Sensitive" not in str(record.fields)
 

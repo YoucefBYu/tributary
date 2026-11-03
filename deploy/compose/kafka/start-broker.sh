@@ -1,9 +1,9 @@
 #!/bin/bash
 # Broker entrypoint for the lite stack. Formats KRaft storage (wiping it first whenever kafka-tls-init
 # wrote a new credentials generation; the data directory is a tmpfs, so it is empty at every start
-# anyway), starts the broker on the generated server.properties, then grants `kafka-users-init` its one
-# ACL (ALTER on the cluster: all AlterUserScramCredentials needs) using the broker's own certificate,
-# and only then reports ready. No password is ever an argument of a process here: the SCRAM users are
+# anyway), starts the broker on the generated server.properties, then reports ready and, on request,
+# grants `kafka-users-init` ALTER on the cluster (all AlterUserScramCredentials needs) using the broker's
+# own certificate, for the length of that one-shot only (it revokes it; see the grant window below). No password is ever an argument of a process here: the SCRAM users are
 # created afterwards by kafka-users-init, from files.
 set -euo pipefail
 CONF=/etc/tributary/broker
@@ -30,22 +30,39 @@ rm -f /tmp/tb-ready
 broker=$!
 trap 'kill -TERM "$broker" 2>/dev/null || true' TERM INT
 
-granted=0
+# Wait until the broker answers on the admin listener (ACL-less principal: this grants nothing).
+up=0
 for _ in $(seq 1 60); do
-  if /opt/kafka/bin/kafka-acls.sh --bootstrap-server 127.0.0.1:9096 --command-config "$CONF/broker-client.properties" \
-       --add --allow-principal "User:CN=tb-lite-users-init" --operation Alter --cluster >/dev/null 2>&1; then
-    granted=1
+  if /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server 127.0.0.1:9096 \
+       --command-config "$CONF/healthcheck.properties" >/dev/null 2>&1; then
+    up=1
     break
   fi
   kill -0 "$broker" 2>/dev/null || break
   sleep 2
 done
-if [[ $granted -ne 1 ]]; then
-  echo "could not grant kafka-users-init its ACL" >&2
+if [[ $up -ne 1 ]]; then
+  echo "broker did not come up" >&2
   kill -TERM "$broker" 2>/dev/null || true
   wait "$broker" || true
   exit 1
 fi
+
+# Grant window for kafka-users-init (W3-16); the loop is kafka/grant-loop.sh (unit-tested with a stub kafka-acls). The one-shot writes a random nonce to $GRANT/request; this loop
+# grants ALTER on the cluster and answers by writing the same nonce to $GRANT/granted (only after
+# kafka-acls has returned success). The one-shot revokes its own ACL and removes its request when done; this
+# loop removes the ACL too when the request is gone, and ALWAYS once the grant is older than TTL seconds, so
+# a killed one-shot cannot leave ALTER in place. Each side deletes only files it created (the directory is
+# sticky, mode 1770, group 10002). Re-run safe: every new nonce gets a new grant. No secret in the directory.
+export GRANT=/var/run/tb-grant TB_ACLS_BIN=/opt/kafka/bin/kafka-acls.sh
+export TB_ACL_ARGS="--bootstrap-server 127.0.0.1:9096 --command-config $CONF/broker-client.properties --allow-principal User:CN=tb-lite-users-init --operation Alter --cluster"
+rm -f "$GRANT/granted"
+$TB_ACLS_BIN $TB_ACL_ARGS --remove --force >/dev/null 2>&1 || true
+rm -f "$GRANT/loop-started"
+bash /opt/tb/grant-loop.sh "$broker" &
+# Ready only once the loop has taken its stale-request snapshot, or a request could slip past it.
+for _ in $(seq 1 30); do [[ -f "$GRANT/loop-started" ]] && break; sleep 1; done
+[[ -f "$GRANT/loop-started" ]] || { echo "grant loop did not start" >&2; kill -TERM "$broker" 2>/dev/null || true; wait "$broker" || true; exit 1; }
 touch /tmp/tb-ready
 # `wait` returns early when the trap fires; wait again until the broker is really gone.
 while kill -0 "$broker" 2>/dev/null; do wait "$broker" || true; done

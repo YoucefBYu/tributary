@@ -13,6 +13,7 @@ must never be half-applied for the ones that cannot.
 | Authentication | `source.auth` (`type`, `secretRef`) | the next request; a bearer secret is read when the update is applied, and an unreadable or empty one refuses the update |
 | ACK conditions and timeout | `source.ack.nackOn`, `source.ack.timeoutMs` | the next request |
 | Message size limit | `source.maxMessageBytes` | the next request |
+| Reply timeout and pending cap | `source.reply.timeoutMs`, `maxPending` | the next request opened (entries already waiting keep their timeout) |
 | Queue limits | `source.queue.maxBytes`, `maxMessages` | immediately (waiting reservations re-check) |
 | TLS client allow-list | `source.tls.allowedClientSans` | the next handshake, and every open connection is re-checked now: one whose peer is no longer allowed is closed (a request already handed to Kafka still gets its answer) |
 | Stamped channel version | `metadata.version` | the next record published |
@@ -25,6 +26,7 @@ the receiver refuses: a spec carrying any other value is rejected and the last g
 | Setting | Why it cannot change in place |
 |---|---|
 | `source.bind`, `source.port` | the listening socket is bound to them |
+| `source.reply` present or absent | whether this process joins the `replier` group (a consumer, a group member, partitions held) is decided at start |
 | `source.tls` presence, `secretRef`, `clientAuth`, `minVersion` | the `SSLContext` (certificate, key, minimum version, client-auth mode) is built once; going from plain to TLS or back is a different listener |
 | `spec.ordering`, `spec.partitionKey` | the raw producer's key rule is fixed at construction, and a key that changes under a running channel would move one patient between partitions and reorder them silently (invariant 5) |
 
@@ -47,7 +49,7 @@ from __future__ import annotations
 
 from .config import HttpSettings
 
-RESTART_REQUIRED_FIELDS = ("bind", "port", "tls", "ordering", "partition_key")
+RESTART_REQUIRED_FIELDS = ("bind", "port", "tls", "ordering", "partition_key", "reply")
 
 LIVE_FIELDS = (
     "channel_version",
@@ -59,6 +61,7 @@ LIVE_FIELDS = (
     "max_message_bytes",
     "queue_max_bytes",
     "queue_max_messages",
+    "reply",
     "tls.allowed_client_sans",
 )
 
@@ -70,12 +73,16 @@ def restart_required_fields(old: HttpSettings, new: HttpSettings) -> list[str]:
     ]
     if _tls_without_allow_list(old) != _tls_without_allow_list(new):
         changed.append("tls")
+    if (old.reply is None) != (new.reply is None):
+        changed.append("reply")
     return changed
 
 
 def live_fields_changed(old: HttpSettings, new: HttpSettings) -> list[str]:
     """The live fields that differ, by name."""
     changed = [name for name in LIVE_FIELDS if not name.startswith("tls.") and getattr(old, name) != getattr(new, name)]
+    if (old.reply is None) != (new.reply is None):
+        changed.remove("reply")  # presence is restart-only; only a change inside the block is live
     if _allow_list(old) != _allow_list(new):
         changed.append("tls.allowed_client_sans")
     return changed

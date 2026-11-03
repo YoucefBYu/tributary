@@ -320,3 +320,29 @@ def test_driver_exception_text_never_reaches_the_log_and_every_line_matches_the_
     assert {"insert_halted", "event_rejected", "archiver_stats"} <= events
     for line in lines:
         jsonschema.validate(line, schema)
+
+
+def test_a_chunked_batch_stops_at_the_byte_cap_and_the_rest_is_the_next_batch() -> None:
+    """Content records can be ~1 MiB: a count cap alone is not a memory bound (W3-2b review)."""
+    from tributary.archiver.archiver import RowLike
+
+    class Row:
+        values = ("v",)
+        ts = __import__("datetime").datetime.now(__import__("datetime").UTC)
+        attrs_dropped = attrs_dropped_hmac = fields_blanked = 0
+
+    chunks = [[FakeMessage(i * 2 + j, b"x" * 40) for j in range(2)] for i in range(4)]  # 4 chunks of 2 x 40 bytes
+    consumer = FakeConsumer(chunks)
+    sink = FakeSink()
+    archiver = Archiver(
+        consumer,
+        sink,
+        log=JsonLogger("archiver-test", stream=io.StringIO()),
+        settings=ArchiverSettings(max_batch=100, consume_chunk=2, max_batch_bytes=100),
+        sleep=lambda _s: None,
+        parser=lambda _m: Row(),  # type: ignore[arg-type,return-value]
+    )
+    assert isinstance(Row(), object) and RowLike  # the protocol is what the loop needs
+    assert archiver.run_once() == 4  # 2 chunks = 160 bytes >= 100: stop before the third
+    assert len(sink.inserted) == 4 and consumer.calls.count("consume") == 2
+    assert archiver.run_once() == 4

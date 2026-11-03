@@ -1,0 +1,13 @@
+---
+# One headless Service for every StatefulSet in the release (stable pod identity; no ports, no traffic).
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "tb.name" . }}-headless
+  labels: {{- include "tb.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/part-of: tributary

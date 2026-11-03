@@ -57,7 +57,6 @@ import asyncio
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Literal
 
 from tributary.sdk import Message
 from tributary.sdk.context import Logger
@@ -68,17 +67,9 @@ from .client import Request, Response, TlsVerificationError, TransportError, std
 from .config import AuthSpec, HttpDestinationConfig
 from .metrics import LoaderMetrics
 
-Reason = Literal[
-    "success",
-    "circuit-open",
-    "timeout",
-    "transport-error",
-    "tls-verify-failed",
-    "http-5xx",
-    "http-429",
-    "http-4xx",
-    "http-3xx",
-]
+#: `success`, a fixed name (`circuit-open`, `timeout`, `transport-error`, `tls-verify-failed`), `HTTP_REDIRECT_REFUSED`
+#: for a 3xx, or the exact `HTTP_<status>` for any other non-2xx (envelope README 2.3.2, as the fhir loader does).
+Reason = str
 
 DEFAULT_MAX_CONCURRENT_REQUESTS = 8
 
@@ -108,7 +99,11 @@ class DeliveryOutcome:
 
     @property
     def retryable(self) -> bool:
-        return not self.success and self.reason not in ("http-4xx", "http-3xx", "tls-verify-failed")
+        if self.success or self.reason == "tls-verify-failed":
+            return False
+        if self.status_code is None:  # circuit open, timeout, transport failure
+            return True
+        return self.status_code == 429 or 500 <= self.status_code < 600  # a 3xx or other 4xx never succeeds on retry
 
 
 def classify_status(status_code: int) -> Reason:
@@ -119,12 +114,8 @@ def classify_status(status_code: int) -> Reason:
     if 200 <= status_code < 300:
         return "success"
     if 300 <= status_code < 400:
-        return "http-3xx"
-    if status_code == 429:
-        return "http-429"
-    if 500 <= status_code < 600:
-        return "http-5xx"
-    return "http-4xx"
+        return "HTTP_REDIRECT_REFUSED"
+    return f"HTTP_{status_code}"
 
 
 def _auth_header(auth: AuthSpec, resolver: SecretResolver) -> tuple[str, str]:

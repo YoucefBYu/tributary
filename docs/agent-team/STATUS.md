@@ -21,21 +21,60 @@ wave's exit criteria here.
   W3-12 observability contract then W3-17 readiness probe (`architect`, `connector-engineer`), W3-11
   `validate.py --check-expectations` (`architect`), W3-22/W3-20/W3-21 (`qa-engineer`), W3-10 ADR-004
   draft (`architect`).
-- **Branch:** `wave/1-2` until `wave/1-3` is created. Neither wave is merged to `main` (`2c25448`).
+- **Branch: `wave/1-3` for all further wave 3 work (2026-10-06).** The human instructed that
+  `wave/1-1` and `wave/1-2` be merged into `main` and a PR opened for `wave/1-3`. The lead is doing the
+  git side, and the architect has not seen the merge commit or the PR. Until the lead confirms, `main`
+  is recorded at `2c25448`.
+- **Human answers, 2026-10-06 (relayed by the lead): `phases/wave-3.md` 2.7.** 7.1 → `asyncpg`;
+  7.2 → retention is an operator setting (W3-30, W3-31, W3-32); 7.3 → `_hmac` deferred; 7.4 → ADR-004
+  H1/H2/H5 **decided; `security-reviewer` CONCUR WITH CONDITIONS C1-C8** (ADR-004 7.1, lead-relayed;
+  tasks W3-34 `control-plane-engineer`, W3-35 and W3-36 `devops-engineer`); 7.6 → free 3-broker cluster (W3-33a/b);
+  7.7 → merge plus `wave/1-3`. Still open with the human: 7.5, ADR-004 H6 and H7, and the carried items.
+- **2026-10-06, lead input on W3-29 (`wave-3.md` 2.6 H8):** the `reprocessor` gains LITERAL READ on
+  each channel's `raw`, plus DESCRIBE only on group `tb.<env>.reprocessor` (assign needs a `group.id`, as `archive-engineer` measured). Published in set 1.8 with `lag_reader` (decisions log). The
+  lead ruled that replay targets its source channel only, and "shadow" keeps its consumer-group
+  meaning. A replay into a per-key channel needs an audited `allow_reorder` flag.
 - **Human-only questions for wave 3:** `phases/wave-3.md` section 7, mirrored under Open questions below.
-- **Architect batch 1, delivered 2026-10-05, ALL UNVERIFIED (the architect has no shell; the lead
-  runs the verify lines):**
+- **Architect batch 4, 2026-10-12 (README only; counts predicted unchanged at 244 / 0 and 154 / 0):**
+  W3-29 items 2-3 published (`topics/v0` 3.3 instance rule; `INSTANCE_REQUIRED` named in
+  `observability/v0` L6a, not registered). Gap found: the `kafka` source receiver defaults `--instance`
+  to `kafka-0` and uses it as `group.instance.id` (sent to `connector-engineer`). **W3-19 ruled:** HTTP
+  sync `200`/coded `202`/`503`; `Idempotency-Key` ignored; `body: step` deferred (`channel-spec/v0`
+  3.2.6). The connector may build.
+- **W3-24 CLOSED 2026-10-12: host scheduling; no code fix for the tail.** `platform-engineer`'s
+  stage-timing run (coordinator-relayed) found the 44-71 ms sync-reply tail also in an asyncio echo
+  control without Kafka. Separately, p50 drops by an estimated ~5 ms with `clients.worker_producer`
+  `linger.ms` 0 (`topics/v0` 3.2.1; build and throughput check by `platform-engineer`). A per-stage
+  histogram is rejected for now (CHANGELOG).
+- **Architect batch 1, delivered 2026-10-05; closure status 2026-10-12.** The coordinator's run on
+  2026-10-12 covered every contract delivered so far: `validate.py` **244 passed / 0 failed**,
+  `--check-expectations` **154 invalid / 0 drifted** (exit 0). Its counts include W3-12, W3-1a, W3-17
+  and W3-1b. They cannot be split per task, because the predictions per task were never measured
+  separately.
 
-  | Task | Delivered | Verify owed |
-  |---|---|---|
-  | W3-12 | `contracts/observability/v0`: readiness section 2 (**unblocks W3-17**), metric registry (35 metrics, 19 labels), log line schema | `validate.py` N / 0; observability adds 30 checks, 19 pinned pairs |
-  | W3-1a | `contracts/openapi/v0` part 1; ADR-009 Proposed | `validate.py --with openapi-spec-validator`: predicted **210 / 0** in total; openapi adds 24 checks, 10 pairs |
-  | W3-11 | `validate.py --check-expectations` | Exit 0 on the tree (predicted `139 invalid examples, 0 drifted`); exit 1 on a scratchpad copy with one pair altered |
-  | W3-10 | ADR-004 draft, H1-H7 `TODO(human)` | `security-reviewer` reads it |
-  | W3-17 amend | `reply_consumer` reason `unauthorized`; per-check reason binding; `spec` gets no `unauthorized` (ruling, README 2.3); five `log_only` codes in `error-codes.json` (set `1.8`); `OPS_LISTENER_BIND_FAILED` named in O4, not registered (L6a) | `validate.py` predicted **213 / 0**; `--check-expectations` `141 ..., 0 drifted`; `platform-engineer` adds the five codes to `sdk.codes` in the same push or `test_codes_contract.py` goes red |
+  | Task | Delivered | State | Still owed (exact) |
+  |---|---|---|---|
+  | W3-12 | `observability/v0` readiness, metric registry, log line | **CLOSED** by the 244 / 0 run | none |
+  | W3-1a | `openapi/v0` part 1; ADR-009 | **CLOSED 2026-10-12** (coordinator's run): 244 / 0, and `pytest tests/conformance -q -k openapi` → **44 passed** | none |
+  | W3-11 | `--check-expectations` | **CLOSED 2026-10-12** (coordinator's run): exit 0 on the tree (154 invalid / 0 drifted). Negative control on a scratch copy with `request-deploy-unknown-field.json` `expected_validator=required`: `DRIFT openapi: invalid/request-deploy-unknown-field.json`, `154 invalid examples, 1 drifted`, `exit=1` | none |
+  | W3-10 | ADR-004 draft | **CLOSED**: `security-reviewer` read it and concurred with conditions C1-C8 (ADR-004 7.1, lead-relayed 2026-10-06) | none |
+  | W3-17 amend | readiness `unauthorized`, five `log_only` codes | **CLOSED 2026-10-12** (coordinator's run): 244 / 0, and `test_codes_contract.py` → **15 passed** | none |
 
   **CI note:** the `contracts` job must add `--with openapi-spec-validator`, or the default run fails by
   design (W3-14, `devops-engineer`).
+
+### Wave 3 exit criteria (`phases/wave-3.md` section 4), state 2026-10-12
+
+| # | Criterion | State | Evidence | Still owed |
+|---|---|---|---|---|
+| 1 | Message browser API returns per-stage content and destination statuses | **OPEN** | Contract published and verified (W3-1b, `openapi/v0` `getMessage`, `getMessageContent`) | W3-6 endpoints, W3-9b E2E against real ClickHouse with responses validated against `openapi/v0` |
+| 2 | Workers at full rate with ClickHouse, PostgreSQL and the API stopped | **MET under the lead's one-sided rule** | `docs/spikes/wave-3-outage-control-plane.md`, `ec7a3ec`. Set 3: the stopped median of 726 msg/s is at or above the control minimum of 395. Control median 711, and the stopped median also falls inside the control range. 0 order violations, 0 ACKed loss in 30 runs; the fault fired in 15/15 stopped runs; the mutation control is red | **Ruling recorded:** the lead replaced the plan's two-sided "inside the control min-max" with the one-sided "stopped median ≥ control minimum" (set 1 failed two-sided by being *faster*). **Caveat:** set 3's control minimum (395) is an outlier against 697-735, so the one-sided bound is loose there. Sets 1 and 2 (848 ≥ 484, 888 ≥ 701) carry the tighter evidence |
+| 3 | Deploy and rollback through the API and the CLI | **EVIDENCE CITED, NOT CLOSED** | API `d9e3bef`, CLI `a2ddeb5` (coordinator-relayed; the architect has not read them) | For each path: the owner's handoff line, i.e. the integration test name and its `pytest -q` summary, showing deploy v2, then the worker on v2 with the **same PID** (W3-5 verify: same PID and new `metadata.version`, or `tb_spec_version`), then rollback to v1, observed the same way. Plus a green CI run at or after both commits |
+| 4 | `security-reviewer` clean on API authn, audit and PHI | **OPEN** | ADR-009 reviewed (rev 2); `audit/v0` published | W3-32 audit producer (fail closed, one record per view, no payload bytes), W3-6, **W3-37a/b (ADR-004 C1a: API listener TLS by default, mesh mode opt-in; ruled 2026-10-12 on a design Medium)**, then the reviewer's pass with no unresolved Critical or High, closing audit against W3-30 (2) and W3-32 |
+
+**Also gate-tracked:** no image before W3-13 is green; `tb_partitions_halted` exported and the
+`partition_halted` alert shown firing (W3-25, W3-8); ADR-004 drafted (done). State of these not
+re-checked on 2026-10-12.
 - **W3-8 open risks ruled 2026-10-06** (`phases/wave-3.md` 2.4-2.5; chart uncommitted under
   `deploy/helm/tributary/`). New tasks: **W3-25** runtime ops listener + `/metrics` + worker
   (`platform-engineer`, on call); **W3-26** receivers `/metrics`, loaders ops listener
@@ -48,6 +87,18 @@ wave's exit criteria here.
   unchanged): `FINAL` wording corrected (`events/v0` 4.1 rule 2); reprocess copies `tb-received-at`
   (`envelope/v0` 6 rule 5); destination-scoped reprocess deferred to wave 4, the refusal stays, and the
   W3-3 verify is amended to a refusal test. `reprocessor` role added to W3-29.
+- **W3-1b delivered 2026-10-06, VERIFIED 2026-10-12 (coordinator's run; code review approved): set 1.8 part 2.** `openapi/v0`
+  part 2 (search, detail, per-stage content, reprocess, replay as `202` + resource, stats, SSE tailed
+  from the archive, read-only retention), `x-tributary-phi-content` on content, reprocess and replay
+  POST (operator, admin), `x-tributary-audit-action`; `audit/v0` (new) with the `audit_log` row shape;
+  archiver READ LITERAL `_tb.<env>.audit`; rollback default-target wording (README 3.3); ADR-008 D5
+  aligned with `topics/v0` 3.8 and ADR-004 C7. Same day: ADR-010 reserves `tb-` channel names
+  (non-additive, recorded); ADR-004 R7 rev 3 puts `audit_log` on plain `MergeTree` with query-time dedup;
+  `HTTP_4XX`/`HTTP_5XX` ruled out (emit exact `HTTP_<status>`). **Measured:** `validate.py`
+  **244 passed / 0 failed**, `--check-expectations` **154 invalid / 0 drifted**. **Unblocks** W3-6, W3-32, W3-30 (2).
+  **Requests out:** `archive-engineer` (`AuditEvent.error_code` on `failed`; widen `ACTOR` to the
+  `Subject` grammar, or valid IdP subjects like `idp|123` get `INVALID_REQUEST`), `devops-engineer`
+  (regenerate `files/acls.json`), `qa-engineer` (`audit` in conformance; guard lists).
 
 ### Wave 2 exit, 2026-10-05: CLOSED, condition lifted
 
@@ -458,6 +509,7 @@ All six filed and synthesised. Full threshold table with evidence ratings quoted
 | Phase 0 go/no-go | **GO WITH CONDITIONS (signed by the human)** | 2026-09-22 | Instruction: *"Approve orjson, hypothesis and pathspec; record Phase 0 GO WITH CONDITIONS signed"*. All four blocking conditions were met first. **The conditions still standing are the non-blocking open items only:** audit retention (open, blocks the `_tb.<env>.audit` contract), the Mirth corpus (not decided), the keyed-hash mechanism (unresolved until before the archiver is built), and the Phase 1 requirements table in `gates/phase-0-spikes.md` 7.1. **Signing does NOT start Phase 1 — Phase 1 needs the human's separate go-ahead.** |
 | Phase 1 wave 1 exit | **CI passed on the pushed branch; starting wave 2 approved** | 2026-09-24 | Recorded exactly as relayed by the lead: the human confirmed that CI passed and approved starting wave 2. That met the gate's one remaining condition. **Not recorded here, because it was not stated:** a merge to `main` (none has happened; `main` is at `2c25448`) and any separate signature on the gate report |
 | Phase 1 wave 2 exit | **Closed by the lead and architect under the human's delegation; condition lifted 2026-10-05** | 2026-10-05 | The human's words, relayed by the lead: *"Execute them by priority and let the lead and architect decide."* Criteria 1-4 met (Current, Wave 2 exit). Condition lifted: `security-reviewer` closed `fb60f3a` and three other wave 2 findings at `b6b0c97` (lead-relayed, no scanners run). **Not a human signature on a gate report. No merge to `main`** |
+| Merge of `wave/1-1` and `wave/1-2` to `main`; PR for `wave/1-3` | **Instructed by the human** (relayed by the lead) | 2026-10-06 | The lead executes the git side. Merge commit and PR not yet seen by the architect |
 | Phase 1 wave 3 exit | pending | | |
 | MVP release decision | pending | | |
 | Phase 2 v1.0 release decision | pending | | |
@@ -537,7 +589,7 @@ All six filed and synthesised. Full threshold table with evidence ratings quoted
 | 2026-09-28 | **W2-8 sync-reply proposal ruled (`platform-engineer`, `b0c91cb`); contract set 1.2 published, additive, unverified.** (1) `spec.source.reply` on `mllp`/`http`: **approved with amendments** (`after` = `routed` only; `reply.partitions` alone sizes `reply`; transactional refusal moved into the schema; split refused at load). (2) Targeted routing through the `replier` group: **approved with amendments** (`group.instance.id` per process; advertise only after an established fetch position; unparseable reply records dropped, never crash). Broadcast rejected as default. (3) `AR` = commit not confirmed, `AE` = committed, `AA` = committed and routed: **approved with an amendment**: neither `AA` nor `AE` precedes the `raw` callback, so a revoke before it waits. `Reject` → `AE` **approved**; `Drop` → `AA` **approved**; partial failure takes the first failure in spec order; absent/unknown status → `AE`. HTTP mapping **deferred to W2-7** under a no-auto-retry-status constraint (the proposed `500` breaks it). (4) Transactional and split refusals **approved**. (5) Headers **approved with amendments** (`tb-reply-status` schema-optional to stay additive; `tb-reply-deadline` present iff `tb-reply-partition`; a bad routing header disables the reply, not the message). `REPLY_` + six codes **approved**, `REPLY_PARTITION_INVALID` renamed `REPLY_ROUTE_INVALID`. ACLs and `reply.partitions` **approved**. `ctx.reply` **approved with amendments** (pipeline steps only; failed-attempt bodies discarded; `body: step` must charge bodies to `queue.maxBytes`). (6) **D9 finding correct**: a resend after `AE` has a new `tb-msg-id`; ADR-003 D9 amended, ADR-001 7/13 and the risk row corrected. No invariant changes, nothing breaking | `contracts/CHANGELOG.md` 2026-09-28, channel-spec README 3.2.6, envelope README 2.3.3, topics README 3.3.1, ADR-003 D9/D10 |
 | 2026-09-29 | **Engine Kafka credentials, all data-plane roles: one `engine-kafka/v0` document per process, named by `TB_ENGINE_KAFKA_FILE`** (bootstrap servers + `kafkaSecurity` shape, secrets by `secretRef` from local files; invariant 3 holds). Workers, loaders and the archiver enforce the same rules as `e3ddee1`: PLAINTEXT only to loopback, **no opt-out**; verified TLS with the AEAD pin; credentials present; `SSL` needs a client certificate. `--bootstrap`, `--engine-security`, `TB_BOOTSTRAP_SERVERS` retired. Rejected: per-role CLI flags, env vars carrying values, fetching from the control plane | ADR-008 D1-D3, `contracts/engine-kafka/v0` |
 | 2026-09-29 | **Defect found while ruling (invariant 1):** `KafkaSettings.security` is merged after the contract's producer defaults, so it can override `acks` and idempotence. No passthrough; only security keys accepted; contract values win | ADR-008 D4 |
-| 2026-09-29 | **Compose lite stack runs `SASL_SSL`**, dev CA and per-component SCRAM users generated at `up`, deny-by-default ACLs from `topic-defaults.json`. Rejected: a dev-only PLAINTEXT opt-out (no definition keeps it out of production: a container network is not loopback, and lite is allowed for small sites carrying PHI), and a shared network namespace (leaves TLS, SCRAM and ACLs untested until Helm). Lite lowers durability, never transport security | ADR-008 D5, `engine-kafka/v0` 6 |
+| 2026-09-29 | **Compose lite stack runs `SASL_SSL`**, dev CA and per-component SCRAM users generated at `up`, deny-by-default ACLs from `topic-defaults.json`. Rejected: a dev-only PLAINTEXT opt-out (no definition keeps it out of production: a container network is not loopback, and lite is allowed for small sites carrying PHI; *reasoning restated 2026-10-06: lite is never production and is synthetic-only unless ADR-004 C7's custody rules are met, which no component can enforce, so the rejection stands*), and a shared network namespace (leaves TLS, SCRAM and ACLs untested until Helm). Lite lowers durability, never transport security | ADR-008 D5, `engine-kafka/v0` 6 |
 | 2026-09-29 | **`tls.allowedClientSans` APPROVED WITH AMENDMENTS** (proposed as `allowedSubjects`): typed `dns:`/`uri:` SANs only, exact, no wildcard, only with `clientAuth: required`, `mllp` and `http`, checked before any application byte; `TLS_PEER_NOT_ALLOWED`; fingerprint in logs, never names. Rejected: subject DN strings (no canonical form), required-by-default (breaking) | ADR-007 D18, channel-spec README 3.2.7 |
 | 2026-09-29 | **`nackOn: spec-invalid` stays refused on every source type, documented as reserved** until receiver live reload exists, which must also define it | ADR-007 D19, channel-spec README 3.2.8 |
 | 2026-09-29 | **`oauth2-client-credentials` not defined; exit-criterion-1 example switched to `bearer`**; `oauth2-client-credentials` and `mtls` reserved for `http`/`fhir`. OAuth needs a token client and, for SMART Backend Services, `private_key_jwt` key management (ADR-004 + human). Unblocks exit criterion 1 | ADR-007 D20, channel-spec README 3.4.1 |
@@ -575,15 +627,24 @@ All six filed and synthesised. Full threshold table with evidence ratings quoted
 | 2026-10-06 | **W3-8 open risks ruled (four).** (1) `/livez` + `/metrics` for every component are already normative (`observability/v0` 1); one runtime implementation (W3-25) wired by each owner (W3-26, W3-27, W3-4b); `prometheus-client` for exposition only, explicit registry. Blocks neither criterion 2 nor 4; `partition_halted` alert firing gate-tracked. (2) `--instance` vs `--instance-id`: same value and rule, two spellings kept in v0; pid defaults collide (pid 1) → required (W3-28). (3) StatefulSets for all data-plane workloads, `Parallel`, no PVCs; S5 3.21 s same-id restart vs a ~15 s session-timeout stall per new-name pod (derived, not measured on Kubernetes); KEDA scales StatefulSets. (4) `KafkaUser`s generated from `topic-defaults.json` when Strimzi is on; new DESCRIBE-only `lag_reader` role for KEDA (W3-29); contracts ship in the image, ConfigMap removed. Rejected: renaming flags now; Deployments with random names; hand-written ACLs; KEDA on a data-plane principal; operator-supplied contracts. **Give up:** rollout surge, auto-replacement on a lost node, two flag spellings, retuning without a new image | `phases/wave-3.md` 2.4-2.5 |
 | 2026-10-06 | **W3-3 rulings (`archive-engineer`).** (a) `FINAL` collapses across month partitions at read time (setting `do_not_merge_across_partitions_select_final` = 0); only background merges do not. Text corrected on the engineer's 6-vs-5 measurement; `LIMIT 1 BY` stays. (b) Destination-scoped reprocess **deferred to wave 4**, refusal kept; `phase-1.md` never required it. Direction: `out.<dest>` re-entry for loader exhaustion, additive `raw` header for destination-step re-run, never a new topic class (invariant 2). New `reprocessor` role (LITERAL `raw` WRITE per channel) in W3-29. (c) `tb-received-at` copied unchanged on reprocess and replay. Rejected: unscoped re-injection with a warning; reprocess time in the header. **Give up:** no destination-level reprocess in wave 3; `now - tb-received-at` excludes records with `tb-parent-id` | `events/v0` 4.1, `envelope/v0` 6, ADR-003 f-up 10, `phases/wave-3.md` 2.6 |
 | 2026-10-05 | **ADR-004 amended.** K2/H7: the PREFIXED `<env>.` READ also covers `reply`, `retry` and any future `<env>.` topic; the human approves that or per-topic LITERAL grants. A5 kept: archivers INSERT only; schema migration is a separate step with its own CREATE/ALTER credential (`archive-engineer` implementing) | ADR-004 A5, K2, H7 |
+| 2026-10-06 | **Human answers to wave-3 section 7 (relayed by the lead), verbatim.** 7.1 `psycopg` vs `asyncpg`: *"let the lead and architect decide"*. 7.3 `_hmac` search attributes: *"let the lead and architect decide"*. 7.2 retention for audit records and archived events: *"Give the user a possibility to change it"*. 7.4 archive key custody: *"Let the lead, architect and security engineer decide"*. 7.6 3-broker test cluster: *"find alternative free solution"*. 7.7: merge `wave/1-1` and `wave/1-2` into `main`, and open a PR for `wave/1-3` (the lead's wording; no verbatim text relayed). Not answered: 7.5, ADR-004 H6, H7 | `phases/wave-3.md` 2.7, section 7 |
+| 2026-10-06 | **PostgreSQL driver: `asyncpg`** (lead and architect, under the human's delegation). Apache-2.0, already in the lockfile, in `tributary-api` and the `postgresql` loader; `psycopg` (LGPL-3.0) stays denied by `licence_check.py`. Rejected: approving `psycopg` (an invariant-10 escalation for no functional gain). **Give up:** a single sync+async driver; with PgBouncer in transaction mode, the prepared-statement cache must be off (operator docs). **CLAUDE.md stack-table line proposed to the lead:** `\| Control plane \| FastAPI, SQLAlchemy 2, asyncpg (not psycopg: LGPL-3.0), Alembic, PostgreSQL \|` | `wave-3.md` 2.7 D1 |
+| 2026-10-06 | **`_hmac` DEFERRED** (lead and architect, under the delegation) until ADR-004 H1 has concurrence and before any per-patient search task (W4-3). Any `*_hmac` value is treated as PHI whatever its construction, so the design never relies on de-identification and no agent makes a compliance reading. The archiver keeps dropping `*_hmac`. When revisited: a documented construction from an existing library only (RFC 2104 HMAC-SHA-256 via stdlib `hmac` is the candidate). Rejected: building it now (a reversible PHI index before key custody is settled). **Give up:** no per-patient search in wave 3 | ADR-004 H3, `wave-3.md` 2.7 D2 |
+| 2026-10-06 | **Retention is operator-configurable** (per the human's answer). Defaults: events `TB_ARCHIVE_TTL_DAYS` 90, content `TB_ARCHIVE_CONTENT_TTL_DAYS` 30, audit `TB_ARCHIVE_AUDIT_TTL_DAYS` 2190. The audit default is conservative because deletion is irreversible; it is not a compliance determination. Integer days, 1-36500. Audit system of record: ClickHouse `audit_log`, fed by the events archiver from `_tb.<env>.audit` (a 30 d buffer). Changes are applied only by the migrate step (`MODIFY TTL`); a decrease is refused without `TB_ARCHIVE_ALLOW_TTL_DECREASE=true`. Helm `archiver.retention.*`; the API view is read-only. Kafka topic retention is unchanged. Rejected: an API write endpoint (it needs the DDL credential, and a compromised admin could erase its own trail); per-channel retention (later, additive). **Give up:** a change needs a redeploy. **Drift found:** the chart's `archiver.ttlDays: 365` against the documented 90. Contract text: set 1.8 README-only patch. Tasks W3-30, W3-31, W3-32 | ADR-004 section 4, `topics/v0` 2.1, `events/v0` 4.1, CHANGELOG 2026-10-06 |
+| 2026-10-06 | **Key custody DRAFTED, pending `security-reviewer` concurrence** (lead, architect, security; the human's delegation). Tributary manages no keys. `production` requires customer-managed keys (KMS CMK or CMEK, or HSM or Vault on premises) on broker, ClickHouse, PostgreSQL, claim-check and backup storage; lite may use provider-managed keys. The claim-check bucket uses SSE-KMS by bucket default. Rotation is the KMS's automatic rotation. H2: no application-level encryption in v0 (column envelope encryption is key-management design, so human). H5: file-based secrets filled by the operator's store; 90-day recommended cadence (judgement). Documented features only; provider claims not re-checked in this session. **Give up:** production needs a KMS before content is turned on | ADR-004 H1, H2, H5 |
+| 2026-10-06 | **ADR-004 H1/H2/H5 concurred with conditions** by `security-reviewer` (lead-relayed; the architect has not read the review itself), so they are decided by the lead, architect and `security-reviewer` under the human's delegation. C1 TLS with verification on every PHI hop (PostgreSQL `verify-full`, claim-check bucket denies non-TLS, DB plaintext ports loopback-only); C2 the API's `TB_DATABASE_URL` is an H5 exception until a `secretRef` file; C3 broker `connections.max.reauth.ms` ≤ 3600000, revoke ACLs or `KafkaUser` before rotating; C4 secrets read at start, so pods restart; no `subPath` Secret mounts; C5 tiered storage, ClickHouse S3 disks and `BACKUP` targets need customer-managed keys; C6 the H1 (b) wording on key disable; C7 lite without a customer-managed key or full-disk encryption holds synthetic data only (`topics/v0` 3.8 rule 4); C8 content in production needs the ClickHouse `default` user disabled and admin queries logged outside ClickHouse. Tasks W3-34 (C1/C2), W3-35 (C1 ports, C3, C4, C8), W3-36 (C7 docs). **Noted, not ruled:** ADR-008 D5 says lite is allowed for small sites carrying PHI, while `topics/v0` 3.8 rule 2 bars lite from production; C7 now bounds the PHI case | ADR-004 7.1, `wave-3.md` 2.8 |
+| 2026-10-06 | **Set 1.8: `reprocessor` and `lag_reader` roles published** (W3-29 items 1 and 4). reprocessor = READ, WRITE, DESCRIBE on LITERAL `<env>.<ch>.raw`, IDEMPOTENT_WRITE, and **DESCRIBE only** on LITERAL group `tb.<env>.reprocessor`: assign-only still needs a `group.id` and FindCoordinator (measured by `archive-engineer`, lead-relayed). lag_reader = DESCRIBE on `<env>.` and `_tb.<env>.events`, DESCRIBE on group `tb.<env>.`. `platform_groups` and the schema `$defs.consumerGroup` gain `reprocessor`. No examples change, so `validate.py` is predicted unchanged. **Follow-ups:** `platform-engineer` adds `"reprocessor"` to `topics.PlatformGroup` in the same push (or `test_roles_and_platform_groups_match_the_contract` goes red); `devops-engineer` regenerates `acls.json` (`gen_acls.py` pins the contract's SHA-256, so the retention edit earlier today also made it stale) and drops the `lag_reader` placeholder. Both roles stay unverified until the W3-23-style test. **Give up:** a group DESCRIBE no consumer offset needs | `topics/v0` 3.4.1, CHANGELOG |
+| 2026-10-06 | **Free RF=3 testing (W3-33a/b)** instead of paid capacity: a 3-broker KRaft cluster on the standard GitHub runner and developer hosts (`combined`, plus `split` with 1 controller so a two-broker outage keeps quorum). C1 ISR below `min.insync.replicas` gives NACK, never ACK, with a mutation control; C2 rolling restart; C3 leader kill without duplicates; B1 RF=3/RF=1 ratio. Budget about 5 GiB, 2 vCPU, ≤ 45 min (estimate). It proves correctness at RF=3 and a cost ratio, not absolute latency or sizing. Repository visibility is unverified (runner size and minutes depend on it). Paid capacity stays an optional human item (W4-6) | `wave-3.md` 2.7 D5, 2.8 |
+| 2026-10-06 | **W3-29 amended; the lead's replay ruling recorded** (W3-3 security review, lead-relayed). `reprocessor` = READ, WRITE and DESCRIBE on LITERAL `<env>.<ch>.raw` plus IDEMPOTENT_WRITE; it never commits; a LITERAL `tb.<env>.reprocessor` group only if `archive-engineer` shows assign needs a `group.id`. Lead: replay targets only its source channel (no cross-channel republish); "shadow" keeps the `topics/v0` 3.6 consumer-group meaning; a replay into a per-key channel needs an explicit `allow_reorder` flag, recorded in the audit event, or it is refused (invariant 5). **Give up:** the reprocessor reads PHI on each granted channel (folds into H7) | `wave-3.md` 2.6 H8, W3-29, W3-3; ADR-004 section 5 |
 
 ## Open questions for the human
 
-**ADR-004 (2026-10-05), H1-H7, `TODO(human)` in the ADR:** H1 key custody for encryption at rest
-(= 7.4); H2 application-level encryption of archived content (new); H3 `_hmac` construction, key and
-de-identification (= 7.3); H4 retention values and the audit system of record (= 7.2, now also archived
-content at a 30-day placeholder); H5 credential rotation cadence and secret store (new); H6 erasure:
-delete, crypto-shred, or neither (new); H7 sign-off on the Kafka role model, including the content
-archiver reading every channel's PHI in its environment (new).
+**ADR-004, state after the human's 2026-10-06 answers:** H1, H2 and H5 **decided, with
+`security-reviewer` concurring under conditions C1-C8** (delegated to the lead, architect and
+security; ADR-004 7.1). H3 deferred, and
+H4 decided (lead and architect). **Still `TODO(human)`:** H6 erasure (delete, crypto-shred, or
+neither) and H7 sign-off on the Kafka role model. H7 includes the content archiver reading every
+channel's PHI and, since 2026-10-06, the `reprocessor`'s READ on `raw`.
 
 **Seven of the nine Phase 0 gate items were decided on 2026-09-21, and the MPL approval plus the gate
 sign-off followed on 2026-09-22** — see the decisions log above. What remains open is listed here. Items
@@ -592,6 +653,17 @@ struck through were decided and are kept for one revision so the change is visib
 **Nothing blocks the Phase 0 gate any more — it is signed.** Wave 1 is complete. Wave 2 closed on
 2026-10-05 and its one condition was lifted the same day, and wave 3 has started under the human's delegation to the lead and
 architect.
+
+**Open, new in wave 3:**
+
+- **CI while hosted Actions is refused (billing hold), PROPOSED 2026-10-14.** See
+  [`decisions/ci-alternatives.md`](decisions/ci-alternatives.md). Architect's recommendation: C, a
+  repo-owned `ci_local.sh` that the workflows call, with a parity test and a pre-push hook. Fallback A,
+  a self-hosted runner, if a 10-minute test shows it is dispatched under the hold.
+  **Needs the human:**
+  - run that test;
+  - optionally create a statuses token (credential);
+  - fixing billing (spend) or going public (publishing) are separate human decisions.
 
 **Open, new in wave 2:**
 
@@ -625,7 +697,8 @@ architect.
     were shown red against the pre-fix code before going green, and the suite is 31 / 31.
   - Same fix: `tributary-fhir`'s `fhir.resources` and `fhir-core` are now actually checked (BSD), which
     closes W2-2 open item 1.
-- **Wave 3 human questions (`phases/wave-3.md` section 7), 2026-10-05:**
+- **Wave 3 human questions (`phases/wave-3.md` section 7), 2026-10-05. ANSWERED 2026-10-06**
+  (decisions log; `wave-3.md` 2.7), except 7.5. The text below is kept for one revision:
   - **`_hmac` keyed-hash mechanism is now due.** The 2026-09-21 decision deferred it "until before the
     archiver is built", and W3-2a starts the archiver now. Decide now or extend the deferral. Until
     then the archiver writes no identifier-derived attributes and per-patient search stays refused.
@@ -636,7 +709,9 @@ architect.
     **Same answer, one more place (2026-10-05):** archived lifecycle events in ClickHouse default to
     90 days (`TB_ARCHIVE_TTL_DAYS`, placeholder). Say whether the retention duty reaches them.
   - **Merge `wave/1-1` and `wave/1-2` to `main`**: a human action, not blocking.
-- **`psycopg` 3 in the CLAUDE.md stack table. Default chosen 2026-10-05: W3-4a builds on `asyncpg`;
+- **DECIDED 2026-10-06: `asyncpg`** (human: *"let the lead and architect decide"*; the CLAUDE.md line
+  is proposed to the lead, decisions log). Kept for one revision: **`psycopg` 3 in the CLAUDE.md stack
+  table. Default chosen 2026-10-05: W3-4a builds on `asyncpg`;
   the human answer is still needed** (approve `psycopg` or amend the table). CLAUDE.md names it for
   the control plane. It is LGPL-3.0, and `licence_check.py` denies it (reported by the lead and
   `connector-engineer`). Invariant 10 has no LGPL path. The options: approve it as an unmodified
@@ -652,13 +727,18 @@ architect.
   the loader.~~ **DECIDED 2026-09-28: `clickhouse-connect`, with `certifi` approved in the runtime**
   for the archiver only, silent retries off, loader-level review (decisions log, ADR-001 2.3). The
   loader keeps its stdlib client. Kept for one revision so the change is visible.
-- **Linux re-run capacity.** The single-broker Linux re-run was done on 2026-09-28. The memo priced the
+- **ANSWERED 2026-10-06:** *"find alternative free solution"*, so W3-33a/b, a free 3-broker cluster.
+  Paid capacity is needed only for absolute latency or sizing claims (W4-6). Kept for one revision:
+  **Linux re-run capacity.** The single-broker Linux re-run was done on 2026-09-28. The memo priced the
   full version as "CI runner time and a dedicated 3-broker cluster", and a hosted runner is not a
   dedicated cluster. Whether to pay for dedicated RF=3 capacity is cloud spend (W4-6).
 
 **Open, carried:**
 
-- **Audit retention — still open, and it blocks the `_tb.<env>.audit` contract.** What retention duty
+- **DECIDED 2026-10-06: audit retention is an operator setting** (`TB_ARCHIVE_AUDIT_TTL_DAYS`,
+  default 2190 d; the system of record is ClickHouse `audit_log`; decisions log). The audit contract is
+  unblocked (W3-1b). Kept for one revision:
+  **Audit retention — still open, and it blocks the `_tb.<env>.audit` contract.** What retention duty
   applies to the control-plane and access audit trail? HIPAA §164.316(b)(2)(i) requires six-year
   retention of records of required actions and activities; whether that reaches this audit trail is a
   legal-interpretation question and **no legal review has been done, nor should an agent do one**. No
@@ -765,3 +845,7 @@ version is `docs/spikes/PHASE-0-DECISION.md` section 9 and ADR-001 section 13.
 | **Worker, loader and archiver replicas fence each other outside Helm** (2026-10-06): default `group.instance.id` is `pipeline-<pid>` / `loader-<dest>-<pid>` / `archiver-<pid>`, and pid is 1 in every container | Certain with 2+ replicas and no explicit id | High: repeated `_FATAL` fencing, ordered partitions stall | W3-28a-d: refuse to start without an explicit instance id. Helm already sets it from the pod name |
 | **Alerts and dashboards have no data** (2026-10-06): nothing exports `observability/v0` metrics; a halted partition stalls silently | Certain until W3-25..W3-27 | Medium | W3-25..W3-27; `partition_halted` alert firing is gate-tracked |
 | **The 2026-10-05 wave 2 closures carry no scanner evidence** (bandit, pip-audit, gitleaks not installed for that review) | Low | Medium | CI's licence, SBOM and secret-scan jobs still run. Install the scanners for the wave 3 exit review (criterion 4) |
+| **Audit records are not tamper-evident** (2026-10-06): a ClickHouse admin can alter or delete `audit_log` rows (ADR-004 R7) | Low | High for an investigation | Operational control in v0; object storage with object lock is the later option. Retention shortening is guarded by `TB_ARCHIVE_ALLOW_TTL_DECREASE` and logged (`retention_applied`) |
+| **An operator shortens retention and loses records irreversibly**, or expects prompt deletion and gets up to one month's lag (`ttl_only_drop_parts`) (2026-10-06) | Medium | Medium | Decrease refused without an explicit flag (R6); lag documented (R1); erasure uses R4, not TTL |
+| **Chart retention default drifts from the contract** (`archiver.ttlDays: 365` vs documented 90, found 2026-10-06) | Certain until W3-31 | Low | W3-31 removes the key; `helm_check.py` asserts the R2 defaults |
+| **The free RF=3 cluster is read as a sizing result** (2026-10-06) | Medium | Medium | W3-33b reports a ratio only, with the "cannot prove" list (`wave-3.md` 2.7) |

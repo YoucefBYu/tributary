@@ -45,8 +45,8 @@ except ImportError:  # pragma: no cover - the message is the point
 
 CONTRACTS = Path(__file__).resolve().parent
 
-# engine-kafka: set 1.3, ADR-008. observability and openapi: set 1.8 (W3-12, W3-1a).
-FILE_CONTRACTS = ("envelope", "events", "channel-spec", "engine-kafka", "observability", "openapi")
+# engine-kafka: set 1.3, ADR-008. observability and openapi: set 1.8 (W3-12, W3-1a). audit: set 1.8 part 2 (W3-1b).
+FILE_CONTRACTS = ("envelope", "events", "channel-spec", "engine-kafka", "observability", "openapi", "audit")
 OPENAPI_DOCUMENT = CONTRACTS / "openapi/v0/openapi.json"
 TOPIC_MANIFEST = CONTRACTS / "topics/v0/examples/topic-names.json"
 CONTEXT_REGISTRY = CONTRACTS / "context-extension/v0/capabilities.json"  # set 1.5, ADR-007 D21

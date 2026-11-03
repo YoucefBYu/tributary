@@ -40,6 +40,7 @@ from ..backpressure import DEFAULT_MAX_BYTES
 from ..errors import ConfigError
 from ..keys import key_expression_from_spec
 from ..net import is_loopback
+from ..reply.settings import ReplySettings, reply_settings
 from ..tls import TlsSpec
 
 DEFAULT_ACK_TIMEOUT_MS = 10_000
@@ -97,6 +98,8 @@ class HttpSettings:
     #: (`http/reload.py`): the raw producer's key rule is set at construction (invariant 5).
     ordering: str = "none"
     partition_key: str | None = None
+    #: `source.reply` (README 3.2.6): present means synchronous reply mode. `None` is the async `202` path.
+    reply: ReplySettings | None = None
 
     def __post_init__(self) -> None:
         # Every value that is applied live is checked here, once, so a bad update is refused as a
@@ -161,6 +164,15 @@ def http_settings_from_channel_spec(spec: Mapping[str, Any], *, env: str, instan
         partition_key=body.get("partitionKey"),
         env=env,
         instance=instance,
+        transactional=bool((body.get("pipeline") or {}).get("transactional", False)),
+        step_uses=tuple(
+            step.get("uses")
+            for steps in (
+                [(body.get("pipeline") or {}).get("steps") or []]
+                + [d.get("steps") or [] for d in body.get("destinations") or []]
+            )
+            for step in steps
+        ),
     )
 
 
@@ -176,6 +188,10 @@ def http_settings_from_spec(spec: ChannelSpec, *, env: str, instance: str = "htt
         partition_key=spec.partition_key,
         env=env,
         instance=instance,
+        transactional=spec.pipeline.transactional,
+        step_uses=tuple(
+            step.uses for steps in [spec.pipeline.steps, *(d.steps for d in spec.destinations)] for step in steps
+        ),
     )
 
 
@@ -188,16 +204,18 @@ def _settings(
     partition_key: str | None,
     env: str,
     instance: str,
+    transactional: bool,
+    step_uses: tuple[str | None, ...],
 ) -> HttpSettings:
     if source.get("type") != "http":
         raise ConfigError(f"channel {channel!r}: source.type is {source.get('type')!r}, not 'http'")
-    if "reply" in source:
-        # Synchronous reply is built for MLLP only; the HTTP status mapping is decided with W2-7 (channel-spec
-        # README 3.2.6). Refused loudly rather than accepted and answered as async: the sender would believe it
-        # gets the routed outcome and would get "accepted" instead.
+    reply = reply_settings(source, channel=channel, transactional=transactional, step_uses=step_uses)
+    if reply is not None and reply.body != "ack":
+        # README 3.2.6 (set 1.8, ruling 3): a step body needs a response content type, which `ctx.reply` does not
+        # carry yet. Schema-valid, refused here, so the sender never gets a body-less answer it did not ask for.
         raise ConfigError(
-            f"channel {channel!r}: source.reply is not supported by the http receiver yet; "
-            "remove it or use an mllp source (the channel is not started)"
+            f"channel {channel!r}: source.reply.body 'step' is not supported by the http receiver yet; "
+            "use 'ack' (the channel is not started)"
         )
 
     ack = _require(source, "ack", "source")
@@ -259,4 +277,5 @@ def _settings(
         instance=instance,
         ordering=ordering,
         partition_key=partition_key,
+        reply=reply,
     )

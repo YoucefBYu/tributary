@@ -18,6 +18,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[2]
 CHART = ROOT / "deploy" / "helm" / "tributary"
 FORBIDDEN_LOG_VAR = re.compile(r"\$(request|request_uri|args|query_string|http_authorization|http_cookie)\b")
+CA_EXPECTED = True  # ci/values-ci.yaml sets archiver.clickhouse.caCertSecretRef
 METRIC = re.compile(r"\btb_[a-z][a-z0-9_]*")
 
 
@@ -33,7 +34,7 @@ def registry() -> set[str]:
 def pods(docs: list[dict[str, Any]]) -> list[tuple[str, dict[str, Any]]]:
     out = []
     for d in docs:
-        if d["kind"] in ("Deployment", "Job"):
+        if d["kind"] in ("Deployment", "StatefulSet", "Job"):
             out.append((d["metadata"]["name"], d["spec"]["template"]["spec"]))
     return out
 
@@ -55,6 +56,10 @@ def check(docs: list[dict[str, Any]]) -> list[str]:
     rules = [r for rule in by_kind.get("PrometheusRule", []) for g in rule["spec"]["groups"] for r in g["rules"]]
     if not any("tb_partitions_halted" in r["expr"] and r.get("alert") for r in rules):
         bad.append("no alert on partition_halted (tb_partitions_halted)")
+    for outcome in ("unsupported_version", "invalid"):  # observability README 3.5: a dropped audit record pages
+        want = f'sum by (namespace) (increase(tb_archiver_audit_records_total{{outcome="{outcome}"}}[15m])) > 0'
+        if not any(r.get("alert") and r["expr"] == want and r["labels"].get("severity") == "critical" for r in rules):
+            bad.append(f"no critical alert on audit records with outcome={outcome}")
 
     for name, spec in pods(docs):
         for c in spec["containers"]:
@@ -93,7 +98,7 @@ def check(docs: list[dict[str, Any]]) -> list[str]:
     for np in by_kind.get("NetworkPolicy", []):
         for rule in np["spec"].get("ingress", []):
             if any(p["port"] == 9180 for p in rule["ports"]):
-                froms = rule["from"]
+                froms = rule.get("from", [])
                 if any("ipBlock" in f and f["ipBlock"]["cidr"] not in ("0.0.0.0/0", "::/0") for f in froms) and all(
                     "ipBlock" in f or "podSelector" in f for f in froms
                 ):
@@ -103,8 +108,38 @@ def check(docs: list[dict[str, Any]]) -> list[str]:
     if receivers and not cidr_ok:
         bad.append("no NetworkPolicy limiting ingress on 9180 to the kubelet CIDR")
 
+    # Every process that exports tb_* (worker, loaders, archiver) binds the pod IP, so the collector can scrape
+    # tb_partitions_halted and kubelet can probe, and has its own NetworkPolicy on the ops port.
+    labels = {
+        d["metadata"]["name"]: d["spec"]["template"]["metadata"].get("labels", {})
+        for d in docs
+        if d["kind"] == "StatefulSet"
+    }
+    for n, spec in pods(docs):
+        if n not in labels or not (n.endswith("-worker") or "-loader-" in n or n.endswith("-archiver")):
+            continue
+        c = spec["containers"][0]
+        binds = [a for a in c["args"] if a.startswith("--ops-bind")]
+        if binds != ["--ops-bind=$(POD_IP)"]:
+            bad.append(f"{n}: --ops-bind must appear exactly once, as the pod IP")
+        if not any(p["name"] == "ops" and p["containerPort"] == 9180 for p in c.get("ports", [])):
+            bad.append(f"{n}: no container port named ops (the collector keeps only that name)")
+        if c.get("livenessProbe", {}).get("httpGet", {}).get("path") != "/livez":
+            bad.append(f"{n}: no /livez liveness probe")
+
+        # Matched by selector against the pod template labels, not by policy name: a policy that selects
+        # nothing (or the wrong pods) must not pass.
+        def selects(x: dict[str, Any], lab: dict[str, str] = labels[n]) -> bool:
+            want = x["spec"]["podSelector"].get("matchLabels") or {}
+            return bool(want) and want.items() <= lab.items()
+
+        if not any(
+            selects(x) and any(9180 in [p["port"] for p in r["ports"]] for r in x["spec"].get("ingress", []))
+            for x in by_kind.get("NetworkPolicy", [])
+        ):
+            bad.append(f"{n}: no NetworkPolicy selecting its pods that limits ops port 9180")
     arch = [s for n, s in pods(docs) if n.endswith("-archiver")]
-    job = [s for n, s in pods(docs) if n.endswith("-archiver-migrate")]
+    job = [s for n, s in pods(docs) if "archiver-migrate" in n]
     if not arch or "--skip-ddl" not in arch[0]["containers"][0]["args"]:
         bad.append("archiver Deployment does not run --skip-ddl")
     if not job or "--migrate-only" not in job[0]["containers"][0]["args"]:
@@ -132,6 +167,11 @@ def check(docs: list[dict[str, Any]]) -> list[str]:
             if runtime_ref == job_ref:
                 bad.append("runtime and migration secretRef are the same")
 
+    bad += check_adr004_conditions(docs, by_kind)
+    bad += check_api(by_kind)
+    bad += check_workloads(docs, by_kind)
+    bad += check_retention(docs, by_kind)
+    bad += check_acls(by_kind)
     bad += check_network(docs, by_kind, receivers)
     for name, spec in pods(docs):
         if spec.get("securityContext", {}).get("seccompProfile", {}).get("type") != "RuntimeDefault":
@@ -140,7 +180,7 @@ def check(docs: list[dict[str, Any]]) -> list[str]:
         if spec.get("automountServiceAccountToken") is not want:
             bad.append(f"{name}: automountServiceAccountToken must be {str(want).lower()}")
     for svc in by_kind.get("Service", []):
-        for p in svc["spec"]["ports"]:
+        for p in svc["spec"].get("ports", []):
             if p["port"] == 9180 or p.get("targetPort") in (9180, "ops"):
                 bad.append(f"Service {svc['metadata']['name']} exposes the ops port")
 
@@ -160,6 +200,396 @@ def check(docs: list[dict[str, Any]]) -> list[str]:
     return bad
 
 
+def check_workloads(docs: list[dict[str, Any]], by_kind: dict[str, list[dict[str, Any]]]) -> list[str]:
+    """StatefulSets (ruling H3), no PVCs, no contracts volume (ruling H4), archiver CA path (W3-8 follow-up)."""
+    bad: list[str] = []
+    for d in by_kind.get("Deployment", []):
+        if "otel-collector" not in d["metadata"]["name"] and not d["metadata"]["name"].endswith("-api"):
+            bad.append(f"{d['metadata']['name']}: data-plane workload is a Deployment, must be a StatefulSet")
+    sets = by_kind.get("StatefulSet", [])
+    if not sets:
+        bad.append("no StatefulSet rendered")
+    names = {d["metadata"]["name"] for d in by_kind.get("Service", []) if d["spec"].get("clusterIP") == "None"}
+    for d in sets:
+        n = d["metadata"]["name"]
+        if d["spec"].get("podManagementPolicy") != "Parallel":
+            bad.append(f"{n}: podManagementPolicy is not Parallel")
+        if d["spec"].get("volumeClaimTemplates"):
+            bad.append(f"{n}: has volumeClaimTemplates")
+        if d["spec"].get("serviceName") not in names:
+            bad.append(f"{n}: serviceName is not a rendered headless Service")
+    for so in by_kind.get("ScaledObject", []):
+        if so["spec"]["scaleTargetRef"].get("kind") != "StatefulSet":
+            bad.append("ScaledObject scaleTargetRef.kind is not StatefulSet")
+    for name, spec in pods(docs):
+        for v in spec.get("volumes", []):
+            if v["name"] == "contracts" or v.get("configMap", {}).get("name", "").endswith("contracts"):
+                bad.append(f"{name}: has a contracts volume (contracts/ ships in the image)")
+        for c in spec["containers"]:
+            for e in c.get("env", []):
+                if e["name"] == "TB_CONTRACTS_DIR":
+                    bad.append(f"{name}: sets TB_CONTRACTS_DIR (the image sets it)")
+                if e["name"] == "TB_ARCHIVE_CLICKHOUSE_CA_CERT" and not re.fullmatch(
+                    r"/var/run/secrets/tributary-ca/[^/]+", e["value"]
+                ):
+                    bad.append(f"{name}: TB_ARCHIVE_CLICKHOUSE_CA_CERT is not a mounted file path (empty key?)")
+    ca = [
+        e
+        for _, s2 in pods(docs)
+        for c in s2["containers"]
+        for e in c.get("env", [])
+        if e["name"] == "TB_ARCHIVE_CLICKHOUSE_CA_CERT"
+    ]
+    if CA_EXPECTED and not ca:
+        bad.append("archiver CA cert env not rendered although caCertSecretRef is set in the CI values")
+    return bad
+
+
+# ClickHouse plaintext HTTP, native, MySQL, PostgreSQL-compat, interserver. 5432 is allowed: PostgreSQL TLS runs on it.
+PLAINTEXT_DB_PORTS = {8123, 9000, 9004, 9005, 9009}
+MAX_REAUTH_MS = 3_600_000
+
+
+def _uses_secret(spec: dict[str, Any], volume: str) -> bool:
+    for v in spec.get("volumes", []):
+        if v["name"] != volume:
+            continue
+        if "secret" in v:
+            return True
+        return any("secret" in src for src in v.get("projected", {}).get("sources", []))
+    return False
+
+
+def check_adr004_conditions(docs: list[dict[str, Any]], by_kind: dict[str, list[dict[str, Any]]]) -> list[str]:
+    """ADR-004 C1 (no plaintext ClickHouse port exposed, TLS on, sslmode verify-full where set), C3 (broker re-authentication), C4 (no subPath Secret mounts).
+
+    A `subPath` mount never receives a rotated Secret, so a revoked or rotated credential would stay in the
+    container until it restarts (C4). Plaintext ClickHouse and PostgreSQL ports must not be published by a
+    Service, a pod port or a NetworkPolicy rule: the chart only ever talks to them over TLS.
+    """
+    bad: list[str] = []
+    named: dict[str, int] = {}  # container port names that resolve to a plaintext database port
+    for _, spec in pods(docs):
+        for c in [*spec["containers"], *spec.get("initContainers", [])]:
+            for p in c.get("ports", []):
+                if p.get("containerPort") in PLAINTEXT_DB_PORTS and "name" in p:
+                    named[p["name"]] = p["containerPort"]
+
+    def plain(port: Any, end: Any = None) -> bool:
+        if isinstance(port, str):
+            return port in named or (port.isdigit() and int(port) in PLAINTEXT_DB_PORTS)
+        if not isinstance(port, int):
+            return False
+        return any(port <= x <= (end if isinstance(end, int) else port) for x in PLAINTEXT_DB_PORTS)
+
+    for name, spec in pods(docs):
+        for c in [*spec["containers"], *spec.get("initContainers", [])]:
+            for m in c.get("volumeMounts", []):
+                if ("subPath" in m or "subPathExpr" in m) and _uses_secret(spec, m["name"]):
+                    bad.append(f"{name}: Secret volume {m['name']} is mounted with subPath (never rotated, C4)")
+            for p in c.get("ports", []):
+                for key in ("containerPort", "hostPort"):
+                    if plain(p.get(key)):
+                        bad.append(f"{name}: pod exposes plaintext database port {p[key]} (C1)")
+            for e in c.get("env", []):
+                val = str(e.get("value", ""))
+                if e["name"].endswith("_PORT") and plain(val):
+                    bad.append(f"{name}: {e['name']} points at plaintext database port {val} (C1)")
+                if e["name"] == "TB_ARCHIVE_CLICKHOUSE_SECURE" and val != "1":
+                    bad.append(f"{name}: ClickHouse TLS is off (TB_ARCHIVE_CLICKHOUSE_SECURE != 1, C1)")
+                if "sslmode" in e["name"].lower() and val != "verify-full":
+                    bad.append(f"{name}: {e['name']} is not verify-full (C1)")
+                if "sslmode=" in val and "sslmode=verify-full" not in val:
+                    bad.append(f"{name}: {e['name']} sets an sslmode other than verify-full (C1)")
+                if val.startswith(("postgresql://", "postgres://", "postgresql+asyncpg://")) and "sslmode=" not in val:
+                    bad.append(f"{name}: {e['name']} is a PostgreSQL URL without sslmode=verify-full (C1)")
+    for svc in by_kind.get("Service", []):
+        for p in svc["spec"].get("ports", []):
+            if plain(p.get("port")) or plain(p.get("targetPort")):
+                bad.append(f"Service {svc['metadata']['name']} exposes plaintext database port (C1)")
+    for np in by_kind.get("NetworkPolicy", []):
+        for rule in [*np["spec"].get("ingress", []), *np["spec"].get("egress", [])]:
+            for p in rule.get("ports", []):
+                if plain(p.get("port"), p.get("endPort")):
+                    bad.append(f"NetworkPolicy {np['metadata']['name']} opens plaintext database port {p['port']} (C1)")
+    for np in by_kind.get("NetworkPolicy", []):
+        for i, rule in enumerate(np["spec"].get("egress", [])):
+            if not rule.get("ports"):
+                bad.append(f"NetworkPolicy {np['metadata']['name']}: egress rule {i} has no ports (opens every port)")
+    for j in by_kind.get("Job", []):
+        spec = j["spec"]
+        if "archiver-migrate" in j["metadata"]["name"]:
+            if spec.get("parallelism") != 1 or spec.get("completions") != 1:
+                bad.append("archiver migrate Job must set parallelism 1 and completions 1")
+            if "before-hook-creation" in j["metadata"].get("annotations", {}).get("helm.sh/hook-delete-policy", ""):
+                bad.append("archiver migrate Job must not use before-hook-creation (it would replace a live migration)")
+    for k in by_kind.get("Kafka", []):
+        v = k["spec"]["kafka"].get("config", {}).get("connections.max.reauth.ms")
+        if not isinstance(v, int) or isinstance(v, bool) or not 0 < v <= MAX_REAUTH_MS:
+            bad.append(f"Kafka {k['metadata']['name']}: connections.max.reauth.ms must be 1..{MAX_REAUTH_MS} (C3)")
+    return bad
+
+
+def _envs(dep: dict[str, Any]) -> dict[str, str]:
+    c = dep["spec"]["template"]["spec"]["containers"][0]
+    return {e["name"]: str(e.get("value", "$(valueFrom)")) for e in c.get("env", [])}
+
+
+def check_api(by_kind: dict[str, list[dict[str, Any]]]) -> list[str]:
+    """tributary-api (W3-34, ADR-004 C1/C2, ops/v0 O2): PostgreSQL by secretRef with verify-full inputs, ops
+    listener on loopback or on the pod IP behind a collector-only NetworkPolicy, a kubelet probe on the API
+    port, a read-only ClickHouse user, a ClusterIP Service and a NetworkPolicy."""
+    apis = [d for d in by_kind.get("Deployment", []) if d["metadata"]["name"].endswith("-api")]
+    bad: list[str] = []
+    for dep in apis:
+        n = dep["metadata"]["name"]
+        env = _envs(dep)
+        spec = dep["spec"]["template"]["spec"]
+        c = spec["containers"][0]
+        for k in ("TB_DATABASE_HOST", "TB_DATABASE_NAME", "TB_DATABASE_USER", "TB_DATABASE_SECRET_REF"):
+            if not env.get(k):
+                bad.append(f"{n}: {k} is not set (ADR-004 C2)")
+        if not env.get("TB_DATABASE_CA_SECRET_REF"):
+            bad.append(f"{n}: no database CA secretRef, so sslmode verify-full cannot be met (C1)")
+        for k in env:
+            if k == "TB_DATABASE_URL" or "PASSWORD" in k:
+                bad.append(f"{n}: {k} carries a database credential in the environment (C2)")
+        if env.get("TB_DATABASE_SSLMODE", "verify-full") != "verify-full":
+            bad.append(f"{n}: TB_DATABASE_SSLMODE is not verify-full (C1)")
+        ops = env.get("TB_OPS_BIND", "")
+        if ops not in ("127.0.0.1", "$(POD_IP)"):
+            bad.append(f"{n}: TB_OPS_BIND must be loopback or the pod IP, got {ops!r}")
+        if env.get("TB_API_BIND") not in ("$(POD_IP)", "127.0.0.1"):
+            bad.append(f"{n}: TB_API_BIND is not the pod IP")
+        if ops == "$(POD_IP)":
+            ops_port = int(env["TB_OPS_PORT"])
+            nps = [
+                np
+                for np in by_kind.get("NetworkPolicy", [])
+                if np["spec"].get("podSelector", {}).get("matchLabels", {}).get("app.kubernetes.io/component") == "api"
+            ]
+            if not nps:
+                bad.append(f"{n}: ops bound to the pod IP without an api NetworkPolicy")
+            for np in nps:
+                for rule in np["spec"].get("ingress", []):
+                    if any(p.get("port") == ops_port for p in rule.get("ports", [])):
+                        if not rule.get("from"):
+                            bad.append(f"{n}: an ops-port ingress rule with no `from` admits everyone")
+                        for f in rule.get("from", []):
+                            comp = f.get("podSelector", {}).get("matchLabels", {}).get("app.kubernetes.io/component")
+                            if "ipBlock" in f or comp != "otel-collector":
+                                bad.append(f"{n}: the ops port admits more than the OTel collector")
+                    elif not rule.get("ports"):
+                        bad.append(f"{n}: an ingress rule without ports opens the ops port")
+        mode = env.get("TB_API_TLS_MODE", "listener")
+        if mode not in ("listener", "mesh"):
+            bad.append(f"{n}: TB_API_TLS_MODE must be unset, listener or mesh, got {mode!r} (C1a)")
+        want_port, want_scheme = ("https", "HTTPS") if mode == "listener" else ("http", "HTTP")
+        for probe in ("startupProbe", "readinessProbe", "livenessProbe"):
+            pr = c.get(probe, {}).get("httpGet", {})
+            if pr.get("port") != want_port or pr.get("scheme") != want_scheme:
+                bad.append(f"{n}: {probe} must be {want_scheme} on port {want_port} in {mode} mode (C1a)")
+        live = c.get("livenessProbe", {}).get("httpGet", {})
+        if live.get("path") != "/livez":
+            bad.append(f"{n}: liveness must be kubelet httpGet /livez on the API port")
+        if [p["name"] for p in c["ports"] if p.get("containerPort") == int(env.get("TB_API_PORT", "0") or 0)] != [
+            want_port
+        ]:
+            bad.append(
+                f"{n}: the API port must be named {want_port} in {mode} mode (a plaintext API port in listener mode)"
+            )
+        for v in spec.get("volumes", []):
+            if v["name"] in ("api-tls", "clickhouse-ca") and v.get("secret", {}).get("defaultMode") != 0o400:
+                bad.append(f"{n}: Secret volume {v['name']} must set defaultMode 0400 (owner read only)")
+        if mode == "listener":
+            ref = env.get("TB_API_TLS_SECRET_REF", "")
+            mounts = [m for m in c.get("volumeMounts", []) if m["mountPath"] == f"/var/run/secrets/tributary/{ref}"]
+            if not ref or not mounts:
+                bad.append(f"{n}: listener mode without the TLS Secret mounted (C1a)")
+            elif any("subPath" in m or "subPathExpr" in m for m in mounts):
+                bad.append(f"{n}: the TLS Secret is mounted with subPath (C1a, C4)")
+        else:
+            rules: list[dict[str, Any]] = []
+            for np in by_kind.get("NetworkPolicy", []):
+                if np["spec"].get("podSelector", {}).get("matchLabels", {}).get("app.kubernetes.io/component") != "api":
+                    continue
+                rules += [
+                    r
+                    for r in np["spec"].get("ingress", [])
+                    if not r.get("ports") or any(p.get("port") == int(env["TB_API_PORT"]) for p in r["ports"])
+                ]
+
+            def rule_ok(rule: dict[str, Any]) -> bool:
+                frm = rule.get("from", [])
+                sel = [f for f in frm if "ipBlock" not in f]
+                blocks = [f for f in frm if "ipBlock" in f]
+                sel_ok = bool(sel) and all(
+                    f.get("podSelector", {}).get("matchLabels") or f.get("namespaceSelector", {}).get("matchLabels")
+                    for f in sel
+                )
+                # The only ipBlock is the kubelet CIDR the chart always adds; mesh mode wants it node-sized
+                # or tighter (/24): a wider block would admit hostNetwork pods of a flat CNI, plaintext.
+                blocks_ok = len(blocks) <= 1 and all(int(b["ipBlock"]["cidr"].split("/")[1]) >= 24 for b in blocks)
+                return sel_ok and blocks_ok
+
+            # EVERY rule that reaches the API port must be ingress-controller-only (plus kubelet).
+            peers_ok = bool(rules) and all(rule_ok(r) for r in rules)
+            if not peers_ok:
+                bad.append(
+                    f"{n}: mesh mode without a NetworkPolicy admitting only the ingress controller to the API port (C1a)"
+                )
+        if env.get("TB_CLICKHOUSE_URL"):
+            if not env["TB_CLICKHOUSE_URL"].startswith("https://"):
+                bad.append(f"{n}: TB_CLICKHOUSE_URL is not https (C1)")
+            ca = env.get("TB_CLICKHOUSE_CA_SECRET_REF")
+            mounted = {m["mountPath"] for m in c.get("volumeMounts", []) if "subPath" not in m}
+            secrets_dir = env.get("TB_SECRETS_DIR", "/var/run/secrets/tributary")
+            if ca and f"{secrets_dir}/{ca}" not in mounted:
+                bad.append(f"{n}: TB_CLICKHOUSE_CA_SECRET_REF {ca} is not mounted at TB_SECRETS_DIR/{ca} (no subPath)")
+            if any("clickhouse-ca" in m["name"] for m in c.get("volumeMounts", [])) and not ca:
+                bad.append(f"{n}: a ClickHouse CA is mounted but TB_CLICKHOUSE_CA_SECRET_REF is not set")
+            if env.get("TB_CLICKHOUSE_USER", "default") == "default":
+                bad.append(f"{n}: the tamper check uses the ClickHouse default user (needs a SELECT-only user)")
+        if not c["securityContext"].get("readOnlyRootFilesystem"):
+            bad.append(f"{n}: root filesystem is writable")
+    for ing in by_kind.get("Ingress", []):
+        if not ing["metadata"]["name"].endswith("-api"):
+            continue
+        ann = ing["metadata"].get("annotations", {})
+        mesh = any(_envs(d).get("TB_API_TLS_MODE") == "mesh" for d in apis)
+        if not mesh and (
+            ann.get("nginx.ingress.kubernetes.io/backend-protocol") != "HTTPS"
+            or ann.get("nginx.ingress.kubernetes.io/proxy-ssl-verify") != "on"
+            or not ann.get("nginx.ingress.kubernetes.io/proxy-ssl-secret")
+        ):
+            bad.append(
+                f"Ingress {ing['metadata']['name']}: listener mode must re-encrypt and verify the API certificate (C1a)"
+            )
+    for svc in by_kind.get("Service", []):
+        if svc["metadata"]["name"].endswith("-api") and svc["spec"].get("type", "ClusterIP") != "ClusterIP":
+            bad.append(f"Service {svc['metadata']['name']} is not ClusterIP")
+        if svc["metadata"]["name"].endswith("-api"):
+            listener = any(_envs(d).get("TB_API_TLS_MODE", "listener") == "listener" for d in apis)
+            if listener and [p["name"] for p in svc["spec"]["ports"]] != ["https"]:
+                bad.append(f"Service {svc['metadata']['name']}: listener mode must expose the port `https` only (C1a)")
+    return bad
+
+
+def check_retention(docs: list[dict[str, Any]], by_kind: dict[str, list[dict[str, Any]]]) -> list[str]:
+    """ADR-004 R2/R3: the three TTL vars on archiver and migrate Job with the R2 defaults; the decrease guard
+    on the Job only; the audit topic buffer read from the contract."""
+    bad: list[str] = []
+    want = {"TB_ARCHIVE_TTL_DAYS": "90", "TB_ARCHIVE_CONTENT_TTL_DAYS": "30", "TB_ARCHIVE_AUDIT_TTL_DAYS": "2190"}
+    for name, spec in pods(docs):
+        if not (name.endswith("-archiver") or "archiver-migrate" in name):
+            continue
+        env = {e["name"]: e.get("value") for c in spec["containers"] for e in c.get("env", [])}
+        for k, v in want.items():
+            if env.get(k) != v:
+                bad.append(f"{name}: {k} is {env.get(k)!r}, expected the R2 default {v!r}")
+        guard = env.get("TB_ARCHIVE_ALLOW_TTL_DECREASE")
+        if name.endswith("-archiver") and guard is not None:
+            bad.append(f"{name}: the decrease guard must reach the migrate Job only")
+        if "archiver-migrate" in name and guard != "false":
+            bad.append(f"{name}: TB_ARCHIVE_ALLOW_TTL_DECREASE is not 'false' by default")
+    topics = by_kind.get("KafkaTopic", [])
+    if by_kind.get("KafkaUser"):
+        for t in topics:
+            if (t["metadata"].get("annotations") or {}).get("helm.sh/resource-policy") != "keep":
+                bad.append(f"{t['spec']['topicName']}: KafkaTopic lacks helm.sh/resource-policy: keep")
+            if t["spec"]["config"].get("message.timestamp.type") != "LogAppendTime":
+                bad.append(f"{t['spec']['topicName']}: message.timestamp.type is not LogAppendTime")
+        if {t["spec"]["topicName"].rsplit(".", 1)[1] for t in topics} != {"events", "audit"}:
+            bad.append("events and audit KafkaTopics are not both rendered")
+        audit = [t for t in topics if t["spec"]["topicName"].endswith(".audit")]
+        contract = json.loads((ROOT / "contracts/topics/v0/topic-defaults.json").read_text())["classes"]["audit"]
+        if len(audit) != 1:
+            bad.append("no _tb.<env>.audit KafkaTopic")
+        elif audit[0]["spec"]["config"].get("retention.ms") != str(contract["configs"]["retention.ms"]):
+            bad.append("audit topic retention.ms differs from topic-defaults.json")
+        elif audit[0]["spec"]["partitions"] != contract["partitions"]:
+            bad.append("audit topic partitions differ from topic-defaults.json")
+    return bad
+
+
+def check_acls(by_kind: dict[str, list[dict[str, Any]]]) -> list[str]:
+    """Rendered KafkaUser ACLs against the contract (re-parsed independently of the template)."""
+    users = {u["metadata"]["labels"]["tributary.dev/role"]: u for u in by_kind.get("KafkaUser", [])}
+    if not users:
+        return []  # strimzi.enabled=false: nothing rendered
+    bad: list[str] = []
+    for role in ("receiver", "worker", "loader", "archiver", "lag-reader"):
+        if role not in users:
+            bad.append(f"no KafkaUser for role {role}")
+    rendered = {
+        role: {
+            (a["resource"]["type"], a["resource"].get("name", ""), a["resource"].get("patternType", ""), op)
+            for a in u["spec"]["authorization"]["acls"]
+            for op in a["operations"]
+        }
+        for role, u in users.items()
+    }
+    for role, acls in rendered.items():
+        for t, name, _pat, op in acls:
+            if name in ("*", "") and t != "cluster":
+                bad.append(f"KafkaUser {role}: wildcard or empty resource name")
+            if op in ("Alter", "Delete", "All") or (t == "cluster" and op not in ("IdempotentWrite", "Describe")):
+                bad.append(f"KafkaUser {role}: forbidden operation {op} on {t}")
+            if op == "Write" and name.endswith(".channels") and role != "api":
+                bad.append(f"KafkaUser {role}: WRITE on the channels topic")
+    # Sync-reply grants (set 1.2): present for the syncReply channel, absent for the other one.
+    rcv, wrk = rendered.get("receiver", set()), rendered.get("worker", set())
+    if ("topic", "prod.adt-passthrough.reply", "literal", "Read") not in rcv or (
+        "group",
+        "tb.prod.adt-passthrough.replier",
+        "literal",
+        "Read",
+    ) not in rcv:
+        bad.append("receiver lacks the sync-reply READ on reply or the replier group (every sync request would AR)")
+    if ("topic", "prod.adt-passthrough.reply", "literal", "Write") not in wrk:
+        bad.append("worker lacks WRITE on the sync-reply topic")
+    if any(".reply" in n or ".replier" in n for _t, n, _p, op in rcv | wrk if "lab-results" in n):
+        bad.append("sync-reply grants rendered for a channel without syncReply")
+    if any(op == "Write" and n.endswith(".reply") for _t, n, _p, op in rcv):
+        bad.append("receiver can WRITE reply (it could forge an answer)")
+    lag = rendered.get("lag-reader", set())
+    if any(op != "Describe" for *_, op in lag):
+        bad.append("lag_reader holds more than DESCRIBE")
+    if not any(op == "Write" for *_, op in rendered.get("receiver", set())):
+        bad.append("receiver has no WRITE (raw)")
+    if any(t == "topic" and ".out." in n and op == "Write" for t, n, _p, op in rendered.get("receiver", set())):
+        bad.append("receiver can WRITE out topics")
+    # Two-way against the generated file: every contract grant for the cluster-independent roles appears.
+    gen = json.loads((CHART / "files" / "acls.json").read_text())["roles"]
+    for role, key in (("archiver", "archiver"), ("worker", "worker")):
+        want = {
+            (g["resourceType"].lower(), g["name"].replace("@ENV@", "prod"))
+            for g in gen[key]
+            if "@CHANNEL@" not in g["name"]
+        }
+        have = {(t, n) for t, n, _p, _o in rendered.get(role, set())}
+        for t, n in want:
+            if t != "cluster" and (t, n) not in have:
+                bad.append(f"KafkaUser {role}: contract grant on {n} missing from the render")
+    if "api" in rendered:  # rendered only with api.enabled: exactly the contract's `api` role, nothing more
+        camel = lambda op: "".join(w.capitalize() for w in op.split("_"))  # noqa: E731
+        want_api = {
+            (
+                g["resourceType"].lower(),
+                "" if g["resourceType"] == "CLUSTER" else g["name"].replace("@ENV@", "prod"),
+                "" if g["resourceType"] == "CLUSTER" else g["patternType"].lower(),
+                camel(g["operation"]),
+            )
+            for g in gen["api"]
+        }
+        have_api = {(t, n, p, op) for t, n, p, op in rendered["api"]}
+        if have_api != want_api:
+            bad.append(
+                f"KafkaUser api: ACLs differ from acls.json (missing {sorted(want_api - have_api)}, extra {sorted(have_api - want_api)})"
+            )
+    return bad
+
+
 def check_network(
     docs: list[dict[str, Any]], by_kind: dict[str, list[dict[str, Any]]], receivers: list[Any]
 ) -> list[str]:
@@ -168,7 +598,9 @@ def check_network(
     if not any(n["spec"]["podSelector"] == {} and "ingress" not in n["spec"] for n in nps):
         bad.append("no namespace default-deny NetworkPolicy")
     labels = {
-        d["metadata"]["name"]: d["spec"]["template"]["metadata"]["labels"] for d in docs if d["kind"] == "Deployment"
+        d["metadata"]["name"]: d["spec"]["template"]["metadata"]["labels"]
+        for d in docs
+        if d["kind"] in ("Deployment", "StatefulSet")
     }
     for name, _ in receivers:
         sel = [n["spec"]["podSelector"].get("matchLabels", {}) for n in nps if n["metadata"]["name"] == name]
@@ -178,7 +610,11 @@ def check_network(
         for rule in n["spec"].get("ingress", []):
             ports = {p["port"] for p in rule.get("ports", [])}
             if 9180 in ports:
-                for f in rule["from"]:
+                if not rule.get("from"):
+                    bad.append(
+                        f"NetworkPolicy {n['metadata']['name']}: a 9180 ingress rule with no `from` admits everyone"
+                    )
+                for f in rule.get("from", []):
                     sel = f.get("podSelector", f.get("namespaceSelector"))
                     if ("podSelector" in f or "namespaceSelector" in f) and not sel:
                         bad.append("NetworkPolicy allows 9180 from podSelector {} (all pods)")
@@ -189,7 +625,7 @@ def check_network(
                     spec_ports = {
                         p["containerPort"]
                         for d in docs
-                        if d["metadata"]["name"] == name and d["kind"] == "Deployment"
+                        if d["metadata"]["name"] == name and d["kind"] in ("Deployment", "StatefulSet")
                         for c in d["spec"]["template"]["spec"]["containers"]
                         for p in c["ports"]
                         if p["name"] == "ingest"

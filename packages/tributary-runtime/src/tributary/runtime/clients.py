@@ -19,7 +19,7 @@ from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from .config import TopicDefaults
+from .config import TopicDefaults, worker_producer_profile
 from .errors import ConfigError, KafkaSecurityError
 from .kafka_security import check_link, split_bootstrap
 from .spec import ChannelSpec
@@ -190,6 +190,21 @@ def producer_config(settings: KafkaSettings, defaults: TopicDefaults, *, client_
     return _merge(
         settings,
         {"bootstrap.servers": settings.bootstrap_servers, "client.id": client_id, **dict(defaults.producer)},
+    )
+
+
+def worker_producer_config(settings: KafkaSettings, defaults: TopicDefaults, *, client_id: str) -> dict[str, Any]:
+    """The pipeline worker's non-transactional producer (`out`, `dlq`, `reply`): `clients.worker_producer`.
+
+    The same invariant-1 profile as `producer_config` except `linger.ms` 0 (set 1.8, topics README 3.2.1):
+    the worker flushes every record's `out` and `dlq` records before it commits, so linger bought no
+    batching there and delayed the never-flushed reply by a fixed 5 ms (W3-24 stage timing). The block is
+    validated here, not at load, so only the worker depends on it; a defective or missing block raises
+    `ConfigError`.
+    """
+    return _merge(
+        settings,
+        {"bootstrap.servers": settings.bootstrap_servers, "client.id": client_id, **worker_producer_profile(defaults)},
     )
 
 

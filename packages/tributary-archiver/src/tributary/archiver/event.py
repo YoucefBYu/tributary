@@ -22,6 +22,7 @@ from typing import Any, Final
 import orjson
 
 from .errors import EventRejected
+from .tswindow import in_window
 
 SUPPORTED_VERSION: Final = 0
 MAX_ATTRS: Final = 16
@@ -89,6 +90,8 @@ class EventRow:
     ts: datetime
     attrs_dropped: int
     fields_blanked: int = 0
+    #: Of `attrs_dropped`, the entries whose name ends `_hmac` (`tb_archiver_attrs_dropped_total{reason="hmac"}`).
+    attrs_dropped_hmac: int = 0
 
 
 def _uuid(value: Any) -> uuid.UUID:
@@ -168,7 +171,7 @@ def clean_attrs(value: Any) -> tuple[dict[str, str], int]:
     return kept, dropped
 
 
-def parse_event(record_value: bytes) -> EventRow:
+def parse_event(record_value: bytes, *, anchor: datetime | None = None, now: datetime | None = None) -> EventRow:
     """Decode one record value. Raises `EventRejected` (a code, never content) for anything unstorable."""
     try:
         raw = orjson.loads(record_value)
@@ -183,6 +186,8 @@ def parse_event(record_value: bytes) -> EventRow:
     if kind not in KINDS:
         raise EventRejected("EVENT_KIND_UNKNOWN")
     ts = parse_ts(raw.get("ts"))
+    if not in_window(ts, anchor, now=now):  # the table is partitioned by month: an absurd ts must not reach an insert
+        raise EventRejected("EVENT_TS_OUT_OF_RANGE")
     channel = _str(raw, "channel", required=True, limit=64)
     stage = _str(raw, "stage", required=True, limit=32)
     status = _str(raw, "status", required=True, limit=16)
@@ -244,4 +249,12 @@ def parse_event(record_value: bytes) -> EventRow:
         attrs,
         scope,
     )
-    return EventRow(values=values, ts=ts, attrs_dropped=dropped, fields_blanked=b1 + b2 + b3)
+    raw_attrs = raw.get("attrs")
+    hmac_dropped = (
+        sum(1 for name in raw_attrs if isinstance(name, str) and name.endswith("_hmac"))
+        if isinstance(raw_attrs, dict)
+        else 0
+    )
+    return EventRow(
+        values=values, ts=ts, attrs_dropped=dropped, fields_blanked=b1 + b2 + b3, attrs_dropped_hmac=hmac_dropped
+    )

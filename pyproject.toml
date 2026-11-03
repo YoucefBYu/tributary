@@ -22,6 +22,7 @@ tributary-fhir = { workspace = true }
 tributary-content-hl7-fhir = { workspace = true }
 tributary-api = { workspace = true }
 tributary-archiver = { workspace = true }
+tributary-cli = { workspace = true }
 
 [dependency-groups]
 dev = [
@@ -33,10 +34,12 @@ dev = [
     "tributary-fhir",
     "tributary-content-hl7-fhir",
     "tributary-api",
-    "tributary-archiver",
+    "tributary-archiver[clickhouse]",
+    "tributary-cli",
     "pytest>=8.3",
     "hypothesis>=6.112",   # MPL-2.0, human-approved 2026-09-22, unmodified
     "jsonschema>=4.23",    # conformance suite (tests/conformance)
+    "httpx>=0.27",         # BSD-3-Clause. ASGI test client for tributary-api
     "ruff>=0.8",
     "mypy>=1.13",
     "pre-commit>=4.0",
@@ -56,6 +59,7 @@ markers = [
     "integration: needs Kafka, ClickHouse or PostgreSQL (testcontainers or the compose stack)",
     "chaos: injects broker, consumer or dependency faults",
     "bench: measurement run, not a pass/fail test",
+    "rf3: needs the 3-broker RF=3 cluster (deploy/compose/docker-compose.rf3.yml)",
 ]
 
 [tool.ruff]
@@ -74,6 +78,7 @@ ignore = [
 "**/tests/**" = ["S101"]
 "tests/**" = ["S101"]
 "**/test_*.py" = ["S101"]
+"deploy/**/test_*.py" = ["S101", "S603", "S607"]  # tests that start local bash and sleep stubs
 ".github/scripts/**" = ["S404", "S603", "S607", "E402"]  # CI tooling shells out to git and uv
 "benchmarks/**" = ["S311", "RUF046"]  # seeded synthetic-data RNG, not cryptographic
 
@@ -92,5 +97,10 @@ mypy_path = [
     "packages/tributary-content-hl7-fhir/src",
     "packages/tributary-api/src",
     "packages/tributary-archiver/src",
+    "packages/tributary-cli/src",
 ]
 exclude = ['/tests/', '^spikes/']
+
+[[tool.mypy.overrides]]
+module = ["yaml"]
+ignore_missing_imports = true  # PyYAML ships no stubs; the CLI parses channel files into plain dicts

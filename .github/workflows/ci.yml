@@ -22,80 +22,60 @@ jobs:
     # clean clone before uv sync and before the workspace exists at all, ahead of and separate from
     # qa-engineer's pytest conformance suite below.
     name: contract validation (contracts/validate.py)
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.TB_RUNNER || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
         with:
           python-version: "3.12"
-      # Without openapi-spec-validator the default run fails by design (209 passed, 1 failed).
-      - name: contracts validate
-        run: uv run --no-project --python 3.12 --with jsonschema --with openapi-spec-validator python contracts/validate.py
-      # Exits non-zero if any pinned (json_path, validator) pair has drifted from what the schema measures.
-      - name: pinned failure pairs have not drifted
-        run: uv run --no-project --python 3.12 --with jsonschema --with openapi-spec-validator python contracts/validate.py --check-expectations
+      # Exits non-zero if the default run or any pinned (json_path, validator) pair fails; see ci_local.sh.
+      - name: contracts validate and pinned failure pairs
+        run: .github/scripts/ci_local.sh --here contracts
 
   python:
     name: lint, types, unit tests, conformance
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.TB_RUNNER || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
         with:
           python-version: "3.12"
           enable-cache: true
-      - run: uv sync
-      - run: uv run ruff check . && uv run ruff format --check .
-      - run: uv run mypy packages
-      - run: uv run pytest -m "not integration and not chaos and not bench"
-      # Explicit so a contracts/** change can never skip it, even if testpaths change.
-      - name: contract conformance
-        run: uv run pytest tests/conformance -q
-      # Named so a marker, testpaths or collection change cannot silently drop the sync-reply
-      # property tests.
-      - name: sync-reply property tests
-        run: >
-          uv run pytest -q
-          packages/tributary-receivers/tests/reply/test_properties.py
-          packages/tributary-runtime/tests/test_reply_properties.py
+      - name: lint, types, fast tests, contract conformance, sync-reply property tests
+        run: .github/scripts/ci_local.sh --here python
 
   integration:
     name: integration (testcontainers)
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.TB_RUNNER || 'ubuntu-24.04' }}
     needs: python
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
         with:
           python-version: "3.12"
           enable-cache: true
-      - run: uv sync
-      # Collection check first (no Docker needed): the -m integration selection must equal
-      # tests/support/integration_expected.json. Then the run itself: passed == expected count and
-      # skipped == 0, so Docker missing or a skip/deselect cannot pass. The same -m integration selector is
-      # used for both, so chaos tests also marked integration are counted on both sides.
-      - name: integration collection matches expected
-        run: uv run python -m tests.support.integration_expected --check
+      # Collection check, the run, and the passed-equals-expected, none-skipped count check; see ci_local.sh.
       - name: integration tests
-        run: uv run pytest -m integration -ra --junitxml=integration-junit.xml
-      - name: integration passed count equals expected, none skipped
-        run: uv run python .github/scripts/check_integration_counts.py integration-junit.xml
+        run: .github/scripts/ci_local.sh --here integration
 
   supply-chain:
     name: licence and SBOM, secret scan, gitignore guard
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.TB_RUNNER || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
         with:
           python-version: "3.12"
-      - run: uv sync
-      - name: gitignore still protects sensitive paths
-        run: uv run python .github/scripts/gitignore_guard.py
-      - name: secret scan
-        run: uv run python .github/scripts/secret_scan.py
-      - name: licence check (runtime, dev and build-system requires) and SBOM
-        run: uv run python .github/scripts/licence_check.py --sbom sbom.cdx.json
+      - name: gitignore guard, secret scan, licence check and SBOM
+        run: .github/scripts/ci_local.sh --here supply-chain
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         if: always()
         with:
@@ -108,21 +88,24 @@ jobs:
     # tributary.* step entry points match the registries), plus a negative control per image. No image is
     # published until this is green.
     name: image environment check (duplicates, entry-point registries)
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.TB_RUNNER || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
-      - run: .github/scripts/image_check.sh
+      - name: image environment check
+        run: .github/scripts/ci_local.sh --here image-check
 
   ui:
     name: ui lint, typecheck, test
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.TB_RUNNER || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
       - name: skip until ui/ exists
         id: has_ui
-        run: echo "present=$([ -f ui/package.json ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+        run: .github/scripts/ci_local.sh --here ui-present >> "$GITHUB_OUTPUT"
       - uses: pnpm/action-setup@d9184bf108216479bc5a137cc391f4d7b14c870b  # v6.1.0
         if: steps.has_ui.outputs.present == 'true'
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
@@ -130,4 +113,4 @@ jobs:
         with:
           node-version: "22"
       - if: steps.has_ui.outputs.present == 'true'
-        run: pnpm --dir ui install --frozen-lockfile && pnpm --dir ui lint && pnpm --dir ui typecheck && pnpm --dir ui test --run
+        run: .github/scripts/ci_local.sh --here ui

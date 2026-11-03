@@ -187,6 +187,45 @@ buckets alike. `latency` includes 0.05 s, the S2 ACK threshold.
   `outcome="success", code="NONE"`. `circuit-open` maps to the registered `CIRCUIT_OPEN`. A reason
   that is not a registered code is registered first (`envelope/v0` `error-codes.json`).
 
+### 3.4 The `audit_log` tamper check (set 1.8, ADR-004 R7 rev 3)
+
+`tb_audit_tamper_suspect_ids{environment}` and `tb_audit_tamper_check_timestamp_seconds{environment}`.
+
+- **Who runs it: the API**, which already holds SELECT on the archive (ADR-004 A5). **Rejected:** the
+  events archiver. It holds INSERT only, so it would need a new SELECT grant, and it is the writer
+  whose rows are being checked: a compromised writer could forge a row and report 0. **Give up:** the
+  check pauses while the API is down. The staleness alert below catches that.
+- **Refresh:** a background task per environment, every `TB_AUDIT_TAMPER_CHECK_INTERVAL_S` (default
+  900, range 60-86400; outside the range the API refuses to start). The scrape only reads the stored
+  values (O6). Each replica runs its own check; alerts use `max by (environment)`.
+- **Query** (readonly, under the query-library limits):
+  `SELECT count() FROM (SELECT audit_id FROM audit_log GROUP BY audit_id HAVING
+  uniqExact(cityHash64(<every record field>)) > 1)`. "Every record field" means the `audit/v0` fields,
+  **not** `inserted_at`, `source_partition` or `source_offset`. A redelivery can differ in those, and
+  it is not tampering.
+- **On success:** set the count, then set the timestamp to the completion time. **On failure:** change
+  neither, and log `audit_tamper_check_failed` with `error_type` (class name only). Both series are
+  absent until the first check completes.
+- **Labels:** `environment` only. Never an `audit_id`, an actor or a channel. The operator finds the ids
+  with the same query in ClickHouse.
+- **Alerts (W3-8, `devops-engineer`):** `max by (environment) (tb_audit_tamper_suspect_ids) > 0` pages.
+  `time() - max by (environment) (tb_audit_tamper_check_timestamp_seconds) > 3 *
+  interval` warns, and so does `absent(...)` once the API has run for 3 × interval.
+
+### 3.5 Audit records the archiver does not store (set 1.8, W3-30 part 2)
+
+`tb_archiver_audit_records_total{outcome}` counts `written`, `invalid` and `unsupported_version`, the
+same shape as `tb_archiver_events_total`. One counter with an `outcome` label is used rather than one
+counter per reason, so the written count is beside the losses. **Alerts (`devops-engineer`, Helm
+monitoring):** both page, because each increase is an audit record missing from the system of record
+(ADR-004 R7) and the 30 d topic buffer is the only remaining copy.
+
+- `sum by (namespace) (increase(tb_archiver_audit_records_total{outcome="unsupported_version"}[15m])) > 0`
+- `sum by (namespace) (increase(tb_archiver_audit_records_total{outcome="invalid"}[15m])) > 0`
+
+The runbook: find the record by the logged topic, partition and offset within 30 d. `invalid` from the
+API's strictly validating producer means a defect or a writer other than the API.
+
 ---
 
 ## 4. Log line schema
@@ -202,7 +241,7 @@ One JSON object per line on stderr, as `tributary.runtime.logs.JsonLogger` write
 | L4 Content deny-list (**new**) | `payload`, `body`, `content`, `raw`, `message`, `msg`, `text`, `segment`, `headers`, `traceback`, `stack`, `stack_trace`, `exc_info`, `exception`, `exc_text`, `query`, `query_string`, `sql` |
 | L5 Values | Scalars only, at most 256 characters, no CR or LF (`guards.validate_log_field`) |
 | L6 Well-known fields | `message_id`, `parent_id`, `correlation_id` (uuid shape); `channel`, `channel_version`, `destination`; `error_code` (registered code); `error` (an exception **class name**, never `str(exc)`); `ready`; `instance`; `trace_id`, `span_id` (W3C hex, for log-trace correlation) |
-| L6a Two code fields (set 1.8) | `error_code` holds a code **registered** in `envelope/v0` `error-codes.json` (`codes` or `log_only`) or a minted member of a reserved prefix. `code` on a `startup_refused` line is a startup-refusal code (`OPS_LISTENER_BIND_FAILED`, `SECRET_UNRESOLVED`, `ENGINE_KAFKA_SECRET_UNRESOLVED`): an exit reason for the operator, never on a record, an event or a metric label, and **not registered in v0** (section 6) |
+| L6a Two code fields (set 1.8) | `error_code` holds a code **registered** in `envelope/v0` `error-codes.json` (`codes` or `log_only`) or a minted member of a reserved prefix. `code` on a `startup_refused` line is a startup-refusal code (`OPS_LISTENER_BIND_FAILED`, `SECRET_UNRESOLVED`, `ENGINE_KAFKA_SECRET_UNRESOLVED`; **set 1.8, W3-29 item 3:** `INSTANCE_REQUIRED` and `ARGUMENTS_INVALID` (`topics/v0` 3.3 rules 1-2), `RETENTION_DECREASE_REFUSED` (ADR-004 R6); `API_TLS_REQUIRED` and `API_TLS_INVALID` (ADR-004 C1a, 2026-10-12: no TLS on a non-loopback bind; TLS files missing, unreadable or unusable); `AUDIT_HOME_ENV_REQUIRED` and `AUDIT_HOME_ENV_UNKNOWN` (`audit/v0` 2, 2026-10-12: unset with several environments; set to an environment the control plane does not manage)): an exit reason for the operator, never on a record, an event or a metric label, and **not registered in v0** (section 6) |
 | L7 Message id spelling | **`message_id`** (as in `events/v0`). `tb_msg_id` and `msg_id` (receivers, wave 2) are accepted in v0 as deprecated aliases with the same uuid shape |
 
 **What the schema cannot check:** that a permitted name like `reason` or `path` carries no PHI. Code
@@ -233,5 +272,5 @@ lines (`kafka_source/receiver.py`, `sftp/poller.py`, the `listening` events) lac
   vocabulary as the labels plus `message_id`. Not written yet; no code emits spans with attributes today.
 - Whether metadata warm-up alone removes the first-ACK outlier (2.4, W3-17 measures).
 - A registry for `startup_refused` `code` values (L6a). Today they are named where they are defined
-  (O4 for `OPS_LISTENER_BIND_FAILED`). Registering one family member alone would make the list look
-  complete when it is not.
+  (O4 for `OPS_LISTENER_BIND_FAILED`, `topics/v0` 3.3 for `INSTANCE_REQUIRED`). Registering one family
+  member alone would make the list look complete when it is not. L6a names six now; still not a registry.

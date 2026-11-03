@@ -137,7 +137,7 @@ when a connector lands with its tests.
 | Kind | Type | Task | Status |
 |---|---|---|---|
 | source | `mllp` | W1-5 | **Implemented.** **Sync reply (`source.reply`, 3.2.6): Built** (set 1.7, 2026-10-05), `body: ack` and `body: step`. Receiver side `8bfe205`, `33b2207`, `f420634`, `4134ab3`, plus `c051002` (step-body charge released after a cancelled wait; real-Kafka test that a fenced replier exits 1); worker side earlier (reply producer, `ReplyContext`, `REPLY_` codes). The reply consumer reads its own `clients.reply_consumer` profile, no worker settings and no literals (`c5fc09a`, `e563d42`; set 1.7 ruling 5). Not yet "Implemented": the round-trip latency tail is unexplained (STATUS) and receivers have no readiness probe (both wave 3) |
-| source | `http` (HTTP and FHIR ingest) | W2-7 | **Built** (set 1.7.1). Spec read from `_tb.<env>.channels`, `--channel-spec` refused at startup. **Sync reply: not built** (wave 3); a spec with `source.reply` is refused at receiver startup (`receivers/http/config.py`, 3.2.6), so it emits no `REPLY_` code |
+| source | `http` (HTTP and FHIR ingest) | W2-7 | **Built** (set 1.7.1). Spec read from `_tb.<env>.channels`, `--channel-spec` refused at startup. **Sync reply: mapping ruled 2026-10-12 (set 1.8, 3.2.6), build pending (W3-19)**; until the build lands, a spec with `source.reply` is refused at receiver startup (`receivers/http/config.py`), so it emits no `REPLY_` code. After it: `body: ack` accepted, `body: step` still refused at startup |
 | source | `sftp` (poller) | W2-7 | **Built** (set 1.7.1). Spec read from `_tb.<env>.channels`. `paramiko`, human-approved (section 10.2) |
 | source | `kafka` | W2-7 | **Built** (set 1.7.1). Spec read from `_tb.<env>.channels` |
 | destination | `http` | W1-6 | **Implemented** |
@@ -168,7 +168,7 @@ necessary but not the same thing.
 
 | Field | Required | Notes |
 |---|---|---|
-| `name` | R | `^[a-z][a-z0-9-]{0,63}$`. Becomes the `tb-channel` header and the channel segment of every topic name. |
+| `name` | R | `^(?!tb-)[a-z][a-z0-9-]{0,63}$`. Becomes the `tb-channel` header and the channel segment of every topic name. **Set 1.8 (ADR-010):** the prefix `tb-` is reserved for platform stand-ins that occupy the channel position, such as the archiver's `channel="tb-archiver"` metric label, so no channel can collide with one. Only the spec grammar narrows; header, topic and label grammars stay as they are. |
 | `version` | C | Integer, set by the **control plane** at publish time, absent in an authored bundle file. Becomes `tb-channel-version`. See section 6. |
 | `labels` | O | ≤ 16 short codes. No PHI: labels reach metric labels and the UI. |
 | `description` | O | ≤ 512 characters. |
@@ -222,7 +222,7 @@ this table is normative — invariant 1 is the column on the left.
 | Type | ACK, only after the `raw` record is committed (`acks=all`) | NACK | Kafka unavailable | Input over `maxMessageBytes` |
 |---|---|---|---|---|
 | `mllp` | HL7 `AA` | `AR` with a code and `tb-msg-id` only, before any commit is confirmed. `AE` only in sync mode, and only after the commit (3.2.6) | `AR` or no ACK | `AR` |
-| `http` | `202 Accepted`, body carries `tb-msg-id` only | `400` parse error, `415` content type, `401`/`403` auth — code only, never payload or exception text | `503` with `Retry-After` | `413` before the body is buffered past the limit |
+| `http` | `202 Accepted`, body carries `tb-msg-id` only. **Sync mode (`source.reply`, set 1.8): `200` for `AA`, coded `202` for `AE`, see 3.2.6** | `400` parse error, `415` content type, `401`/`403` auth — code only, never payload or exception text | `503` with `Retry-After` | `413` before the body is buffered past the limit |
 | `sftp` | `afterCommit`: delete, or move to `archiveDirectory` | move to `rejectDirectory`; **never delete** | leave the file; retry next poll | move to `rejectDirectory` |
 | `kafka` | commit the **source** offset | none exists — see below | do not commit; pause the source partition | halt that source partition (below) |
 
@@ -319,8 +319,9 @@ with the amendments marked below. Decisions and what they give up: ADR-003 D9 (a
 | `partitions` | 3 | 1-64 | Partition count of `<env>.<ch>.reply`, and the only thing that sizes it (`spec.partitions` does not apply). **At least the number of receiver processes** |
 
 The block's presence switches sync mode on; `reply: {}` means every default. `ack.mode` stays
-`after-commit`. Sources: `mllp` now, `http` once W2-7 implements it (refused at receiver startup until
-then, as in 3.0). `sftp` and `kafka` reject the field in the schema.
+`after-commit`. Sources: `mllp`; `http` with `body: ack` once the W3-19 build lands (mapping ruled in
+set 1.8, below; refused at receiver startup until then, as in 3.0). `sftp` and `kafka` reject the field
+in the schema.
 
 **Refusals.**
 
@@ -387,11 +388,80 @@ Rules behind the table:
   is unconditional (amended from "when every destination relies only on `tb-msg-id`": the key is
   always `tb-msg-id`, 5).
 
-**HTTP mapping: not fixed in set 1.2** (amendment). It is decided when W2-7 implements sync mode, under
-one binding constraint: **not-committed outcomes are exactly `503` with `Retry-After`, and no committed
-outcome uses a status that standard clients or proxies retry automatically** (`5xx`, `408`, `429`). The
-proposal's `500` for a pipeline failure breaks that constraint: a generic HTTP client resends on `500`,
-and here that resend is a duplicate.
+**What the sender gets (HTTP, normative; set 1.8, W3-19, ruled 2026-10-12).** Ruled on
+`connector-engineer`'s proposal (`docs/agent-team/proposals/W3-19-http-sync-reply.md`), which is
+accepted with the rulings below. The binding constraint from set 1.2 stands: **not-committed outcomes
+are exactly `503` with `Retry-After`, and no committed outcome uses a status that standard clients or
+proxies retry automatically** (`5xx`, `408`, `429`). Without `source.reply` nothing changes (3.2.2).
+
+| Case | Committed | Status | `Tb-Reply-Code` | Body `status` | MLLP twin |
+|---|---|---|---|---|---|
+| Reply `accepted` (routed; includes a whole-message `Drop`) | yes | **`200`** | absent | `accepted` | `AA` |
+| Reply `rejected` (a `Reject` code) | yes | **`202`** | the reject code | `rejected` | `AE` + code |
+| Reply `failed` (`TRANSFORM_ERROR`, `REPLY_BODY_MISSING`, ...) | yes | `202` | the code | `failed` | `AE` + code |
+| `tb-reply-status` absent or unrecognised (fail-safe) | yes | `202`, never `200` | the reply's `tb-error-code`, else absent | `unknown` | `AE` |
+| No reply by the deadline | yes | `202` | `REPLY_TIMEOUT` | `unknown` | `AE` |
+| Reply partition revoked, or receiver stopping or spec undeployed, with a committed request pending | yes | `202` | `REPLY_ROUTE_LOST` | `unknown` | `AE` |
+| Kafka down; `raw` publish failed or timed out | not confirmed | **`503`** + `Retry-After` | `PRODUCE_FAILED` / `PRODUCE_TIMEOUT` | `not_committed` | `AR` |
+| Pending map full or connection at its fairness bound; process holds no reply partition | no, nothing published | `503` + `Retry-After` | `REPLY_BUSY` / `REPLY_UNAVAILABLE` | `not_committed` | `AR` |
+| Before any publish: parse, content type, auth, size, queue full | no | unchanged (3.2.2): `400`, `415`, `401`/`403`, `413`, `422`, `503` | as today | as today | `AR` |
+
+**Response.** `Content-Type: application/json` and `Cache-Control: no-store` on every sync answer.
+The body is `{"v": 0, "status": <above>, "tb-msg-id": <id>, "code": <registered code>}`. `code` is
+present exactly when `Tb-Reply-Code` is; `tb-msg-id` keeps the async `202` body's key (3.2.2).
+**Clarified 2026-10-12:** `tb-msg-id` and the `Tb-Msg-Id` header are present **exactly when a `raw`
+publish was attempted**. That means every `200` and `202`, and the `503` with `PRODUCE_FAILED` or
+`PRODUCE_TIMEOUT`, where the id lets an operator check whether a timed-out write landed. They are
+absent on `503` `REPLY_BUSY` and `REPLY_UNAVAILABLE`, where nothing was published, and on every
+pre-publish error. `Retry-After` is on every `503`, in integer seconds. **A `raw` delivery timeout
+answers `PRODUCE_TIMEOUT`, not `PRODUCE_FAILED`.** It is the one `AR` after which a resend can
+duplicate (integrator rule above), so the sender and the operator must be able to tell it apart.
+Ids and registered codes only: never payload, a header value from the request, or exception text
+(invariant 6). No new request header and no new Kafka header. `tb_receiver_sync_answers_total` maps
+`200` → `AA`, sync `202` → `AE`, `503` → `AR`, so `metrics.json` is unchanged.
+
+**Invariant 1 (checked in the ruling).** `200` and `202` are written only after the receiver's own
+successful `raw` delivery callback (`acks=all`, idempotent producer). An entry whose partition is
+revoked, or whose receiver is stopping, before the callback waits for it, then answers `202` on success
+or `503` on failure, the same amendment as MLLP above. `REPLY_BUSY` and `REPLY_UNAVAILABLE` answer
+before anything is published. No path answers success before the commit or drops after one. Two
+residual duplicate risks, as for MLLP, are not loss. (a) After a publish **timeout**, `503` may
+precede a write librdkafka still completes. (b) A process that dies between the callback and writing
+the answer leaves a committed message unanswered, and the sender resends it.
+
+**Pending map.** As MLLP: `maxPending`, the per-connection bound `max(1, maxPending // 4)`, and
+`timeoutMs` from the successful callback. The http receiver reads one request per connection at a time
+(no pipelining), so a connection holds at most one entry, and open sockets stay bounded by the
+existing connection limit. A client that disconnects while pending frees its slot. Its message is still
+processed (sync mode never cancels work), and a late reply is dropped as unknown and counted.
+
+**Rulings on the proposal's section 6.**
+
+1. **`202` for every `AE`, `200` only for `AA`. `409` for `Reject` is rejected.** Criteria: one
+   status class per meaning ("committed, outcome not success"), no automatic retry, no status reused
+   from the not-committed side. A `4xx` reads as "your request was wrong, fix it and resend", and for a
+   committed message that resend is a duplicate. `422` already means "not committed" here (3.2.2).
+   **Give up:** a sender cannot tell `AE` from success by status class alone. It must read
+   the body. **Clarified 2026-10-12, the table wins:** `Tb-Reply-Code` is present whenever a code
+   exists, and it is absent on a `202` whose reply carried an unrecognised status and no code. What
+   identifies `AE` exactly is the body: on a sync channel every `202` carries `status` `rejected`,
+   `failed` or `unknown`, never `accepted`. Rejected: a new code for that case (an `error-codes.json`
+   change for a fail-safe path the body already marks).
+2. **`Idempotency-Key` never deduplicates in v0.** A deduplicating store keyed by a sender value is
+   state on the receive path outside Kafka (invariant 2) and is ADR-003 D8's deferred edge dedupe. The
+   key may also be derived from a patient identifier. So the receiver **ignores the header**: it is
+   not logged, not echoed, not copied into any `tb-*` or `tb-usr-*` header, and never a metric label
+   (invariant 6). **Give up:** an HTTP sender that resends after `AE` creates a duplicate, as an MLLP
+   sender does. The control-plane warning above applies unchanged.
+3. **`body: step` is deferred for `http`.** It needs a response content type on `ctx.reply`, which is a
+   `platform-engineer` SDK change and a contract change of its own. Until then a `http` spec with
+   `reply.body: step` is **refused at receiver startup** (schema-valid, as 3.0 lists for other
+   reserved values), and the two `REPLY_BODY_*` rows do not apply to HTTP.
+
+**Notes the integrator documentation carries.** (a) The sender's client timeout must exceed
+`timeoutMs` plus a margin, or it gives up on a committed request and resends a duplicate. (b) A
+timeout or `504` produced by a proxy in front of the receiver is outside the engine's control and
+carries the same duplicate risk. (c) The `AE` rule "do not resend blindly" holds unchanged.
 
 **Worker rules** (ADR-003 D9, fail-fast plus DLQ, batched commit):
 

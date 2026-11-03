@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 
 @dataclass
 class LoaderMetrics:
-    #: keyed by `loader.Reason` ("success", "http-5xx", "timeout", ...); `str` here, not that type,
+    #: keyed by `loader.Reason` ("success", "HTTP_503", "timeout", ...); `str` here, not that type,
     #: to avoid a circular import (`loader.py` constructs one of these).
     by_reason: dict[str, int] = field(default_factory=dict)
     circuit_opens: int = 0
@@ -25,7 +25,9 @@ class LoaderMetrics:
         self.by_reason[reason] = self.by_reason.get(reason, 0) + 1
 
     def snapshot(self) -> dict[str, int]:
-        out: dict[str, int] = {f"delivery_{reason}": count for reason, count in self.by_reason.items()}
+        out: dict[str, int] = {
+            f"delivery_{reason}": count for reason, count in dict(self.by_reason).items()
+        }  # one C-level copy: the ops thread reads it
         out["circuit_opens"] = self.circuit_opens
         out["circuit_closes"] = self.circuit_closes
         return out

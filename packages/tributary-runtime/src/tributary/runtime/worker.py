@@ -4,24 +4,44 @@ One Kafka hop in, one per destination out, and everything between them in memory
 worker commits its input offset only after every `out.<dest>` record has a delivery callback, so a
 crash mid-flight replays rather than drops (invariants 1 and 4).
 
+Lifecycle events (`_tb.<env>.events`, fire-and-forget): `received` then `queued` for every consumed `raw` record
+before any step runs (events/v0 2.1, set 1.8: the worker, not the receiver, emits both; ADR-001 5.5 order), then
+`filtered`, `transformed`, `routed` or `dlq`. `received.ts` is the record's `tb-received-at` (consume time for a
+`tb-parent-id` re-injection or a missing/malformed header); `queued.ts` is the consume time. The handler
+remembers the last `RECEIVED_MEMORY` records it emitted those for, so the loop re-handing a record it already
+saw emits nothing new: a blocking retry of one record, and a transactional abort that rewinds the whole window,
+each yield one `received` and one `queued` per record. A replay this process
+did not see (another worker's records after a rebalance, a restart) emits again, with the same `tb-msg-id` and
+`attempt`, which the archive collapses (events/v0 2.2). A record the loop quarantines (undecodable) or rejects
+(malformed header) never reaches the handler, so it gets no `received`: its `quarantined` or `dlq` event is its
+whole timeline. There is no retry-topic redelivery to count here: the worker reads only `raw`, and
+`retry.policy: retry-topic` is refused at spec load (`spec.py`); were it added, each redelivery would be a new
+record with its own `tb-attempt`, so one `received` per attempt, each a distinct archive key.
+
 `pipeline.transactional: true` (ADR-003 D6) makes each commit window one Kafka transaction: the
 `out.<dest>` and DLQ records and the `raw` offsets commit atomically (`transactions.py`). The flag is
 read at startup, because the producer's transactional identity is fixed at construction; a hot reload
 that flips it is logged and takes effect at the next restart.
 
 Hot reload without a control plane: the channel-spec cache is polled once per message, so a new
-`metadata.version` published to `_tb.<env>.channels` takes effect on the next record. PostgreSQL and
-the API can be down throughout (invariant 3).
+`metadata.version` published to `_tb.<env>.channels` takes effect on the next record (and, while idle, within
+about a second: the loop's tick refreshes it). PostgreSQL and the API can be down throughout (invariant 3).
+
+Operations (W3-25, W3-28a): the instance id is required (`--instance-id` or `TB_INSTANCE_ID`, `startup.py`),
+and `main` serves `/livez` and `/metrics` on the ops listener (`ops.py`, `worker_metrics.py`). There is no
+worker `/readyz` (`observability/v0` 1).
 """
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import functools
 import os
 import signal
 import sys
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -31,14 +51,21 @@ from tributary.sdk import Drop, Message
 from tributary.sdk import headers as h
 from tributary.sdk.codes import REPLY_BODY_MISSING, TB_OUTPUT_ENVELOPE_INVALID, TB_PIPELINE_TIME_BUDGET
 from tributary.sdk.context import Logger
-from tributary.sdk.errors import EnvelopeError, HeaderError, UsrHeaderError
+from tributary.sdk.errors import EnvelopeError, HeaderError, MissingHeaderError, UsrHeaderError
 from tributary.sdk.ids import child_traceparent, new_traceparent, uuid7
 from tributary.sdk.projection import Ordering, TopicClass, validate_for_produce
 from tributary.sdk.reply import ReplyBody
 
 from .channels import ChannelsConsumerLike, LiveSpecSource, open_spec_source
-from .clients import KafkaSettings, consumer_config, events_producer_config, max_poll_interval_ms, producer_config
-from .config import TopicDefaults, load_topic_defaults
+from .clients import (
+    KafkaSettings,
+    consumer_config,
+    events_producer_config,
+    max_poll_interval_ms,
+    producer_config,
+    worker_producer_config,
+)
+from .config import TopicDefaults, load_topic_defaults, worker_producer_profile
 from .consumer import ConsumerLoop, KafkaConsumerLike, LoopSettings, LoopStats
 from .context import ContextExtension, WorkerContext
 from .engine_kafka import load_engine_kafka_or_exit
@@ -50,10 +77,11 @@ from .errors import (
     RuntimeConfigurationError,
     safe_token,
 )
-from .events import EventEmitter, MessageEvent, NullEmitter
+from .events import EventEmitter, EventError, MessageEvent, NullEmitter, now_text
 from .executor import ChannelPlan, PipelineAbort, StepFailure, StepStats, run_splitter
 from .extensions import ContextResolver
 from .logs import JsonLogger
+from .ops import OpsServer, OpsSettings, OpsThread, add_ops_arguments, ops_settings_or_exit, start_ops_or_exit
 from .producer import KafkaEventEmitter, KafkaProducerLike, RecordProducer
 from .records import RECORD_UNDECODABLE, ConsumedRecord, quarantine_blob
 from .reply import (
@@ -68,6 +96,14 @@ from .reply import (
     destination_rank,
 )
 from .spec import ChannelSpec, RetryPolicy
+from .stage_timing import StageTimer, enabled_from_env
+from .startup import (
+    QuietArgumentParser,
+    add_instance_argument,
+    refuse,
+    refuse_configuration,
+    resolve_instance_id,
+)
 from .steps import Node, Resolver, StepResolver, build_plan
 from .topics import (
     channels_topic,
@@ -86,12 +122,18 @@ from .transactions import (
     transactional_id,
     transactional_producer_config,
 )
+from .worker_metrics import WorkerMetrics, WorkerSources
 
 #: Retry policy for the produce half of the pipeline worker. The channel spec carries a policy per
 #: destination, which governs the loader; a failure to produce to `out.<dest>` is a Kafka-side failure
 #: with no destination to ask. JUDGEMENT, unmeasured: halting preserves order and never drops, which is
 #: the safe direction when the broker itself is the thing that is unwell.
 PRODUCE_RETRY = RetryPolicy(policy="blocking", max_attempts=10, on_exhaust="halt-partition", max_delay_ms=30_000)
+
+#: How many recent `(topic, partition, offset)` keys the handler remembers to emit `received` once per record.
+#: 4096 keys is about 0.5 MB, far above the contract's commit window (`commit_every`, 50), which the worker
+#: raises it to if a window is ever larger. JUDGEMENT, unmeasured.
+RECEIVED_MEMORY = 4096
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,14 +152,22 @@ class WorkerSettings:
     poll_timeout_s: float = 0.2
     flush_timeout_s: float = 30.0
     shadow: str | None = None
+    #: Per-record stage timestamps (`stage_timing.py`, W3-24), a diagnostic. `main` sets it from `TB_STAGE_TIMING`.
+    stage_timing: bool = False
+    #: The ops listener (`/livez`, `/metrics`). `None`: none (an embedded caller or a unit test); `main` always
+    #: sets one, and `build()` binds it first, refusing the start if it cannot (O4).
+    ops: OpsSettings | None = None
 
     def __post_init__(self) -> None:
         """Refuse a name the consumer group cannot carry when the settings are made, not at `build()`.
 
-        Builds the group once and throws it away: that checks `env`, `channel` and the shadow label
-        against `contracts/topics/v0` (`TopicNameError`) before any Kafka client exists.
+        Builds the groups once and throws them away: that checks `env`, `channel`, the shadow label and the
+        instance id against `contracts/topics/v0` (`TopicNameError`) before any Kafka client exists. The
+        instance id is `group.instance.id` verbatim (W3-29), so it has no default here: a pid-derived one
+        is identical in every container (W3-28).
         """
         consumer_group(self.env, self.channel, "pipeline", shadow=self.shadow)
+        spec_reader_group(self.env, self.channel, self.instance_id)
 
     @property
     def instance(self) -> str:
@@ -423,8 +473,13 @@ class PipelineHandler:
         context_extensions: Sequence[ContextExtension] | None = None,
         context_resolver: ContextResolver | None = None,
         step_resolver: StepResolver | None = None,
+        metrics: WorkerMetrics | None = None,
+        stage_timer: StageTimer | None = None,
+        received_memory: int = RECEIVED_MEMORY,
     ) -> None:
         self._env = env
+        self._metrics = metrics
+        self._stage_timer = stage_timer
         # L7: an explicit tuple replaces discovery (tests only; nothing in `main` sets it).
         self._context_override = tuple(context_extensions) if context_extensions is not None else None
         self._context_resolver = context_resolver if context_resolver is not None else ContextResolver(log=log)
@@ -449,9 +504,15 @@ class PipelineHandler:
         self._refused_version: int | None = None
         self._stats_interval_s = stats_interval_s
         self._stats_logged_at = time.monotonic()
-        self.stats = StepStats()
+        self.stats = StepStats(observer=metrics.observe_step if metrics is not None else None)
         self.dead_lettered = 0
         self.filtered = 0
+        #: The most recent `(stage, topic, partition, offset)` keys whose `received` or `queued` event was
+        #: emitted, oldest first, for at most `received_memory` records. Sized above a commit window, so a
+        #: blocking retry and a transactional rewind both find every record they re-hand. Bounded so memory
+        #: does not grow with traffic; a key that aged out simply re-emits, which the archive dedups (2.2).
+        self._arrived: OrderedDict[tuple[str, str, int, int], None] = OrderedDict()
+        self._arrival_memory = 2 * max(1, received_memory)
 
     # -- plan ------------------------------------------------------------------------------------
 
@@ -477,6 +538,25 @@ class PipelineHandler:
             )
         self._plan, self._plan_spec = plan, spec
         return plan
+
+    @property
+    def applied_version(self) -> int | None:
+        """The `metadata.version` whose plan is running (`tb_spec_version`). A refused newer one does not count."""
+        plan = self._plan
+        return None if plan is None else plan.version
+
+    def refresh(self) -> None:
+        """Apply a newer spec now, as the next record would. On the loop's thread only.
+
+        Called by the loop's tick after **every** iteration, busy or idle (rate-limited to once a second by
+        `PipelineWorker._tick`); it matters while idle, because a busy loop applies the spec per record anyway. A
+        spec the next record would fail on (undeployed, or the first plan refused) is left for that record: the
+        tick changes when a version is applied, never what happens to a message.
+        """
+        if self._plan is None:
+            return
+        with contextlib.suppress(ChannelSpecError):
+            self._current()
 
     def _current(self) -> tuple[ChannelSpec, ChannelPlan]:
         """The plan for the latest spec, or the previous plan when the latest one is refused.
@@ -508,6 +588,9 @@ class PipelineHandler:
     # -- one record ------------------------------------------------------------------------------
 
     def handle(self, record: ConsumedRecord) -> None:
+        started = time.perf_counter()
+        if self._stage_timer is not None:
+            self._stage_timer.mark("handle")
         spec, plan = self._current()
         if spec.pipeline.transactional != self._transactional and self._warned_version != spec.version:
             # The producer's transactional identity is fixed at construction: say so, once per version.
@@ -520,8 +603,9 @@ class PipelineHandler:
             )
         if self._replies is not None:
             self._replies.poll()  # serve the previous record's reply callback: its `replied` event
-        budget = TimeBudget(self._time_budget_s, clock=self._clock)
         message = record.message
+        self._emit_arrival(spec, record)
+        budget = TimeBudget(self._time_budget_s, clock=self._clock)
         ctx = WorkerContext(
             channel=spec.name,
             channel_version=spec.version,
@@ -598,6 +682,7 @@ class PipelineHandler:
                 subject = child
             self._route(spec, plan, record, subject, branch_ctx, pending, budget)
 
+        compute_s = time.perf_counter() - started
         # Phase 2. Validate every record before producing any: one that cannot be produced (a child or a
         # destination output over the envelope's limits) must not leave its siblings half-delivered, and
         # must not crash the worker into a replay loop. The consumed record goes to the DLQ instead.
@@ -616,11 +701,17 @@ class PipelineHandler:
         # transaction the commit itself flushes and fails - then aborts - if any record did not land.
         if not self._transactional:
             self._producer.flush_pending(self._flush_timeout_s)
+        if self._stage_timer is not None:
+            # Meaningful only when non-transactional. A transactional channel's records are flushed by the
+            # loop's commit; it never answers, so its stamps are never written (no `flushed_ms`, no line).
+            self._stage_timer.mark("flushed")
 
         self.dead_lettered += pending.dead
         self.filtered += pending.filtered
         for emit in pending.events:
             emit()
+        if self._metrics is not None:
+            self._metrics.observe_pipeline(compute_s)  # the record's `transformed` event was just emitted
         # Every `out` and `dlq` record has its delivery callback by now (the flush above), so the answer
         # can say "routed" truthfully. Fail-fast: this never raises and never delays the commit.
         self._reply(spec, plan, record, pending.failures.outcome(), body=ctx.reply_body, dropped=False)
@@ -858,8 +949,93 @@ class PipelineHandler:
         if route is None or self._replies is None:
             return
         self._replies.publish(record, route, outcome, channel=spec.name, channel_version=spec.version, body=used)
+        if self._stage_timer is not None:
+            self._stage_timer.replied(record.msg_id, status=outcome.status)
 
     # -- events and stats ------------------------------------------------------------------------
+
+    def _emit_arrival(self, spec: ChannelSpec, record: ConsumedRecord) -> None:
+        """`received` then `queued` for one consumed `raw` record, before any step runs (events/v0 2.1).
+
+        The worker is the emitter of both: a receiver holds no WRITE on the events topic and must not put a
+        produce on its ACK path (invariants 1 and 9). Same fire-and-forget emitter as every other stage, so
+        a slow or absent archive never blocks or fails the record. ADR-001 5.5 orders them RECEIVED, QUEUED
+        (raw committed, ACK sent), then FILTERED / ERROR / TRANSFORMED, so both precede the first step.
+        Each carries ids, the raw coordinates and the payload size only; no `attrs`, no step has run yet.
+
+        `ts`: `received` is the receiver's commit time (`tb-received-at`, `_received_ts`); `queued` is the
+        consume time. `tb-msg-id` is the receiver's, so every redelivery carries the same one and the
+        archive collapses copies on `(message_id, stage, destination, attempt)` (contract 2.2).
+        """
+        consumed_at = now_text()
+        # `received.ts` is computed only when the key misses the memory: a re-handled record neither re-parses
+        # its header nor re-logs a fallback for an event it will not emit.
+        self._emit_once(spec, record, "received", lambda: self._received_ts(record, consumed_at))
+        self._emit_once(spec, record, "queued", lambda: consumed_at)
+
+    def _received_ts(self, record: ConsumedRecord, consumed_at: str) -> str:
+        """`received.ts` per events/v0 2.1 (ruled 2026-10-13).
+
+        The record's `tb-received-at`, normalised to UTC with milliseconds. A record with `tb-parent-id` is
+        a reprocess or replay re-injection carrying the original's `tb-received-at` (envelope/v0 6 rule 5),
+        so it gets the consume time; so does a record whose header is missing or malformed (debug, ids only).
+        """
+        message = record.message
+        if message.get(h.TB_PARENT_ID) is not None:
+            return consumed_at
+        try:
+            return h.format_timestamp(h.parse_timestamp(h.TB_RECEIVED_AT, message.get(h.TB_RECEIVED_AT)))
+        except HeaderError as exc:
+            fields: dict[str, object] = {
+                "reason": "missing" if isinstance(exc, MissingHeaderError) else "malformed",
+                "topic": record.topic,
+                "partition": record.partition,
+                "offset": record.offset,
+            }
+            message_id = message.get(h.TB_MSG_ID)
+            if message_id:
+                fields["message_id"] = message_id
+            self._log.debug("received_ts_fallback", **fields)
+            return consumed_at
+
+    def _emit_once(self, spec: ChannelSpec, record: ConsumedRecord, stage: str, ts: Callable[[], str]) -> None:
+        """Emit an arrival stage unless this record's was already emitted by this process.
+
+        The loop re-hands a record on a blocking retry and rewinds a whole window on a transactional abort;
+        neither is a new arrival. A key is remembered only after the emit succeeded, so a refused event is
+        tried again on the next attempt.
+        """
+        key = (stage, record.topic, record.partition, record.offset)
+        if key in self._arrived:
+            return
+        message = record.message
+        try:
+            self._emit(
+                spec,
+                record,
+                message,
+                stage=stage,
+                status="ok",
+                ctx=None,
+                # A claim-checked payload has no inline bytes to count (events contract: size_bytes 0 or absent).
+                size_bytes=message.payload_size if message.claim_check is None else None,
+                ts=ts(),
+            )
+        except (EventError, HeaderError) as exc:
+            # Observability must not fail the message: the record still runs, and its later stages say why
+            # if the envelope is really broken. Logged with ids and the exception type only (invariant 6).
+            self._log.warning(
+                "event_emit_failed",
+                stage=stage,
+                error_type=type(exc).__name__,
+                topic=record.topic,
+                partition=record.partition,
+                offset=record.offset,
+            )
+            return
+        self._arrived[key] = None
+        if len(self._arrived) > self._arrival_memory:
+            self._arrived.popitem(last=False)
 
     def _emit_dead(
         self,
@@ -914,6 +1090,7 @@ class PipelineHandler:
         size_bytes: int | None = None,
         error_code: str | None = None,
         error_message: str | None = None,
+        ts: str | None = None,
     ) -> None:
         event_attrs = dict(attrs if attrs is not None else ctx.attrs() if ctx is not None else {})
         self._emitter.emit(
@@ -938,6 +1115,7 @@ class PipelineHandler:
                 parent_id=subject.get(h.TB_PARENT_ID),
                 correlation_id=subject.get(h.TB_CORRELATION_ID),
                 attrs=event_attrs or None,
+                ts=ts if ts is not None else now_text(),
             )
         )
 
@@ -1011,19 +1189,81 @@ class PipelineWorker:
     #: points (`extensions.py`); a tuple, even an empty one, replaces that (L7, tests only).
     context_extensions: tuple[ContextExtension, ...] | None = None
     log: Logger = field(default_factory=lambda: JsonLogger("worker"))
+    #: `None` builds one from `observability/v0/metrics.json` in `build()` (tests inject a strict one).
+    metrics: WorkerMetrics | None = None
     loop: ConsumerLoop | None = field(default=None, init=False)
     specs: LiveSpecSource | None = field(default=None, init=False)
     emitter: EventEmitter = field(default_factory=NullEmitter, init=False)
     handler: PipelineHandler | None = field(default=None, init=False)
+    ops: OpsThread | None = field(default=None, init=False)
+    #: `/livez` fails when the loop has not finished an iteration for this long: by then the consumer has been
+    #: evicted from the group anyway (`max.poll.interval.ms`). Set from the spec in `build()`.
+    stale_after_s: float = field(default=300.0, init=False)
+    _refreshed_at: float = field(default=0.0, init=False)
+
+    def worker_metrics(self) -> WorkerMetrics:
+        if self.metrics is None:
+            self.metrics = WorkerMetrics.create(
+                channel=self.settings.channel, contracts_dir=self.settings.contracts_dir, log=self.log
+            )
+        return self.metrics
+
+    def alive(self) -> bool:
+        """Liveness for `/livez`: the loop has started or iterated within `stale_after_s` (or `run()` has not been
+        called yet: `build()` is bounded by the spec catch-up timeout). Never Kafka. `run()` stamps the heartbeat
+        before its first poll, so a first poll or handle that never returns fails liveness too."""
+        loop = self.loop
+        since = loop.seconds_since_tick() if loop is not None else None
+        return since is None or since < self.stale_after_s
+
+    def start_ops(self) -> int | None:
+        """Bind the ops listener on its thread, or exit 2 (O4). Returns the port; `None` without `settings.ops`."""
+        if self.ops is not None:
+            return self.ops.server.port
+        if self.settings.ops is None:
+            return None
+        metrics = self.worker_metrics()
+        server = OpsServer(
+            self.settings.ops, component="worker", metrics=metrics.render, liveness=self.alive, log=self.log
+        )
+        self.ops = start_ops_or_exit(server, self.log)
+        return self.ops.server.port
+
+    def close_ops(self) -> None:
+        ops, self.ops = self.ops, None
+        if ops is not None:
+            ops.close()
 
     def build(self) -> ConsumerLoop:
+        # Bound first: O4 refuses the start before any Kafka client exists, and the probe answers during the
+        # spec catch-up below.
+        self.start_ops()
+        try:
+            return self._build()
+        except BaseException:
+            self.close_ops()
+            raise
+
+    def _tick(self) -> None:
+        """Once per loop iteration: at most once a second, apply a newer spec while idle (`tb_spec_version`)."""
+        now = time.monotonic()
+        if now - self._refreshed_at < 1.0 or self.handler is None:
+            return
+        self._refreshed_at = now
+        self.handler.refresh()
+
+    def _build(self) -> ConsumerLoop:
         from confluent_kafka import Consumer, Producer
 
+        metrics = self.worker_metrics()
         defaults = self.defaults or load_topic_defaults(self.settings.contracts_dir)
         env, channel = self.settings.env, self.settings.channel
         # Before any client is built: a warning emitted after a failed connection is a warning nobody
         # sees on the run where it matters most.
         emit_profile_warning(self.log, defaults, profile=self.settings.profile)
+        # The worker's own producer block is validated here, before any client: a contract without it refuses
+        # this worker only (`ConfigError`); receivers and loaders that share the loader never look at it.
+        worker_producer_profile(defaults)
         # Every client below, the `_tb.<env>.channels` reader first, is built from this one link. Its
         # `engine_kafka_link` line was logged once by `load_engine_kafka_or_exit` in `main`.
 
@@ -1047,12 +1287,14 @@ class PipelineWorker:
         spec = self.specs.current()
 
         transactional = spec.pipeline.transactional
-        base_config = producer_config(
-            self.settings.kafka, defaults, client_id=f"tb-{env}-{channel}-{self.settings.instance_id}"
-        )
+        client_id = f"tb-{env}-{channel}-{self.settings.instance_id}"
+        # Non-transactional: `clients.worker_producer` (linger 0, topics README 3.2.1). A transactional channel
+        # keeps the `receiver_producer` base it always had: that ruling covered only the non-transactional
+        # producer, and its records are flushed by the commit, not per record.
+        base_config = worker_producer_config(self.settings.kafka, defaults, client_id=client_id)
         if transactional:
             base_config = transactional_producer_config(
-                base_config,
+                producer_config(self.settings.kafka, defaults, client_id=client_id),
                 transactional_id_value=transactional_id(
                     defaults.transactional_id_template, env=env, channel=channel, instance=self.settings.instance_id
                 ),
@@ -1061,15 +1303,18 @@ class PipelineWorker:
         producer = RecordProducer(cast("KafkaProducerLike", data_producer), log=self.log)
         check_partition_counts(data_producer, env, spec)
 
-        self.emitter = KafkaEventEmitter(
-            cast(
-                "KafkaProducerLike",
-                Producer(
-                    events_producer_config(self.settings.kafka, client_id=f"tb-events-{self.settings.instance_id}")
+        # Counted at emit time (`tb_messages_total`), so the count holds while the archiver is down.
+        self.emitter = metrics.counted(
+            KafkaEventEmitter(
+                cast(
+                    "KafkaProducerLike",
+                    Producer(
+                        events_producer_config(self.settings.kafka, client_id=f"tb-events-{self.settings.instance_id}")
+                    ),
                 ),
-            ),
-            events_topic(env),
-            log=self.log,
+                events_topic(env),
+                log=self.log,
+            )
         )
 
         reply_partitions = ReplyPartitionCount(data_producer.list_topics, reply_topic(env, channel))
@@ -1086,6 +1331,7 @@ class PipelineWorker:
             instance=self.settings.instance,
             partition_count=reply_partitions,
         )
+        stage_timer = StageTimer(self.log) if self.settings.stage_timing else None
         handler = PipelineHandler(
             env=env,
             spec_provider=self._current_spec,
@@ -1100,6 +1346,10 @@ class PipelineWorker:
             time_budget_s=handle_budget_s(max_poll_interval_ms(spec), self.settings.flush_timeout_s),
             replies=replies,
             context_extensions=self.context_extensions,
+            metrics=metrics,
+            stage_timer=stage_timer,
+            # Above the commit window, so a transactional rewind re-hands only records it remembers.
+            received_memory=max(RECEIVED_MEMORY, 2 * defaults.consumer.commit_every),
         )
         # Resolve and bind every step, and load the declared context extensions, now: a bad `with`, a
         # splitter on a per-key channel or an unresolvable `pipeline.context` stops the worker before it
@@ -1151,6 +1401,19 @@ class PipelineWorker:
                 flush_timeout_s=self.settings.flush_timeout_s,
             ),
             on_dead_lettered=handler.after_dead_letter,
+            on_tick=self._tick,
+            stage_timer=stage_timer,
+        )
+        self.stale_after_s = max_poll_interval_ms(spec) / 1000.0
+        loop, specs = self.loop, self.specs
+        metrics.bind(
+            WorkerSources(
+                loop_stats=lambda: loop.stats,
+                partition_counts=loop.partition_counts,
+                reply_stats=lambda: replies.stats,
+                applied_version=lambda: handler.applied_version,
+                spec_available=lambda: specs.available,
+            )
         )
         self.loop.start()
         self.log.info(
@@ -1181,6 +1444,7 @@ class PipelineWorker:
             self.emitter.close()
             if self.specs is not None:
                 self.specs.close()
+            self.close_ops()
 
     def stop(self) -> None:
         if self.loop is not None:
@@ -1188,23 +1452,52 @@ class PipelineWorker:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Entry point for the container image: configuration from the environment, SIGTERM-aware.
+    """Entry point for the container image: configuration from flags and the environment, SIGTERM-aware.
 
     The engine link comes only from the `TB_ENGINE_KAFKA_FILE` document (`engine-kafka/v0`, ADR-008):
     there is no default broker, and `TB_BOOTSTRAP_SERVERS` or `--bootstrap` refuses to start rather
     than being silently ignored. A refused configuration exits 2 (`SystemExit`) before any Kafka client
     exists, through the shared `load_engine_kafka_or_exit`.
+
+    Flags: `--instance-id` (or `TB_INSTANCE_ID`; **required**, W3-28: `startup_refused` with
+    `code: INSTANCE_REQUIRED`, exit 2), `--ops-bind` / `--ops-port` (or `TB_OPS_BIND` / `TB_OPS_PORT`,
+    default `127.0.0.1:9180`, O2). Environment: `TB_CHANNEL` (required), `TB_ENV`, `TB_PROFILE`,
+    `TB_CONTRACTS_DIR`, and `TB_STAGE_TIMING` (`1`/`true`/`yes`; default off): one `stage_timing` log line
+    per answered synchronous record, ids and epoch-ms stamps only (`stage_timing.py`, W3-24).
     """
-    kafka = load_engine_kafka_or_exit(argv=sys.argv[1:] if argv is None else argv, log=JsonLogger("worker"))
-    settings = WorkerSettings(
-        env=os.environ.get("TB_ENV", "dev"),
-        channel=os.environ["TB_CHANNEL"],
-        kafka=kafka,
-        instance_id=os.environ.get("TB_INSTANCE_ID", f"pipeline-{os.getpid()}"),
-        profile=os.environ.get("TB_PROFILE", "lite"),
-        contracts_dir=os.environ.get("TB_CONTRACTS_DIR"),
+    args_list = list(sys.argv[1:] if argv is None else argv)
+    log = JsonLogger("worker")
+    # First, so a retired `--bootstrap` refuses with its own code rather than as an unknown flag.
+    kafka = load_engine_kafka_or_exit(argv=args_list, log=log)
+    parser = QuietArgumentParser(
+        log, prog="python -m tributary.runtime.worker", description="Tributary pipeline worker"
     )
-    worker = PipelineWorker(settings)
+    add_instance_argument(parser)
+    add_ops_arguments(parser)
+    args = parser.parse_args(args_list)
+    try:
+        instance_id = resolve_instance_id(args.instance_id)
+    except RuntimeConfigurationError as exc:
+        refuse_configuration(log, exc)
+    ops = ops_settings_or_exit(args, log)
+    channel = os.environ.get("TB_CHANNEL")
+    if not channel:
+        refuse(log, error="UsageError", code="ARGUMENTS_INVALID", reason="TB_CHANNEL is required")
+    try:
+        settings = WorkerSettings(
+            env=os.environ.get("TB_ENV", "dev"),
+            channel=channel,
+            kafka=kafka,
+            instance_id=instance_id,
+            profile=os.environ.get("TB_PROFILE", "lite"),
+            contracts_dir=os.environ.get("TB_CONTRACTS_DIR"),
+            ops=ops,
+            stage_timing=enabled_from_env(os.environ),
+        )
+    except RuntimeConfigurationError as exc:
+        # A topic-name error can quote the name; the class and code are enough to act on.
+        refuse(log, error=type(exc).__name__, code=exc.code)
+    worker = PipelineWorker(settings, log=log)
     worker.build()
 
     def _shutdown(signum: int, _frame: object) -> None:

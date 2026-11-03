@@ -26,7 +26,7 @@ from tests.support.mllp_receiver import ensure_channels_topic, publish_channel_s
 from tests.support.processes import ManagedProcess
 from tests.support.receiver_specs import http_document, kafka_source_document, sftp_document
 
-from .readiness_rig import await_ready, get, ops_port, readyz, reasons
+from .readiness_rig import await_ready, get, ops_port, readyz, reasons, scrape
 
 pytestmark = pytest.mark.integration
 
@@ -144,6 +144,9 @@ def test_not_ready_before_the_first_spec_and_the_warm_up_then_ready_then_undeplo
     assert "reason" not in str(doc["checks"])
     if ingest_port:
         assert not refused(ingest_port)
+    series = scrape(port)
+    assert series[f'tb_ready{{component="receiver",channel="{channel}"}}'] == 1
+    assert series[f'tb_spec_version{{component="receiver",channel="{channel}"}}'] == 1
     assert get(port, "/readyz", method="POST") == (405, None)
     assert get(port, "/nothing-here") == (404, None)
 

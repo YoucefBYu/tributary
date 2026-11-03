@@ -231,7 +231,7 @@ def spawn_http_loader(
             "--instance-id",
             instance_id,
         ],
-        env=engine_kafka_env(bootstrap),
+        env=receiver_env(engine_kafka_env(bootstrap)),
     )
     proc.wait_for_event("loader_started", timeout_s=timeout_s)
     return proc
@@ -270,7 +270,7 @@ def spawn_postgresql_loader(
     ]
     if secrets_dir is not None:
         args += ["--secrets-dir", str(secrets_dir)]
-    proc = ManagedProcess(args, env=engine_kafka_env(bootstrap))
+    proc = ManagedProcess(args, env=receiver_env(engine_kafka_env(bootstrap)))
     proc.wait_for_event("loader_started", timeout_s=timeout_s)
     return proc
 
@@ -306,7 +306,7 @@ def spawn_kafka_loader(
     ]
     if secrets_dir is not None:
         args += ["--secrets-dir", str(secrets_dir)]
-    proc = ManagedProcess(args, env=engine_kafka_env(bootstrap))
+    proc = ManagedProcess(args, env=receiver_env(engine_kafka_env(bootstrap)))
     proc.wait_for_event("loader_started", timeout_s=timeout_s)
     return proc
 
@@ -343,7 +343,7 @@ def spawn_clickhouse_loader(
     ]
     if secrets_dir is not None:
         args += ["--secrets-dir", str(secrets_dir)]
-    proc = ManagedProcess(args, env=engine_kafka_env(bootstrap))
+    proc = ManagedProcess(args, env=receiver_env(engine_kafka_env(bootstrap)))
     proc.wait_for_event("loader_started", timeout_s=timeout_s)
     return proc
 
@@ -375,7 +375,7 @@ def spawn_fhir_loader(
     ]
     if secrets_dir is not None:
         args += ["--secrets-dir", str(secrets_dir)]
-    proc = ManagedProcess(args, env=engine_kafka_env(bootstrap))
+    proc = ManagedProcess(args, env=receiver_env(engine_kafka_env(bootstrap)))
     proc.wait_for_event("loader_started", timeout_s=timeout_s)
     return proc
 
@@ -407,7 +407,7 @@ def spawn_sftp_loader(
     ]
     if secrets_dir is not None:
         args += ["--secrets-dir", str(secrets_dir)]
-    proc = ManagedProcess(args, env=engine_kafka_env(bootstrap))
+    proc = ManagedProcess(args, env=receiver_env(engine_kafka_env(bootstrap)))
     proc.wait_for_event("loader_started", timeout_s=timeout_s)
     return proc
 
@@ -439,7 +439,7 @@ def spawn_s3_loader(
     ]
     if secrets_dir is not None:
         args += ["--secrets-dir", str(secrets_dir)]
-    proc = ManagedProcess(args, env=engine_kafka_env(bootstrap))
+    proc = ManagedProcess(args, env=receiver_env(engine_kafka_env(bootstrap)))
     proc.wait_for_event("loader_started", timeout_s=timeout_s)
     return proc
 
@@ -475,7 +475,7 @@ def spawn_mllp_loader(
     ]
     if secrets_dir is not None:
         args += ["--secrets-dir", str(secrets_dir)]
-    proc = ManagedProcess(args, env=engine_kafka_env(bootstrap))
+    proc = ManagedProcess(args, env=receiver_env(engine_kafka_env(bootstrap)))
     proc.wait_for_event("loader_started", timeout_s=timeout_s)
     return proc
 
@@ -523,7 +523,7 @@ def spawn_pipeline_worker(
     """
     proc = ManagedProcess(
         [sys.executable, "-c", WORKER_PROGRAM, env, channel, bootstrap, instance_id],
-        env={**os.environ, **(extra_env or {})},
+        env={**os.environ, "TB_OPS_PORT": "0", **(extra_env or {})},
     )
     proc.wait_for_event("worker_started", timeout_s=timeout_s)
     return proc

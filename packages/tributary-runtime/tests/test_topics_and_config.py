@@ -116,6 +116,14 @@ def test_archiver_platform_group_is_the_literal_contract_name() -> None:
     assert validator.is_valid(topics.consumer_group("prod", "archiver", "pipeline"))
 
 
+@pytest.mark.parametrize("kind", get_args(topics.PlatformGroup))
+def test_every_platform_group_builds_a_contract_valid_literal_name(kind: str) -> None:
+    # Set 1.8 added `reconciler` (the API's spec reconciler); each kind must build `tb.<env>.<kind>`.
+    group = topics.platform_group("prod", cast(Any, kind))
+    assert group == f"tb.prod.{kind}"
+    assert _consumer_group_schema().is_valid(group)
+
+
 @pytest.mark.parametrize(
     ("role", "destination", "shadow"),
     [
@@ -441,3 +449,118 @@ def test_worker_profile_is_unchanged_by_the_reply_profile() -> None:
     assert config["auto.offset.reset"] == "earliest"
     assert "isolation.level" not in config
     assert config["session.timeout.ms"] == _contract_clients()["worker_consumer"]["session.timeout.ms"]
+
+
+# -- clients.worker_producer (set 1.8, README 3.2.1; 3.7 acceptance) ------------------------------------
+
+WORKER_PRODUCER_KEYS = (
+    "acks",
+    "enable.idempotence",
+    "max.in.flight.requests.per.connection",
+    "delivery.timeout.ms",
+    "linger.ms",
+    "compression.type",
+)
+
+
+def _producer_configs(root: Path | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
+    from tributary.runtime.clients import KafkaSettings, producer_config, worker_producer_config
+
+    settings, defaults = KafkaSettings(bootstrap_servers="localhost:9092"), load_topic_defaults(root)
+    return (
+        worker_producer_config(settings, defaults, client_id="tb-dev-adt-pipeline-1"),
+        producer_config(settings, defaults, client_id="tb-dev-adt-rx"),
+    )
+
+
+def test_worker_producer_effective_config_equals_the_contract() -> None:
+    """3.7: every value of `clients.worker_producer` is the one the worker's producer gets; linger is 0."""
+    contract = _contract_clients()["worker_producer"]
+    worker, receiver = _producer_configs()
+    for key in WORKER_PRODUCER_KEYS:
+        assert worker[key] == contract[key], key
+    assert worker["linger.ms"] == 0
+    # The receiver keeps its own block (linger 5, the S2 TODO): only the worker moved.
+    assert receiver["linger.ms"] == _contract_clients()["receiver_producer"]["linger.ms"]
+
+
+def _edited(tmp_path: Path, edit: Any) -> Path:
+    root = tmp_path / "contracts"
+    shutil.copytree(CONTRACTS / "topics", root / "topics")
+    path = root / "topics" / "v0" / "topic-defaults.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    edit(document["clients"])
+    path.write_text(json.dumps(document), encoding="utf-8")
+    return root
+
+
+def test_worker_producer_values_move_with_their_own_block(tmp_path: Path) -> None:
+    def edit(clients: dict[str, Any]) -> None:
+        clients["worker_producer"]["linger.ms"] = 2
+        clients["worker_producer"]["delivery.timeout.ms"] = 90000
+        clients["receiver_producer"]["linger.ms"] = 7
+
+    worker, receiver = _producer_configs(_edited(tmp_path, edit))
+    assert (worker["linger.ms"], worker["delivery.timeout.ms"]) == (2, 90000)
+    assert receiver["linger.ms"] == 7 and receiver["delivery.timeout.ms"] == 120000
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        lambda clients: clients.pop("worker_producer"),
+        lambda clients: clients["worker_producer"].pop("linger.ms"),
+        lambda clients: clients["worker_producer"].update({"acks": 1}),
+        lambda clients: clients["worker_producer"].update({"enable.idempotence": False}),
+        lambda clients: clients["worker_producer"].update({"max.in.flight.requests.per.connection": 6}),
+        lambda clients: clients["worker_producer"].update({"max.in.flight.requests.per.connection": 0}),
+    ],
+    ids=["block-missing", "key-missing", "acks-1", "not-idempotent", "in-flight-6", "in-flight-0"],
+)
+def test_a_defective_worker_producer_block_refuses_only_the_worker(tmp_path: Path, edit: Any) -> None:
+    """Re-review MED: `load_topic_defaults` is shared, so a stale contract must not stop a receiver, the
+    replier or a loader; only the worker's producer config refuses, with a typed error."""
+    from tributary.runtime.clients import KafkaSettings, consumer_config, producer_config, worker_producer_config
+
+    defaults = load_topic_defaults(_edited(tmp_path, edit))  # loads for everyone
+    settings = KafkaSettings(bootstrap_servers="localhost:9092")
+    assert producer_config(settings, defaults, client_id="tb-dev-adt-rx")["acks"] == "all"  # receiver
+    consumer_config(settings, defaults, group_id="tb.dev.adt.replier", profile="reply_consumer")  # replier
+    consumer_config(settings, defaults, group_id="tb.dev.adt.loader.http")  # loader
+    with pytest.raises(ConfigError):
+        worker_producer_config(settings, defaults, client_id="tb-dev-adt-pipeline-1")
+
+
+def test_the_worker_build_refuses_a_contract_without_the_block_before_any_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import io
+
+    import confluent_kafka
+    from tributary.runtime.clients import KafkaSettings
+    from tributary.runtime.logs import JsonLogger
+    from tributary.runtime.worker import PipelineWorker, WorkerSettings
+
+    def no_client(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("a Kafka client was built before the contract was checked")
+
+    monkeypatch.setattr(confluent_kafka, "Consumer", no_client)
+    monkeypatch.setattr(confluent_kafka, "Producer", no_client)
+    root = tmp_path / "contracts"
+    shutil.copytree(CONTRACTS, root)  # whole tree: the worker also loads the metrics contract first
+    path = root / "topics" / "v0" / "topic-defaults.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["clients"].pop("worker_producer")
+    path.write_text(json.dumps(document), encoding="utf-8")
+    worker = PipelineWorker(
+        WorkerSettings(
+            env="dev",
+            channel="adt",
+            kafka=KafkaSettings(bootstrap_servers="localhost:9092"),
+            instance_id="pipeline-1",
+            contracts_dir=str(root),
+        ),
+        log=JsonLogger("worker", stream=io.StringIO()),
+    )
+    with pytest.raises(ConfigError, match="worker_producer is missing"):
+        worker.build()

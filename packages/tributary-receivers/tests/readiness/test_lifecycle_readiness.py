@@ -13,8 +13,8 @@ from typing import Any
 import pytest
 from tributary.receivers.http.runner import HttpRunner, RunnerOptions
 from tributary.receivers.http.server import HttpServer
-from tributary.receivers.ops import OpsSettings
 from tributary.runtime.errors import ChannelsUnavailableError
+from tributary.runtime.ops import OpsSettings
 from tributary.runtime.spec import ChannelSpec
 from tributary.sdk import Message
 
