@@ -42,6 +42,7 @@ from tributary.runtime.config import load_topic_defaults
 from tributary.runtime.engine_kafka import load_engine_kafka
 from tributary.runtime.topics import channels_topic, dlq_topic, events_topic, out_topic, platform_topic, raw_topic
 
+from tests.support.kafka_helpers import committed_with_retry
 from tests.support.secure_broker import Grant, SecureBroker, contract_grants, secure_broker
 
 pytestmark = pytest.mark.integration
@@ -217,7 +218,7 @@ def test_lag_reader_can_describe_and_read_offsets_but_not_read_or_write_data(
         assert metadata.topics[RAW].error is None and len(metadata.topics[RAW].partitions) == 1
         low, high = probe.get_watermark_offsets(TopicPartition(RAW, 0), timeout=30, cached=False)
         assert (low, high) == (0, SEEDED)
-        committed = probe.committed([TopicPartition(RAW, 0)], timeout=30)
+        committed = committed_with_retry(probe, [TopicPartition(RAW, 0)], timeout_s=30)
         assert committed[0].error is None and committed[0].offset == COMMITTED
         assert high - committed[0].offset == SEEDED - COMMITTED  # the lag KEDA scales on
     finally:
