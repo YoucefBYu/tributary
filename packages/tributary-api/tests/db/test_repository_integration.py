@@ -15,18 +15,28 @@ from tributary.api.db.errors import (
     InUseError,
     InvalidValueError,
     NotFoundError,
-    NothingToRollBackError,
 )
 from tributary.api.db.migrate import upgrade
 from tributary.api.db.models import ChannelVersion
-from tributary.api.db.repository import ChannelRepository, DeploymentRepository, EnvironmentRepository
+from tributary.api.db.repository import (
+    ChannelRepository,
+    DeploymentRepository,
+    EnvironmentRepository,
+    image_digest_of,
+    published_bytes,
+    spec_digest,
+)
 
 pytestmark = pytest.mark.integration
 
 D1 = "sha256:" + "1" * 64
 D2 = "sha256:" + "2" * 64
-D3 = "sha256:" + "3" * 64
-SPEC = {"apiVersion": "tributary.dev/v0", "kind": "Channel", "metadata": {"name": "adt"}, "spec": {}}
+SPEC = {
+    "apiVersion": "tributary.dev/v1",
+    "kind": "Channel",
+    "metadata": {"name": "adt"},
+    "spec": {"pipeline": {"bundle": f"reg.example/img@{D1}"}},
+}
 
 
 @pytest.fixture(scope="module")
@@ -51,15 +61,23 @@ def run(url: str, scenario: Callable[[AsyncSession], Awaitable[None]]) -> None:
     asyncio.run(_go())
 
 
-def test_versions_are_consecutive_and_digest_pinned(migrated: str) -> None:
+def test_versions_are_consecutive_stamped_and_hash_the_published_bytes(migrated: str) -> None:
     async def scenario(s: AsyncSession) -> None:
         ch = ChannelRepository(s)
         await ch.create("adt", "user-1")
-        v1 = await ch.add_version("adt", SPEC, "user-1")
-        v2 = await ch.add_version("adt", {**SPEC, "spec": {"x": 1}}, "user-1")
+        v1 = await ch.add_version("adt", SPEC, "user-1", {"kind": "ui"})
+        v2 = await ch.add_version("adt", {**SPEC, "spec": {**SPEC["spec"], "x": 1}}, "user-1")
         assert (v1.version, v2.version) == (1, 2)
-        assert v1.spec_sha256 != v2.spec_sha256
+        assert (v1.spec["metadata"]["version"], v2.spec["metadata"]["version"]) == (1, 2)
+        assert "version" not in SPEC["metadata"]  # the caller's dict is not mutated
+        assert v1.spec_sha256 == spec_digest(v1.spec) != v2.spec_sha256
+        assert v1.origin == {"kind": "ui"} and v2.origin == {"kind": "api"}
+        # JSONB round trip keeps the published bytes (the deploy path re-checks this at publish time)
+        await s.refresh(v1)
+        assert spec_digest(v1.spec) == v1.spec_sha256
+        assert published_bytes(v1.spec).startswith(b'{"apiVersion"')
         assert [v.version for v in await ch.list_versions("adt")] == [2, 1]
+        assert [v.version for v in await ch.list_versions("adt", limit=1, before_version=2)] == [1]
         with pytest.raises(AlreadyExistsError):
             await ch.create("adt", "user-1")
         with pytest.raises(NotFoundError):
@@ -79,180 +97,148 @@ def test_versions_are_immutable(migrated: str) -> None:
     run(migrated, scenario)
 
 
-def test_deploy_supersedes_and_one_active(migrated: str) -> None:
-    async def scenario(s: AsyncSession) -> None:
-        await EnvironmentRepository(s).create("dev", "ui-managed")
-        await EnvironmentRepository(s).create("prod", "git-managed")
-        ch = ChannelRepository(s)
-        c = await ch.create("adt", "u")
-        await ch.add_version("adt", SPEC, "u")
-        await ch.add_version("adt", SPEC, "u")
-        dr = DeploymentRepository(s)
-        d1 = await dr.deploy("adt", 1, "dev", D1, "u")
-        d2 = await dr.deploy("adt", 2, "dev", D2, "u")
-        p1 = await dr.deploy("adt", 1, "prod", D1, "u")
-        await s.refresh(d1)
-        assert (d1.status, d2.status, p1.status) == ("superseded", "active", "active")
-        envs = {e.name: e for e in await EnvironmentRepository(s).list()}
-        active = await dr.active(c.id, envs["dev"].id)
-        assert active is not None and active.id == d2.id
-        assert len(await dr.history("adt")) == 3
-        assert len(await dr.history("adt", "dev")) == 2
-
-    run(migrated, scenario)
+def test_image_digest_comes_from_the_bundle() -> None:
+    assert image_digest_of(SPEC) == D1
+    assert image_digest_of({"spec": {"pipeline": {"bundle": "img:latest"}}}) is None
+    assert image_digest_of({"spec": {}}) is None
 
 
-def test_tag_instead_of_digest_is_refused(migrated: str) -> None:
-    async def scenario(s: AsyncSession) -> None:
-        await EnvironmentRepository(s).create("dev", "ui-managed")
-        await ChannelRepository(s).create("adt", "u")
-        await ChannelRepository(s).add_version("adt", SPEC, "u")
-        with pytest.raises(InvalidValueError):
-            await DeploymentRepository(s).deploy("adt", 1, "dev", "registry/img:latest", "u")
-
-    run(migrated, scenario)
-
-
-def test_rollback_walks_back_and_records_history(migrated: str) -> None:
-    async def scenario(s: AsyncSession) -> None:
-        await EnvironmentRepository(s).create("dev", "ui-managed")
-        ch = ChannelRepository(s)
-        await ch.create("adt", "u")
-        for _ in range(3):
-            await ch.add_version("adt", SPEC, "u")
-        dr = DeploymentRepository(s)
-        await dr.deploy("adt", 1, "dev", D1, "u")
-        await dr.deploy("adt", 2, "dev", D2, "u")
-        d3 = await dr.deploy("adt", 3, "dev", D3, "u")
-        r1 = await dr.rollback("adt", "dev", "u")
-        assert (r1.image_digest, r1.status) == (D2, "active")
-        assert r1.restored_from is not None
-        await s.refresh(d3)
-        assert d3.status == "rolled_back"
-        r2 = await dr.rollback("adt", "dev", "u")
-        assert r2.image_digest == D1
-        with pytest.raises(NothingToRollBackError):
-            await dr.rollback("adt", "dev", "u")
-        assert len(await dr.history("adt", "dev")) == 5  # append-only
-
-    run(migrated, scenario)
-
-
-def test_rollback_without_deployment_is_refused(migrated: str) -> None:
-    async def scenario(s: AsyncSession) -> None:
-        await EnvironmentRepository(s).create("dev", "ui-managed")
-        await ChannelRepository(s).create("adt", "u")
-        with pytest.raises(NothingToRollBackError):
-            await DeploymentRepository(s).rollback("adt", "dev", "u")
-        with pytest.raises(NotFoundError):
-            await DeploymentRepository(s).rollback("nope", "dev", "u")
-
-    run(migrated, scenario)
-
-
-def test_channel_with_deployments_cannot_be_deleted(migrated: str) -> None:
-    async def scenario(s: AsyncSession) -> None:
-        await EnvironmentRepository(s).create("dev", "ui-managed")
-        ch = ChannelRepository(s)
-        await ch.create("adt", "u")
-        await ch.add_version("adt", SPEC, "u")
-        await DeploymentRepository(s).deploy("adt", 1, "dev", D1, "u")
-        with pytest.raises(InUseError):
-            await ch.delete("adt")
-
-    run(migrated, scenario)
-
-
-def test_invalid_environment_mode_refused(migrated: str) -> None:
-    async def scenario(s: AsyncSession) -> None:
-        with pytest.raises(InvalidValueError):
-            await EnvironmentRepository(s).create("dev", "whatever")
-        await EnvironmentRepository(s).create("dev", "ui-managed")
-        with pytest.raises(AlreadyExistsError):
-            await EnvironmentRepository(s).create("dev", "ui-managed")
-
-    run(migrated, scenario)
-
-
-async def _seed(s: AsyncSession, versions: int = 3) -> None:
-    await EnvironmentRepository(s).create("dev", "ui-managed")
+async def _seed(s: AsyncSession, versions: int = 3, mode: str = "ui-managed") -> None:
+    await EnvironmentRepository(s).create("dev", mode)
     ch = ChannelRepository(s)
     await ch.create("adt", "u")
     for _ in range(versions):
         await ch.add_version("adt", SPEC, "u")
 
 
-def test_failed_deploy_leaves_old_deployment_active(migrated: str) -> None:
-    """Regression: the status flip and the insert share one savepoint."""
-
+def test_request_supersedes_older_pending_and_current_is_newest_live(migrated: str) -> None:
     async def scenario(s: AsyncSession) -> None:
         await _seed(s)
+        c = ChannelRepository(s)
+        ch, env = await c.get_by_name("adt"), await EnvironmentRepository(s).get_by_name("dev")
+        v1, v2 = await c.get_version("adt", 1), await c.get_version("adt", 2)
         dr = DeploymentRepository(s)
-        d1 = await dr.deploy("adt", 1, "dev", D1, "u")
-        with pytest.raises(InvalidValueError):
-            await dr.deploy("adt", 2, "dev", "latest", "u")  # rejected in Python
-        with pytest.raises(InvalidValueError):
-            await dr.deploy("adt", 2, "dev", D2, "x" * 500)  # rejected by the database
+        assert await dr.current(ch.id, env.id) is None
+        d1 = await dr.request(ch, env, "deploy", v1, None, "u")
+        assert d1.status == "pending" and d1.image_digest == D1
+        d2 = await dr.request(ch, env, "deploy", v2, 1, "u")
         await s.refresh(d1)
-        assert d1.status == "active"
-        assert len(await dr.history("adt", "dev")) == 1
+        assert (d1.status, d2.status) == ("superseded", "pending")
+        current = await dr.current(ch.id, env.id)
+        assert current is not None and current.id == d2.id
+        await dr.mark_published(d2)
+        assert d2.published_at is not None
+        with pytest.raises(InvalidValueError):
+            await dr.mark_published(d2)  # only pending moves
 
     run(migrated, scenario)
 
 
-def test_deploy_after_rollback_then_rollback_again(migrated: str) -> None:
+def test_failed_is_never_current_and_needs_a_code(migrated: str) -> None:
     async def scenario(s: AsyncSession) -> None:
         await _seed(s)
+        c = ChannelRepository(s)
+        ch, env = await c.get_by_name("adt"), await EnvironmentRepository(s).get_by_name("dev")
         dr = DeploymentRepository(s)
-        await dr.deploy("adt", 1, "dev", D1, "u")
-        await dr.deploy("adt", 2, "dev", D2, "u")
-        r = await dr.rollback("adt", "dev", "u")
-        assert r.image_digest == D1
-        d3 = await dr.deploy("adt", 3, "dev", D3, "u")
-        back = await dr.rollback("adt", "dev", "u")
-        # d3 is replaced by the most recent superseded deployment that differs: the restored D1 copy
-        assert back.image_digest == D1
-        await s.refresh(d3)
-        assert d3.status == "rolled_back"
+        d1 = await dr.request(ch, env, "deploy", await c.get_version("adt", 1), None, "u")
+        await dr.mark_published(d1)
+        d2 = await dr.request(ch, env, "deploy", await c.get_version("adt", 2), 1, "u")
+        await dr.mark_failed(d2, "PUBLISH_TIMEOUT")
+        current = await dr.current(ch.id, env.id)
+        assert current is not None and current.id == d1.id
+        states = await dr.states_for_channel(ch)
+        assert [(n, d.status) for n, d in states] == [("dev", "failed")]  # the failure stays visible
+        with pytest.raises(InvalidValueError):
+            await dr.mark_failed(d2, "PUBLISH_FAILED")
 
     run(migrated, scenario)
 
 
-def test_rollback_skips_target_identical_to_current(migrated: str) -> None:
+def test_undeploy_tombstone_and_current_listing(migrated: str) -> None:
     async def scenario(s: AsyncSession) -> None:
         await _seed(s)
+        c = ChannelRepository(s)
+        ch, env = await c.get_by_name("adt"), await EnvironmentRepository(s).get_by_name("dev")
         dr = DeploymentRepository(s)
-        await dr.deploy("adt", 1, "dev", D1, "u")
-        await dr.deploy("adt", 2, "dev", D2, "u")
-        await dr.deploy("adt", 2, "dev", D2, "u")  # same version and image again
-        r = await dr.rollback("adt", "dev", "u")
-        assert r.image_digest == D1  # skipped the identical D2 row
+        d1 = await dr.request(ch, env, "deploy", await c.get_version("adt", 1), None, "u")
+        await dr.mark_published(d1)
+        assert [n for n, _ in await dr.current_in_environment(env, limit=10)] == ["adt"]
+        t = await dr.request(ch, env, "undeploy", None, 1, "u")
+        assert (t.version_id, t.image_digest) == (None, None)
+        await dr.mark_published(t)
+        cur = await dr.current(ch.id, env.id)
+        assert cur is not None and cur.kind == "undeploy"
+        assert await dr.current_in_environment(env, limit=10) == []
+        assert len(await dr.history(ch, env, limit=10)) == 2
+        assert [d.kind for d in await dr.history(ch, env, limit=10, before_seq=t.seq)] == ["deploy"]
 
     run(migrated, scenario)
 
 
-def test_restored_from_walk_back_after_intervening_deploy(migrated: str) -> None:
+def test_previous_published_version_skips_unpublished_and_identical(migrated: str) -> None:
     async def scenario(s: AsyncSession) -> None:
         await _seed(s, versions=4)
+        c = ChannelRepository(s)
+        ch, env = await c.get_by_name("adt"), await EnvironmentRepository(s).get_by_name("dev")
         dr = DeploymentRepository(s)
-        d1 = await dr.deploy("adt", 1, "dev", D1, "u")
-        await dr.deploy("adt", 2, "dev", D2, "u")
-        await dr.deploy("adt", 3, "dev", D3, "u")
-        r = await dr.rollback("adt", "dev", "u")  # restores D2
-        assert r.image_digest == D2
-        d4 = await dr.deploy("adt", 4, "dev", "sha256:" + "4" * 64, "u")  # fresh lineage
-        assert d4.restored_from is None
-        r2 = await dr.rollback("adt", "dev", "u")
-        assert r2.image_digest == D2  # most recent superseded differing row is the D2 copy
-        r3 = await dr.rollback("adt", "dev", "u")
-        assert r3.image_digest == D1  # then walks back past the restored deployment
-        await s.refresh(d1)
-        assert d1.status == "superseded"
+
+        async def go(version: int, *, publish: bool = True) -> object:
+            d = await dr.request(ch, env, "deploy", await c.get_version("adt", version), None, "u")
+            await (dr.mark_published(d) if publish else dr.mark_failed(d, "PUBLISH_FAILED"))
+            return d
+
+        await go(1)
+        await go(2)
+        await go(3, publish=False)  # failed: never published, so never a rollback target
+        d2b = await go(2)  # the same version again
+        target = await dr.previous_published_version(d2b)  # type: ignore[arg-type]
+        assert target is not None and target.version == 1
 
     run(migrated, scenario)
 
 
-def test_concurrent_deploys_leave_exactly_one_active(migrated: str) -> None:
+def test_missing_bundle_and_bad_inputs_are_refused(migrated: str) -> None:
+    async def scenario(s: AsyncSession) -> None:
+        await EnvironmentRepository(s).create("dev", "ui-managed")
+        c = ChannelRepository(s)
+        await c.create("nobundle", "u")
+        await c.add_version("nobundle", {**SPEC, "spec": {}}, "u")
+        ch, env = await c.get_by_name("nobundle"), await EnvironmentRepository(s).get_by_name("dev")
+        with pytest.raises(InvalidValueError):
+            await DeploymentRepository(s).request(ch, env, "deploy", await c.get_version("nobundle", 1), None, "u")
+        await c.create("adt", "u")
+        good = await c.add_version("adt", SPEC, "u")
+        with pytest.raises(InvalidValueError):  # rejected by the database (created_by is 255 characters)
+            await DeploymentRepository(s).request(ch, env, "deploy", good, None, "x" * 500)
+
+    run(migrated, scenario)
+
+
+def test_channel_with_deployments_cannot_be_deleted(migrated: str) -> None:
+    async def scenario(s: AsyncSession) -> None:
+        await _seed(s, versions=1)
+        c = ChannelRepository(s)
+        ch, env = await c.get_by_name("adt"), await EnvironmentRepository(s).get_by_name("dev")
+        await DeploymentRepository(s).request(ch, env, "deploy", await c.get_version("adt", 1), None, "u")
+        with pytest.raises(InUseError):
+            await c.delete("adt")
+
+    run(migrated, scenario)
+
+
+def test_invalid_environment_mode_and_profile_refused(migrated: str) -> None:
+    async def scenario(s: AsyncSession) -> None:
+        with pytest.raises(InvalidValueError):
+            await EnvironmentRepository(s).create("dev", "whatever")
+        env = await EnvironmentRepository(s).create("dev", "ui-managed")
+        assert env.profile == "production"
+        with pytest.raises(AlreadyExistsError):
+            await EnvironmentRepository(s).create("dev", "ui-managed")
+
+    run(migrated, scenario)
+
+
+def test_concurrent_requests_under_the_channel_lock_leave_one_pending(migrated: str) -> None:
     async def go() -> None:
         engine = make_engine(migrated)
         try:
@@ -264,27 +250,23 @@ def test_concurrent_deploys_leave_exactly_one_active(migrated: str) -> None:
             async with factory() as s, s.begin():
                 await _seed(s, versions=2)
 
-            async def deploy(version: int, digest: str) -> None:
+            async def request(version: int) -> None:
                 async with factory() as s, s.begin():
-                    await DeploymentRepository(s).deploy("adt", version, "dev", digest, "u")
+                    dr = DeploymentRepository(s)
+                    ch = await dr.lock_channel("adt")
+                    env = await EnvironmentRepository(s).get_by_name("dev")
+                    ver = await ChannelRepository(s).get_version("adt", version)
+                    await dr.request(ch, env, "deploy", ver, None, "u")
 
-            await asyncio.gather(*(deploy(1 + i % 2, "sha256:" + str(i % 10) * 64) for i in range(8)))
+            await asyncio.gather(*(request(1 + i % 2) for i in range(8)))
             async with factory() as s:
-                hist = await DeploymentRepository(s).history("adt", "dev")
+                c = ChannelRepository(s)
+                ch, env = await c.get_by_name("adt"), await EnvironmentRepository(s).get_by_name("dev")
+                hist = await DeploymentRepository(s).history(ch, env, limit=50)
                 assert len(hist) == 8
-                assert [d.status for d in hist].count("active") == 1
-                assert hist[0].status == "active"  # the last writer in seq order won
+                assert [d.status for d in hist].count("pending") == 1
+                assert hist[0].status == "pending"  # the last writer in seq order is the live one
         finally:
             await engine.dispose()
 
     asyncio.run(go())
-
-
-def test_update_of_spec_sha256_is_refused(migrated: str) -> None:
-    async def scenario(s: AsyncSession) -> None:
-        await ChannelRepository(s).create("adt", "u")
-        v = await ChannelRepository(s).add_version("adt", SPEC, "u")
-        with pytest.raises(DBAPIError, match="immutable"):
-            await s.execute(update(ChannelVersion).where(ChannelVersion.id == v.id).values(spec_sha256="0" * 64))
-
-    run(migrated, scenario)

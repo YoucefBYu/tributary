@@ -38,9 +38,16 @@ ENV UV_PROJECT_ENVIRONMENT=/opt/venv \
 # Optional build secret `ca`: an extra CA bundle for networks that re-terminate TLS (corporate or CI
 # egress proxies). Never copied into a layer; absent in normal builds:
 #   docker build --secret id=ca,src=/path/ca-bundle.crt ...
+#
+# TB_EXTRAS: an optional extra of TB_PACKAGE itself. Only tributary-archiver has one in use (`clickhouse`, the
+# driver and its certifi dependency, MPL-2.0 approved for the archiver only). Any other package asking for an
+# extra fails the build, so the API image can never pick up certifi through this arg.
+ARG TB_EXTRAS=""
 RUN --mount=type=secret,id=ca,required=false \
+    if [ -n "${TB_EXTRAS}" ] && { [ "${TB_PACKAGE}" != "tributary-archiver" ] || [ "${TB_EXTRAS}" != "clickhouse" ]; }; then \
+      echo "TB_EXTRAS=${TB_EXTRAS} is allowed only as clickhouse for tributary-archiver" >&2; exit 2; fi; \
     if [ -s /run/secrets/ca ]; then export SSL_CERT_FILE=/run/secrets/ca UV_SYSTEM_CERTS=1; fi; \
-    uv sync --frozen --no-dev --no-editable --package "${TB_PACKAGE}"
+    uv sync --frozen --no-dev --no-editable --package "${TB_PACKAGE}" ${TB_EXTRAS:+--extra "${TB_EXTRAS}"}
 
 FROM python:3.12-slim@sha256:2f17fc044b579bab302c2e8054d3a686e2cb9a83de48e70534b94cd8ebbe06a9 AS runtime
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
@@ -51,7 +58,12 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     && useradd --uid 10001 --gid tributary --no-create-home --shell /usr/sbin/nologin tributary
 
 COPY --from=build /opt/venv /opt/venv
-ENV PATH=/opt/venv/bin:$PATH \
+# contracts/ ships in every image (W3 ruling H4): topic-defaults.json carries invariant-1 producer values
+# pinned to this code version, so it must travel with the code, not come from an operator-built ConfigMap.
+# Compose still bind-mounts ../../contracts over this path for development.
+COPY contracts/ /contracts/
+ENV TB_CONTRACTS_DIR=/contracts \
+    PATH=/opt/venv/bin:$PATH \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 

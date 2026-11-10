@@ -17,7 +17,14 @@ import pytest
 # name"); a bare `sys.path` entry makes `bootstrap_topics` importable as a top-level module instead,
 # matching the pattern already used for `.github/scripts`.
 sys.path.insert(0, str(Path(__file__).parent))
-from bootstrap_topics import data_topic_name, derive_topics, load_defaults, platform_topic_name
+from bootstrap_topics import (
+    alter_existing_configs,
+    data_topic_name,
+    derive_topics,
+    existing_topic_alterations,
+    load_defaults,
+    platform_topic_name,
+)
 
 CONTRACT_PATH = Path(__file__).resolve().parents[3] / "contracts" / "topics" / "v0" / "topic-defaults.json"
 
@@ -37,13 +44,21 @@ def test_topic_names_match_the_naming_grammar(defaults: dict) -> None:  # type: 
         "dev.adt-passthrough.out.http-stub",
         "_tb.dev.channels",
         "_tb.dev.events",
+        "_tb.dev.audit",
     }
 
 
-def test_audit_topic_is_never_created(defaults: dict) -> None:  # type: ignore[type-arg]
-    # The contract flags audit retention as an open legal question; no topic until it is answered.
-    topics = derive_topics(defaults, env="dev", profile="lite", channel="adt-passthrough", destinations=("http-stub",))
-    assert platform_topic_name("dev", "audit") not in {t.name for t in topics}
+def test_audit_topic_is_created_with_the_contract_buffer_config(defaults: dict) -> None:  # type: ignore[type-arg]
+    # ADR-004 R7 / set 1.8: `_tb.<env>.audit` is a 30 d transport buffer; every value comes from the contract.
+    topics = {
+        t.name: t
+        for t in derive_topics(
+            defaults, env="dev", profile="lite", channel="adt-passthrough", destinations=("http-stub",)
+        )
+    }
+    audit = topics[platform_topic_name("dev", "audit")]
+    assert audit.partitions == defaults["classes"]["audit"]["partitions"]
+    assert audit.configs["retention.ms"] == str(defaults["classes"]["audit"]["configs"]["retention.ms"])
 
 
 def test_reply_topic_is_never_created_for_a_non_sync_reply_channel(defaults: dict) -> None:  # type: ignore[type-arg]
@@ -319,3 +334,64 @@ def test_derive_acls_refuses_a_shared_principal(defaults: dict) -> None:  # type
             destinations=DESTS,
             principals={"receiver": "User:x", "worker": "User:x"},
         )
+
+
+@pytest.mark.parametrize("kind", ["events", "audit"])
+def test_events_and_audit_topics_use_broker_timestamps_from_the_contract(defaults: dict, kind: str) -> None:  # type: ignore[type-arg]
+    want = defaults["classes"][kind]["configs"]["message.timestamp.type"]
+    assert want == "LogAppendTime"
+    topics = {t.name: t for t in derive_topics(defaults, env="dev", profile="lite", channel="c", destinations=("d",))}
+    assert topics[platform_topic_name("dev", kind)].configs["message.timestamp.type"] == want
+
+
+def test_existing_events_and_audit_topics_get_the_setting_and_nothing_else(defaults: dict) -> None:  # type: ignore[type-arg]
+    topics = derive_topics(defaults, env="dev", profile="lite", channel="c", destinations=("d",))
+    existing = {t.name for t in topics}
+    alter = existing_topic_alterations(topics, existing)
+    assert alter == {
+        platform_topic_name("dev", "events"): {"message.timestamp.type": "LogAppendTime"},
+        platform_topic_name("dev", "audit"): {"message.timestamp.type": "LogAppendTime"},
+    }
+    assert existing_topic_alterations(topics, set()) == {}  # a topic that was just created is not altered
+
+
+class _Future:
+    def __init__(self, exc: Exception | None = None) -> None:
+        self._exc = exc
+
+    def result(self) -> None:
+        if self._exc:
+            raise self._exc
+
+
+class _FakeAdmin:
+    def __init__(self, fail: set[str] = frozenset()) -> None:  # type: ignore[assignment]
+        self.fail, self.calls = fail, []  # type: ignore[var-annotated]
+
+    def incremental_alter_configs(self, resources):  # type: ignore[no-untyped-def]
+        self.calls.append(resources)
+        return {r: _Future(RuntimeError("denied") if r.name in self.fail else None) for r in resources}
+
+
+def test_alter_existing_configs_sends_one_incremental_set_per_topic(defaults: dict) -> None:  # type: ignore[type-arg]
+    topics = derive_topics(defaults, env="dev", profile="lite", channel="c", destinations=("d",))
+    admin = _FakeAdmin()
+    assert alter_existing_configs(admin, topics, {t.name for t in topics}) is False
+    (resources,) = admin.calls
+    assert {r.name for r in resources} == {platform_topic_name("dev", "events"), platform_topic_name("dev", "audit")}
+    for r in resources:
+        entries = r.incremental_configs
+        assert [(e.name, e.value) for e in entries] == [("message.timestamp.type", "LogAppendTime")]
+
+
+def test_alter_existing_configs_reports_failure_and_still_tries_the_rest(defaults: dict) -> None:  # type: ignore[type-arg]
+    topics = derive_topics(defaults, env="dev", profile="lite", channel="c", destinations=("d",))
+    admin = _FakeAdmin(fail={platform_topic_name("dev", "audit")})
+    assert alter_existing_configs(admin, topics, {t.name for t in topics}) is True
+
+
+def test_alter_existing_configs_does_nothing_for_new_topics(defaults: dict) -> None:  # type: ignore[type-arg]
+    topics = derive_topics(defaults, env="dev", profile="lite", channel="c", destinations=("d",))
+    admin = _FakeAdmin()
+    assert alter_existing_configs(admin, topics, set()) is False
+    assert admin.calls == []

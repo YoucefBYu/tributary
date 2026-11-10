@@ -8,6 +8,7 @@ from typing import Any
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -32,7 +33,12 @@ NAMING = {
 }
 
 ENV_MODES = ("git-managed", "ui-managed")
-DEPLOYMENT_STATUSES = ("active", "superseded", "rolled_back")
+ENV_PROFILES = ("lite", "production")
+DEPLOYMENT_KINDS = ("deploy", "rollback", "undeploy")
+#: `openapi/v0` DeploymentStatus. `pending` and `published` count as "current" (what the caller asked for,
+#: and what the channels topic holds); `failed` and `superseded` never do.
+DEPLOYMENT_STATUSES = ("pending", "published", "failed", "superseded")
+FAILURE_CODES = ("PUBLISH_FAILED", "PUBLISH_TIMEOUT")
 DIGEST_PATTERN = "^sha256:[0-9a-f]{64}$"
 NAME_PATTERN = "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
 
@@ -50,11 +56,13 @@ class Environment(Base):
     __table_args__ = (
         CheckConstraint(_in("mode", ENV_MODES), name="mode"),
         CheckConstraint(f"name ~ '{NAME_PATTERN}'", name="name"),
+        CheckConstraint(_in("profile", ENV_PROFILES), name="profile"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name: Mapped[str] = mapped_column(String(63), unique=True)
     mode: Mapped[str] = mapped_column(String(16))
+    profile: Mapped[str] = mapped_column(String(16), server_default="production")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -64,7 +72,7 @@ class Channel(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name: Mapped[str] = mapped_column(String(63), unique=True)
-    created_by: Mapped[str] = mapped_column(String(128))
+    created_by: Mapped[str] = mapped_column(String(255))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -83,23 +91,33 @@ class ChannelVersion(Base):
     version: Mapped[int] = mapped_column(Integer)
     spec: Mapped[dict[str, Any]] = mapped_column(JSONB)
     spec_sha256: Mapped[str] = mapped_column(String(64))
-    created_by: Mapped[str] = mapped_column(String(128))
+    origin: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default=text("""'{"kind": "api"}'::jsonb"""))
+    created_by: Mapped[str] = mapped_column(String(255))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class Deployment(Base):
-    """One row per deploy or rollback. At most one `active` row per (channel, environment)."""
+    """One row per deploy, rollback or undeploy REQUEST (`openapi/v0` Deployment). Append-only apart from
+    the one transition out of `pending`. `version_id` and `image_digest` are null for an undeploy (a
+    tombstone). At most one `pending` row per (channel, environment): a newer request supersedes it."""
 
     __tablename__ = "deployments"
     __table_args__ = (
+        CheckConstraint(_in("kind", DEPLOYMENT_KINDS), name="kind"),
         CheckConstraint(_in("status", DEPLOYMENT_STATUSES), name="status"),
         CheckConstraint(f"image_digest ~ '{DIGEST_PATTERN}'", name="image_digest"),
+        CheckConstraint("(kind = 'undeploy') = (version_id IS NULL)", name="undeploy_has_no_version"),
+        CheckConstraint("(kind = 'undeploy') = (image_digest IS NULL)", name="undeploy_has_no_image"),
+        CheckConstraint("(status = 'published') = (published_at IS NOT NULL)", name="published_at"),
+        CheckConstraint(_in("failure_code", FAILURE_CODES), name="failure_code"),
+        CheckConstraint("(status = 'failed') = (failure_code IS NOT NULL)", name="failed_has_code"),
+        CheckConstraint("previous_version IS NULL OR previous_version >= 1", name="previous_version"),
         Index(
-            "uq_deployments_one_active",
+            "uq_deployments_one_pending",
             "channel_id",
             "environment_id",
             unique=True,
-            postgresql_where=text("status = 'active'"),
+            postgresql_where=text("status = 'pending'"),
         ),
         Index("ix_deployments_channel_env_seq", "channel_id", "environment_id", "seq"),
     )
@@ -108,11 +126,64 @@ class Deployment(Base):
     seq: Mapped[int] = mapped_column(BigInteger, Identity(always=True), unique=True)  # total order of history
     channel_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("channels.id", ondelete="RESTRICT"))
     environment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("environments.id", ondelete="RESTRICT"))
-    version_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("channel_versions.id", ondelete="RESTRICT"))
-    image_digest: Mapped[str] = mapped_column(String(71))
+    kind: Mapped[str] = mapped_column(String(16))
+    version_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("channel_versions.id", ondelete="RESTRICT"), nullable=True
+    )
+    image_digest: Mapped[str | None] = mapped_column(String(71), nullable=True)
+    previous_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     status: Mapped[str] = mapped_column(String(16))
+    failure_code: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     restored_from: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("deployments.id", ondelete="SET NULL"), nullable=True
     )
-    created_by: Mapped[str] = mapped_column(String(128))
+    created_by: Mapped[str] = mapped_column(String(255))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+REPLAY_STATUSES = ("running", "completed", "failed")
+REPLAY_FAILURE_CODES = (
+    "AUDIT_UNAVAILABLE", "TOPIC_NOT_FOUND", "RANGE_TOO_LARGE", "SOURCE_ERROR", "SOURCE_TIMEOUT",
+    "DEADLINE_EXCEEDED", "PRODUCE_FAILED", "PRODUCE_TIMEOUT", "PRODUCE_REFUSED", "ENVELOPE_INVALID",
+    "INTERRUPTED", "INTERNAL",
+)  # fmt: skip
+
+
+class Replay(Base):
+    """One channel replay (`openapi/v0` Replay). Counts and codes only. `body_sha256` makes `replay_id` an
+    idempotency key; a `running` row past `deadline_at` is rendered `failed` / `INTERRUPTED`."""
+
+    __tablename__ = "replays"
+    __table_args__ = (
+        CheckConstraint(_in("status", REPLAY_STATUSES), name="status"),
+        CheckConstraint("body_sha256 ~ '^[0-9a-f]{64}$'", name="body_sha256"),
+        CheckConstraint("range_start < range_end", name="range"),
+        CheckConstraint(_in("failure_code", REPLAY_FAILURE_CODES), name="failure_code"),
+        CheckConstraint("(status = 'failed') = (failure_code IS NOT NULL)", name="failed_has_code"),
+        CheckConstraint("(status = 'running') = (finished_at IS NULL)", name="finished_at"),
+        Index("ix_replays_channel_env_seq", "channel_id", "environment_id", "seq"),
+    )
+
+    replay_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    seq: Mapped[int] = mapped_column(BigInteger, Identity(always=True), unique=True)
+    environment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("environments.id", ondelete="RESTRICT"))
+    channel_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("channels.id", ondelete="RESTRICT"))
+    body_sha256: Mapped[str] = mapped_column(String(64))
+    range_start: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    range_end: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    allow_reorder: Mapped[bool] = mapped_column(Boolean)
+    max_records: Mapped[int] = mapped_column(Integer)
+    deadline_s: Mapped[int] = mapped_column(Integer)
+    requested_by: Mapped[str] = mapped_column(String(255))
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    deadline_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(String(16))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    partitions_scanned: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    span: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    republished: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    skipped_undecodable: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    skipped_out_of_range: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    skipped_no_timestamp: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    failure_code: Mapped[str | None] = mapped_column(String(32), nullable=True)

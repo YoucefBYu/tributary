@@ -60,7 +60,7 @@ events; that made `message_id` meaninglessly non-null.
 | `parent_id` | UUID | no | From `tb-parent-id`. |
 | `correlation_id` | string | no | |
 | `destination` | string | no | Destination name; absent for pre-routing stages. |
-| `attempt` | integer 0-9999 | no | |
+| `attempt` | integer 0-9999 | no | **Per stage (ruled 2026-10-13, corrected the same day).** `retrying`, `error`, `dlq` and `sent`: the loop's **1-based number of the delivery try** the event reports. The first failure is `retrying` 1 (`ConsumerLoop`), and a success after k failures is `sent` k+1. `routed`, and the other worker and receive stages: the record's **0-based `tb-attempt`** header, which is `0` because stages reset it (`envelope/v0` 6 rule 4). Not `tb-attempt` for loader tries: a blocking retry does not re-produce the record, so the header stays `0`. Keys cannot collide across stages, because `stage` is part of the dedup key. **Accepted over-count:** the try count lives in the loader process and restarts at 1. A record that succeeded on try k > 1, followed by a crash before the offset commit, is redelivered and emits a second `sent` with attempt 1: a new dedup key, so `sent` counts that message twice. This happens only after failures followed by a crash in the commit window, and it never loses an event. |
 | `content_type` | string | no | |
 | `size_bytes` | integer ≥ 0 | no | Payload size. `0` with a claim-check. |
 | `claim_check` | string | no | Object-store URI, so the browser can fetch large content. |
@@ -75,6 +75,15 @@ events; that made `message_id` meaninglessly non-null.
 
 `kind=message`: `received`, `queued`, `filtered`, `transformed`, `routed`, `pending`, `sent`,
 `retrying`, `replied`, `error`, `dlq`.
+
+**Emitter of `received` and `queued` (set 1.8, 2026-10-13):** the pipeline worker, when it consumes the
+`raw` record, carrying that record's `topic`, `partition` and `offset`. Receivers hold no WRITE on
+`_tb.<env>.events` (`topics/v0` 3.4.1), and no extra produce sits on the ACK path (invariants 1 and 9).
+**`ts` of `received` (ruled 2026-10-13):** the consumed record's `tb-received-at`, the receiver's
+commit time, rendered in UTC with milliseconds. Exception: a record carrying `tb-parent-id` is a
+reprocess or replay re-injection, and on `raw` it carries the original's `tb-received-at`
+(`envelope/v0` 6 rule 5), so its `received` event uses the worker's consume time. `queued` uses the
+consume time.
 
 `kind=partition`: `partition_paused`, `partition_resumed`, `partition_halted`.
 
@@ -230,11 +239,11 @@ tested against one.
    (`tb_archiver_attrs_dropped_total{reason}`), and the rest of the event is stored. `_hmac` is
    dropped even though its shape is schema-valid, because the mechanism is unresolved (3.1) and the
    human has not answered 7.3. This follows "lenient consumers": one bad entry does not lose the event.
-4. **Retention of archived events.** Default **90 days** (`TB_ARCHIVE_TTL_DAYS`), an engineering
-   placeholder matching ADR-001 6.6's illustrative content TTL. **TODO(human)**, decided together with
-   audit retention (`topics/v0` 2.1, question 3, and `phases/wave-3.md` 7.2): whether a retention duty
-   reaches event metadata is the same legal reading. The archiver keeps the value configurable. It is
-   not a blocker for the build.
+4. **Retention of archived events: an operator setting (decided 2026-10-06).** `TB_ARCHIVE_TTL_DAYS`,
+   default **90 days**, integer 1-36500. The human's answer, verbatim: *"Give the user a possibility
+   to change it"* (`topics/v0` 2.1, ADR-004 R2). The migrate step applies a change to the existing
+   table with `MODIFY TTL` and refuses a decrease unless `TB_ARCHIVE_ALLOW_TTL_DECREASE=true` (ADR-004
+   R6). With `ttl_only_drop_parts`, a row can outlive its TTL by up to one month partition (R1).
 
 ---
 
@@ -247,6 +256,8 @@ synthetic.
 
 - No aggregate or rollup events (per-channel per-minute counters). Metrics cover that today; the
   browser may want it once the archive is measured.
-- No control-plane events here: those go to `_tb.<env>.audit` with its own contract, unwritten.
+- No control-plane events here: those go to `_tb.<env>.audit` with its own contract,
+  [`audit/v0`](../../audit/v0/README.md) (W3-1b; retention decided 2026-10-06 as an operator
+  setting, `topics/v0` 2.1).
 - `duration_ms` versus deriving latency by joining stages: v0 allows both, which risks the two
   disagreeing. Pick one in v1 once the archiver exists.

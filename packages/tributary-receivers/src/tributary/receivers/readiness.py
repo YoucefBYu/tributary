@@ -80,6 +80,3 @@ class Report:
 
     def body(self) -> bytes:
         return orjson.dumps(self.document())
-
-
-LIVE_BODY = orjson.dumps({"v": 0, "status": "alive", "component": "receiver"})

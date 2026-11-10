@@ -338,7 +338,7 @@ def reply_message(
 
 @dataclass(slots=True)
 class ReplyStats:
-    """Counters for the worker's shutdown line. Metrics export waits on `contracts/observability/v0`."""
+    """Counters for the worker's shutdown line, exported as `tb_worker_replies_total` (`worker_metrics.py`)."""
 
     produced: int = 0
     delivered: int = 0

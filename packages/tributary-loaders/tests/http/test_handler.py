@@ -109,7 +109,7 @@ def test_handle_raises_retryable_delivery_error_on_5xx() -> None:
     try:
         with pytest.raises(DeliveryError) as exc_info:
             handler.handle(make_record())
-        assert exc_info.value.error_code == "HTTP_5XX"
+        assert exc_info.value.error_code == "HTTP_503"
         assert exc_info.value.retryable is True
     finally:
         handler.close()
@@ -121,7 +121,7 @@ def test_handle_raises_non_retryable_delivery_error_on_4xx() -> None:
     try:
         with pytest.raises(DeliveryError) as exc_info:
             handler.handle(make_record())
-        assert exc_info.value.error_code == "HTTP_4XX"
+        assert exc_info.value.error_code == "HTTP_422"
         assert exc_info.value.retryable is False
     finally:
         handler.close()
@@ -173,3 +173,18 @@ def test_close_closes_the_spec_source_too() -> None:
     handler = HttpRecordHandler(loader, spec_source=source, destination="dest")
     handler.close()
     assert source.closed is True
+
+
+def test_metric_code_and_dlq_code_agree_for_every_http_status() -> None:
+    from tributary.loaders.http.loader import classify_status
+
+    for status, code in ((301, "HTTP_REDIRECT_REFUSED"), (404, "HTTP_404"), (429, "HTTP_429"), (503, "HTTP_503")):
+        loader = HttpLoader(make_config(), send=lambda req, s=status: Response(s))
+        handler = make_handler(loader)
+        try:
+            with pytest.raises(DeliveryError) as exc_info:
+                handler.handle(make_record())
+            assert exc_info.value.error_code == classify_status(status) == code
+            assert exc_info.value.retryable is (status in (429, 503))
+        finally:
+            handler.close()

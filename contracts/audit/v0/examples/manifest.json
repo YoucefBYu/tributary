@@ -1,0 +1,20 @@
+{
+  "contract": "tributary.audit/v0",
+  "schema": "../audit-event.schema.json",
+  "note": "All values synthetic; actors are synth-* subjects. PHI guard: content-view-with-payload, proposed as AUDIT_PHI_GUARDS (1) for tests/conformance, asserted by name, never skipped. replay-requested-without-allow-reorder guards invariant 5's audit half (wave-3.md 2.6 H8).",
+  "expectation_note": "Pairs written 2026-10-06 (W3-1b) by the architect WITHOUT a run: predictions until validate.py measures them.",
+  "valid": [
+    { "file": "valid/content-view-requested.json", "note": "One record per content view, before the read; stage and destination of the row read" },
+    { "file": "valid/reprocess-requested.json", "note": "allow_reorder recorded on requested; operation_id joins the phases" },
+    { "file": "valid/reprocess-failed.json", "note": "Failed after requested: count 0 and the library's code" },
+    { "file": "valid/replay-completed-reorder.json", "note": "A per-key replay accepted with allow_reorder; target is the same channel's raw" },
+    { "file": "valid/deployment-rollback-requested.json", "note": "Control-plane action: one requested record; outcome lives in the deployment record" }
+  ],
+  "invalid": [
+    { "file": "invalid/content-view-with-payload.json", "violates": "an audit record never carries content (invariant 6; W3-6 verify)", "expected_json_path": "$", "expected_validator": "additionalProperties" },
+    { "file": "invalid/replay-requested-without-allow-reorder.json", "violates": "a reprocess or replay requested record states allow_reorder (invariant 5: never reorder silently)", "expected_json_path": "$", "expected_validator": "required" },
+    { "file": "invalid/replay-target-not-raw.json", "violates": "replay writes only to a raw topic, never out, dlq or reply", "expected_json_path": "$.target_topic", "expected_validator": "pattern" },
+    { "file": "invalid/reprocess-failed-without-error-code.json", "violates": "a failed record names its machine-readable cause", "expected_json_path": "$", "expected_validator": "required" },
+    { "file": "invalid/action-unknown.json", "violates": "actions are a closed list; a new auditable action is a contract change", "expected_json_path": "$.action", "expected_validator": "enum" }
+  ]
+}

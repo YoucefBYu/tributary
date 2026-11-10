@@ -22,6 +22,7 @@ from tributary.runtime.logs import JsonLogger
 from tributary.runtime.producer import RecordProducer
 from tributary.runtime.reply import ReplyPublisher
 from tributary.runtime.spec import ChannelSpec, StepRef
+from tributary.runtime.stage_timing import StageTimer
 from tributary.runtime.steps import Node
 from tributary.runtime.worker import PRODUCE_RETRY, KafkaDlqWriter, PipelineHandler
 from tributary.sdk import Message
@@ -182,6 +183,7 @@ class Rig:
     handler: PipelineHandler
     replies: ReplyPublisher
     log: io.StringIO
+    stage_timer: StageTimer | None = None
 
     def loop(self, consumer: FakeConsumer) -> ConsumerLoop:
         record_producer = RecordProducer(self.producer, log=JsonLogger("test", stream=self.log))
@@ -198,6 +200,7 @@ class Rig:
             instance="worker:test@localhost",
             dlq=KafkaDlqWriter(record_producer, DLQ, log=JsonLogger("dlq", stream=self.log), source="worker:test"),
             on_dead_lettered=self.handler.after_dead_letter,
+            stage_timer=self.stage_timer,
         )
 
     def run(self, message: Message, *, offset: int = 0) -> ConsumerLoop:
@@ -221,6 +224,7 @@ def rig(
     transactional: bool = False,
     now: datetime = NOW,
     partitions: int | None = REPLY_PARTITIONS,
+    stage_timer: StageTimer | None = None,
 ) -> Rig:
     producer = OrderedProducer()
     emitter = RecordingEmitter()
@@ -251,6 +255,9 @@ def rig(
         resolve=resolver,
         transactional=transactional,
         replies=replies,
+        stage_timer=stage_timer,
     )
     handler.prepare(chosen)
-    return Rig(producer=producer, emitter=emitter, handler=handler, replies=replies, log=stream)
+    return Rig(
+        producer=producer, emitter=emitter, handler=handler, replies=replies, log=stream, stage_timer=stage_timer
+    )

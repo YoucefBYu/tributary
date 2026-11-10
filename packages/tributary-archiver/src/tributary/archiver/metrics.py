@@ -1,8 +1,7 @@
 """Archiver counters and the lag figures the message browser needs (names and meaning, not an exporter).
 
-There is no metrics endpoint yet: `contracts/observability/v0` (W3-12) is not published. Until it is,
-`snapshot()` is logged as the `archiver_stats` line. Names below are the ones to map. No label carries
-a message id, channel or any event field.
+`exposition.py` serves these on the ops listener (`contracts/observability/v0`); `snapshot()` is also logged
+as the `archiver_stats` line. No label carries a message id or any event field.
 
 Lag, two figures with different meanings:
 * `ingest_lag_ms`: wall clock minus the `ts` of the newest event in the last written batch. This is how
@@ -14,6 +13,7 @@ Lag, two figures with different meanings:
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 
@@ -33,6 +33,16 @@ class ArchiverMetrics:
     ingest_lag_ms: float = 0.0
     kafka_lag_messages: int = 0
     last_insert_ms: float = 0.0
+    commits_ok: int = 0
+    #: Audit records with `v` other than 0 (`audit/v0` README 4): alert above 0. `tb_archiver_audit_records_total{outcome="unsupported_version"}`.
+    audit_unsupported_version: int = 0
+    #: Audit records not stored for any other reason (`AuditRejected`): alert on any increase (outcome `invalid`).
+    audit_invalid: int = 0
+    #: Audit rows inserted into `audit_log` (a subset of `rows_written`).
+    audit_written: int = 0
+    attrs_dropped_hmac: int = 0
+    #: Called with the seconds one successful insert batch took (the ops histogram); None when no listener.
+    observe_insert: Callable[[float], None] | None = None
 
     def snapshot(self) -> dict[str, int | float]:
         return {
@@ -47,6 +57,9 @@ class ArchiverMetrics:
             "attrs_dropped": self.attrs_dropped,
             "fields_blanked": self.fields_blanked,
             "commit_failures": self.commit_failures,
+            "audit_unsupported_version": self.audit_unsupported_version,
+            "audit_invalid": self.audit_invalid,
+            "audit_written": self.audit_written,
             "ingest_lag_ms": round(self.ingest_lag_ms, 1),
             "kafka_lag_messages": self.kafka_lag_messages,
             "last_insert_ms": round(self.last_insert_ms, 1),

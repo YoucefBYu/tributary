@@ -13,6 +13,7 @@ image:
     runtime: ""
     loaders: ""
     archiver: ""
+    api: ""
 
 # Engine-to-Kafka connection (engine-kafka/v0), rendered to a ConfigMap per role. SCRAM secrets are
 # Strimzi KafkaUser secrets (or your own) named in secretRef; they hold no value in this chart.
@@ -25,11 +26,13 @@ kafka:
     worker: tb-worker
     loader: tb-loader
     archiver: tb-archiver
+    api: tb-api                # the API's channels/audit producer and reconciler consumer (ACLs: architect, topic-defaults.json)
 
 # One entry per channel. The channel spec itself is read from the compacted _tb.<env>.channels topic
 # (invariant 3), not from this chart.
 channels: []
 #  - name: adt-passthrough
+#    syncReply: true     # sync-reply channel: adds the receiver reply READ and replier group, worker reply WRITE
 #    receiver: {module: tributary.receivers.mllp, port: 6661, replicas: 2}
 #    worker:   {replicas: 2}
 #    destinations:
@@ -47,10 +50,76 @@ worker:
 loader:
   resources: {requests: {cpu: 100m, memory: 128Mi}, limits: {memory: 512Mi}}
 
+# Control-plane API (packages/tributary-api). Off by default; it is not part of the data plane (invariant 3),
+# so receivers, workers and loaders never depend on it. A Deployment because it is stateless.
+api:
+  enabled: false
+  replicas: 2
+  port: 8080
+  opsPort: 9180
+  # TB_OPS_BIND. false (default): the ops listener (/metrics, /livez) stays on loopback and cannot be scraped.
+  # true: it binds the pod IP, and the NetworkPolicy then lets only the OTel collector reach it.
+  opsBindPodIP: false
+  resources: {requests: {cpu: 200m, memory: 256Mi}, limits: {memory: 1Gi}}
+  probes:
+    startup: {periodSeconds: 5, failureThreshold: 30}
+    readiness: {periodSeconds: 5, failureThreshold: 3, timeoutSeconds: 2}
+    liveness: {initialDelaySeconds: 10, periodSeconds: 10, failureThreshold: 3, timeoutSeconds: 2}
+  # PostgreSQL (ADR-004 C1/C2). The API always connects with TLS verify-full; the password is the file
+  # <secretRef>/password and the CA is <caSecretRef>/ca.crt. There is no URL and no password in values.
+  database:
+    host: ""
+    port: 5432
+    name: ""
+    user: ""
+    secretRef: ""
+    caSecretRef: ""
+  oidc:
+    issuer: ""            # https URL
+    audience: ""
+    roleMap: {}           # IdP role or group -> one of the five Tributary roles
+    rolesClaim: roles
+    jwksUri: ""
+  corsOrigins: []
+  # ADR-004 C1a: the ingress-to-API hop carries bearer tokens (and PHI later), so it is TLS.
+  #   listener (default): TLS on the API's own listener; secretRef holds tls.crt and tls.key (cert-manager or
+  #     your store), caSecretRef holds ca.crt for the ingress to verify the pod certificate (api.ingress).
+  #   mesh: explicit opt-in for a service mesh that enforces mTLS. The API then serves plaintext (it logs
+  #     api_tls_delegated_to_mesh) and a NetworkPolicy admits only ingressControllerFrom to the API port.
+  tls:
+    mode: listener
+    secretRef: ""
+    caSecretRef: ""
+    # mesh only: peers (the ingress controller pods) allowed on the API port. Every peer MUST carry a non-empty
+    # podSelector.matchLabels (a namespaceSelector may narrow it further, but alone it would admit every pod in
+    # that namespace, so the render fails). No ipBlock, no matchExpressions.
+    ingressControllerFrom: []
+  ingress:
+    enabled: false
+    className: nginx
+    host: ""
+    tlsSecretName: ""           # the external certificate the ingress presents
+  # Audit tamper check (ADR-004 R7 rev 3). Leave url empty to turn it off (its series stay absent). The user
+  # is a READ-ONLY ClickHouse user: SELECT on <database>.audit_log only, never INSERT (the writer does not
+  # grade itself). See the README for the exact GRANT.
+  clickhouse:
+    url: ""               # https://...
+    user: ""
+    secretRef: ""
+    caSecretRef: ""       # optional Secret with ca.crt for a private ClickHouse CA (mounted; the API side follows)
+    targets: {}           # environment name -> ClickHouse database
+    intervalSeconds: 900  # keep equal to monitoring.auditTamperCheckIntervalSeconds
+
 archiver:
   enabled: true
   replicas: 1
-  ttlDays: 365
+  # Retention (ADR-004 R1-R8): integer days, 1-36500, validated at render. Applied ONLY by the migrate Job
+  # (MODIFY TTL); archivers never apply it. See README "Changing retention" before lowering a value.
+  retention:
+    eventsDays: 90         # TB_ARCHIVE_TTL_DAYS
+    contentDays: 30        # TB_ARCHIVE_CONTENT_TTL_DAYS (read when content archiving is on)
+    auditDays: 2190        # TB_ARCHIVE_AUDIT_TTL_DAYS: six years, an engineering default, not a compliance determination
+    allowDecrease: false   # TB_ARCHIVE_ALLOW_TTL_DECREASE, the migrate Job only: a decrease deletes rows irreversibly
   # Runtime credential is INSERT-only (ADR-004 A5); DDL runs in the migrate Job with its own secret.
   clickhouse:
     host: clickhouse
@@ -85,9 +154,12 @@ networkPolicy:
     worker: []
     loader: []           # destinations (HTTP, FHIR, SFTP, ...)
     archiver: []         # ClickHouse
+    api: []              # PostgreSQL (5432 TLS), Kafka, the OIDC issuer, and ClickHouse when the tamper check is on
     otel: []             # an OTLP trace backend, if otel.otlpEndpointExporter is set
     # Each entry is a raw NetworkPolicy egress rule, e.g.
     #   - {to: [{podSelector: {matchLabels: {strimzi.io/cluster: tributary}}}], ports: [{protocol: TCP, port: 9093}]}  # Peers allowed to reach each receiver's ingest port. Empty means ingest is denied (default-deny).
+  # Peers allowed to reach the API port (ingress controller, UI). The kubelet CIDR is always allowed on it.
+  apiFrom: []
   ingestFrom: []
   #  - ipBlock: {cidr: 10.20.0.0/16}
   #  - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: ingress-nginx}}
@@ -101,11 +173,6 @@ securityContext:               # pod level; containers are non-root, read-only, 
   runAsGroup: 10001
   fsGroup: 10001
 
-# Contracts mounted from a ConfigMap you create from contracts/ (worker, loader and receiver read
-# topic-defaults.json via TB_CONTRACTS_DIR). Create it with:
-#   kubectl create configmap tributary-contracts --from-file=topic-defaults.json=contracts/topics/v0/topic-defaults.json
-contractsConfigMap: tributary-contracts
-
 keda:
   enabled: true
   lagThreshold: "1000"
@@ -115,6 +182,10 @@ keda:
   cooldownPeriod: 300
   # TriggerAuthentication reads SCRAM credentials from this Secret (keys: sasl, username, password, ca).
   authSecretRef: tb-keda-kafka
+  # KafkaUser rendered with strimzi.enabled: the lag_reader role (DESCRIBE only; placeholder grants until
+  # W3-29 adds it to topic-defaults.json). Its Strimzi secret holds only `password`; keda.authSecretRef is
+  # still composed by the operator (sasl, username, password, ca, tls) from it.
+  lagReaderUser: tb-lag-reader
 
 # Strimzi Kafka (KRaft). Needs the Strimzi operator installed; the chart renders the CR only.
 strimzi:
@@ -130,6 +201,9 @@ strimzi:
     transaction.state.log.replication.factor: 3
     transaction.state.log.min.isr: 2
     auto.create.topics.enable: false
+    # ADR-004 C3: SASL sessions re-authenticate at least hourly, so a removed ACL or KafkaUser takes effect
+    # on open connections (KIP-368). At most 3600000; helm_check.py enforces it on the rendered Kafka CR.
+    connections.max.reauth.ms: 3600000
   resources: {requests: {cpu: "1", memory: 4Gi}, limits: {memory: 4Gi}}
 
 otel:
@@ -141,6 +215,8 @@ otel:
   resources: {requests: {cpu: 100m, memory: 128Mi}, limits: {memory: 512Mi}}
 
 monitoring:
+  # TB_AUDIT_TAMPER_CHECK_INTERVAL_S of the API (default 900); the stale-check alert fires after 3x this.
+  auditTamperCheckIntervalSeconds: 900
   # Peers allowed to scrape the collector on :8889 (NetworkPolicy peers). Required while
   # networkPolicy.enabled and otel.enabled.
   prometheusFrom: []

@@ -14,9 +14,10 @@ from __future__ import annotations
 import socket
 import time
 import uuid
+from collections.abc import Callable
 from typing import Any
 
-from confluent_kafka import Consumer, KafkaException, Producer
+from confluent_kafka import Consumer, KafkaException, Producer, TopicPartition
 from confluent_kafka.admin import AdminClient, NewTopic
 from tributary.sdk import Message
 from tributary.sdk import headers as h
@@ -245,3 +246,38 @@ def first_delivery_order(records: list[Any], *, sequence_header: str) -> dict[by
         if sequence not in seen:
             seen.append(sequence)
     return order
+
+
+#: Group-coordinator races on a fresh broker or group (seen on GitHub Actions: `committed()` raised NOT_COORDINATOR,
+#: "Failed to get committed offsets", while the coordinator was loading). Safe to repeat once the coordinator settles.
+COORDINATOR_RETRY_CODES = frozenset({"NOT_COORDINATOR", "COORDINATOR_LOAD_IN_PROGRESS", "COORDINATOR_NOT_AVAILABLE"})
+
+
+def is_retriable_kafka_error(exc: KafkaException) -> bool:
+    error: Any = exc.args[0] if exc.args else None
+    if error is None or not hasattr(error, "name"):
+        return False
+    return bool(getattr(error, "retriable", lambda: False)()) or str(error.name()) in COORDINATOR_RETRY_CODES
+
+
+def kafka_call_with_retry[T](call: Callable[[float], T], *, timeout_s: float, pause_s: float = 0.25) -> T:
+    """Run a Kafka offsets or metadata call within `timeout_s` in total, retrying a retriable or coordinator error.
+
+    `call` receives the seconds left, to pass as its own client timeout, so the whole retry stays inside the
+    caller's existing deadline. Anything not retriable, or a retriable error at the deadline, is re-raised.
+    The same rule as `kafka_call_with_retry` in `packages/tributary-archiver/tests/conftest.py` (c6aff28).
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        remaining = deadline - time.monotonic()
+        try:
+            return call(max(remaining, 0.1))
+        except KafkaException as exc:
+            if not is_retriable_kafka_error(exc) or time.monotonic() + pause_s >= deadline:
+                raise
+            time.sleep(pause_s)
+
+
+def committed_with_retry(consumer: Consumer, partitions: list[TopicPartition], *, timeout_s: float) -> list[Any]:
+    """`consumer.committed(partitions)` within `timeout_s`, retrying coordinator races (`kafka_call_with_retry`)."""
+    return kafka_call_with_retry(lambda left: consumer.committed(partitions, timeout=left), timeout_s=timeout_s)

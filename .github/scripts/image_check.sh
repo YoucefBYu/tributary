@@ -28,10 +28,11 @@ make_fixture() { # package
   chmod -R a+rX "$fixture"
 }
 
+checks=()
 run_check() { # image [extra docker args...]
   local image="$1"; shift
   docker run --rm --read-only --network none --cap-drop ALL --security-opt no-new-privileges -v "$root/contracts:/c:ro" -v "$root/.github/scripts:/s:ro" "$@" \
-    --entrypoint python "$image" /s/image_env_check.py --contracts /c
+    --entrypoint python "$image" /s/image_env_check.py --contracts /c "${checks[@]}"
 }
 
 status=0
@@ -39,7 +40,9 @@ for pkg in "${packages[@]}"; do
   image="tributary-imgcheck/$pkg"
   echo "== $pkg: build"
   built+=("$image")
-  docker build -q ${TB_BUILD_CA_BUNDLE:+--secret "id=ca,src=$TB_BUILD_CA_BUNDLE"} -f deploy/compose/images/python-app.Dockerfile --build-arg "TB_PACKAGE=$pkg" -t "$image" . >/dev/null
+  extras=""; checks=(--forbid-dist certifi)
+  if [ "$pkg" = "tributary-archiver" ]; then extras="clickhouse"; checks=(--require-dist clickhouse-connect --require-dist certifi); fi
+  docker build -q --build-arg "TB_EXTRAS=$extras" ${TB_BUILD_CA_BUNDLE:+--secret "id=ca,src=$TB_BUILD_CA_BUNDLE"} -f deploy/compose/images/python-app.Dockerfile --build-arg "TB_PACKAGE=$pkg" -t "$image" . >/dev/null
   echo "== $pkg: check"
   run_check "$image" || { echo "FAIL: $pkg image environment"; status=1; }
   echo "== $pkg: negative control (must fail)"

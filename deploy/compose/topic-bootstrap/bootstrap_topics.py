@@ -10,9 +10,7 @@ There is no `tributary-runtime` topic-creation tool yet (W1-4 is not that far al
 compose-only stand-in for the lite stack, not a contract. Once the runtime has one, this file should
 call it instead of re-deriving the same configs.
 
-Two things deliberately not created here, both documented in the contract itself:
-  * `_tb.<env>.audit` -- its retention is an open legal question (topic-defaults.json `classes.audit`
-    `retention_open_question`; architect, "no number is written").
+One thing deliberately not created here, documented in the contract itself:
   * `<channel>.reply` -- the demo channel (`adt-passthrough`) is not a sync-reply channel.
 """
 
@@ -266,7 +264,7 @@ def derive_topics(
                 _class_configs(defaults, "out", profile),
             )
         )
-    for platform_kind in ("channels", "events"):  # audit deliberately excluded, see module docstring
+    for platform_kind in ("channels", "events", "audit"):  # audit: a 30 d buffer (ADR-004 R7, set 1.8)
         topics.append(
             TopicSpec(
                 platform_topic_name(env, platform_kind),
@@ -276,6 +274,44 @@ def derive_topics(
             )
         )
     return topics
+
+
+#: Topic configs re-applied to a topic that already exists, because `create_topics` sets config only on a new one.
+#: Only settings that must hold on a long-lived cluster belong here (set 1.8: broker-stamped timestamps).
+ENFORCED_ON_EXISTING = ("message.timestamp.type",)
+
+
+def existing_topic_alterations(topics: list[TopicSpec], existing: set[str]) -> dict[str, dict[str, str]]:
+    """The `ENFORCED_ON_EXISTING` settings the contract gives each topic in `existing` (idempotent SET)."""
+    out: dict[str, dict[str, str]] = {}
+    for t in topics:
+        if t.name in existing and (cfg := {k: t.configs[k] for k in ENFORCED_ON_EXISTING if k in t.configs}):
+            out[t.name] = cfg
+    return out
+
+
+def alter_existing_configs(admin: Any, topics: list[TopicSpec], existing: set[str]) -> bool:
+    """Re-run safe: set `ENFORCED_ON_EXISTING` on topics that already existed (incremental SET, no other key).
+    Returns True when any alter failed (logged by topic and exception class only)."""
+    from confluent_kafka.admin import AlterConfigOpType, ConfigEntry, ConfigResource  # type: ignore[attr-defined]
+
+    resources = []
+    for name, cfg in existing_topic_alterations(topics, existing).items():
+        res = ConfigResource(ConfigResource.Type.TOPIC, name)
+        for k, v in cfg.items():
+            res.add_incremental_config(ConfigEntry(k, v, incremental_operation=AlterConfigOpType.SET))
+        resources.append(res)
+    if not resources:
+        return False
+    failed = False
+    for res, fut in admin.incremental_alter_configs(resources).items():
+        try:
+            fut.result()
+            log.info(json.dumps({"topic": res.name, "status": "config-applied"}))
+        except Exception as exc:
+            failed = True
+            log.error(json.dumps({"topic": res.name, "status": "config-failed", "reason": type(exc).__name__}))
+    return failed
 
 
 def emit_lite_warning(defaults: dict[str, Any], profile: str) -> None:
@@ -333,19 +369,20 @@ def main(argv: list[str] | None = None) -> int:
     ]
     futures = admin.create_topics(new_topics, request_timeout=30)
     failed = False
+    existing: set[str] = set()
     for name, future in futures.items():
         try:
             future.result()
             log.info(json.dumps({"topic": name, "status": "created"}))
         except Exception as exc:  # TopicExistsError has no stable public import path across versions
             if "already exists" in str(exc).lower():
+                existing.add(name)
                 log.info(json.dumps({"topic": name, "status": "already-exists"}))
             else:
                 failed = True
                 log.error(json.dumps({"topic": name, "status": "failed", "reason": type(exc).__name__}))
     if failed:
         return 1
-
     # Deny-by-default cluster: nothing but these grants lets a data-plane principal touch a topic.
     acls = derive_acls(
         defaults,
@@ -374,6 +411,9 @@ def main(argv: list[str] | None = None) -> int:
             failed = True
             log.error(json.dumps({"acl": "create", "status": "failed", "reason": type(exc).__name__}))
     log.info(json.dumps({"acls": len(bindings), "status": "failed" if failed else "applied"}))
+    # After the ACLs on purpose: a missing ALTER_CONFIGS grant must not block ACL reconciliation. Still non-zero.
+    if alter_existing_configs(admin, topics, existing):
+        failed = True
     return 1 if failed else 0
 
 

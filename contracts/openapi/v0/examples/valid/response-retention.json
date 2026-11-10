@@ -1,0 +1,8 @@
+{
+  "environment": "prod",
+  "stores": [
+    { "store": "events", "days": 90, "previous_days": null, "applied_at": "2026-10-06T07:00:00.000Z", "release": "0.3.0" },
+    { "store": "content", "days": 60, "previous_days": 30, "applied_at": "2026-10-06T07:00:00.000Z", "release": "0.3.0" },
+    { "store": "audit", "days": 2190, "previous_days": null, "applied_at": "2026-10-06T07:00:00.000Z", "release": "0.3.0" }
+  ]
+}

@@ -423,6 +423,13 @@
       "expected_json_path": "$.spec.pipeline.stepNamespaces",
       "expected_validator": "minProperties",
       "expectation_note": "PREDICTED by the architect (set 1.6), UNMEASURED. First use of minProperties in the channel-spec examples"
+    },
+    {
+      "file": "invalid/channel-name-reserved-prefix.json",
+      "violates": "the tb- prefix is reserved for platform stand-ins in the channel position (archiver metric label tb-archiver); ADR-010",
+      "expected_json_path": "$.metadata.name",
+      "expected_validator": "pattern",
+      "expectation_note": "PREDICTED by the architect (set 1.8, ADR-010), UNMEASURED. Identical to channel-name-not-topic-safe.json except the name, which passes the old grammar and fails only the (?!tb-) lookahead"
     }
   ]
 }

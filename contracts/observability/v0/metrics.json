@@ -25,7 +25,8 @@
     "version": { "description": "Tributary distribution version of the process (tb_build_info only).", "pattern": "^[0-9A-Za-z.+-]{1,64}$" },
     "route": { "description": "The OpenAPI path TEMPLATE (/v1/channels/{channel}), never the concrete path, which can contain ids.", "pattern": "^/[a-z0-9/{}_.-]{0,127}$" },
     "method": { "description": "HTTP method.", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"] },
-    "http_status": { "description": "Response status code as three digits.", "pattern": "^[1-5][0-9]{2}$" }
+    "http_status": { "description": "Response status code as three digits.", "pattern": "^[1-5][0-9]{2}$" },
+    "environment": { "description": "The <env> of topics/v0, as configured for the control plane (set 1.8, ADR-004 R7 rev 3). Operator-defined, at most 64 per control plane (openapi/v0 EnvironmentList).", "pattern": "^[a-z][a-z0-9-]{0,15}$" }
   },
   "metrics": [
     { "name": "tb_build_info", "type": "gauge", "help": "Always 1. Identifies the component and its version.", "labels": ["component", "version"], "emitters": ["receiver", "worker", "loader", "archiver", "api"] },
@@ -64,9 +65,12 @@
     { "name": "tb_archiver_events_total", "type": "counter", "help": "_tb.<env>.events records consumed by the archiver.", "labels": ["outcome"], "label_values": { "outcome": ["written", "invalid"] }, "emitters": ["archiver"] },
     { "name": "tb_archiver_attrs_dropped_total", "type": "counter", "help": "attrs entries dropped before storage; the rest of the event is stored (events/v0 4.1 rule 3).", "labels": ["reason"], "label_values": { "reason": ["hmac", "denied_name"] }, "emitters": ["archiver"] },
     { "name": "tb_archiver_batches_total", "type": "counter", "help": "ClickHouse insert batches.", "labels": ["outcome"], "label_values": { "outcome": ["ok", "failed"] }, "emitters": ["archiver"] },
+    { "name": "tb_archiver_audit_records_total", "type": "counter", "help": "_tb.<env>.audit records consumed by the events archiver, by outcome (audit/v0 README 4).", "labels": ["outcome"], "label_values": { "outcome": ["written", "invalid", "unsupported_version"] }, "emitters": ["archiver"], "note": "Set 1.8 (W3-30 part 2). invalid: not a JSON object, or a known field missing or invalid. unsupported_version: v other than 0. Neither is stored, so any increase of either is an audit record lost from audit_log: alert (README 3.5)." },
     { "name": "tb_archiver_insert_duration_seconds", "type": "histogram", "help": "One ClickHouse insert batch.", "labels": [], "buckets": "delivery", "emitters": ["archiver"] },
 
     { "name": "tb_api_requests_total", "type": "counter", "help": "API requests by route template, method and status.", "labels": ["route", "method", "http_status"], "emitters": ["api"] },
-    { "name": "tb_api_request_duration_seconds", "type": "histogram", "help": "API request duration.", "labels": ["route", "method"], "buckets": "latency", "emitters": ["api"] }
+    { "name": "tb_api_request_duration_seconds", "type": "histogram", "help": "API request duration.", "labels": ["route", "method"], "buckets": "latency", "emitters": ["api"] },
+    { "name": "tb_audit_tamper_suspect_ids", "type": "gauge", "help": "audit_ids in audit_log with two or more copies whose record fields differ, as of the last completed check. Above 0 means something other than a redelivery wrote audit_log.", "labels": ["environment"], "emitters": ["api"], "note": "ADR-004 R7 rev 3; README 3.4. Set by a periodic background check, never computed during a scrape (O6). Absent until the first check completes. Emitted by the API (SELECT holder), not the archiver (the writer does not grade itself)." },
+    { "name": "tb_audit_tamper_check_timestamp_seconds", "type": "gauge", "help": "Unix time at which the last audit_log tamper check completed successfully.", "labels": ["environment"], "emitters": ["api"], "note": "A failed check leaves it unchanged, so staleness covers both a failing check and a stopped API (README 3.4)." }
   ]
 }

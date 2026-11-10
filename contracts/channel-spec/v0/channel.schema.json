@@ -24,8 +24,8 @@
       "properties": {
         "name": {
           "type": "string",
-          "pattern": "^[a-z][a-z0-9-]{0,63}$",
-          "$comment": "Same grammar as the tb-channel header and the channel segment of a topic name, because it becomes both. See contracts/topics/v0 section 1."
+          "pattern": "^(?!tb-)[a-z][a-z0-9-]{0,63}$",
+          "$comment": "Same grammar as the tb-channel header and the channel segment of a topic name, because it becomes both. See contracts/topics/v0 section 1. Set 1.8 (ADR-010): the prefix tb- is reserved for platform stand-ins in the channel position (for example the archiver's metric label value tb-archiver), so no channel can be named tb-*. The header, topic and metric-label grammars are unchanged: they must still admit the stand-ins."
         },
         "version": {
           "type": "integer",

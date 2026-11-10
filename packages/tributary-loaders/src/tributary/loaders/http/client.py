@@ -21,7 +21,7 @@ to whatever the `Location` header names; and that target is not checked against 
 `http://` loopback-only rule (`contracts/channel-spec/v0`), so a 302 can point a credential at a
 plaintext, non-loopback URL the spec would never have allowed as the configured destination. `_OPENER`
 below replaces the default redirect handler with one that declines every redirect, so a 3xx surfaces
-as an ordinary, classified response (`loader.classify_status`'s `http-3xx`) instead of a followed hop.
+as an ordinary, classified response (`loader.classify_status`'s `HTTP_REDIRECT_REFUSED`) instead of a followed hop.
 """
 
 from __future__ import annotations

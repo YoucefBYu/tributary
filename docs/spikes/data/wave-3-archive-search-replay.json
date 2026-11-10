@@ -1,0 +1,84 @@
+{
+  "benchmark": "w3-9b-archive-search-replay",
+  "at": "2026-10-13T17:38:24.098382+00:00",
+  "environment": {
+    "python": "3.12.3",
+    "implementation": "CPython",
+    "platform": "Linux-6.18.44-fc-v114-x86_64-with-glibc2.39",
+    "machine": "x86_64",
+    "processor": "x86_64",
+    "cpu_count": 4
+  },
+  "images": {
+    "kafka": "apache/kafka:4.0.0",
+    "clickhouse": "clickhouse/clickhouse-server:24.8",
+    "postgres": "postgres:16-alpine"
+  },
+  "rows_requested": 100000,
+  "rows_stored": 100000,
+  "requests_per_case": 200,
+  "search": {
+    "page1": {
+      "n": 200.0,
+      "p50_ms": 101.74,
+      "p95_ms": 133.42,
+      "p99_ms": 152.46,
+      "max_ms": 170.2,
+      "mean_ms": 105.22,
+      "items_per_page": 50
+    },
+    "page1_narrow": {
+      "n": 200.0,
+      "p50_ms": 63.3,
+      "p95_ms": 86.09,
+      "p99_ms": 98.51,
+      "max_ms": 105.25,
+      "mean_ms": 66.33,
+      "items_per_page": 50
+    },
+    "error_filter": {
+      "n": 200.0,
+      "p50_ms": 104.68,
+      "p95_ms": 132.86,
+      "p99_ms": 143.51,
+      "max_ms": 152.62,
+      "mean_ms": 107.48,
+      "items_per_page": 50
+    },
+    "baseline_authed_no_archive": {
+      "n": 200.0,
+      "p50_ms": 9.25,
+      "p95_ms": 12.47,
+      "p99_ms": 16.45,
+      "max_ms": 99.61,
+      "mean_ms": 9.93
+    },
+    "paginate": {
+      "n": 20.0,
+      "p50_ms": 120.92,
+      "p95_ms": 136.78,
+      "p99_ms": 138.13,
+      "max_ms": 138.13,
+      "mean_ms": 122.39,
+      "pages": 20
+    }
+  },
+  "replay": [
+    {
+      "records_produced": 5000,
+      "republished": 5000,
+      "elapsed_s": 1.519,
+      "records_per_s": 3291.1,
+      "skipped_undecodable": 0,
+      "skipped_out_of_range": 0
+    },
+    {
+      "records_produced": 20000,
+      "republished": 20000,
+      "elapsed_s": 4.387,
+      "records_per_s": 4558.9,
+      "skipped_undecodable": 0,
+      "skipped_out_of_range": 0
+    }
+  ]
+}

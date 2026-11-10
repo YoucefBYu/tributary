@@ -99,3 +99,36 @@ def test_retired_flag_is_refused_before_argparse_and_not_echoed(
     assert exc.value.code == 2
     lines = [json.loads(x) for x in err.err.splitlines() if "startup_refused" in x]
     assert len(lines) == 1 and lines[0]["code"] == "ENGINE_KAFKA_RETIRED_INPUT"
+
+
+def _kafka_source_main(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *extra: str) -> Callable[[], None]:
+    module = importlib.import_module("tributary.receivers.kafka_source.receiver")
+    monkeypatch.setattr("confluent_kafka.Producer", _no_client)
+    monkeypatch.setattr("confluent_kafka.Consumer", _no_client)
+    monkeypatch.delenv("TB_BOOTSTRAP_SERVERS", raising=False)
+    monkeypatch.delenv("TB_INSTANCE_ID", raising=False)
+    monkeypatch.setenv("TB_ENGINE_KAFKA_FILE", str(write_engine_kafka_file(tmp_path, "127.0.0.1:9092")))
+    monkeypatch.setenv("TB_OPS_PORT", "0")
+    monkeypatch.setattr("sys.argv", ["prog", "--channel", "c", "--env", "dev", *extra])
+    return module.main  # type: ignore[no-any-return]
+
+
+def test_kafka_source_without_an_instance_id_exits_2_instance_required(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The instance id is the static group member id: a `kafka-0` default shared by replicas fences them out."""
+    main = _kafka_source_main(monkeypatch, tmp_path)
+    with pytest.raises(SystemExit) as exc:
+        main()
+    _refused(exc, capsys, "INSTANCE_REQUIRED")
+
+
+@pytest.mark.parametrize("instance", ["_bad", "has space", "x" * 129])
+def test_kafka_source_with_a_malformed_instance_id_exits_2_without_echoing_it(
+    instance: str, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    main = _kafka_source_main(monkeypatch, tmp_path, "--instance", instance)
+    with pytest.raises(SystemExit) as exc:
+        main()
+    err = capsys.readouterr().err
+    assert exc.value.code == 2 and instance not in err and "Traceback" not in err

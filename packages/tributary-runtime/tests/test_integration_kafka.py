@@ -113,6 +113,8 @@ def kafka() -> Iterator[str]:
         .with_env("KAFKA_AUTO_CREATE_TOPICS_ENABLE", "false")
         .with_env("CLUSTER_ID", "MkU3OEVBNTcwNTJENDM2Qk")
         .with_bind_ports(9092, port)
+        # A unique name: several agents and CI jobs share one Docker daemon.
+        .with_name(f"tb-runtime-it-kafka-{uuid.uuid4().hex[:12]}")
     )
     container.start()
     bootstrap = f"127.0.0.1:{port}"
@@ -293,6 +295,68 @@ def test_a_message_flows_from_raw_to_out_with_events(deployed_spec: dict[str, An
     assert {"transformed", "routed"} <= stages
     for event in emitted[:20]:
         assert list(events.iter_errors(event)) == []
+
+
+def received_events(bootstrap: str, ids: set[str]) -> dict[str, list[dict[str, Any]]]:
+    """Every `received` event for `ids`, in events-topic order (one partition here), by message id."""
+    by_id: dict[str, list[dict[str, Any]]] = {}
+    for raw in drain(bootstrap, events_topic(ENV), expected=len(ids)):
+        event = json.loads(raw.value())
+        if event.get("stage") == "received" and event.get("message_id") in ids:
+            by_id.setdefault(event["message_id"], []).append(event)
+    return by_id
+
+
+def test_every_raw_record_gets_a_received_event_with_its_coordinates(
+    deployed_spec: dict[str, Any], topics: str
+) -> None:
+    """Events contract 2.1 (set 1.8): the worker emits `received` then `queued` for each consumed `raw` record.
+
+    The coordinates are checked against the record as it sits on `raw`, so the event points at the exact
+    record a reprocess would read. `received.ts` is that record's `tb-received-at` at millisecond precision.
+    `received`, `queued`, `transformed` in that order for the same message: one key, one events partition,
+    both arrival events emitted before any step runs.
+    """
+    published = set(publish(topics, 2, start=50))
+    running = worker(topics, "pipeline-received")
+    running.build()
+    running.run(max_iterations=300)
+
+    coordinates = {
+        header_map(raw)[h.TB_MSG_ID]: (
+            raw.topic(),
+            raw.partition(),
+            raw.offset(),
+            len(raw.value() or b""),
+            h.format_timestamp(h.parse_timestamp(h.TB_RECEIVED_AT, header_map(raw)[h.TB_RECEIVED_AT])),
+        )
+        for raw in drain(topics, raw_topic(ENV, CHANNEL), expected=len(published))
+        if header_map(raw).get(h.TB_MSG_ID) in published
+    }
+    assert set(coordinates) == published, "every published record is really on raw"
+
+    schema = Draft202012Validator(
+        json.loads((CONTRACTS / "events" / "v0" / "event.schema.json").read_text(encoding="utf-8"))
+    )
+    emitted = [json.loads(raw.value()) for raw in drain(topics, events_topic(ENV), expected=3 * len(published))]
+    by_id = received_events(topics, published)
+    assert set(by_id) == published, "one received event per consumed raw record"
+    for message_id, copies in by_id.items():
+        topic, partition, offset, size, received_at = coordinates[message_id]
+        for event in copies:
+            assert list(schema.iter_errors(event)) == []
+            assert (event["kind"], event["status"], event["channel"]) == ("message", "ok", CHANNEL)
+            assert event["channel_version"] == deployed_spec["metadata"]["version"]
+            assert (event["topic"], event["partition"], event["offset"]) == (topic, partition, offset)
+            assert event["attempt"] == 0 and event["size_bytes"] == size
+            assert "attrs" not in event and "destination" not in event
+            assert event["ts"] == received_at, "received.ts is the receiver's commit time"
+        timeline = [event for event in emitted if event.get("message_id") == message_id]
+        stages = [event["stage"] for event in timeline]
+        assert stages.index("received") < stages.index("queued") < stages.index("transformed")
+        queued = timeline[stages.index("queued")]
+        assert list(schema.iter_errors(queued)) == []
+        assert (queued["topic"], queued["partition"], queued["offset"]) == (topic, partition, offset)
 
 
 def test_an_experimental_header_is_tolerated_inbound_and_stripped_on_produce(
@@ -481,3 +545,13 @@ def test_kill_and_restart_preserves_per_key_order_and_loses_nothing(deployed_spe
 
     for _key, sequences in first_delivery_order(replayed).items():
         assert sequences == sorted(sequences), f"per-key order broken for a key ({len(sequences)} records)"
+
+    # A replayed record is consumed again, so its `received` event may be emitted twice (the killed
+    # worker's copy survives only if its fire-and-forget queue was sent before the kill). Every copy must
+    # carry the same archive dedup key and raw coordinates, which is what makes the duplicate harmless.
+    received = received_events(topics, set(published))
+    assert set(received) == set(published), "every replayed record has a received event"
+    for copies in received.values():
+        assert len({(e["message_id"], e["stage"], e.get("destination"), e["attempt"]) for e in copies}) == 1
+        assert len({(e["topic"], e["partition"], e["offset"]) for e in copies}) == 1
+    print(f"received duplicates across the kill: {sum(len(c) - 1 for c in received.values())}")

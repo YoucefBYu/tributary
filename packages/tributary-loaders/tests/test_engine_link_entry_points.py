@@ -112,7 +112,20 @@ def test_bad_instance_id_exits_2_with_one_phi_free_line(
     assert exc.value.code == 2
     assert "Traceback" not in err and "MARKER" not in err
     lines = [json.loads(x) for x in err.splitlines() if "startup_refused" in x]
-    assert len(lines) == 1 and lines[0]["code"] == "TOPIC_NAME_INVALID"
+    assert len(lines) == 1 and lines[0]["code"] == "ARGUMENTS_INVALID"
+
+
+@pytest.mark.parametrize("entry", LOADERS, indirect=True)
+def test_a_missing_instance_id_exits_2_and_the_environment_is_accepted(
+    entry: Callable[[], None], capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """W3-28b: no pid default (it is identical in every container); `TB_INSTANCE_ID` is the other way in."""
+    monkeypatch.setenv("TB_ENGINE_KAFKA_FILE", str(write_engine_kafka_file(tmp_path, "127.0.0.1:9092")))
+    monkeypatch.delenv("TB_INSTANCE_ID", raising=False)
+    monkeypatch.setenv("TB_OPS_PORT", "0")
+    with pytest.raises(SystemExit) as exc:
+        entry()
+    _refused(exc, capsys, "INSTANCE_REQUIRED")
 
 
 def test_spec_reader_group_is_inside_the_acl_granted_prefix() -> None:

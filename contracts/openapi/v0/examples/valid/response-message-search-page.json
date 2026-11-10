@@ -1,0 +1,27 @@
+{
+  "items": [
+    {
+      "ts": "2026-10-06T08:41:07.250Z",
+      "kind": "message",
+      "channel": "adt-fanout",
+      "channel_version": 3,
+      "stage": "dlq",
+      "status": "error",
+      "instance": "tb-loader-fhir-store-0",
+      "message_id": "0192f3b0-1a2b-7c3d-8e4f-0123456789ab",
+      "destination": "fhir-store",
+      "attempt": 3,
+      "content_type": "application/fhir+json",
+      "size_bytes": 2210,
+      "topic": "prod.adt-fanout.dlq",
+      "partition": 2,
+      "offset": 118,
+      "error_code": "FHIR_VALIDATION_FAILED",
+      "error_message": "Destination rejected the resource.",
+      "duration_ms": 38.5,
+      "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+      "attrs": { "msg_type": "ADT-A01" }
+    }
+  ],
+  "next_cursor": "WzE3MjgyMDQwNjcyNTAsImFkdC1mYW5vdXQiXQ"
+}

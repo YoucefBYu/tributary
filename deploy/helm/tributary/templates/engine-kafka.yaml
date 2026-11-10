@@ -1,4 +1,4 @@
-{{- range $role := list "receiver" "worker" "loader" "archiver" }}
+{{- range $role := (ternary (list "receiver" "worker" "loader" "archiver" "api") (list "receiver" "worker" "loader" "archiver") .Values.api.enabled) }}
 ---
 apiVersion: v1
 kind: ConfigMap

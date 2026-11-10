@@ -86,7 +86,10 @@ def kafka() -> Iterator[str]:
 
 @pytest.fixture(scope="module")
 def clickhouse() -> Iterator[ClickHouseContainer]:
-    with ClickHouseContainer("clickhouse/clickhouse-server:24.8") as container:
+    with ClickHouseContainer("clickhouse/clickhouse-server:24.8").with_env(
+        "CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT",
+        "1",  # the tests create the INSERT/SELECT runtime user
+    ) as container:
         yield container
 
 
@@ -120,6 +123,25 @@ def fresh_db(ch: ClickHouseContainer) -> tuple[Any, str]:
     client = connect(target(ch, name))
     ensure_schema(client, database=name)
     return client, name
+
+
+def write_runtime_secret(ch: ClickHouseContainer, database: str, directory: Path) -> None:
+    """The archiver's runtime credential as production grants it: INSERT and SELECT, nothing more. The startup
+    grant check refuses anything wider on `audit_log`, so tests must not run the archiver as the admin user."""
+    user, password = f"arch_{uuid.uuid4().hex[:10]}", uuid.uuid4().hex
+    admin = connect(target(ch, ch.dbname))
+    admin.command(f"CREATE USER IF NOT EXISTS {user} IDENTIFIED BY '{password}'")
+    admin.command(f"GRANT INSERT, SELECT ON {database}.* TO {user}")
+    admin.command(  # the profile the archiver requires at startup (README, "Settings profile")
+        f"CREATE SETTINGS PROFILE IF NOT EXISTS p_{user} SETTINGS insert_allow_materialized_columns = 0 CONST TO {user}"
+    )
+    admin.close()
+    ref = directory / SECRET_REF
+    ref.mkdir()
+    (ref / "user").write_text(user)
+    (ref / "password").write_text(password)
+    for f in ref.iterdir():
+        f.chmod(0o600)
 
 
 def recent(offset_s: float = 0.0) -> str:
@@ -209,6 +231,7 @@ def archiver_env(kafka: str, ch: ClickHouseContainer, database: str, secrets: Pa
             "TB_ARCHIVE_CLICKHOUSE_DATABASE": database,
             "TB_ARCHIVE_CLICKHOUSE_SECRET_REF": SECRET_REF,
             "TB_SECRETS_DIR": str(secrets),
+            "TB_OPS_PORT": "0",  # ephemeral ops listener: parallel agents must not collide on 9180
         }
     )
     return env
@@ -226,11 +249,31 @@ def spawn_archiver(env: dict[str, str], instance: str) -> ManagedProcess:
             instance,
             "--flush-interval-s",
             "0.5",
+            "--skip-ddl",  # the runtime user is INSERT and SELECT only; the table is created by fresh_db
         ],
         env=env,
     )
     proc.wait_for_event("archiver_started", timeout_s=60.0)
     return proc
+
+
+def ops_port(proc: ManagedProcess) -> int:
+    """The bound ops port, read back from the `ops_listening` line."""
+    for line in proc.lines:
+        if line.get("event") == "ops_listening":
+            return int(line["ops_port"])
+    raise AssertionError("no ops_listening line")
+
+
+def http_get(port: int, path: str) -> tuple[int, str]:
+    import urllib.error
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=5) as response:
+            return response.status, response.read().decode()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read().decode()
 
 
 def wait_count(ch: ClickHouseContainer, database: str, sql: str, at_least: int, timeout_s: float = 60.0) -> int:
@@ -289,14 +332,9 @@ def test_archiver_stopped_leaves_the_worker_unblocked_and_real_events_parse(
         ],
         compact=channels_topic(ENV),
     )
-    ref = tmp_path / SECRET_REF
-    ref.mkdir()
-    (ref / "user").write_text(clickhouse.username)
-    (ref / "password").write_text(clickhouse.password)
-    for f in ref.iterdir():
-        f.chmod(0o600)
     client, database = fresh_db(clickhouse)
     client.close()
+    write_runtime_secret(clickhouse, database, tmp_path)
     spec = walking_skeleton_document(
         mllp_port=free_port(), http_url="http://127.0.0.1:1/unused", channel=CHANNEL, destination=DESTINATION
     )
@@ -350,4 +388,51 @@ def test_archiver_stopped_leaves_the_worker_unblocked_and_real_events_parse(
         assert grown >= 3 * BATCH, "messages processed while the archive was away must be archived from Kafka"
     finally:
         worker.terminate_and_wait()
+        archiver.terminate_and_wait()
+
+
+def test_ops_listener_serves_livez_and_the_metrics_after_a_batch(
+    kafka: str, clickhouse: ClickHouseContainer, tmp_path: Path
+) -> None:
+    """W3-27: a real archiver process, real Kafka and ClickHouse; scrape after a batch landed."""
+    make_topics(kafka, [(events_topic(ENV), 1)])
+    client, database = fresh_db(clickhouse)
+    client.close()
+    write_runtime_secret(clickhouse, database, tmp_path)
+    total = 25
+    producer = Producer({"bootstrap.servers": kafka, "acks": "all", "enable.idempotence": True})
+    for i in range(total):
+        event = base(ts=recent(i / 10), message_id=str(uuid.uuid4()))
+        producer.produce(events_topic(ENV), key=event["message_id"].encode(), value=orjson.dumps(event))
+    producer.produce(events_topic(ENV), key=b"poison", value=b"not json")
+    assert producer.flush(30) == 0
+    archiver = spawn_archiver(archiver_env(kafka, clickhouse, database, tmp_path), "archiver-ops")
+    try:
+        assert wait_count(clickhouse, database, "SELECT count() FROM message_events FINAL", total) >= total
+        port = ops_port(archiver)
+        assert http_get(port, "/livez")[0] == 200
+        assert http_get(port, "/readyz")[0] == 404, "observability/v0 does not contract an archiver /readyz"
+        deadline = time.monotonic() + 30
+        text = ""
+        while time.monotonic() < deadline:
+            status, text = http_get(port, "/metrics")
+            assert status == 200
+            if 'tb_commits_total{component="archiver",channel="tb-archiver",outcome="ok"}' in text and (
+                f'tb_archiver_events_total{{outcome="written"}} {total}' in text
+            ):
+                break
+            time.sleep(0.5)
+        assert f'tb_archiver_events_total{{outcome="written"}} {total}' in text
+        assert 'tb_archiver_events_total{outcome="invalid"} 1' in text
+        assert 'tb_archiver_batches_total{outcome="ok"}' in text
+        assert 'tb_build_info{component="archiver",version="' in text
+        assert "tb_archiver_insert_duration_seconds_count" in text
+        commits = [
+            x
+            for x in text.splitlines()
+            if x.startswith('tb_commits_total{component="archiver"') and 'outcome="ok"' in x
+        ]
+        assert commits and float(commits[0].rsplit(" ", 1)[1]) >= 1
+        assert "message_id" not in "\n".join(x for x in text.splitlines() if not x.startswith("#"))
+    finally:
         archiver.terminate_and_wait()

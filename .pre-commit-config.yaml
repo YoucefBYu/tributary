@@ -24,3 +24,12 @@ repos:
         entry: uv run python .github/scripts/secret_scan.py
         language: system
         pass_filenames: false
+      # Advisory (`git push --no-verify` bypasses it): runs the committed HEAD in a clean worktree. Install with
+      #   uv run pre-commit install --hook-type pre-push
+      - id: ci-local-fast
+        name: ci_local.sh fast (contracts, lint, types, fast tests, supply-chain)
+        entry: .github/scripts/ci_local.sh fast
+        language: system
+        stages: [pre-push]
+        pass_filenames: false
+        always_run: true

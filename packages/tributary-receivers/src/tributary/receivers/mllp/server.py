@@ -62,7 +62,7 @@ from ..tls import AEAD_CIPHER_PIN, build_ssl_context, log_peer_refused, peer_san
 from .ack import build_ack
 from .config import MllpSettings
 from .framing import CR, EB, SB, Fatal, FrameParser, Oversize, control_id, looks_like_hl7
-from .kafka_publisher import RawPublisher, build_raw_envelope
+from .kafka_publisher import RawPublisher, build_raw_envelope, publish_outcome
 from .kafka_publisher import topic_name as raw_topic_name
 from .reload import restart_required_fields
 
@@ -238,7 +238,9 @@ class MllpServer:
                     )
                     entry.bind(message.require(h.TB_MSG_ID))  # before the produce: no reply can name it earlier
                     t0 = time.monotonic()
-                    ok = await self.publisher.publish(message, timeout_s=timeout)
+                    published = await publish_outcome(self.publisher, message, timeout_s=timeout)
+                    ok = published == "committed"
+                    entry.produce_code = "PRODUCE_TIMEOUT" if published == "timeout" else "PRODUCE_FAILED"
                     self.metrics.record_ack_latency_ms((time.monotonic() - t0) * 1000)
             except Exception:
                 ok = False
@@ -266,6 +268,7 @@ class MllpServer:
             return build_ack("AA", cid, msg_id)
         if resolution.answer == "AE":
             self.metrics.reply_ae += 1
+            self.metrics.record_sync_answer("AE", resolution.code)
             if resolution.code == REPLY_TIMEOUT:
                 self.metrics.reply_timeouts += 1
             elif resolution.code == REPLY_ROUTE_LOST:
@@ -273,6 +276,7 @@ class MllpServer:
             return build_ack("AE", cid, f"{resolution.code or ''} {msg_id}".strip())
         self.metrics.publish_failures += 1
         self.metrics.nacked_unavailable += 1
+        self.metrics.record_sync_answer("AR", resolution.code or result.produce_code or "PRODUCE_FAILED")
         return build_ack("AR", cid, "unavailable")
 
     def _release_body_when_done(self, task: asyncio.Task[Any]) -> None:
@@ -357,7 +361,7 @@ class MllpServer:
         peer = w.get_extra_info("peername")
         remote = f"{peer[0]}:{peer[1]}" if peer else "unknown"
         if self._refusal is not None or self.metrics.connections_open >= self.cfg.max_conns:
-            self.metrics.connections_refused += 1
+            self.metrics.refuse_connection("not_accepting" if self._refusal is not None else "max_conns")
             w.close()
             return
         if self.cfg.tls is not None and self.cfg.tls.allowed_client_sans:
@@ -542,8 +546,10 @@ def main() -> None:
     supervisor restarts on 0), 2 for a refused startup configuration."""
     from tributary.runtime.config import load_topic_defaults
     from tributary.runtime.errors import RuntimeConfigurationError
+    from tributary.runtime.ops import add_ops_arguments, ops_settings_or_exit
+    from tributary.runtime.startup import QuietArgumentParser
 
-    from ..cli import QuietArgumentParser, add_ops_arguments, ops_settings_or_exit, run_until_stopped, spec_feed_opener
+    from ..cli import run_until_stopped, spec_feed_opener
     from ..startup import refuse, refuse_retired_channel_spec_flag, spec_reader_group_or_exit
     from .runner import MllpRunner, RunnerOptions
 

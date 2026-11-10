@@ -17,7 +17,7 @@ from jsonschema.validators import validator_for
 CONTRACTS = Path(__file__).resolve().parents[2] / "contracts"
 # Contracts with a manifest.json of {schema, valid[], invalid[]} under v0/examples/. Add a new
 # contract here (one line) rather than in each function below.
-FILE_CONTRACTS = ("envelope", "events", "channel-spec", "observability", "openapi")
+FILE_CONTRACTS = ("envelope", "events", "channel-spec", "observability", "openapi", "audit")
 EVENT_PHI_GUARDS = {
     "invalid/payload-in-event.json",
     "invalid/attrs-clear-text-mrn.json",

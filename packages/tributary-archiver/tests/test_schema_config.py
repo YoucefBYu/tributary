@@ -34,21 +34,19 @@ def test_ttl_days_out_of_range_is_refused(bad: Any) -> None:
 
 
 class RecordingClient:
-    def __init__(self, existing: str) -> None:
-        self.existing, self.commands = existing, []
+    def __init__(self) -> None:
+        self.commands: list[str] = []
 
     def command(self, cmd: str, **_: Any) -> Any:
         self.commands.append(cmd)
-        return self.existing if cmd.startswith("SELECT") else None
+        return ""
 
 
-def test_ttl_is_altered_only_when_it_differs() -> None:
-    same = RecordingClient("... TTL toDateTime(ts) + toIntervalDay(90) ...")
-    ensure_schema(same, ttl_days=90)
-    assert not any(c.startswith("ALTER") for c in same.commands)
-    changed = RecordingClient("... TTL toDateTime(ts) + toIntervalDay(90) ...")
-    ensure_schema(changed, ttl_days=7)
-    assert any(c.startswith("ALTER") and "INTERVAL 7 DAY" in c for c in changed.commands)
+def test_ensure_schema_only_creates_and_never_alters_a_ttl() -> None:
+    client = RecordingClient()
+    ensure_schema(client, ttl_days=7)
+    assert [c.split(" (")[0] for c in client.commands] == ["CREATE TABLE IF NOT EXISTS message_events"]
+    assert "ALTER" not in " ".join(client.commands)
 
 
 class Resolver:
@@ -82,6 +80,43 @@ def test_config_defaults_and_group() -> None:
 def test_bad_config_is_refused(mutation: dict[str, str]) -> None:
     with pytest.raises(ArchiverConfigError):
         load_config("dev", {**ENVIRON, **mutation}, Resolver())
+
+
+def test_retention_settings_defaults_and_overrides() -> None:
+    config = load_config("dev", ENVIRON, Resolver())
+    assert (config.audit_ttl_days, config.content_ttl_days, config.allow_ttl_decrease) == (2190, None, False)
+    on = {**ENVIRON, "TB_ARCHIVE_CONTENT": "true", "TB_ARCHIVE_ALLOW_TTL_DECREASE": "true"}
+    config = load_config("dev", on, Resolver())
+    assert (config.content_ttl_days, config.allow_ttl_decrease) == (30, True)
+    custom = {
+        **on,
+        "TB_ARCHIVE_CONTENT_TTL_DAYS": "7",
+        "TB_ARCHIVE_AUDIT_TTL_DAYS": "36500",
+        "TB_ARCHIVE_TTL_DAYS": "1",
+    }
+    config = load_config("dev", custom, Resolver())
+    assert (config.content_ttl_days, config.audit_ttl_days, config.ttl_days) == (7, 36500, 1)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"TB_ARCHIVE_AUDIT_TTL_DAYS": "0"},
+        {"TB_ARCHIVE_AUDIT_TTL_DAYS": "36501"},
+        {"TB_ARCHIVE_AUDIT_TTL_DAYS": "six"},
+        {"TB_ARCHIVE_CONTENT": "true", "TB_ARCHIVE_CONTENT_TTL_DAYS": "0"},
+        {"TB_ARCHIVE_CONTENT": "true", "TB_ARCHIVE_CONTENT_TTL_DAYS": "36501"},
+        {"TB_ARCHIVE_ALLOW_TTL_DECREASE": "yes"},  # only true or false: never read as the unsafe choice
+    ],
+)
+def test_bad_retention_settings_are_refused(mutation: dict[str, str]) -> None:
+    with pytest.raises(ArchiverConfigError):
+        load_config("dev", {**ENVIRON, **mutation}, Resolver())
+
+
+def test_content_ttl_is_not_read_while_content_is_off() -> None:
+    config = load_config("dev", {**ENVIRON, "TB_ARCHIVE_CONTENT_TTL_DAYS": "0"}, Resolver())
+    assert config.content_ttl_days is None
 
 
 def test_bad_env_segment_is_refused() -> None:
@@ -279,3 +314,21 @@ def test_migration_credential_ref_is_separate() -> None:
     assert load_config("dev", environ, Resolver(), ref_env_name="TB_ARCHIVE_CLICKHOUSE_MIGRATE_SECRET_REF")
     with pytest.raises(ArchiverConfigError):
         load_config("dev", ENVIRON, Resolver(), ref_env_name="TB_ARCHIVE_CLICKHOUSE_MIGRATE_SECRET_REF")
+
+
+def test_missing_instance_id_refuses_with_exit_2_before_any_client_is_built(tmp_path: Path) -> None:
+    from tests.support.engine_kafka import engine_kafka_env
+
+    env = {k: v for k, v in __import__("os").environ.items() if k != "TB_INSTANCE_ID"}
+    env.update(engine_kafka_env("127.0.0.1:9092"))
+    result = subprocess.run(
+        [sys.executable, "-m", "tributary.archiver", "--env", "dev"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 2
+    lines = [json.loads(x) for x in result.stderr.splitlines() if x.startswith("{")]
+    refused = [x for x in lines if x["event"] == "startup_refused"]
+    assert [x["code"] for x in refused] == ["INSTANCE_REQUIRED"]

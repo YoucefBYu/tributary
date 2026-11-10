@@ -1,0 +1,8 @@
+{
+  "type": "https://tributary.dev/problems/request-invalid",
+  "title": "The request is well-formed but cannot be processed",
+  "status": 422,
+  "code": "REQUEST_INVALID",
+  "detail": "stage=received takes no destination; stage=routed requires one.",
+  "request_id": "0192f3a4-7600-7abc-8def-0123456789ab"
+}

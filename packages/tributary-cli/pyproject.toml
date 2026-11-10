@@ -1,0 +1,22 @@
+[project]
+name = "tributary-cli"
+version = "0.0.0"
+description = "Command line client for the Tributary control plane API: dev, test, deploy, channels, messages."
+license = "Apache-2.0"
+requires-python = ">=3.12"
+# No HTTP client library on purpose: the stdlib is enough, and httpx would pull certifi (MPL-2.0), which the
+# licence gate allows only for tributary-archiver.
+dependencies = [
+    "typer>=0.12",        # MIT. Pulls click (BSD-3-Clause), rich (MIT), shellingham (ISC), typing-extensions (PSF), markdown-it-py (MIT), mdurl (MIT)
+    "pyyaml>=6.0",        # MIT. Channel files may be YAML (the spec is authored in YAML, ADR-001)
+]
+
+[project.scripts]
+tributary = "tributary.cli.main:main"
+
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tributary"]

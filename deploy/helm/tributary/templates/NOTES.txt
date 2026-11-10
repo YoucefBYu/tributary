@@ -1,0 +1,5 @@
+{{- if and .Values.api.enabled (eq .Values.api.tls.mode "mesh") }}
+WARNING: api.tls.mode=mesh. The API serves PLAINTEXT on port {{ .Values.api.port }} and relies on your service mesh
+to enforce mTLS between the ingress controller and the pod (ADR-004 C1a). Only api.tls.ingressControllerFrom is
+admitted to that port by NetworkPolicy. Without an enforcing mesh, bearer tokens cross the network in clear.
+{{- end }}

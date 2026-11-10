@@ -49,7 +49,7 @@ from tributary.sdk.testing import make_message
 
 from tests.support.channel_spec import walking_skeleton_document
 from tests.support.chaos_assertions import assert_fault_fired
-from tests.support.kafka_helpers import await_broker, free_port, publish_messages
+from tests.support.kafka_helpers import await_broker, committed_with_retry, free_port, publish_messages
 from tests.support.processes import ManagedProcess, spawn_fhir_loader
 
 pytestmark = pytest.mark.integration
@@ -223,7 +223,7 @@ def _committed_total(bootstrap: str) -> int:
     )
     try:
         partitions = [TopicPartition(out_topic(ENV, CHANNEL, DESTINATION), p) for p in range(PARTITIONS)]
-        return sum(max(tp.offset, 0) for tp in consumer.committed(partitions, timeout=10))
+        return sum(max(tp.offset, 0) for tp in committed_with_retry(consumer, partitions, timeout_s=10))
     finally:
         consumer.close()
 

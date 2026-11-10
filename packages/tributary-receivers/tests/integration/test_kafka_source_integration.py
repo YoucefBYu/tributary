@@ -13,9 +13,10 @@ import asyncio
 import time
 import uuid
 from dataclasses import replace
+from typing import Any
 
 import pytest
-from confluent_kafka import Consumer, Producer, TopicPartition
+from confluent_kafka import Consumer, KafkaException, Producer, TopicPartition
 from confluent_kafka.admin import NewTopic
 from tributary.receivers.kafka_source.config import KafkaSourceSettings, SourceSecurity
 from tributary.receivers.kafka_source.receiver import KafkaSourceReceiver, build_consumer
@@ -63,11 +64,32 @@ def produce(bootstrap: str, topic: str, records: list[tuple[bytes, bytes]]) -> N
     assert p.flush(30) == 0
 
 
-def committed(bootstrap: str, group: str, topic: str) -> int:
+#: Group-coordinator races on a fresh broker or group: the call is fine to repeat once the coordinator settles.
+#: Same rule as `kafka_call_with_retry` in packages/tributary-archiver/tests/conftest.py.
+RETRY_CODES = frozenset({"NOT_COORDINATOR", "COORDINATOR_LOAD_IN_PROGRESS"})
+
+
+def _retriable(exc: KafkaException) -> bool:
+    error: Any = exc.args[0] if exc.args else None
+    return error is not None and (
+        bool(getattr(error, "retriable", lambda: False)()) or str(error.name()) in RETRY_CODES
+    )
+
+
+def committed(bootstrap: str, group: str, topic: str, *, timeout_s: float = 15.0, pause_s: float = 0.25) -> int:
+    """The group's committed offset, retrying a retriable or coordinator error within `timeout_s` (the old single
+    call's budget); anything else, or the error at the deadline, is re-raised."""
+    deadline = time.monotonic() + timeout_s
     c = Consumer({"bootstrap.servers": bootstrap, "group.id": group, "enable.auto.commit": False})
     try:
-        (tp,) = c.committed([TopicPartition(topic, 0)], timeout=15)
-        return int(tp.offset)  # negative (-1001) when nothing was ever committed
+        while True:
+            try:
+                (tp,) = c.committed([TopicPartition(topic, 0)], timeout=max(deadline - time.monotonic(), 0.1))
+                return int(tp.offset)  # negative (-1001) when nothing was ever committed
+            except KafkaException as exc:
+                if not _retriable(exc) or time.monotonic() + pause_s >= deadline:
+                    raise
+                time.sleep(pause_s)
     finally:
         c.close()
 

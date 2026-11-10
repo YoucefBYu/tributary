@@ -118,10 +118,34 @@ def test_ordering_none_with_a_key_is_refused() -> None:
         build(spec)
 
 
-def test_sync_reply_is_refused_because_http_does_not_implement_it() -> None:
-    """`source.reply` is schema-valid on http, but only MLLP answers synchronously: accepting it and answering
-    `202` would tell the sender its message was routed when only the commit is known."""
+def test_sync_reply_is_accepted_with_its_defaults_and_bounds() -> None:
     spec = load()
     spec["spec"]["source"]["reply"] = {}
-    with pytest.raises(ConfigError, match=r"source\.reply is not supported by the http receiver"):
+    cfg = build(spec)
+    assert cfg.reply is not None and (cfg.reply.timeout_s, cfg.reply.max_pending, cfg.reply.body) == (
+        10.0,
+        10000,
+        "ack",
+    )
+    spec["spec"]["source"]["reply"] = {"timeoutMs": 2500, "maxPending": 7}
+    cfg = build(spec)
+    assert cfg.reply is not None and (cfg.reply.timeout_s, cfg.reply.max_pending) == (2.5, 7)
+    spec["spec"]["source"]["reply"] = {"timeoutMs": 999}
+    with pytest.raises(ConfigError, match="timeoutMs"):
+        build(spec)
+
+
+def test_sync_reply_body_step_is_refused_for_http_at_startup() -> None:
+    """README 3.2.6 (set 1.8, ruling 3): a step body needs a response content type `ctx.reply` does not carry."""
+    spec = load()
+    spec["spec"]["source"]["reply"] = {"body": "step"}
+    with pytest.raises(ConfigError, match="body 'step' is not supported by the http receiver"):
+        build(spec)
+
+
+def test_sync_reply_is_refused_on_a_transactional_pipeline() -> None:
+    spec = load()
+    spec["spec"]["source"]["reply"] = {}
+    spec["spec"].setdefault("pipeline", {})["transactional"] = True
+    with pytest.raises(ConfigError, match="transactional"):
         build(spec)

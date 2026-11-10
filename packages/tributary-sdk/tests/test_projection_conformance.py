@@ -366,3 +366,25 @@ def test_malformed_reply_partitions_are_not_well_formed(value: str) -> None:
 def test_the_schema_check_itself_can_go_red(validator: Draft202012Validator) -> None:
     """The control for the control: an empty object must fail, or the validator is not wired up."""
     assert failures(validator, {})
+
+
+@pytest.mark.parametrize("topic_class", sorted(CASES))
+@pytest.mark.parametrize(
+    "value",
+    ["SYNTH-yesterday", "2026-01-02T03:04:05Z", "2026-01-02T03:04:05.123+02:00", "2026-01-02 03:04:05.123Z"],
+    ids=["text", "no-fraction", "non-utc", "space"],
+)
+def test_a_malformed_received_at_fails_both_checks(
+    validator: Draft202012Validator, topic_class: TopicClass, value: str
+) -> None:
+    """Regression: the producer side accepted any `tb-received-at`, which `decode_record` then rejects."""
+    broken = CASES[topic_class]().with_header(h.TB_RECEIVED_AT, value)
+    assert failures(validator, record_projection(broken, topic_class=topic_class)), "the schema refuses it too"
+    with pytest.raises(EnvelopeError) as caught:
+        validate_for_produce(broken, topic_class=topic_class)
+    assert value not in str(caught.value), "the refusal names the header, never the value"
+
+
+@pytest.mark.parametrize("value", ["2026-01-02T03:04:05.123Z", "2026-01-02T03:04:05.123456789+00:00"])
+def test_every_contract_legal_received_at_is_accepted(value: str) -> None:
+    validate_for_produce(raw_message().with_header(h.TB_RECEIVED_AT, value), topic_class="raw")

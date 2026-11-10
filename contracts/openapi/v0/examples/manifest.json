@@ -1,13 +1,13 @@
 {
   "contract": "tributary.openapi/v0",
   "schema_note": "No manifest-level schema: every entry names the component it is checked against, as '../openapi.json#/components/schemas/<Name>'. validate.py validates with the whole OpenAPI document as the root, so internal references resolve.",
-  "note": "All values synthetic. PHI and leak guards: response-problem-echoes-input, response-validation-issue-with-message, response-problem-unknown-code. Proposed as OPENAPI_PHI_GUARDS (3) for tests/conformance. The readiness entry is the observability/v0 example itself, checked against ApiReadiness here too, so the two contracts cannot drift on the api case.",
-  "expectation_note": "Pairs written 2026-10-05 by the architect WITHOUT a run: predictions until validate.py measures them.",
+  "note": "All values synthetic. PHI and leak guards: response-problem-echoes-input, response-validation-issue-with-message, response-problem-unknown-code, and (part 2) response-message-detail-with-payload, response-message-content-presigned-claim-check, request-message-search-identifier-attr. Proposed as OPENAPI_PHI_GUARDS (6) for tests/conformance. The readiness entry is the observability/v0 example itself, checked against ApiReadiness here too, so the two contracts cannot drift on the api case. The inline content example's payload is the 15 ASCII bytes TRIBUTARY-SYNTH, not a clinical message.",
+  "expectation_note": "Pairs written 2026-10-05 (part 1) and 2026-10-06 (part 2, W3-1b) by the architect WITHOUT a run: predictions until validate.py measures them.",
   "valid": [
     { "file": "valid/request-create-channel-git.json", "schema": "../openapi.json#/components/schemas/ChannelVersionCreate", "note": "POST /v1/channels or /versions: authored document (no metadata.version), git origin with commit and path" },
     { "file": "valid/request-deploy-guarded.json", "schema": "../openapi.json#/components/schemas/DeployRequest", "note": "Optimistic concurrency guard" },
     { "file": "valid/request-deploy-first.json", "schema": "../openapi.json#/components/schemas/DeployRequest", "note": "expected_current_version null: deploy only if nothing is deployed" },
-    { "file": "valid/request-rollback.json", "schema": "../openapi.json#/components/schemas/RollbackRequest", "note": "to_version defaults to the previously published version" },
+    { "file": "valid/request-rollback.json", "schema": "../openapi.json#/components/schemas/RollbackRequest", "note": "to_version defaults to the most recently published version that differs from the current one (README 3.3)" },
     { "file": "valid/response-channel-version.json", "schema": "../openapi.json#/components/schemas/ChannelVersion", "note": "Stored document carries metadata.version = version" },
     { "file": "valid/response-deployment-pending.json", "schema": "../openapi.json#/components/schemas/Deployment", "note": "202 body: pending" },
     { "file": "valid/response-deployment-rollback-published.json", "schema": "../openapi.json#/components/schemas/Deployment", "note": "Rollback republishes version 2 unchanged" },
@@ -16,7 +16,22 @@
     { "file": "valid/response-problem-version-mismatch.json", "schema": "../openapi.json#/components/schemas/Problem", "note": "409 with fixed detail text" },
     { "file": "valid/response-environment-list.json", "schema": "../openapi.json#/components/schemas/EnvironmentList", "note": "Management mode and profile per environment" },
     { "file": "valid/response-channel.json", "schema": "../openapi.json#/components/schemas/Channel", "note": "Latest version and per-environment state" },
-    { "file": "../../../observability/v0/examples/valid/readiness-api-ready.json", "schema": "../openapi.json#/components/schemas/ApiReadiness", "note": "Cross-contract: the observability api readiness example must also satisfy the OpenAPI response schema" }
+    { "file": "../../../observability/v0/examples/valid/readiness-api-ready.json", "schema": "../openapi.json#/components/schemas/ApiReadiness", "note": "Cross-contract: the observability api readiness example must also satisfy the OpenAPI response schema" },
+    { "file": "valid/request-message-search.json", "schema": "../openapi.json#/components/schemas/MessageSearchRequest", "note": "Part 2. Every filter at once; a non-identifying attribute" },
+    { "file": "valid/response-message-search-page.json", "schema": "../openapi.json#/components/schemas/MessageSearchPage", "note": "Part 2. One dlq event, metadata only, and a next_cursor" },
+    { "file": "valid/response-message-detail.json", "schema": "../openapi.json#/components/schemas/MessageDetail", "note": "Part 2, exit criterion 1 shape: timeline, two destinations (sent, retrying), content index without bytes" },
+    { "file": "valid/response-message-content-inline.json", "schema": "../openapi.json#/components/schemas/MessageContent", "note": "Part 2, PHI operation: received content inline as base64, envelope headers without tb-usr-*" },
+    { "file": "valid/request-reprocess.json", "schema": "../openapi.json#/components/schemas/ReprocessRequest", "note": "Part 2. Client-minted UUIDv7 operation_id" },
+    { "file": "valid/response-reprocess.json", "schema": "../openapi.json#/components/schemas/ReprocessResult", "note": "Part 2. New id is UUIDv7-shaped, same channel's raw" },
+    { "file": "valid/request-replay-per-key.json", "schema": "../openapi.json#/components/schemas/ReplayRequest", "note": "Part 2. allow_reorder true: accepted on a per-key channel, and audited" },
+    { "file": "valid/response-replay-running.json", "schema": "../openapi.json#/components/schemas/Replay", "note": "Part 2. 202 body" },
+    { "file": "valid/response-replay-failed-partial.json", "schema": "../openapi.json#/components/schemas/Replay", "note": "Part 2. Failed after 4000 acknowledged: the partial count is reported" },
+    { "file": "valid/response-problem-ordering-would-break.json", "schema": "../openapi.json#/components/schemas/Problem", "note": "Part 2. The W3-1b refusal code for a per-key replay or reprocess without allow_reorder" },
+    { "file": "valid/response-channel-stats.json", "schema": "../openapi.json#/components/schemas/ChannelStats", "note": "Part 2. Two versions seen during a rollout" },
+    { "file": "valid/response-retention.json", "schema": "../openapi.json#/components/schemas/RetentionSettings", "note": "Part 2. ADR-004 R2 defaults with content raised to 60" },
+    { "file": "valid/stream-event-message.json", "schema": "../openapi.json#/components/schemas/MessageEvent", "note": "Part 2. data of an SSE message event" },
+    { "file": "valid/response-problem-content-stage-destination.json", "schema": "../openapi.json#/components/schemas/Problem", "note": "0.2.2. getMessageContent 422: a destination with stage=received, or none with stage=routed. Fixed detail text, no echo of the query" },
+    { "file": "valid/response-problem-audit-unavailable.json", "schema": "../openapi.json#/components/schemas/Problem", "note": "0.2.1. 503 from any audited operation (part 1 create, deploy, rollback, undeploy included) when the requested audit record is not committed: fail closed, nothing done" }
   ],
   "invalid": [
     { "file": "invalid/request-origin-git-without-commit.json", "schema": "../openapi.json#/components/schemas/ChannelVersionCreate", "violates": "a git origin names its commit and path", "expected_json_path": "$.origin", "expected_validator": "required" },
@@ -28,6 +43,13 @@
     { "file": "invalid/response-deployment-undeploy-with-version.json", "schema": "../openapi.json#/components/schemas/Deployment", "violates": "an undeploy publishes a tombstone, so version is null", "expected_json_path": "$.version", "expected_validator": "type" },
     { "file": "invalid/response-deployment-published-without-time.json", "schema": "../openapi.json#/components/schemas/Deployment", "violates": "published means committed to _tb.<env>.channels, and says when", "expected_json_path": "$", "expected_validator": "required" },
     { "file": "invalid/response-problem-unknown-code.json", "schema": "../openapi.json#/components/schemas/Problem", "violates": "problem codes are a closed list; a library exception name is not one", "expected_json_path": "$.code", "expected_validator": "enum" },
-    { "file": "invalid/response-channel-version-bad-digest.json", "schema": "../openapi.json#/components/schemas/ChannelVersion", "violates": "spec_sha256 is 64 lowercase hex, no prefix", "expected_json_path": "$.spec_sha256", "expected_validator": "pattern" }
+    { "file": "invalid/response-channel-version-bad-digest.json", "schema": "../openapi.json#/components/schemas/ChannelVersion", "violates": "spec_sha256 is 64 lowercase hex, no prefix", "expected_json_path": "$.spec_sha256", "expected_validator": "pattern" },
+    { "file": "invalid/request-replay-target-channel.json", "schema": "../openapi.json#/components/schemas/ReplayRequest", "violates": "replay targets only its source channel's raw: there is no target field (wave-3.md 2.6 H8)", "expected_json_path": "$", "expected_validator": "additionalProperties" },
+    { "file": "invalid/request-reprocess-operation-id-not-v7.json", "schema": "../openapi.json#/components/schemas/ReprocessRequest", "violates": "operation_id is a canonical UUIDv7, the library's request id grammar", "expected_json_path": "$.operation_id", "expected_validator": "pattern" },
+    { "file": "invalid/request-message-search-identifier-attr.json", "schema": "../openapi.json#/components/schemas/MessageSearchRequest", "violates": "a search attribute named for a direct identifier is refused (identifier search is deferred, ADR-004 H3)", "expected_json_path": "$.attrs", "expected_validator": "not", "expectation_note": "The 'not' keyword is the deny-list. If this reports 'pattern', the example fails on the name grammar and the deny-list is no longer tested" },
+    { "file": "invalid/request-message-search-without-since.json", "schema": "../openapi.json#/components/schemas/MessageSearchRequest", "violates": "since is required: with the channel it bounds the archive scan", "expected_json_path": "$", "expected_validator": "required" },
+    { "file": "invalid/response-message-detail-with-payload.json", "schema": "../openapi.json#/components/schemas/MessageDetail", "violates": "message detail is metadata for every role; content is only on the audited operator/admin operation (ADR-009 D14)", "expected_json_path": "$", "expected_validator": "additionalProperties" },
+    { "file": "invalid/response-replay-completed-without-counts.json", "schema": "../openapi.json#/components/schemas/Replay", "violates": "a completed replay reports its counts", "expected_json_path": "$", "expected_validator": "required" },
+    { "file": "invalid/response-message-content-presigned-claim-check.json", "schema": "../openapi.json#/components/schemas/MessageContent", "violates": "a claim-check locator is never a presigned URL (a stored, replayable credential)", "expected_json_path": "$.claim_check", "expected_validator": "pattern" }
   ]
 }

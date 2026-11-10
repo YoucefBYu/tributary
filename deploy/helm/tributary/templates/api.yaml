@@ -1,0 +1,236 @@
+{{- if .Values.api.enabled }}
+{{- $a := .Values.api }}
+{{- $db := $a.database }}
+{{- $ch := $a.clickhouse }}
+{{- $name := printf "%s-api" (include "tb.name" .) }}
+{{- /* ADR-004 C1a. listener (default): TLS on the API's own listener, certificate and key from a secretRef.
+       mesh: explicit opt-in for a mesh that enforces mTLS; the API then serves plaintext and a NetworkPolicy
+       admits only the ingress controller. */}}
+{{- $tls := $a.tls }}
+{{- if not (has $tls.mode (list "listener" "mesh")) }}{{ fail "api.tls.mode must be listener or mesh" }}{{ end }}
+{{- $mesh := eq $tls.mode "mesh" }}
+{{- $portName := ternary "http" "https" $mesh }}
+{{- if not $mesh }}{{- $_ := required "api.tls.secretRef is required in listener mode (files tls.crt and tls.key, ADR-004 C1a)" $tls.secretRef }}{{ end }}
+{{- if and $mesh (not $tls.ingressControllerFrom) }}{{ fail "api.tls.mode=mesh needs api.tls.ingressControllerFrom: the only peers the API port admits" }}{{ end }}
+{{- if and $mesh (not .Values.networkPolicy.enabled) }}{{ fail "api.tls.mode=mesh serves plaintext and is safe only behind the API NetworkPolicy: networkPolicy.enabled must be true (no opt-out)" }}{{ end }}
+{{- range $i, $peer := $tls.ingressControllerFrom }}
+{{- if $mesh }}
+{{- if hasKey $peer "ipBlock" }}{{ fail (printf "api.tls.ingressControllerFrom[%d]: an ipBlock peer is not allowed; name the ingress controller pods by selector" $i) }}{{ end }}
+{{- $psel := (get $peer "podSelector") | default dict }}{{ $nsel := (get $peer "namespaceSelector") | default dict }}
+{{- /* matchLabels only: matchExpressions can express catch-alls (Exists on a universal key, DoesNotExist on an absent one). */}}
+{{- if or (hasKey $psel "matchExpressions") (hasKey $nsel "matchExpressions") }}{{ fail (printf "api.tls.ingressControllerFrom[%d]: matchExpressions is not allowed in mesh mode; use matchLabels" $i) }}{{ end }}
+{{- $ps := (get $psel "matchLabels") | default dict }}{{ $ns := (get $nsel "matchLabels") | default dict }}
+{{- /* L1: a namespaceSelector alone admits every pod in that namespace; ADR-004 C1a allows only the ingress controller. */}}
+{{- if not $ps }}{{ fail (printf "api.tls.ingressControllerFrom[%d].podSelector.matchLabels is required and must be non-empty in mesh mode (a namespaceSelector alone admits every pod in the namespace)" $i) }}{{ end }}
+{{- if and (hasKey $peer "namespaceSelector") (not $ns) }}{{ fail (printf "api.tls.ingressControllerFrom[%d].namespaceSelector.matchLabels is empty" $i) }}{{ end }}
+{{- end }}
+{{- end }}
+{{- if and $a.ingress.enabled (not $a.ingress.host) }}{{ fail "api.ingress.host is required when api.ingress.enabled" }}{{ end }}
+{{- if and $a.ingress.enabled (not $a.ingress.tlsSecretName) }}{{ fail "api.ingress.tlsSecretName is required when api.ingress.enabled" }}{{ end }}
+{{- if and $a.ingress.enabled (not $mesh) (not $tls.caSecretRef) }}{{ fail "api.tls.caSecretRef is required for ingress upstream verification in listener mode" }}{{ end }}
+{{- /* Required inputs fail the render rather than start an API that refuses (or worse, runs weak). */}}
+{{- $_ := required "api.database.host is required" $db.host }}
+{{- $_ := required "api.database.name is required" $db.name }}
+{{- $_ := required "api.database.user is required" $db.user }}
+{{- $_ := required "api.database.secretRef is required (the password is the file <secretRef>/password, never a value)" $db.secretRef }}
+{{- $_ := required "api.database.caSecretRef is required: the API verifies the server certificate (sslmode verify-full, ADR-004 C1)" $db.caSecretRef }}
+{{- $_ := required "api.oidc.issuer is required (https)" $a.oidc.issuer }}
+{{- $_ := required "api.oidc.audience is required" $a.oidc.audience }}
+{{- if not $a.oidc.roleMap }}{{ fail "api.oidc.roleMap is required" }}{{ end }}
+{{- if or $ch.url $ch.user $ch.secretRef $ch.targets }}
+{{- if not (and $ch.url $ch.user $ch.secretRef $ch.targets) }}{{ fail "api.clickhouse.url, user, secretRef and targets go together" }}{{ end }}
+{{- if not (hasPrefix "https://" $ch.url) }}{{ fail "api.clickhouse.url must be https" }}{{ end }}
+{{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "tb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  replicas: {{ $a.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: api
+  template:
+    metadata:
+      labels:
+        {{- include "tb.labels" . | nindent 8 }}
+        app.kubernetes.io/component: api
+    spec:
+      automountServiceAccountToken: false
+      securityContext: {{- include "tb.podSecurityContext" . | nindent 8 }}
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: api
+          image: {{ include "tb.image" (dict "root" . "pkg" "api") | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: [tributary.api]
+          env:
+            {{- include "tb.downwardEnv" . | nindent 12 }}
+            {{- include "tb.commonEnv" . | nindent 12 }}
+            - {name: TB_SECRETS_DIR, value: /var/run/secrets/tributary}
+            - {name: TB_API_BIND, value: "$(POD_IP)"}
+            - {name: TB_API_PORT, value: {{ $a.port | quote }}}
+            - {name: TB_API_TLS_MODE, value: {{ $tls.mode | quote }}}
+            {{- if not $mesh }}
+            - {name: TB_API_TLS_SECRET_REF, value: {{ $tls.secretRef | quote }}}
+            {{- end }}
+            {{- /* Ops listener (/metrics, /livez): loopback unless api.opsBindPodIP, then the pod IP with a
+                   NetworkPolicy that admits the OTel collector only. */}}
+            {{- if $a.opsBindPodIP }}
+            - {name: TB_OPS_BIND, value: "$(POD_IP)"}
+            {{- else }}
+            - {name: TB_OPS_BIND, value: "127.0.0.1"}
+            {{- end }}
+            - {name: TB_OPS_PORT, value: {{ $a.opsPort | quote }}}
+            - {name: TB_DATABASE_HOST, value: {{ $db.host | quote }}}
+            - {name: TB_DATABASE_PORT, value: {{ $db.port | quote }}}
+            - {name: TB_DATABASE_NAME, value: {{ $db.name | quote }}}
+            - {name: TB_DATABASE_USER, value: {{ $db.user | quote }}}
+            - {name: TB_DATABASE_SECRET_REF, value: {{ $db.secretRef | quote }}}
+            - {name: TB_DATABASE_CA_SECRET_REF, value: {{ $db.caSecretRef | quote }}}
+            - {name: TB_OIDC_ISSUER, value: {{ $a.oidc.issuer | quote }}}
+            - {name: TB_OIDC_AUDIENCE, value: {{ $a.oidc.audience | quote }}}
+            - {name: TB_OIDC_ROLE_MAP, value: {{ $a.oidc.roleMap | toJson | quote }}}
+            - {name: TB_OIDC_ROLES_CLAIM, value: {{ $a.oidc.rolesClaim | quote }}}
+            {{- if $a.oidc.jwksUri }}
+            - {name: TB_OIDC_JWKS_URI, value: {{ $a.oidc.jwksUri | quote }}}
+            {{- end }}
+            {{- if $a.corsOrigins }}
+            - {name: TB_CORS_ORIGINS, value: {{ join "," $a.corsOrigins | quote }}}
+            {{- end }}
+            {{- if $ch.url }}
+            - {name: TB_CLICKHOUSE_URL, value: {{ $ch.url | quote }}}
+            - {name: TB_CLICKHOUSE_USER, value: {{ $ch.user | quote }}}
+            - {name: TB_CLICKHOUSE_SECRET_REF, value: {{ $ch.secretRef | quote }}}
+            {{- if $ch.caSecretRef }}
+            - {name: TB_CLICKHOUSE_CA_SECRET_REF, value: {{ $ch.caSecretRef | quote }}}
+            {{- end }}
+            - {name: TB_AUDIT_TAMPER_TARGETS, value: {{ $ch.targets | toJson | quote }}}
+            - {name: TB_AUDIT_TAMPER_CHECK_INTERVAL_S, value: {{ $ch.intervalSeconds | quote }}}
+            {{- end }}
+          ports:
+            - {name: {{ $portName }}, containerPort: {{ $a.port }}}
+            {{- if $a.opsBindPodIP }}
+            - {name: ops, containerPort: {{ $a.opsPort }}}
+            {{- end }}
+          # Kubelet probes the API port (NetworkPolicy admits the kubelet CIDR). /livez and /readyz carry no
+          # data and need no token (openapi security []). Not the ops /livez, which also tracks the tamper
+          # task: the ops listener is collector-only by policy (the kubelet is not admitted to it), exists only
+          # while the tamper check is configured, and a stuck tamper task must not restart an API that is
+          # serving requests. The tamper task's health is the stale-check alert on its timestamp gauge.
+          startupProbe:
+            httpGet: {path: /livez, port: {{ $portName }}, scheme: {{ ternary "HTTP" "HTTPS" $mesh }}}
+            {{- toYaml $a.probes.startup | nindent 12 }}
+          readinessProbe:
+            httpGet: {path: /readyz, port: {{ $portName }}, scheme: {{ ternary "HTTP" "HTTPS" $mesh }}}
+            {{- toYaml $a.probes.readiness | nindent 12 }}
+          livenessProbe:
+            httpGet: {path: /livez, port: {{ $portName }}, scheme: {{ ternary "HTTP" "HTTPS" $mesh }}}
+            {{- toYaml $a.probes.liveness | nindent 12 }}
+          resources: {{- toYaml $a.resources | nindent 12 }}
+          securityContext: {{- include "tb.containerSecurityContext" . | nindent 12 }}
+          volumeMounts:
+            {{- include "tb.kafkaMounts" (dict "root" . "role" "api") | nindent 12 }}
+            - {name: database, mountPath: /var/run/secrets/tributary/{{ $db.secretRef }}, readOnly: true}
+            - {name: database-ca, mountPath: /var/run/secrets/tributary/{{ $db.caSecretRef }}, readOnly: true}
+            {{- if $ch.secretRef }}
+            - {name: clickhouse, mountPath: /var/run/secrets/tributary/{{ $ch.secretRef }}, readOnly: true}
+            {{- end }}
+            {{- if not $mesh }}
+            # The certificate and key: a whole-Secret mount, never subPath (a subPath mount is not refreshed).
+            - {name: api-tls, mountPath: /var/run/secrets/tributary/{{ $tls.secretRef }}, readOnly: true}
+            {{- end }}
+            {{- if $ch.caSecretRef }}
+            # Optional private CA for the ClickHouse endpoint: TB_SECRETS_DIR/<caSecretRef>/ca.crt, named to the
+            # API by TB_CLICKHOUSE_CA_SECRET_REF.
+            - {name: clickhouse-ca, mountPath: /var/run/secrets/tributary/{{ $ch.caSecretRef }}, readOnly: true}
+            {{- end }}
+      volumes:
+        {{- include "tb.kafkaVolumes" (dict "root" . "role" "api") | nindent 8 }}
+        - name: database
+          secret: {secretName: {{ $db.secretRef }}}
+        - name: database-ca
+          secret: {secretName: {{ $db.caSecretRef }}}
+        {{- if $ch.secretRef }}
+        - name: clickhouse
+          secret: {secretName: {{ $ch.secretRef }}}
+        {{- end }}
+        {{- if not $mesh }}
+        - name: api-tls
+          secret: {secretName: {{ $tls.secretRef }}, defaultMode: 256}   # 0400 (decimal in YAML 1.1 JSON)
+        {{- end }}
+        {{- if $ch.caSecretRef }}
+        - name: clickhouse-ca
+          secret: {secretName: {{ $ch.caSecretRef }}, defaultMode: 256}  # 0400
+        {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "tb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: api
+  ports:
+    - {name: {{ $portName }}, port: {{ $a.port }}, targetPort: {{ $portName }}}
+{{- if $a.ingress.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $name }}
+  labels: {{- include "tb.labels" . | nindent 4 }}
+  annotations:
+    nginx.ingress.kubernetes.io/enable-access-log: "false"
+    {{- if $mesh }}
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
+    {{- else }}
+    # ingress-nginx re-encrypts to the pod and verifies the API certificate against the CA Secret
+    # (<namespace>/<name>, key ca.crt) and the Service DNS name. Other controllers: see the README.
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+    nginx.ingress.kubernetes.io/proxy-ssl-verify: "on"
+    nginx.ingress.kubernetes.io/proxy-ssl-verify-depth: "2"
+    nginx.ingress.kubernetes.io/proxy-ssl-secret: {{ printf "%s/%s" .Release.Namespace $tls.caSecretRef | quote }}
+    nginx.ingress.kubernetes.io/proxy-ssl-name: {{ printf "%s.%s.svc" $name .Release.Namespace | quote }}
+    {{- end }}
+spec:
+  ingressClassName: {{ $a.ingress.className }}
+  tls:
+    - hosts: [{{ $a.ingress.host | quote }}]
+      secretName: {{ $a.ingress.tlsSecretName }}
+  rules:
+    - host: {{ $a.ingress.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $name }}
+                port: {name: {{ $portName }}}
+{{- end }}
+{{- if .Values.podDisruptionBudget.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $name }}
+  labels: {{- include "tb.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: api
+{{- end }}
+{{- end }}

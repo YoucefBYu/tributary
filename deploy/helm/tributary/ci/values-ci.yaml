@@ -8,6 +8,7 @@ monitoring:
       podSelector: {matchLabels: {app.kubernetes.io/name: prometheus}}
 channels:
   - name: adt-passthrough
+    syncReply: true
     receiver:
       module: tributary.receivers.mllp
       port: 6661
@@ -18,6 +19,13 @@ channels:
       - name: http-stub
         module: tributary.loaders.http
         replicas: 2
+  - name: lab-results
+    receiver:
+      module: tributary.receivers.http
+      port: 8080
+    destinations:
+      - name: fhir-stub
+        module: tributary.loaders.fhir
 ingress:
   enabled: true
   className: nginx
@@ -26,3 +34,21 @@ ingress:
   channel: adt-passthrough
   logFormat:
     enabled: true
+archiver:
+  clickhouse:
+    caCertSecretRef: chca
+api:
+  enabled: true
+  opsBindPodIP: true
+  tls: {mode: listener, secretRef: tb-api-tls, caSecretRef: tb-api-tls-ca}
+  ingress: {enabled: true, host: api.example.internal, tlsSecretName: tb-api-ingress-tls}
+  database: {host: pg.example.internal, name: tributary, user: tb_api, secretRef: tb-api-db, caSecretRef: tb-api-db-ca}
+  oidc:
+    issuer: https://idp.example.internal/realms/tb
+    audience: tributary-api
+    roleMap: {tb-admins: admin}
+  clickhouse:
+    url: https://clickhouse.example.internal:8443
+    user: tb_api_audit_ro
+    secretRef: tb-api-clickhouse
+    targets: {prod: tributary}

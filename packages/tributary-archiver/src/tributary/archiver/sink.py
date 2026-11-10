@@ -29,15 +29,13 @@ import ipaddress
 import logging
 import re
 import ssl
+import struct
 from collections.abc import Sequence
 from dataclasses import dataclass
 from ssl import CertificateError
 from typing import Any, Final, Protocol
 
-import clickhouse_connect
 import urllib3
-from clickhouse_connect.driver import exceptions as ch_exc
-from clickhouse_connect.driver.httputil import get_pool_manager_options
 
 from .errors import ArchiverConfigError, SinkError
 from .event import COLUMNS
@@ -48,15 +46,50 @@ from .schema import TABLE
 #: 497 ACCESS_DENIED, 516 AUTHENTICATION_FAILED.
 PERMANENT_CODES: Final = frozenset({16, 47, 53, 60, 81, 497, 516})
 _CODE = re.compile(r"Code: (\d{1,4})")
+#: Raised by the driver while it turns a Python value into a column (a string for a UUID, a number out of range).
+#: Local, deterministic and a property of the row: permanent, so the loop can isolate the row instead of retrying.
+LOCAL_CONVERSION_ERRORS: Final = (
+    AttributeError,
+    TypeError,
+    ValueError,
+    OverflowError,
+    KeyError,
+    IndexError,
+    UnicodeError,
+    struct.error,
+)
+
+
+def _network_cause(exc: BaseException) -> bool:
+    seen: set[int] = set()
+    stack: list[BaseException | None] = [exc]
+    while stack and len(seen) < 16:
+        current = stack.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, OSError | urllib3.exceptions.HTTPError):
+            return True
+        stack.extend([current.__cause__, current.__context__])
+    return False
 
 
 def is_permanent(exc: BaseException) -> bool:
     """Whether retrying the same insert is pointless. Reads the driver's text only to extract a number;
     nothing from it is logged or kept."""
+    from clickhouse_connect.driver import (
+        exceptions as ch_exc,  # extra `clickhouse`; lazy so importing this module needs no driver
+    )
+
     if isinstance(exc, ch_exc.OperationalError):
         return False
     if isinstance(exc, ch_exc.DataError | ch_exc.ProgrammingError):
         return True
+    if isinstance(exc, LOCAL_CONVERSION_ERRORS):
+        # The driver could not serialise a value: retrying the same bytes fails the same way. Unless the
+        # exception sits on top of a network fault (its chain holds an OSError or a urllib3 error): then it is
+        # transient and must not cost a row.
+        return not _network_cause(exc)
     match = _CODE.search(str(exc))
     return match is not None and int(match.group(1)) in PERMANENT_CODES
 
@@ -151,6 +184,8 @@ def _code(exc: BaseException) -> str:
 
 
 def build_pool(target: ClickhouseTarget) -> urllib3.PoolManager:
+    from clickhouse_connect.driver.httputil import get_pool_manager_options
+
     options = get_pool_manager_options(
         ca_cert=(target.ca_cert or "certifi") if target.secure else None,
         verify=target.secure,
@@ -161,6 +196,14 @@ def build_pool(target: ClickhouseTarget) -> urllib3.PoolManager:
 
 def connect(target: ClickhouseTarget) -> Any:
     """A client with driver-side retries off. Raises `SinkError` (fixed text) if the server is unreachable."""
+    try:
+        import clickhouse_connect
+    except ImportError:
+        raise SinkError(
+            "clickhouse-connect is not installed; install tributary-archiver[clickhouse]",
+            transient=False,
+            code="DRIVER_MISSING",
+        ) from None
     quiet_driver_logging()
     pool = build_pool(target)
     try:
@@ -193,15 +236,16 @@ def connect(target: ClickhouseTarget) -> Any:
 class ClickhouseSink:
     """Inserts one batch per call. Thread-confined: one client per archiver process (a session is not shared)."""
 
-    def __init__(self, client: Any, *, table: str = TABLE) -> None:
+    def __init__(self, client: Any, *, table: str = TABLE, columns: Sequence[str] = COLUMNS) -> None:
         self._client = client
         self._table = table
+        self._columns = list(columns)
 
     def insert(self, rows: Sequence[Sequence[Any]]) -> None:
         if not rows:
             return
         try:
-            self._client.insert(self._table, list(rows), column_names=list(COLUMNS))
+            self._client.insert(self._table, list(rows), column_names=self._columns)
         except Exception as exc:
             raise SinkError(
                 f"clickhouse insert failed ({type(exc).__name__})", transient=not is_permanent(exc), code=_code(exc)

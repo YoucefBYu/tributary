@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import NoReturn
 
 from tributary.runtime.errors import RuntimeConfigurationError, safe_token
+from tributary.runtime.startup import refuse_configuration, resolve_instance_id
 from tributary.runtime.topics import spec_reader_group
 from tributary.sdk.context import Logger
 
@@ -24,3 +25,13 @@ def spec_reader_group_or_exit(env: str, channel: str, instance: str, log: Logger
         return spec_reader_group(env, channel, instance)
     except RuntimeConfigurationError as exc:
         _refuse(log, exc)
+
+
+def instance_or_exit(flag: str | None, log: Logger) -> str:
+    """The loader's instance id (`--instance-id` or `TB_INSTANCE_ID`), required and unique per replica: it is the
+    Kafka `group.instance.id`. One PHI-free `startup_refused` line and exit 2 when missing or malformed
+    (`INSTANCE_REQUIRED`, `ARGUMENTS_INVALID`); the value is never echoed."""
+    try:
+        return resolve_instance_id(flag)
+    except RuntimeConfigurationError as exc:
+        refuse_configuration(log, exc)

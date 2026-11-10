@@ -47,3 +47,78 @@ spec:
     topicOperator: {}
     userOperator: {}
 {{- end }}
+{{- if .Values.strimzi.enabled }}
+{{- /* One KafkaUser per role. ACLs come from files/acls.json, generated from
+       contracts/topics/v0/topic-defaults.json by deploy/helm/gen_acls.py (CI drift check), never written
+       here. @ENV@, @CHANNEL@ and @DEST@ are expanded per channel and destination. */}}
+{{- $acls := .Files.Get "files/acls.json" | fromJson }}
+{{- $ops := dict "READ" "Read" "WRITE" "Write" "DESCRIBE" "Describe" "IDEMPOTENT_WRITE" "IdempotentWrite" "CREATE" "Create" "DELETE" "Delete" "ALTER" "Alter" "CLUSTER_ACTION" "ClusterAction" "ALL" "All" }}
+{{- $types := dict "TOPIC" "topic" "GROUP" "group" "CLUSTER" "cluster" }}
+{{- $pat := dict "LITERAL" "literal" "PREFIXED" "prefix" }}
+{{- $users := dict "receiver" .Values.kafka.roleSecretRefs.receiver "worker" .Values.kafka.roleSecretRefs.worker "loader" .Values.kafka.roleSecretRefs.loader "archiver" .Values.kafka.roleSecretRefs.archiver "lag_reader" .Values.keda.lagReaderUser }}
+{{- if .Values.api.enabled }}{{ $_ := set $users "api" .Values.kafka.roleSecretRefs.api }}{{ end }}
+{{- range $role, $user := $users }}
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaUser
+metadata:
+  name: {{ $user }}
+  labels:
+    strimzi.io/cluster: {{ $.Values.strimzi.name }}
+    {{- include "tb.labels" $ | nindent 4 }}
+    tributary.dev/role: {{ $role | replace "_" "-" }}
+spec:
+  authentication: {type: scram-sha-512}
+  authorization:
+    type: simple
+    acls:
+    {{- range $g := (index $acls.roles $role) }}
+    {{- $names := list }}
+    {{- $base := $g.name | replace "@ENV@" $.Values.env }}
+    {{- if contains "@CHANNEL@" $base }}
+      {{- range $ch := $.Values.channels }}
+       {{- if or (not $g.syncReplyOnly) $ch.syncReply }}
+        {{- $n := $base | replace "@CHANNEL@" $ch.name }}
+        {{- if contains "@DEST@" $n }}
+          {{- range $d := $ch.destinations }}{{ $names = append $names ($n | replace "@DEST@" $d.name) }}{{ end }}
+        {{- else }}{{ $names = append $names $n }}{{ end }}
+       {{- end }}
+      {{- end }}
+    {{- else }}{{ $names = append $names $base }}{{ end }}
+    {{- range $name := $names }}
+      - resource:
+          type: {{ index $types $g.resourceType }}
+          {{- if ne $g.resourceType "CLUSTER" }}
+          name: {{ $name | quote }}
+          patternType: {{ index $pat $g.patternType }}
+          {{- end }}
+        operations: [{{ index $ops $g.operation }}]
+        host: "*"
+    {{- end }}
+    {{- end }}
+{{- end }}
+{{- end }}
+{{- if .Values.strimzi.enabled }}
+{{- /* `_tb.<env>.events` and `_tb.<env>.audit`: values from topic-defaults.json via files/acls.json (drift-checked),
+       including message.timestamp.type=LogAppendTime. A KafkaTopic also reconciles the config of a topic that
+       already exists, so a re-run of `helm upgrade` fixes an older topic. audit is a 30 d buffer (ADR-004 R7). */}}
+{{- range $kind, $t := (.Files.Get "files/acls.json" | fromJson).topics }}
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: tb-{{ $.Values.env }}-{{ $kind }}
+  annotations:
+    helm.sh/resource-policy: keep   # `helm uninstall` must not delete a topic (and its retained records)
+  labels:
+    strimzi.io/cluster: {{ $.Values.strimzi.name }}
+    {{- include "tb.labels" $ | nindent 4 }}
+spec:
+  topicName: {{ printf "_tb.%s.%s" $.Values.env $kind | quote }}
+  partitions: {{ $t.partitions }}
+  replicas: {{ $t.replicas }}
+  config: {{- range $k, $v := $t.config }}
+    {{ $k | quote }}: {{ $v | quote }}
+  {{- end }}
+{{- end }}
+{{- end }}

@@ -2,7 +2,7 @@
 {{- $name := printf "%s-%s-receiver" (include "tb.name" $) $ch.name }}
 ---
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: {{ $name }}
   labels:
@@ -10,6 +10,9 @@ metadata:
     app.kubernetes.io/component: receiver
     tributary.dev/channel: {{ $ch.name }}
 spec:
+  serviceName: {{ include "tb.name" $ }}-headless
+  podManagementPolicy: Parallel
+  updateStrategy: {type: RollingUpdate}
   replicas: {{ $ch.receiver.replicas | default 1 }}
   selector:
     matchLabels:

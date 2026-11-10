@@ -26,12 +26,12 @@
     "destination": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,63}$" },
     "consumerGroup": {
       "type": "string",
-      "description": "tb.<env>.<channel>.<role>[.<destination>][.shadow-<label>], or (set 1.8) the environment-wide platform group tb.<env>.archiver",
+      "description": "tb.<env>.<channel>.<role>[.<destination>][.shadow-<label>], or (set 1.8) an environment-wide platform group tb.<env>.archiver, tb.<env>.reprocessor or tb.<env>.reconciler (the API's channels-table reader, assign-only)",
       "anyOf": [
         { "pattern": "^tb\\.[a-z][a-z0-9-]{0,15}\\.[a-z][a-z0-9-]{0,63}\\.(pipeline|loader|replier)(\\.[a-z][a-z0-9-]{0,63})?(\\.shadow-[a-z0-9-]{1,32})?$" },
         {
-          "pattern": "^tb\\.[a-z][a-z0-9-]{0,15}\\.archiver$",
-          "$comment": "Set 1.8. The archiver consumes _tb.<env>.events for every channel, so its group has no channel segment. Its ACL is LITERAL: a PREFIXED tb.<env>.archiver grant would also match the groups of a channel named 'archiver' (tb.<env>.archiver.pipeline)."
+          "pattern": "^tb\\.[a-z][a-z0-9-]{0,15}\\.(archiver|reprocessor|reconciler)$",
+          "$comment": "Set 1.8. Platform groups have no channel segment: the archiver consumes _tb.<env>.events for every channel; the reprocessor's group is a group.id librdkafka requires for assign(), never joined or committed. Both ACLs are LITERAL: a PREFIXED tb.<env>.archiver grant would also match the groups of a channel named 'archiver' (tb.<env>.archiver.pipeline), and likewise for 'reprocessor'."
         }
       ]
     }
