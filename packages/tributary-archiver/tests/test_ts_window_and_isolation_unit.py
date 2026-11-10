@@ -457,3 +457,18 @@ def test_the_streak_resets_when_the_bisect_stores_rows() -> None:
     # With the old behaviour the streak would now be at the limit and a lone bad row would halt the archiver.
     sink.bad.add("lone")
     assert archiver._write([Row("lone", datetime(2026, 10, 1, tzinfo=UTC))]) is True  # type: ignore[arg-type]
+
+
+def test_a_contract_example_older_than_the_lookback_is_rejected_and_the_same_record_fresh_is_stored() -> None:
+    """Pins the window without depending on the calendar: the anchor and the clock are both today."""
+    from tributary.archiver.tswindow import LOOKBACK
+
+    now = datetime.now(UTC)
+
+    def stamp(moment: datetime) -> str:
+        return moment.strftime("%Y-%m-%dT%H:%M:%S.") + f"{moment.microsecond // 1000:03d}Z"
+
+    with pytest.raises(AuditRejected) as raised:
+        audit_row(anchor=now, now=now, ts=stamp(now - LOOKBACK - timedelta(minutes=1)))
+    assert raised.value.code == "AUDIT_TIMESTAMP_INVALID"
+    assert audit_row(anchor=now, now=now, ts=stamp(now)).ts.year == now.year

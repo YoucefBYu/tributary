@@ -114,7 +114,11 @@ class Rig:
 
     def record(self, name: str = "content-view-requested.json", **over: Any) -> dict[str, Any]:
         record = json.loads((EXAMPLES / name).read_text())
-        record.update({"environment": self.env, "audit_id": uuid7(), **over})
+        # The examples carry a fixed `ts`; the audit window allows 30 days before the Kafka record time, so a
+        # fixed date is a time bomb. Fresh `ts` unless the caller overrides it.
+        now = datetime.now(UTC)
+        fresh = now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
+        record.update({"environment": self.env, "audit_id": uuid7(), "ts": fresh, **over})
         return record  # type: ignore[no-any-return]
 
     def publish(self, value: bytes, key: bytes = b"synth-operator-0002") -> None:
