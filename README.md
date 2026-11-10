@@ -11,6 +11,7 @@ Durable HL7 v2 and FHIR messaging where every guarantee is measured, tested and 
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-control%20plane-4169E1?logo=postgresql&logoColor=white)
 ![Kubernetes](https://img.shields.io/badge/Kubernetes-Helm%20%2B%20Strimzi-326CE5?logo=kubernetes&logoColor=white)
 ![Type checked](https://img.shields.io/badge/mypy-strict-2A6DB2)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
 </div>
 
@@ -140,7 +141,7 @@ Project status and the plan for each wave are in [`docs/agent-team/STATUS.md`](d
 
 ## Licence
 
-The core is designed to be Apache-2.0, and every dependency is restricted to permissive licences (checked in CI). The project is pre-release, and a `LICENSE` file will be added when it is first published.
+Licensed under the [Apache License 2.0](LICENSE). Every dependency is restricted to permissive licences (Apache-2.0, MIT, BSD, ISC, PSF), and a CI licence check enforces it.
 
 ---
 
