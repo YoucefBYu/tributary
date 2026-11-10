@@ -73,8 +73,8 @@ def write_secret(directory: Path, ref: str, user: str, password: str) -> None:
 class Stack:
     """A fresh Kafka env (unique topic names), ClickHouse database and the two credentials."""
 
-    def __init__(self, kafka: str, ch: ClickHouseContainer, tmp_path: Path) -> None:
-        self.kafka, self.ch = kafka, ch
+    def __init__(self, kafka: str, ch: ClickHouseContainer, tmp_path: Path, retry: Any) -> None:
+        self.kafka, self.ch, self.retry = kafka, ch, retry
         self.env = f"c{uuid.uuid4().hex[:8]}"
         self.database = f"t_{uuid.uuid4().hex[:12]}"
         self.admin = connect(target(ch, ch.dbname))
@@ -185,8 +185,9 @@ class Stack:
                 done = True
                 for name in topics:
                     topic = self.topic(name)
-                    _, high = probe.get_watermark_offsets(TopicPartition(topic, 0), timeout=10)
-                    (committed,) = probe.committed([TopicPartition(topic, 0)], timeout=10)
+                    tp = TopicPartition(topic, 0)
+                    _, high = self.retry(lambda tp=tp: probe.get_watermark_offsets(tp, timeout=10), deadline=deadline)
+                    (committed,) = self.retry(lambda tp=tp: probe.committed([tp], timeout=10), deadline=deadline)
                     done = done and committed.offset >= high
                 if done:
                     return
@@ -219,8 +220,8 @@ class Stack:
 
 
 @pytest.fixture
-def stack(kafka_bootstrap: str, clickhouse: ClickHouseContainer, tmp_path: Path) -> Iterator[Stack]:
-    s = Stack(kafka_bootstrap, clickhouse, tmp_path)
+def stack(kafka_bootstrap: str, clickhouse: ClickHouseContainer, tmp_path: Path, kafka_retry: Any) -> Iterator[Stack]:
+    s = Stack(kafka_bootstrap, clickhouse, tmp_path, kafka_retry)
     try:
         yield s
     finally:

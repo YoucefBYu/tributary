@@ -71,8 +71,8 @@ def secret(directory: Path, ref: str, user: str, password: str) -> None:
 
 
 class Rig:
-    def __init__(self, kafka: str, ch: ClickHouseContainer, tmp_path: Path) -> None:
-        self.kafka, self.ch = kafka, ch
+    def __init__(self, kafka: str, ch: ClickHouseContainer, tmp_path: Path, retry: Any) -> None:
+        self.kafka, self.ch, self.retry = kafka, ch, retry
         self.env = f"a{uuid.uuid4().hex[:8]}"
         self.database = f"t_{uuid.uuid4().hex[:12]}"
         self.admin = connect(target(ch, ch.dbname))
@@ -149,8 +149,9 @@ class Rig:
         try:
             deadline = time.monotonic() + timeout_s
             while time.monotonic() < deadline:
-                _, high = probe.get_watermark_offsets(TopicPartition(self.audit_topic, 0), timeout=10)
-                (committed,) = probe.committed([TopicPartition(self.audit_topic, 0)], timeout=10)
+                tp = TopicPartition(self.audit_topic, 0)
+                _, high = self.retry(lambda tp=tp: probe.get_watermark_offsets(tp, timeout=10), deadline=deadline)
+                (committed,) = self.retry(lambda tp=tp: probe.committed([tp], timeout=10), deadline=deadline)
                 if committed.offset >= high:
                     return
                 time.sleep(0.5)
@@ -169,8 +170,8 @@ class Rig:
 
 
 @pytest.fixture
-def rig(kafka_bootstrap: str, clickhouse: ClickHouseContainer, tmp_path: Path) -> Iterator[Rig]:
-    r = Rig(kafka_bootstrap, clickhouse, tmp_path)
+def rig(kafka_bootstrap: str, clickhouse: ClickHouseContainer, tmp_path: Path, kafka_retry: Any) -> Iterator[Rig]:
+    r = Rig(kafka_bootstrap, clickhouse, tmp_path, kafka_retry)
     try:
         yield r
     finally:
