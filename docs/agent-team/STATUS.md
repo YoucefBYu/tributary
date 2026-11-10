@@ -5,6 +5,25 @@ wave's exit criteria here.
 
 ## Current
 
+### Wave 4: PLANNED 2026-11-10, awaiting the human's go-ahead
+
+- **Wave 3: COMPLETE, pending the PR #2 merge** (`wave/1-3`, head `aeb0e27`). Exit criteria 1-4 met
+  per `phases/wave-3.md` 4.2 (criterion 2 under the lead's one-sided rule; criterion 4 on the relayed
+  `security-reviewer` pass, whose file is still owed under `docs/`).
+- **Wave 4 plan:** [`phases/wave-4.md`](phases/wave-4.md), DRAFT. Goals: the console (W4-1..W4-4),
+  wave 3 carry-overs (replay cancel W4-9, audited `401`/`403` W4-10, stats residuals W4-11, W3-30
+  follow-ups W4-12, destination-scoped reprocess design W4-13, KEDA on real lag W4-14), MVP release
+  candidate (W4-6..W4-8), CI on public Actions (W4-15) and a post-publication audit (W4-16). Importer
+  and Kubernetes operator stay in Phase 2 (`wave-4.md` 1.1). **Batch 1:** W4-16 `devops-engineer`,
+  W4-1 `ui-engineer`, W4-9/W4-10 contracts `architect`, W4-11 `archive-engineer`.
+- **Human questions:** `wave-4.md` section 7 (Q0 go-ahead, Q1 H7/K2, Q2 `LICENSE`, Q3 CI governance,
+  Q4 release and naming, Q5 dedicated capacity, Q6 scope, Q7 `hl7.org`, Q8 H6 erasure).
+- **CI: GitHub Actions runs again** because the repository is now public (coordinator-relayed; the
+  architect has not seen a run). `.github/scripts/ci_local.sh` is the single source of the job
+  commands for both the workflows and the lead's gate (`aeb0e27`), with `test_ci_parity.py` against
+  drift. A self-hosted runner must never be attached to the public repo. Whether the pre-publication
+  audit of `decisions/ci-alternatives.md` F was done is **not recorded**: W4-16.
+
 ### Wave 3, started 2026-10-05
 
 - **Phase / wave:** **Phase 1, wave 3: archive, control plane, operations. STARTED 2026-10-05** under
@@ -664,6 +683,9 @@ architect.
   - run that test;
   - optionally create a statuses token (credential);
   - fixing billing (spend) or going public (publishing) are separate human decisions.
+  **Superseded 2026-11-10:** option C is built (`ci_local.sh`, parity test, gate uses it) and the
+  repository is public, so hosted runners run. The self-hosted runner test is withdrawn (never on a
+  public repo). What remains is `wave-4.md` Q3.
 
 **Open, new in wave 2:**
 
